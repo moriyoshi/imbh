@@ -1,0 +1,49 @@
+[package]
+name = "imbh-lgtm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+# The three query languages target the Grafana LGTM stack's query surfaces: PromQL (Prometheus/Mimir),
+# LogQL (Loki), and TraceQL (Tempo). "G" (Grafana) is a dashboard UI with no query language of its
+# own, so this crate implements the L/T/M query languages, not a neutral cross-ecosystem standard.
+description = "LGTM-stack (Loki/Tempo/Mimir) query-language compatibility for IMBH: PromQL, LogQL, and TraceQL parsing plus reference evaluation."
+
+[features]
+default = []
+# Native execution against the `imbh` facade (source adapters + the *SemanticsExt execution traits).
+# Off by default so parse-only/evaluate-only consumers stay free of the DataFusion/Tantivy subtree.
+source = ["dep:imbh"]
+
+[dependencies]
+imbh = { workspace = true, optional = true }
+# The shared full-text tokenizer / `matches()` term semantics (pure, no Tantivy). Reused by the LogQL
+# reference evaluator (`LineMatches`, the in-memory re-filter on the `|?` metric path) so it matches the
+# index byte-for-byte (ARCHITECTURE.md §8/§9.2) — the same definition `imbh-index` wraps into its
+# Tantivy analyzer, not a duplicate tokenizer. Adds `tokio` (rt) to the parse-only profile, but not the
+# DataFusion/Tantivy subtree the `source` feature gates; tokio is already in every real consumer graph.
+imbh-core = { workspace = true }
+regex.workspace = true
+self_cell = "1.3.0"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros"] }
+# OTLP fixture builders for the native-execution (`source`) end-to-end tests.
+imbh-test-support = { workspace = true }
+
+# These examples benchmark the raw-Arrow (Level 2) read paths against the `imbh` facade DTOs, so they
+# need the `source`-gated surface. Declared explicitly so a focused `cargo clippy/test -p imbh-lgtm
+# --all-targets` (without `--features source`) skips them instead of failing to compile.
+[[example]]
+name = "logql_level2"
+required-features = ["source"]
+
+[[example]]
+name = "metric_level2"
+required-features = ["source"]
+
+[[example]]
+name = "trace_level2_ceiling"
+required-features = ["source"]

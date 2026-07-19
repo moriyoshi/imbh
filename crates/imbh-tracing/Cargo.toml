@@ -1,0 +1,25 @@
+[package]
+name = "imbh-tracing"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "In-process `tracing` plumbing for imbh: `DbLayer` — a `tracing_subscriber::Layer` that sinks spans/events straight into an embedded imbh `Db` (self-observation, zero network hops)."
+
+[dependencies]
+# `DbLayer` needs the `registry` layer for span storage / `LookupSpan`; the shared workspace
+# `tracing-subscriber` (fmt + env-filter, used by `imbh`'s console renderer) pulls it in.
+tracing-subscriber.workspace = true
+# `DbLayer` and its OTLP construction. Not feature-gated: `imbh-tracing` is itself the opt-in boundary
+# (a host depends on it only to wire tracing to imbh), so an inner feature would be redundant. Depending
+# on `imbh` here does NOT enable `imbh/tracing` (emission) — that stays a separate opt-in on the host's
+# own `imbh` dependency, so the sink and imbh's self-instrumentation remain independent.
+imbh.workspace = true
+opentelemetry-proto.workspace = true
+prost.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros"] }

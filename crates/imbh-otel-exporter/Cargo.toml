@@ -1,0 +1,31 @@
+[package]
+name = "imbh-otel-exporter"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Optional opentelemetry-rust exporter adapters that write directly into an embedded imbh Db (ARCHITECTURE.md §12)."
+
+[dependencies]
+imbh.workspace = true
+# `logs`/`metrics` are added on top of the workspace `trace` features (Cargo unifies them); already
+# enabled transitively via opentelemetry-proto's workspace config, so no new crates.
+opentelemetry = { workspace = true, features = ["logs", "metrics"] }
+opentelemetry_sdk = { workspace = true, features = ["logs", "metrics"] }
+opentelemetry-proto = { workspace = true, features = [
+    "gen-tonic-messages",
+    "trace",
+    "logs",
+    "metrics",
+] }
+prost.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros"] }
+# The SDK providers the integration test drives (regular deps aren't in scope for a `tests/` crate).
+opentelemetry = { workspace = true, features = ["logs", "metrics"] }
+opentelemetry_sdk = { workspace = true, features = ["logs", "metrics"] }
+tempfile.workspace = true
+imbh-test-support.workspace = true

@@ -1,0 +1,193 @@
+//! End-to-end test of the reference `imbhd` server over a **real loopback socket**: bind an
+//! ephemeral `127.0.0.1` port, run `serve()` on a background thread, and drive it with a blocking
+//! HTTP/1.1 client (`imbh_test_support::http`). This exercises the `serve()` accept loop, the
+//! HTTP/1.1 request parser, and the status/error mapping over the wire — the surface the socket-free
+//! `route()` unit tests can't reach. Loopback only: no external network or daemon, so it stays
+//! within the hermetic `cargo test --workspace` rule (TESTING.md Layer 1).
+
+use std::net::TcpListener;
+use std::sync::Arc;
+use std::time::Duration;
+
+use imbh::Db;
+use imbh_server::serve;
+use imbh_test_support::http;
+use imbh_test_support::otlp::{otlp_hist, otlp_log, otlp_metrics, otlp_trace};
+
+/// Grab a free `127.0.0.1` port by binding `:0` and immediately releasing it, then hand the address
+/// to `serve()`. There is a tiny window before `serve()` re-binds, but nothing else races for a
+/// loopback ephemeral port in a hermetic test.
+fn free_addr() -> String {
+    let l = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+    l.local_addr().expect("local addr").to_string()
+}
+
+/// Start `imbhd` on a background thread over an in-memory DB and wait until it answers `/health`.
+fn start_server() -> String {
+    let addr = free_addr();
+    let db: Arc<Db> = Db::in_memory().open().expect("open in-memory db");
+    let serve_addr = addr.clone();
+    std::thread::spawn(move || {
+        let _ = serve(db, &serve_addr);
+    });
+
+    // Poll until the accept loop is up (the thread has to re-bind the port first).
+    for _ in 0..200 {
+        if let Ok(resp) = http::get(&addr, "/health")
+            && resp.status == 200
+        {
+            return addr;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    panic!("server did not become ready on {addr}");
+}
+
+#[test]
+fn http_wire_ingest_query_stats_and_errors() {
+    let addr = start_server();
+
+    // Liveness.
+    let health = http::get(&addr, "/health").expect("GET /health");
+    assert_eq!(health.status, 200);
+    assert_eq!(health.text(), "ok");
+    assert_eq!(http::get(&addr, "/").expect("GET /").status, 200);
+
+    // OTLP/HTTP ingest of all three signals over the socket.
+    let logs = http::post(
+        &addr,
+        "/v1/logs",
+        "application/x-protobuf",
+        &otlp_log("cart", "hello", 1),
+    )
+    .expect("POST /v1/logs");
+    assert_eq!(logs.status, 200);
+    assert_eq!(logs.content_type, "application/json");
+    assert!(
+        logs.text().contains("\"accepted\":1"),
+        "got {}",
+        logs.text()
+    );
+
+    let traces = http::post(
+        &addr,
+        "/v1/traces",
+        "application/x-protobuf",
+        &otlp_trace("cart", "GET /x", 2, 1000, 1500, 0),
+    )
+    .expect("POST /v1/traces");
+    assert_eq!(traces.status, 200);
+    assert!(traces.text().contains("\"accepted\":1"));
+
+    let metrics = http::post(
+        &addr,
+        "/v1/metrics",
+        "application/x-protobuf",
+        &otlp_metrics("cart"),
+    )
+    .expect("POST /v1/metrics");
+    assert_eq!(metrics.status, 200);
+    // cpu (gauge) + requests (sum) = 2 scalar points accepted.
+    assert!(
+        metrics.text().contains("\"accepted\":2"),
+        "got {}",
+        metrics.text()
+    );
+
+    // A List-typed column (histogram bucket_counts) must serialize to JSON over the wire.
+    assert_eq!(
+        http::post(
+            &addr,
+            "/v1/metrics",
+            "application/x-protobuf",
+            &otlp_hist("lat", &[1.0, 5.0], &[2, 3, 2])
+        )
+        .expect("POST hist")
+        .status,
+        200
+    );
+
+    // Full round-trip: query the just-ingested logs back as JSON rows.
+    let q = http::post(
+        &addr,
+        "/api/query",
+        "text/plain",
+        b"SELECT service, count(*) AS c FROM logs GROUP BY service",
+    )
+    .expect("POST /api/query");
+    assert_eq!(q.status, 200);
+    let json = q.text();
+    assert!(json.contains("\"service\":\"cart\""), "got {json}");
+    assert!(json.contains("\"c\":1"), "got {json}");
+
+    let hist_q = http::post(
+        &addr,
+        "/api/query",
+        "text/plain",
+        b"SELECT metric, bucket_counts FROM metrics_histogram",
+    )
+    .expect("POST hist query");
+    assert_eq!(hist_q.status, 200);
+    assert!(
+        hist_q.text().contains("bucket_counts"),
+        "got {}",
+        hist_q.text()
+    );
+
+    // Operational stats.
+    let stats = http::get(&addr, "/stats").expect("GET /stats");
+    assert_eq!(stats.status, 200);
+    let s = stats.text();
+    assert!(s.contains("\"tables\""), "got {s}");
+    assert!(s.contains("\"durable_lsn\""), "got {s}");
+
+    // Admin maintenance actions.
+    assert_eq!(
+        http::post(&addr, "/admin/flush", "text/plain", b"")
+            .expect("flush")
+            .status,
+        200
+    );
+    assert_eq!(
+        http::post(&addr, "/admin/compact", "text/plain", b"")
+            .expect("compact")
+            .status,
+        200
+    );
+
+    // Error paths over the wire (validates error_response's classifier mapping).
+    // Malformed protobuf → decode error → user error → 400.
+    let bad_proto = http::post(&addr, "/v1/logs", "application/x-protobuf", &[0x08, 0x80])
+        .expect("POST bad proto");
+    assert_eq!(
+        bad_proto.status,
+        400,
+        "malformed protobuf: {}",
+        bad_proto.text()
+    );
+    // Bad SQL → query error → user error → 400.
+    let bad_sql = http::post(
+        &addr,
+        "/api/query",
+        "text/plain",
+        b"SELECT nope FROM missing",
+    )
+    .expect("POST bad sql");
+    assert_eq!(bad_sql.status, 400, "bad sql: {}", bad_sql.text());
+    // Unknown route → 404.
+    assert_eq!(
+        http::get(&addr, "/does/not/exist")
+            .expect("GET unknown")
+            .status,
+        404
+    );
+
+    // An empty body is a well-formed empty request, not an error: accepted 0, still 200.
+    let empty = http::post(&addr, "/v1/logs", "application/x-protobuf", b"").expect("POST empty");
+    assert_eq!(empty.status, 200);
+    assert!(
+        empty.text().contains("\"accepted\":0"),
+        "got {}",
+        empty.text()
+    );
+}

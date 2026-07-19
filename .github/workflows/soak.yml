@@ -1,0 +1,32 @@
+name: Soak
+
+# Opt-in slow tests kept out of the per-push gate (TESTING.md Layer 3 / QUALITY_GATE.md §2): the RSS
+# soak sentinel and the long interleave-stress variant. Runs nightly and on manual dispatch so a
+# gradual leak or a concurrency regression surfaces without slowing PR CI. Linux only (the soak reads
+# /proc/self/status).
+
+on:
+  schedule:
+    - cron: '0 3 * * *' # nightly 03:00 UTC
+  workflow_dispatch:
+
+concurrency:
+  group: soak-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  soak:
+    name: RSS soak + long stress
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: RSS soak (steady-state VmRSS sentinel)
+        run: cargo test -p imbh --test soak_rss -- --ignored --nocapture
+      - name: Long interleave stress
+        run: cargo test -p imbh --test maintenance_stress -- --ignored --nocapture

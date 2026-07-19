@@ -1,0 +1,28 @@
+[package]
+name = "imbh-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "imbh core: domain types, ids, config, errors, manifest types, canonical JSON. No arrow/DataFusion — the engine boundary lives in imbh-storage/imbh-query (ARCHITECTURE.md §12)."
+
+[dependencies]
+# Only for `Maintenance::Runtime(tokio::runtime::Handle)` — the host-runtime scheduling variant
+# (ARCHITECTURE.md §5/§10.2). `rt` is the minimal feature that exposes `runtime::Handle`; tokio is
+# already in the `imbh` graph (blocking facade + async loop), so this adds no new unique crates.
+tokio = { workspace = true, features = ["rt"] }
+# Optional serde derives on the domain types (off by default — ARCHITECTURE.md §10.13). See the
+# workspace dependency comment for why enabling it adds no new crate to the footprint graph.
+serde = { workspace = true, optional = true }
+
+[features]
+# JSON (de)serialization for the domain types embedded in imbh's query builders / result DTOs
+# (Timestamp/TimeRange/Direction/Table/SeverityNumber/Attributes/AnyValue and the hex ids). Off by
+# default so the default build stays serde-free.
+serde = ["dep:serde"]
+
+[dev-dependencies]
+# JSON round-trip assertions for the `serde` feature (tests are gated `#[cfg(feature = "serde")]`).
+serde_json.workspace = true

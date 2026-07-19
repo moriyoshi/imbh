@@ -1,0 +1,29 @@
+[package]
+name = "imbh-test-support"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+# Dev-only shared test harness: OTLP builders, assertion helpers, a current-thread runtime helper,
+# a re-exec harness, a blocking HTTP/1.1 client, and a VmRSS reader. This crate is depended on ONLY
+# through the `[dev-dependencies]` of test crates, so it never enters the shipping `imbh`/`imbhd`
+# graph and adds zero footprint (ARCHITECTURE.md §11 / §12). See .agents/docs/TESTING.md.
+
+# Keep this crate out of the cargo-release plan entirely. `publish = false` above already stops the
+# crates.io upload, but a plan member still shows up in `cargo release`'s "Publishing ..." status
+# line (cargo-release builds that message from every selected package, then filters by `publish`
+# only when assembling the actual `cargo publish --package` args). The shared version bump still
+# reaches this crate through `version.workspace = true`, and its dependents refer to it by path
+# only (no version requirement to rewrite).
+[package.metadata.release]
+release = false
+
+[dependencies]
+imbh = { workspace = true }
+opentelemetry-proto = { workspace = true }
+prost = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["rt", "time"] }

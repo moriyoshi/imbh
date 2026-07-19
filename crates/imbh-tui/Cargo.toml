@@ -1,0 +1,23 @@
+[package]
+name = "imbh-tui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Read-only terminal explorer for IMBH metrics, traces, and logs."
+
+[dependencies]
+imbh.workspace = true
+imbh-lgtm = { workspace = true, features = ["source"] }
+ratatui.workspace = true
+crossterm.workspace = true
+unicode-width.workspace = true
+tokio = { workspace = true, features = ["rt", "macros", "sync", "time"] }
+# Drives the mascot easter eggs' randomness (seeded per run for reproducible tests). imbh-tui is not
+# part of the core library, so a small extra dependency here is acceptable.
+rand = { version = "0.9", features = ["small_rng"] }
+
+[[bin]]
+name = "imbh-tui"

@@ -1,0 +1,20 @@
+# Cargo build artifacts — never version-controlled (AGENTS.md; ARCHITECTURE.md §12).
+/target/
+
+# Cargo.lock IS tracked on purpose: this workspace ships the `imbhd` binary and
+# pins exact dependency versions for footprint reproducibility (ARCHITECTURE.md
+# Appendix A). Do not add it here.
+
+# Rustfmt backups.
+**/*.rs.bk
+
+# Scratch / agent workspace and local session state are ignored via their own
+# nested .gitignore files (.agents-workspace/.gitignore, .claude/.gitignore).
+
+# Editor / OS noise.
+*.swp
+*.swo
+*~
+.DS_Store
+.idea/
+.vscode/

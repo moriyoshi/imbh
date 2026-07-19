@@ -1,0 +1,113 @@
+name: CI
+
+# The always-on gate (QUALITY_GATE.md §1–2): the Rust gate (fmt / clippy / build / test) plus the
+# deterministic crash-injection E2E and the footprint gate. The default `cargo test --workspace`
+# already includes the Layer-3 E2E suite (server HTTP wire, crash/recovery, malformed input,
+# tri-signal lifecycle, exporter-through-SDK, example smoke, interleave stress) — see TESTING.md.
+# The slow opt-in RSS soak runs in soak.yml; the full license + notices gate runs in release.yml on
+# tags. The `licenses` job below also runs the license-compatibility check on default-branch pushes
+# (not on PRs) for earlier feedback.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Cancel superseded runs on the same ref (e.g. a new push to a PR branch).
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  gate:
+    name: Rust gate + E2E
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format check
+        run: cargo fmt --all --check
+      - name: Clippy (workspace, all targets)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Clippy (fault-injection feature)
+        run: cargo clippy -p imbh --all-targets --features fault-injection -- -D warnings
+      - name: Build
+        run: cargo build --workspace
+      - name: Test (workspace — unit + Layer-3 E2E)
+        run: cargo test --workspace
+      - name: Crash-injection E2E (deterministic mid-seal hazards)
+        run: cargo test -p imbh --features fault-injection --test crash_points
+
+  feature-matrix:
+    name: Feature matrix (producer / consumer)
+    runs-on: ubuntu-latest
+    # The M6c producer/consumer split (ARCHITECTURE.md §11). Feature unification means the default
+    # `cargo build --workspace` compiles even if a role's own feature set is insufficient, so the
+    # reduced-config builds are the real proof and must be built explicitly here. This is a build +
+    # clippy + dependency-cut gate: a producer can't run query tests (and vice-versa), so functional
+    # tests stay in the default `--workspace` job above.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # Producer: ingest-only. Must drop the entire query engine.
+      - name: Build producer (--features ingest)
+        run: cargo build -p imbh --no-default-features --features ingest
+      - name: Clippy producer
+        run: cargo clippy -p imbh --no-default-features --features ingest -- -D warnings
+      - name: Assert producer dropped DataFusion + sqlparser + imbh-query + tantivy
+        run: |
+          if cargo tree -e no-dev -p imbh --no-default-features --features ingest \
+              | grep -qiE 'datafusion|sqlparser|imbh-query|tantivy'; then
+            echo "::error::producer (ingest-only) build still pulls the query engine — the M6c cut regressed"
+            cargo tree -e no-dev -p imbh --no-default-features --features ingest | grep -iE 'datafusion|sqlparser|imbh-query|tantivy'
+            exit 1
+          fi
+      # Consumer: query-only. Must drop the OTLP decode path.
+      - name: Build consumer (--features query)
+        run: cargo build -p imbh --no-default-features --features query
+      - name: Clippy consumer
+        run: cargo clippy -p imbh --no-default-features --features query -- -D warnings
+      - name: Assert consumer dropped OTLP decode (imbh-otlp)
+        run: |
+          if cargo tree -e no-dev -p imbh --no-default-features --features query | grep -qi 'imbh-otlp'; then
+            echo "::error::consumer (query-only) build still pulls imbh-otlp — the M6c cut regressed"
+            exit 1
+          fi
+      # Storage-only: neither role (open/stats/compact/snapshot only).
+      - name: Build storage-only (--no-default-features)
+        run: cargo build -p imbh --no-default-features
+
+  footprint:
+    name: Footprint gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Footprint gate (crate count + release imbhd size)
+        run: ./scripts/footprint-gate.sh
+
+  licenses:
+    name: License gate
+    runs-on: ubuntu-latest
+    # Default-branch pushes only — skipped on PRs (release.yml also runs it, plus notices, on tags).
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      - name: License-compatibility gate
+        run: ./scripts/license-gate.sh

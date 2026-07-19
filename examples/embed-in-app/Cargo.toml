@@ -1,0 +1,31 @@
+[package]
+name = "embed-in-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false  # example crate, not published to crates.io
+description = "Example: embed imbh in a host app — ingest logs/traces/metrics and query them through the typed APIs and SQL."
+
+# Keep this crate out of the cargo-release plan entirely. `publish = false` above already stops the
+# crates.io upload, but a plan member still shows up in `cargo release`'s "Publishing ..." status
+# line (cargo-release builds that message from every selected package, then filters by `publish`
+# only when assembling the actual `cargo publish --package` args). The shared version bump still
+# reaches this crate through `version.workspace = true`.
+[package.metadata.release]
+release = false
+
+[dependencies]
+imbh.workspace = true
+opentelemetry-proto.workspace = true
+prost.workspace = true
+tokio = { workspace = true, features = ["rt", "macros"] }
+
+[features]
+# Opt-in self-observability, mirroring `imbhd` (crates/imbh-server): turn on imbh's internal
+# instrumentation (`imbh/tracing`) and install the facade's RUST_LOG-aware stderr `fmt` subscriber
+# (`imbh/tracing-console`, which owns the `tracing-subscriber` dep). A plain `cargo run -p embed-in-app`
+# pulls no `tracing`/`tracing-subscriber` subtree, so the default footprint is unchanged; enable with
+# `cargo run -p embed-in-app --features tracing` to see imbh's spans/events (filter via `RUST_LOG`).
+tracing = ["imbh/tracing", "imbh/tracing-console"]

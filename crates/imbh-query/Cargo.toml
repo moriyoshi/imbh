@@ -1,0 +1,32 @@
+[package]
+name = "imbh-query"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "imbh query layer: DataFusion session config, providers, and SQL over buffer+segments (ARCHITECTURE.md §9). The only crate that knows the DataFusion query engine."
+
+[dependencies]
+imbh-core.workspace = true
+imbh-index = { workspace = true, optional = true }
+datafusion.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+# Optional self-observability facade (ARCHITECTURE.md §11), off by default.
+tracing = { workspace = true, optional = true }
+
+[features]
+default = ["search"]
+# Tantivy → Parquet `RowSelection` pruning bridge. Without it, segments are read in full and the
+# `matches()` UDF filters row-by-row (identical results, no pruning); drops the imbh-index/tantivy
+# subtree (§11 footprint lever). Pairs with imbh-storage's `search` feature.
+search = ["dep:imbh-index"]
+# Emit query-execution spans/events through the `tracing` facade (off by default — §11 footprint
+# lever). `imbh-index` is optional (search only), so forward with the `?` gate.
+tracing = ["dep:tracing", "imbh-index?/tracing"]
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros"] }
+tempfile.workspace = true

@@ -1,0 +1,41 @@
+[package]
+name = "imbh-storage"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "imbh storage engine: mutable buffer, seal → Parquet segment, naive manifest. Owns the Arrow schema (depends on arrow/parquet directly — no DataFusion — so an ingest-only producer can drop the query engine)."
+
+[dependencies]
+imbh-core.workspace = true
+imbh-index = { workspace = true, optional = true }
+# arrow + parquet directly (NOT via datafusion's re-exports) so a producer/ingest-only build of the
+# `imbh` facade drops the DataFusion query engine entirely (M6c). Pinned in the workspace to the exact
+# 58.3.0 datafusion 54 uses, so the tree unifies to one arrow/parquet instance.
+arrow.workspace = true
+parquet.workspace = true
+xxhash-rust.workspace = true
+fs4.workspace = true
+# Optional self-observability facade (ARCHITECTURE.md §11), off by default.
+tracing = { workspace = true, optional = true }
+
+[features]
+default = ["search"]
+# Test-only deterministic crash injection: under this feature, `seal()` consults `IMBH_FAULT_ABORT_*`
+# env vars and `process::abort()`s at named hazard points (before the manifest is persisted; after it
+# is durable but before WAL reclaim). Off by default and adds no dependencies, so the shipping graph
+# and footprint gate are unchanged; the crash-points E2E test enables it explicitly. See
+# `crates/imbh/tests/crash_points.rs` and .agents/docs/TESTING.md.
+fault-injection = []
+# Tantivy-backed term index: per-segment `.tidx` sidecars built at seal/compact. Without it, the
+# imbh-index/tantivy subtree is dropped and `matches()` falls back to a full scan (§11 footprint
+# lever). Query-side pruning is in imbh-query's matching `search` feature.
+search = ["dep:imbh-index"]
+# Emit WAL/seal/compaction spans/events through the `tracing` facade (off by default — §11 footprint
+# lever). `imbh-index` is optional (search only), so forward with the `?` gate.
+tracing = ["dep:tracing", "imbh-index?/tracing"]
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -1,0 +1,125 @@
+[package]
+name = "imbh"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "The imbh facade: the embeddable Db handle wiring OTLP ingest → storage → query (ARCHITECTURE.md §10)."
+
+# cargo-release stamps the single shared workspace CHANGELOG (at the repo root) here, on the facade
+# crate, so it runs exactly once per release rather than once per member. Paths are relative to this
+# manifest's directory (crates/imbh/), hence `../../CHANGELOG.md`. First replacement closes the
+# `## [Unreleased]` section into a dated version heading and opens a fresh empty one; the second
+# appends a release-tag link below the `<!-- next-url -->` sentinel. Neither depends on a previous
+# tag, so the very first release stamps cleanly.
+[package.metadata.release]
+pre-release-replacements = [
+    { file = "../../CHANGELOG.md", search = "(?m)^## \\[Unreleased\\]$", replace = "## [Unreleased]\n\n## [{{version}}] - {{date}}", exactly = 1 },
+    { file = "../../CHANGELOG.md", search = "<!-- next-url -->", replace = "<!-- next-url -->\n[{{version}}]: https://github.com/moriyoshi/imbh/releases/tag/v{{version}}", exactly = 1 },
+]
+
+[dependencies]
+imbh-core.workspace = true
+# imbh-otlp (OTLP decode) is the producer/ingest engine — optional, gated by the `ingest` feature so a
+# query-only consumer build drops it (M6c producer/consumer axis).
+imbh-otlp = { workspace = true, optional = true }
+# imbh-storage/imbh-query are inherited with `default-features = false` (set in the workspace) so
+# imbh's own `search` feature — not the sub-crates' defaults — decides whether the tantivy subtree
+# is pulled; otherwise `imbh --no-default-features` could not drop it.
+imbh-storage.workspace = true
+imbh-index = { workspace = true, optional = true }
+# imbh-query + datafusion are the consumer/query engine — optional, gated by the `query` feature so an
+# ingest-only producer build drops the whole DataFusion + sqlparser subtree (M6c). arrow/parquet are
+# pulled DIRECTLY (below), so the shared and ingest paths keep their Arrow types without DataFusion.
+imbh-query = { workspace = true, optional = true }
+datafusion = { workspace = true, optional = true }
+# arrow + parquet directly (not via `datafusion::{arrow,parquet}` re-exports) so RecordBatch / schema /
+# Arrow-IPC types are available in a producer build with no DataFusion. Pinned in the workspace to the
+# exact 58.3.0 datafusion 54 uses, so the tree unifies to one arrow/parquet. The workspace `arrow` dep
+# carries `ffi`, which the opt-in `cdata` re-exports use.
+arrow.workspace = true
+parquet.workspace = true
+# Owned current-thread runtime for the blocking facade (`db.blocking()`, §10.12); `time` powers the
+# async maintenance loop's `tokio::time::sleep` under `Maintenance::Runtime` (§5/§10.2); `sync` powers
+# the async-ingest queue's `Notify` backpressure under `Ingest::Async` (§10.5).
+tokio = { workspace = true, features = ["rt", "time", "sync"] }
+# Optional self-observability facade (ARCHITECTURE.md §11), off by default.
+tracing = { workspace = true, optional = true }
+# Optional stderr console renderer (the `console` module), off by default — see the `tracing-console`
+# feature below. Kept out of the default library graph so the footprint gate (§12 containment) is
+# unchanged; only a host that opts into rendering pulls the `tracing-subscriber` subtree.
+tracing-subscriber = { workspace = true, optional = true }
+# Optional JSON DTO derives (ARCHITECTURE.md §10.13), off by default — see the `serde` feature below.
+serde = { workspace = true, optional = true }
+# Optional protobuf wire types for the query-API inputs (ARCHITECTURE.md §10.17), off by default —
+# the `proto` feature below. Its build.rs (protox) compiles only when this crate is in the graph.
+imbh-proto = { workspace = true, optional = true }
+
+[features]
+default = ["ingest", "query", "search"]
+# Producer / consumer split (ARCHITECTURE.md §11, the biggest footprint lever). A host compiles only
+# the role it plays:
+#   `ingest` — producer: OTLP decode (imbh-otlp) + the `Db::ingest_otlp_*` write paths. No query engine.
+#   `query`  — consumer: the DataFusion query engine (imbh-query) + `sql`/`logs()`/`traces()`/
+#              `metrics()`/`attrs()`/`export`. Pulls datafusion + sqlparser.
+# Default is both (today's behavior). A producer build (`--no-default-features --features ingest`) drops
+# DataFusion + sqlparser entirely; a consumer build (`--features query`) drops the OTLP decode path.
+# Storage-level ops (open/stats/compact/maintain/snapshot/segment_files) need neither and stay
+# available in every build.
+ingest = ["dep:imbh-otlp"]
+query = ["dep:imbh-query", "dep:datafusion"]
+# Tantivy-backed term search (§11 footprint lever). On (default): per-segment `.tidx` sidecars +
+# the RowSelection pruning bridge. Off (`--no-default-features`): the imbh-index/tantivy subtree is
+# dropped and `matches()` falls back to a full scan — identical results, smaller build. Forwards to
+# the storage (index build) and query (pruning) crates. Search is a query-side accelerator, so it
+# implies `query`.
+search = ["query", "dep:imbh-index", "imbh-storage/search", "imbh-query?/search"]
+# JSON `Serialize`/`Deserialize` for the typed query builders (`LogQuery`/`TraceQuery`/…) and the
+# result DTOs (`LogEntry`/`Trace`/`Matrix`/…) — the §10.13 footprint lever. Off by default; enabling
+# it adds no new crate to the graph (serde is already compiled transitively). Forwards to imbh-core
+# so the embedded domain types (ids, timestamps, attributes) serialize too.
+serde = ["dep:serde", "imbh-core/serde"]
+# Protobuf query-input types + `TryFrom<imbh_proto::*>` mappings onto the typed builders, and the
+# Arrow-`RecordBatch`-returning query entry points that a Go / FFI binding drives (ARCHITECTURE.md
+# §10.17, "Phase 0"). Off by default: pulls the `imbh-proto` crate (+ its build-time protox codegen)
+# only when a host opts in; the default footprint graph is untouched. Results leave as Arrow, so this
+# adds no result-serialization code.
+proto = ["dep:imbh-proto", "query"]
+# Arrow C Data Interface (FFI_ArrowArray / FFI_ArrowSchema / FFI_ArrowArrayStream) for zero-copy
+# handoff to out-of-process / foreign-runtime consumers (e.g. a Go binding). Off by default: it is
+# only needed by embedders that bridge Arrow across an FFI boundary, and it widens the arrow surface
+# the footprint gate measures. Activating `dep:arrow` (pinned to datafusion's exact arrow, workspace
+# dep) turns on `arrow/ffi` on the single shared arrow crate — no new transitive crate — so
+# `datafusion::arrow::ffi{,_stream}` compile and the facade can re-export the FFI types. Shipping
+# graph is unchanged for non-binding embedders (ARCHITECTURE.md §9.1, OVERVIEW.md §2).
+cdata = []
+# Test-only: forward imbh-storage's deterministic crash-injection hooks (off by default, adds no
+# deps). Enables `crates/imbh/tests/crash_points.rs`; run with `cargo test -p imbh --features
+# fault-injection`. The shipping graph / footprint gate are unchanged.
+fault-injection = ["imbh-storage/fault-injection"]
+# Self-observability: emit spans/events through the `tracing` facade (off by default — §11 footprint
+# lever). Forwards to every instrumented sub-crate; `imbh-index` is optional (search only), so it uses
+# the `?` gate. This is emission only; the `tracing-console` feature below adds the stderr renderer.
+tracing = [
+    "dep:tracing",
+    "imbh-otlp?/tracing",
+    "imbh-storage/tracing",
+    "imbh-query?/tracing",
+    "imbh-index?/tracing",
+]
+# Stderr console renderer: exposes the `console` module (a `tracing-subscriber` fmt subscriber that
+# renders imbh's instrumentation to the terminal, RUST_LOG-aware). Off by default (§11/§12 footprint
+# lever) so the `tracing-subscriber` subtree stays out of the default library graph; a host opts in to
+# render. Independent of the `tracing` emission feature — enable both to see imbh's own spans/events.
+tracing-console = ["dep:tracing-subscriber"]
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros"] }
+tempfile.workspace = true
+opentelemetry-proto.workspace = true
+prost.workspace = true
+# JSON round-trip tests for the `serde` feature (only compiled under `--features serde`).
+serde_json.workspace = true
+imbh-test-support.workspace = true

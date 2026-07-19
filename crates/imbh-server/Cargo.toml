@@ -1,0 +1,63 @@
+[package]
+name = "imbh-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "imbhd: the reference HTTP server wiring for imbh (ARCHITECTURE.md §10.16). A minimal std-net HTTP/1.1 server — one worked example of host wiring, not the product."
+
+[[bin]]
+name = "imbhd"
+path = "src/main.rs"
+
+[dependencies]
+imbh.workspace = true
+# Owned per-connection current-thread runtime; no async net (sockets are std blocking). The optional
+# `grpc` feature adds `rt-multi-thread`/`net`/`time` on top (tonic drives its accept loop on tokio).
+tokio = { workspace = true, features = ["rt"] }
+# ── gRPC (optional, off by default) ──────────────────────────────────────────────────────
+# OTLP/gRPC ingest for the reference server. All three deps are optional and pulled ONLY by the
+# `grpc` feature, so the default build (the footprint gate) carries no tonic/hyper/h2 subtree.
+# `server`/`router`/`codegen` are the minimal tonic features to run the generated collector services;
+# no TLS, no client `channel`. opentelemetry-proto's `gen-tonic` turns on the tonic *service* codegen
+# (the workspace default is `gen-tonic-messages`, messages only); prost re-encodes the decoded request
+# back to bytes for the existing `Db::ingest_otlp_*` byte API.
+tonic = { workspace = true, optional = true, features = [
+    "server",
+    "router",
+    "codegen",
+] }
+opentelemetry-proto = { workspace = true, optional = true, features = ["gen-tonic"] }
+prost = { workspace = true, optional = true }
+# Optional self-observability (ARCHITECTURE.md §11). The stderr subscriber wiring lives in the imbh
+# facade's `console` module (behind `imbh/tracing-console`, which owns the `tracing-subscriber` dep);
+# `imbhd` just calls its one-liner. `tracing` here is for the binary's own banner events. Both are
+# pulled only under the `tracing` feature, so the default footprint-gate build is unchanged (§12 keeps
+# the subscriber out of the graph).
+tracing = { workspace = true, optional = true }
+
+[features]
+# Install imbh's stderr console subscriber (RUST_LOG-aware) and turn on imbh's instrumentation.
+# Off by default so `cargo build -p imbh-server` (the footprint gate) stays at the measured crate count;
+# enable with `cargo build -p imbh-server --features tracing`.
+tracing = ["dep:tracing", "imbh/tracing", "imbh/tracing-console"]
+# OTLP/gRPC ingest on a second port (default 127.0.0.1:4317), served by tonic alongside the std-net
+# HTTP/1.1 server. Off by default so `cargo build -p imbh-server` (the footprint gate) stays at the
+# measured crate count; enable with `cargo build -p imbh-server --features grpc`. Pulls the tonic
+# subtree and the tokio net/multi-thread runtime tonic needs.
+grpc = [
+    "dep:tonic",
+    "dep:opentelemetry-proto",
+    "dep:prost",
+    "tokio/rt-multi-thread",
+    "tokio/net",
+    "tokio/time",
+]
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros"] }
+opentelemetry-proto.workspace = true
+prost.workspace = true
+imbh-test-support.workspace = true

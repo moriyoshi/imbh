@@ -1,0 +1,186 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/imbh-core",
+    "crates/imbh-lgtm",
+    "crates/imbh-tui",
+    "crates/imbh-otlp",
+    "crates/imbh-storage",
+    "crates/imbh-index",
+    "crates/imbh-query",
+    "crates/imbh",
+    "crates/imbh-proto",
+    "crates/imbh-server",
+    "crates/imbh-tracing",
+    "crates/imbh-test-support",
+    "examples/replay-otlp-file",
+    "examples/embed-in-app",
+    "examples/bench",
+    "examples/rss-probe",
+    "examples/gen-demo-db",
+    "crates/imbh-otel-exporter",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+license = "Apache-2.0"
+repository = "https://github.com/moriyoshi/imbh"
+# Publishable by default; the dev-only harness (imbh-test-support) and the examples/ opt out with
+# their own `publish = false` plus `[package.metadata.release] release = false` (which also drops
+# them from cargo-release's plan, so they stay out of its "Publishing ..." status line). crates.io
+# publishing is driven by cargo-release (see [workspace.metadata.release] below).
+publish = true
+
+# cargo-release configuration. All crates inherit `version.workspace`, so they release together as a
+# single shared version under one `v{{version}}` git tag; internal dependency version requirements
+# are upgraded in lockstep on each bump.
+[workspace.metadata.release]
+shared-version = true
+tag-name = "v{{version}}"
+dependent-version = "upgrade"
+
+# Pinned per ARCHITECTURE.md Appendix A. Engine deps are trimmed to the M0-measured feature
+# set (ARCHITECTURE.md §8/§9.1, Appendix C) so the footprint gate reflects the shipping graph.
+[workspace.dependencies]
+# Internal crates. Each carries a `version` alongside `path` so `cargo publish` can rewrite the
+# path deps to crates.io version requirements; cargo-release keeps these in lockstep with the
+# shared workspace version on every bump (see [workspace.metadata.release]).
+imbh = { path = "crates/imbh", version = "0.1.0" }
+imbh-core = { path = "crates/imbh-core", version = "0.1.0" }
+imbh-lgtm = { path = "crates/imbh-lgtm", version = "0.1.0" }
+imbh-tui = { path = "crates/imbh-tui", version = "0.1.0" }
+imbh-otlp = { path = "crates/imbh-otlp", version = "0.1.0" }
+# default-features = false so the `imbh` facade's own `search` feature governs the tantivy subtree
+# (the facade re-enables it via `imbh-storage/search` + `imbh-query/search`). Standalone builds of
+# these crates (`cargo test -p imbh-storage`) still use their own `default = ["search"]`.
+imbh-storage = { path = "crates/imbh-storage", version = "0.1.0", default-features = false }
+imbh-index = { path = "crates/imbh-index", version = "0.1.0" }
+imbh-query = { path = "crates/imbh-query", version = "0.1.0", default-features = false }
+imbh-tracing = { path = "crates/imbh-tracing", version = "0.1.0" }
+imbh-proto = { path = "crates/imbh-proto", version = "0.1.0" }
+# Dev-only shared test harness (never a dependency of a shipping crate — see the crate's Cargo.toml).
+# Intentionally path-only (no version): it is `publish = false`, so `cargo publish` strips it from
+# the published dev-dependencies of the crates that use it.
+imbh-test-support = { path = "crates/imbh-test-support" }
+
+# Query engine — the only crates that may depend on it are imbh-storage (arrow/parquet
+# re-exports) and imbh-query (the session/provider surface). See ARCHITECTURE.md §9.1/§12.
+datafusion = { version = "54", default-features = false, features = [
+    "parquet",
+    "sql",
+    "datetime_expressions",
+    "string_expressions",
+    "nested_expressions",
+    "regex_expressions",
+    "recursive_protection",
+] }
+# Arrow C Data Interface (FFI_ArrowArray / FFI_ArrowArrayStream) — pinned to the EXACT arrow that
+# datafusion 54 re-exports (its `arrow` 58.3.0) so Cargo feature-unifies to a SINGLE arrow crate
+# instance; a second, separately-versioned arrow would make the FFI structs ABI-incompatible across
+# the boundary (ARCHITECTURE.md §9.1 single-arrow rule). datafusion 54 exposes no `ffi` feature
+# lever, so we turn on `arrow/ffi` directly. `default-features = false` keeps this to just the `ffi`
+# module on top of datafusion's own arrow features (a union), adding no new transitive crate. Pulled
+# ONLY by the imbh facade's opt-in `cdata` feature (off by default), so the shipping graph is
+# unchanged for non-binding embedders.
+arrow = { version = "58.3.0", default-features = false, features = ["ffi"] }
+# arrow + parquet as DIRECT deps of imbh-storage (M6c producer/consumer axis). imbh-storage used to
+# reach these only through `datafusion::{arrow,parquet}` re-exports, which forced the whole DataFusion
+# subtree into every storage-only (producer) build. Depending on the crates directly — pinned to the
+# EXACT 58.3.0 datafusion 54 resolves, so Cargo unifies to a single arrow/parquet instance (the
+# single-arrow rule above) — lets a producer (`imbh --features ingest`) drop DataFusion + sqlparser
+# entirely. `default-features = false` keeps arrow to its core modules (no csv/ipc/json) and parquet to
+# the `arrow` bridge plus only the codecs imbh-storage maps to (`zstd`, `lz4` for LZ4_RAW). In a full
+# build these unify with datafusion's own arrow/parquet features (a superset), so nothing changes; a
+# producer build gets the trimmed set.
+parquet = { version = "58.3.0", default-features = false, features = [
+    "arrow",
+    "zstd",
+    "lz4",
+] }
+# Full-text/term search — confined to imbh-index (ARCHITECTURE.md §8/§12).
+tantivy = { version = "0.26", default-features = false, features = [
+    "mmap",
+    "lz4-compression",
+] }
+# OTLP messages only (no tonic services) — ARCHITECTURE.md Appendix C.
+opentelemetry-proto = { version = "0.32", default-features = false, features = [
+    "gen-tonic-messages",
+    "logs",
+    "trace",
+    "metrics",
+] }
+# opentelemetry-rust API + SDK — used ONLY by the optional `imbh-otel-exporter` crate (ARCHITECTURE.md §12).
+# Already in the tree transitively (opentelemetry-proto's signal features pull the SDK), so this adds
+# no new footprint to the core `imbh`/`imbhd` graph.
+opentelemetry = { version = "0.32", default-features = false, features = ["trace"] }
+opentelemetry_sdk = { version = "0.32", default-features = false, features = ["trace"] }
+prost = "0.14"
+# gRPC transport for the reference server's OPTIONAL, off-by-default `grpc` feature only
+# (imbh-server, ARCHITECTURE.md §10.16). This whole subtree (tonic/hyper/h2/tower) is gated behind
+# that feature, so the default footprint gate never sees it. `default-features = false` keeps TLS,
+# gzip, and the reflection/health extras out; imbh-server re-enables just `server`/`router`/`codegen`.
+# Version tracks opentelemetry-proto 0.32's `gen-tonic` (tonic 0.14.x), so the generated OTLP
+# collector services and this dep resolve to one tonic.
+tonic = { version = "0.14", default-features = false }
+# Build-time only (imbh-proto's build.rs): protox is a pure-Rust protobuf compiler, so codegen needs
+# no system `protoc` and stays hermetic/offline. prost-build turns the descriptor set into Rust types.
+prost-build = "0.14"
+protox = "0.9"
+tokio = { version = "1", default-features = false, features = ["rt", "macros"] }
+tempfile = "3"
+# Pure-Rust XXH3-64 for WAL/manifest frame checksums (ARCHITECTURE.md §7/§11 — no C).
+xxhash-rust = { version = "0.8", default-features = false, features = ["xxh3"] }
+# Cross-platform whole-file advisory lock for the single-writer `writer.lock` (ARCHITECTURE.md §5).
+# Already in the tree via tantivy, so this adds no new crate to the footprint graph. `sync` only
+# (the std `File` extension); no async runtimes pulled.
+fs4 = { version = "0.13", default-features = false, features = ["sync"] }
+
+# Terminal stack isolated to the optional companion binary.
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm_0_29"] }
+crossterm = { version = "0.29.0", default-features = false, features = ["events"] }
+# East Asian display-width for the TUI's fixed-width columns (CJK glyphs occupy two cells).
+# Footprint-neutral: unicode-width 0.2 is already compiled transitively (ratatui/comfy-table), so
+# pinning the same version adds no new crate to the graph.
+unicode-width = { version = "0.2", default-features = false }
+# TableProvider is an async trait; matches the async-trait DataFusion itself uses.
+async-trait = "0.1"
+# Stream combinators (`stream::iter`) to adapt the provider's synchronous per-batch segment reader
+# into a DataFusion `RecordBatchStreamAdapter` for the lazy scan (ARCHITECTURE.md §10.12). Confined
+# to imbh-query. Footprint-neutral: every `futures-*` crate is already compiled transitively (via
+# datafusion/tantivy), so this adds no new crate to the graph. `default-features = false` + `std`
+# pulls only `futures-core`/`futures-util`, not the executor.
+futures = { version = "0.3", default-features = false, features = ["std"] }
+# Optional JSON DTO derives (ARCHITECTURE.md §10.13 footprint lever). Gated behind each crate's
+# off-by-default `serde` feature, so the default graph is serde-free; serde/serde_derive are already
+# compiled transitively (tantivy/datafusion/opentelemetry-proto), so the feature adds no new crate.
+# `std` enables the `std::time::Duration` impls the query builders' `step` fields need.
+serde = { version = "1", default-features = false, features = ["derive", "std"] }
+# RE2-style regular expressions for conformant language matchers. Already present through
+# DataFusion; this direct edge adds no third-party crate to the workspace graph.
+regex = { version = "1", default-features = false, features = ["std", "perf"] }
+# JSON round-trip tests for the serde DTOs (dev-only).
+serde_json = "1"
+# Self-observability facade (ARCHITECTURE.md §11). Feature-gated (`tracing`, off by default) so the
+# default footprint graph is unchanged; the `tracing` facade is near-zero-cost with no subscriber
+# installed. The heavier `tracing-subscriber` subtree is opt-in only: the `imbh` facade's stderr
+# console renderer (its off-by-default `tracing-console` feature) and the `imbh-tracing` helper crate's
+# `DbLayer` are the only things that pull it — keep it OUT of the default library graph (§12
+# containment).
+tracing = { version = "0.1", default-features = false, features = ["std", "attributes"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = [
+    "std",
+    "fmt",
+    "env-filter",
+] }
+
+# The "release-small" shipping profile from ARCHITECTURE.md §11 / Appendix C. This is what the
+# footprint gate builds. `cargo test` / `cargo build` (debug) use the dev profile and are
+# unaffected by panic=abort here.
+[profile.release]
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"

@@ -1,0 +1,42 @@
+# cargo-about configuration — third-party notice generation for the shipped imbhd binary.
+#
+# Run (networked env): ./scripts/gen-notices.sh   (wraps `cargo about generate`)
+#
+# The `accepted` list MUST mirror the `allow` list in deny.toml (repo root) so the license
+# allowlist and the notice generator never drift. deny.toml gates compatibility at build time
+# (`cargo deny check licenses`); this config drives the human-readable THIRD-PARTY-NOTICES.txt.
+# Keep the two lists in sync whenever either changes.
+
+# Accepted SPDX license identifiers — mirror of deny.toml [licenses].allow.
+accepted = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Zlib",
+    "MPL-2.0",
+    "CC0-1.0",
+]
+
+# Resolve the license graph for the host plus the shipping target. x86_64-unknown-linux-musl is
+# the release target for imbhd (OVERVIEW.md §2 footprint budgets are the musl numbers); the host
+# (aarch64/x86_64 glibc) is included so notices also cover a local dev build.
+targets = [
+    "aarch64-unknown-linux-gnu",
+    "x86_64-unknown-linux-gnu",
+    "x86_64-unknown-linux-musl",
+]
+
+# Ignore workspace-private (publish = false) crates — first-party code is not a third-party notice.
+# imbh's own crates are published, so this is a no-op guard for any future internal-only crate.
+private = { ignore = true }
+
+# Notices are generated in a networked env (see scripts/gen-notices.sh), so cargo-about resolves
+# license text via clearlydefined.io and each crate's own LICENSE files — no offline fallback knob
+# needed. (cargo-about 0.9 dropped the old boolean `no-clearly-defined` config key; pass `--offline`
+# on the CLI if a fully local run is ever required.)

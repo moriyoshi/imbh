@@ -1,0 +1,33 @@
+[package]
+name = "replay-otlp-file"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false  # example crate, not published to crates.io
+description = "M0 example: ingest an OTLP/logs protobuf file (or a built-in sample) and run a SQL round-trip."
+
+# Keep this crate out of the cargo-release plan entirely. `publish = false` above already stops the
+# crates.io upload, but a plan member still shows up in `cargo release`'s "Publishing ..." status
+# line (cargo-release builds that message from every selected package, then filters by `publish`
+# only when assembling the actual `cargo publish --package` args). The shared version bump still
+# reaches this crate through `version.workspace = true`.
+[package.metadata.release]
+release = false
+
+[dependencies]
+imbh.workspace = true
+imbh-core.workspace = true
+opentelemetry-proto.workspace = true
+prost.workspace = true
+tokio = { workspace = true, features = ["rt", "macros"] }
+tempfile.workspace = true
+
+[features]
+# Opt-in self-observability, mirroring `imbhd` (crates/imbh-server): turn on imbh's internal
+# instrumentation (`imbh/tracing`) and install the facade's RUST_LOG-aware stderr `fmt` subscriber
+# (`imbh/tracing-console`, which owns the `tracing-subscriber` dep). A plain `cargo run -p replay-otlp-file`
+# pulls no `tracing`/`tracing-subscriber` subtree, so the default footprint is unchanged; enable with
+# `cargo run -p replay-otlp-file --features tracing` to see imbh's spans/events (filter via `RUST_LOG`).
+tracing = ["imbh/tracing", "imbh/tracing-console"]

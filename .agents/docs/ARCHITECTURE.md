@@ -1,0 +1,1163 @@
+# IMBH Architecture
+
+The canonical design reference for IMBH — the data model, storage engine, search, query
+layer, and the full public API surface **as built**. For orientation (vision, goals, non-goals,
+prior art, status), start with [OVERVIEW.md](./OVERVIEW.md).
+
+> **Section numbering.** Sections here retain their numbers from the original design plan so the
+> many `§N` cross-references in the code and docs stay valid: §5–§12, §14, §15, and the
+> appendices live in this file; §1–§4 and §13 live in OVERVIEW.md.
+>
+> **Design vs implementation.** IMBH is built (M0–M6 complete). Where the code diverges from the
+> original design intent, this document describes **what is actually built** and marks the gap
+> with a *Deviation* or *Not yet implemented* note, so the doc is a faithful map of the code, not
+> an aspiration. Verify implementation detail against `crates/**`; JOURNAL/LTM record why a
+> deviation was made.
+
+## 5. Architecture overview
+
+```
+                    ┌────────────────────────────────────────────────┐
+ OTLP protobuf ───▶ │ ingest: decode → normalize → canonical rows    │
+ (bytes or typed)   └───────────────┬────────────────────────────────┘
+                                    ▼
+                    WAL (framed raw OTLP, xxh3, fsync policy)
+                                    ▼
+                    mutable buffer (per-table Vec<Row>, capped)
+                                    ▼  seal (explicit; auto-threshold dormant)
+        ┌─────────────────────── segment (immutable) ────────────────────────┐
+        │  <table>/<day>/<ulid>.parquet     (zstd, sorted by time, page index) │
+        │  <table>/<day>/<ulid>.tidx/       (tantivy: body text + row-ordinal  │
+        │                                    fast field; no attrs field)       │
+        └──────────────────────────────┬──────────────────────────────────────┘
+                                       ▼ registered in
+              MANIFEST delta log + checkpoint (CURRENT → MANIFEST-<N>)
+                                       ▼
+       ┌───────────────────────────────────────────────────────────────┐
+       │ query: SQL → DataFusion → custom TableProvider per table       │
+       │   prune: manifest time ranges → parquet stats/page index       │
+       │   matches() predicate → tantivy search → RowSelection (gated)  │
+       │   residual filters/aggs → DataFusion (memory-pool bounded)     │
+       └───────────────────────────────────────────────────────────────┘
+```
+
+Key properties:
+
+- **Immutability everywhere after seal.** No tombstones, no in-place mutation. Crash safety
+  reduces to WAL replay + manifest delta-log replay (torn tail dropped) + orphan cleanup on open.
+- **Single writer, many readers — across processes.** A read-write open holds an exclusive advisory
+  lock on `<dir>/writer.lock` (via `fs4`, an existing transitive dep), so a second writer — this
+  process or another — fails fast with `Error::lock_held`; the lock releases on drop / process exit
+  (no stale-lock cleanup). Read-only opens (`Db::open_read_only`, `Access::ReadOnly`) take no lock and
+  never mutate the directory, so any number of reader **processes** coexist with the one writer. A
+  reader cannot see the writer's in-RAM buffer, so it reconstructs a point-in-time snapshot per query:
+  the manifest's segments unioned with the writer's live WAL tail (frames past the manifest
+  watermark), materialized through the same replay path as open. Correctness rests on the **manifest
+  re-check bracket** (`read_disk_snapshot`): read manifest → scan WAL → re-read manifest, retrying if
+  the watermark advanced, which makes segments (`lsn ≤ W`) and replayed tail (`lsn > W`) provably
+  disjoint (no double-count) and guarantees no frame `> W` was reclaimed yet (no drop). WAL visibility
+  is via the shared OS page cache, so reads are near-real-time (fsync governs crash durability, not
+  cross-process visibility). A writer advertises its WAL mode in a `db.info` marker at open; a
+  read-only open against a **WAL-off** writer — which could only ever see seal-interval freshness — is
+  rejected by default with `Error::reader_wal_disabled`, with `DbBuilder::allow_stale_reads()` to opt
+  in. **Read-during-delete
+  is handled (Phase 3):** if a query errors and a segment the snapshot named has since been unlinked
+  by writer-side retention/compaction, the read-only path re-derives from the current manifest and
+  retries (bounded by `READER_QUERY_TRIES`); a failure with every path still present is surfaced
+  as-is. See §7.1 for the full cross-process design.
+- **Queries see buffer + segments, atomically.** The writer's own query path takes one
+  `Storage::query_snapshot` under a single lock, capturing every table's buffer *and* its segment set
+  together, so a background seal cannot make a query double-count (a row read from the buffer and
+  again from the just-written segment). Because seal writes the segment **off-lock** — leaving a
+  window where rows are out of the buffer but not yet registered — the snapshot also unions the
+  in-flight seal's staged batches (§7), so no query transiently drops them either. Data is queryable
+  immediately on ingest, before any flush.
+- **No background threads unless opted in.** Maintenance (seal, retention, compaction) runs
+  inline via `db.maintain()`, or on one opt-in owned thread via
+  `Maintenance::Background(interval)`. That thread observes a `closed` flag and is joined by
+  `db.close()`, so shutdown is synchronous with any in-flight seal. This is a hard guarantee for
+  embedders.
+- **Ingest is inline by default; async is opt-in.** By default ingest runs entirely on the caller's
+  thread (decode → WAL append + fsync → buffer push), so data is queryable immediately and the
+  receipt is durable under `WalMode::Always`. `Ingest::Async { handle, capacity, overflow }` (§10.5)
+  offloads the WAL + buffer write to **one** worker task on a host-provided `tokio::runtime::Handle`
+  (never an owned OS thread — an FFI host such as the Go binding drives it with its own threads). The
+  decode still runs on the caller (so `accepted` and decode errors stay synchronous); only the write
+  is deferred. The worker observes the same `closed` flag and is awaited by `db.close()` after the
+  queue drains, so a clean shutdown loses no enqueued rows. The bounded queue's full behavior is
+  chosen by `Overflow::{Block,Fail,DropOldest}`.
+
+## 6. Data model
+
+All tables share OTel's resource/scope split. Timestamps are `Timestamp(Nanosecond, UTC)`. All
+text columns are stored as plain `Utf8`.
+
+> *Deviation (dictionary encoding).* The original design specified `Dictionary(Utf8)` for
+> low-cardinality columns (`service`, `severity_text`, `resource`, `scope`, `metric`, `unit`,
+> span `name`/`kind`/`status_code`). The current schemas use plain `Utf8` throughout — no
+> dictionary encoding anywhere. zstd reclaims most of the redundancy on disk; revisit dictionary
+> encoding if in-memory buffer RSS or scan cost warrants it.
+
+### 6.1 Attribute strategy (the load-bearing decision)
+
+OTel attributes are open maps of `AnyValue`. Arrow/Parquet unions are a dead end and per-key
+column explosion is an RSS/schema-churn trap. The design:
+
+1. **Canonical JSON text column** per attribute scope: `attributes` (record-level), `resource`,
+   `scope`. The **canonical form is a precise spec** (equal maps must serialize byte-identically):
+   UTF-8; keys sorted by Unicode code point; no insignificant whitespace; integers as minimal
+   decimal; doubles via shortest round-trip; `bytes` → base64; non-finite doubles → a reserved
+   sentinel object `{"$f":"nan|inf|-inf"}`; nested `kvlist`/`array` recursively canonicalized.
+   This is **one shared canonical encoder** in `imbh-core`, paired with a **dependency-free JSON
+   parser** (the inverse), used by the segment writer, the metrics/attrs materializers, and the
+   `json_get_str` UDF (§9.3). A property test asserts `canon(map) == canon(shuffle(map))`.
+2. **Promoted `service` column.** `service.name` is always promoted to a `service` column on
+   every signal (the pivot of all observability queries). The configurable `promote = [...]`
+   typed-column feature is **now implemented** via `DbBuilder::promote(Promote::new([...]))`: each
+   listed key becomes a nullable `Dictionary(Int32,Utf8)` column appended (uniformly, same order)
+   to **every** signal schema, materialized at buffer-encode time from the row's canonical-JSON
+   scopes with record `attributes` → `resource` → `scope` precedence (only string values promote;
+   others → NULL). Keys colliding with a built-in column name are dropped. The promoted key **also
+   stays in the JSON blob** — the column is a pushdown/zero-copy accelerator, not a relocation, so
+   `json_get_str` / external `json_extract` / the reference label evaluators are unaffected. Adding
+   or removing keys is backward-compatible: segments sealed before a key was promoted lack the
+   column and are null-filled at query time by the `coerce` schema-evolution path (§9).
+   **Pushdown dispatch is wired**: the typed logs/metrics/traces query builders and the attribute
+   discovery path route each record-`attributes` access through `SqlParams::attr_field`, which emits
+   the promoted dictionary column (`CAST("key" AS VARCHAR)`, exactly like `service`) when the key is
+   promoted and `json_get_str(attributes, $key)` otherwise — provably identical results, since the
+   column mirrors the record `attributes` scope only and the key also stays in the JSON. Column
+   values are string-only.
+
+   *Not pursued — LGTM label-read zero-copy.* Sourcing PromQL/LogQL result-label buffers from the
+   promoted columns (the original ARROW_LGTM_API_PROPOSAL Phase 3 idea) is architecturally bounded
+   and was left out: PromQL treats **every** string attribute as a label, so the full `attributes`
+   JSON is parsed regardless of what is promoted; the facade also materializes that parsed map into
+   the public `MetricPoint`/`LogEntry` DTO fields unconditionally; and the reference evaluators build
+   an owned `LabelSet(Vec<(String,String)>)`, so label strings are owned at that boundary no matter
+   their source. Capturing real zero-copy would need either promoting the entire (unbounded)
+   attribute set — the column-explosion anti-pattern this design rejects — or a breaking `LabelSet`
+   redesign plus a parallel Arrow-native evaluator. The promotion payoff is therefore realized on the
+   **filter/pushdown** side, not the label-read side.
+3. **Attribute filtering** on non-promoted keys resolves via `json_get_str(attributes, 'k')`
+   scans. *Deviation:* the original design indexed all attributes in a **Tantivy JSON field** for
+   exact-term filtering (§8); that field is **not built**, so attribute predicates do not push
+   into Tantivy — they run as UDF scans over surviving rows.
+4. Access in SQL via `json_get_str(json, 'key')`. *Deviation:* only the string accessor exists;
+   `json_get_int/float/bool` are not implemented (cast the string result in SQL if needed).
+
+**RSS cost of the record-level `attributes` column.** Unlike `resource`/`scope`, per-record
+`attributes` are effectively unique, so the mutable buffer holds full uncompressed
+canonical-JSON UTF-8, one blob per row. This is why the buffer is bounded by **bytes, not row
+count** (§7). Levers when it bites: lower the seal byte-threshold (flush sooner) or cap oversized
+attribute maps. zstd reclaims most of it on disk at seal.
+
+**Storage encoding — canonical JSON text (decided GO).** On-disk representation of
+`attributes`/`resource`/`scope` and structured log bodies is canonical JSON text. Two binary
+alternatives were evaluated and rejected: **CBOR** (marginal on-disk wins after zstd; costs the
+zero-copy `segment_files` handoff to external tools that can `json_extract`, and has no
+`cbor_get_*` UDF ecosystem) and **rkyv** (its zero-copy benefit is nullified inside a Parquet
+cell with no alignment guarantee; non-portable, non-evolvable across a retention window and
+external readers). Future path: the Parquet VARIANT logical type is the natural successor — a
+storage-format change that keeps the UDF surface, not an API break.
+
+### 6.2 Logs — table `logs`
+
+| Column          | Type                          | Notes                              |
+|-----------------|-------------------------------|------------------------------------|
+| time            | Timestamp(ns, UTC)            | `time_unix_nano`; sort key         |
+| observed_time   | Timestamp(ns, UTC), nullable  |                                    |
+| service         | Utf8, nullable                | promoted `service.name`            |
+| severity_number | UInt8                         | OTel enum                          |
+| severity_text   | Utf8, nullable                |                                    |
+| body            | Utf8                          | structured bodies → canonical JSON |
+| attributes      | Utf8 (canonical JSON)         |                                    |
+| resource        | Utf8 (canonical JSON)         |                                    |
+| scope           | Utf8 (canonical JSON)         |                                    |
+| trace_id        | FixedSizeBinary(16), nullable | correlation                        |
+| span_id         | FixedSizeBinary(8), nullable  |                                    |
+| flags           | UInt32                        |                                    |
+
+### 6.3 Traces — table `spans`
+
+| Column         | Type                     | Notes                                        |
+|----------------|--------------------------|----------------------------------------------|
+| trace_id       | FixedSizeBinary(16)      |                                              |
+| span_id        | FixedSizeBinary(8)       |                                              |
+| parent_span_id | FixedSizeBinary(8), null |                                              |
+| name           | Utf8                     |                                              |
+| kind           | Utf8                     | `SERVER`/`CLIENT`/…                          |
+| start_time     | Timestamp(ns, UTC)       | sort key                                     |
+| duration_ns    | UInt64                   | stored (not derived) → row-group min/max lets "slow spans" queries prune |
+| status_code    | Utf8                     | `UNSET`/`OK`/`ERROR`                         |
+| status_message | Utf8, null               |                                              |
+| service / attributes / resource / scope | as in logs |                                 |
+| events         | Utf8 (canonical JSON list), null | events/links kept inline               |
+| links          | Utf8 (canonical JSON list), null |                                       |
+| trace_state    | Utf8, null               |                                              |
+| flags          | UInt32                   |                                              |
+
+`end_time` is derived (`start_time + duration_ns`) at query time. *Deviation:* the original
+design put **Parquet bloom filters** on `trace_id`/`span_id`; bloom filters are **not built** —
+`traces().get(id)` relies on manifest time-range and row-group stats pruning plus a filtered
+scan.
+
+### 6.4 Metrics — one table per point kind
+
+OTel's metric model is preserved, not squashed: `metrics_gauge`, `metrics_sum`,
+`metrics_histogram`, `metrics_exp_histogram`, `metrics_summary`.
+
+Shared columns: `time`, `start_time` (null where N/A), `metric` (Utf8), `unit` (Utf8),
+`service`, `attributes`, `resource`, `scope`, `flags`, `temporality` (Utf8, null), and an
+`exemplars` (Utf8 canonical JSON) column — present on every metric table (**not** feature-gated).
+Kind-specific: `value: Float64` + `is_monotonic: Bool` (gauge/sum); histogram: `count: UInt64`,
+`sum/min/max: Float64?`, `explicit_bounds: List<Float64>`, `bucket_counts: List<UInt64>`;
+exp-histogram: `scale: Int32`, `zero_count`, `zero_threshold`, positive/negative `offset: Int32`
++ `counts: List<UInt64>`; summary: `count`, `sum`, and parallel `quantiles: List<Float64>` +
+`values: List<Float64>`.
+
+Metrics tables are **not** Tantivy-indexed (attr cardinality is low; dictionary/promoted columns
++ Parquet stats carry filtering).
+
+**Temporality normalization — asymmetric, and only one direction is built:**
+
+- *Cumulative counter → rate* is windowed and stateless: diff consecutive points within the
+  requested range, clamp negative diffs as counter resets. Exposed at query time via
+  `MetricQuery::…rate()` (per-second over delta) and `.rate_counter()` (over cumulative).
+- *Delta → cumulative* is **stateful** (the running total depends on every prior point). The
+  original design mandated normalizing delta sums/histograms to cumulative **at ingest** via a
+  running accumulator keyed by series identity — the one place the immutable design was meant to
+  bend. *Not yet implemented:* delta points are stored as they arrive; a delta series queried as
+  a cumulative one is a **known gap** (tracked in [TODO.md](./TODO.md)).
+
+## 7. Storage engine
+
+- **WAL**: append-only files of framed records `(len, xxh3, monotonic_lsn, payload)` where the
+  payload is the **raw OTLP export request bytes** plus a signal tag, and `xxh3` is an XXH3-64
+  checksum over the frame (pure-Rust `xxhash-rust`; no C). fsync policy:
+  `off | interval(1s, default) | always`. WAL can be disabled for cache-like deployments.
+  **Idempotent recovery via a watermark:** the manifest records the highest LSN fully captured in
+  sealed segments; replay on open **re-ingests only records with LSN > watermark**, so a crash
+  after a seal but before WAL truncation does not double-count. Truncation of covered WAL is then
+  a space-reclaim, not a correctness step.
+- **Mutable buffer**: per-table `Vec<Row>`; ingest appends under a short mutex. A query snapshot
+  (`Storage::query_snapshot`) is a consistent read of **all** tables' buffers *and* segment sets under
+  one hold of that lock — buffer∪segments is atomic w.r.t. seal, so an interleaved seal cannot make a
+  query double-count. It also unions each buffer with any in-flight seal's staged batches
+  (`Inner::sealing`, keyed by a per-seal generation), which keeps rows visible during the off-lock
+  segment write below — otherwise a snapshot taken mid-seal would find them in neither the buffer nor
+  a segment (a transient *drop*). **Seal** does a `mem::take` of the row vectors and **builds the
+  Arrow `RecordBatch` at seal time**. *Deviation:*
+  the original design was an O(1) freeze-and-swap of live Arrow builders; the current design keeps
+  rows as `Vec<Row>` and materializes Arrow at seal, so the seal cost is the batch build rather
+  than a pointer swap. The buffer is bounded by **bytes** (per-row JSON dominates). *Deviation:*
+  auto-seal at a byte threshold (`seal_threshold_bytes`) is **wired but dormant** — seals are
+  triggered explicitly: `flush()`, `maintain()`, `compact()`, `close()`, and the opt-in
+  background thread.
+- **Seal path**: sort by time → write Parquet to a temp path (zstd level 3 default; page index
+  on; **no bloom filters**) → build the Tantivy index in a temp dir → fsync → update the manifest
+  → rename temp → final. A crash mid-seal leaves an orphan temp dir invisible to the manifest,
+  cleaned on next open. The Parquet/index write runs **off the buffer lock** (so ingest is not
+  blocked during encoding); the taken batches are held in `Inner::sealing` for that window so
+  concurrent queries still see them, and the entry is dropped under the same lock that registers the
+  segment — a query therefore sees each row exactly once (buffer, then staging, then segment).
+- **Manifest**: an **append-only delta log with a compacted checkpoint** (`imbh-storage`'s `manifest`
+  module). It is the sole source of truth for what is queryable; directory scans are never trusted.
+  A tiny `CURRENT` file (atomically replaced write-temp → fsync → rename → fsync-dir) names the active
+  log `MANIFEST-<NNNNNN>`; that log is a sequence of **framed** records (`len | xxh3 | payload`) whose
+  first frame is a full-state **checkpoint** and whose later frames are small **deltas** (segments
+  added/removed since, + an optional new watermark). A seal/retain/compact appends only its diff — so
+  a persist is O(change), not O(total segments), retiring the old whole-file rewrite's write
+  amplification. Once the log grows past a threshold it is **rolled**: a fresh `MANIFEST-<N+1>` is
+  written starting with a checkpoint of the full current state, `CURRENT` flips to it, and the old log
+  is unlinked — bounding both file size and reopen-replay cost. Crash safety mirrors the WAL: frame
+  scanning stops at the first torn/checksum-failing frame (a half-appended edit is simply dropped, and
+  its rows replay from the still-unreclaimed WAL), and a roll is atomic to readers via `CURRENT` (a
+  reader resolves it, replays that one log, and re-resolves if a roll unlinked it mid-read — the new
+  checkpoint holds everything). Durability ordering is unchanged: an edit is fsync'd before the WAL it
+  supersedes is reclaimed or the segment files it drops are deleted. A legacy M0 whole-file `MANIFEST`
+  is migrated to the delta-log format on the first writer open.
+- **Partitioning**: `<table>/<UTC day>/` directories. Retention drops whole days plus manifest
+  entries out of budget (oldest first). Out-of-order/late data lands in current segments; manifest
+  time ranges may overlap and pruning uses ranges, not directory names.
+- **Compaction**: merges small Parquet files within a partition and **rebuilds** the Tantivy
+  index from the merged Parquet. Rebuild (vs. Tantivy segment merge) costs re-tokenization but
+  makes row alignment correct by construction. Optional — a DB that never compacts is still
+  correct. Built.
+- **Retention**: age + max-disk-bytes, oldest-first. Built.
+- **Locking**: Built. A read-write open acquires an exclusive advisory lock on `<dir>/writer.lock`
+  (`fs4::fs_std::FileExt::try_lock_exclusive`, non-blocking); a second writer fails fast with
+  `Error::lock_held`. The lock releases on handle drop / process exit, so a crashed writer leaves no
+  stale lock. Read-only opens (§5) skip the lock entirely. A read-write open also writes a `db.info`
+  marker advertising its WAL mode, so a reader can detect a WAL-off writer and reject a read-only open
+  that would get only seal-interval freshness (§5). See §7.1.
+
+### 7.1 Cross-process concurrency (single-writer, many-reader)
+
+One **writer process** owns a DB directory while any number of **separate reader processes** query it
+and observe ingested data in **near-real-time** (within ~ms, not just at the seal interval). Out of
+scope (non-goals, OVERVIEW.md §3): multiple concurrent writer processes, MVCC / serializable
+isolation, cross-process point deletes or updates.
+
+**Why this needs no new IPC.** A reader in another process cannot see the writer's in-RAM mutable
+buffer, but it does not need to: everything a query requires already lands on disk as two artifacts
+the single writer maintains, both already engineered to be read safely by an outside observer:
+
+1. **Immutable Parquet segments**, listed by the **manifest** — an append-only delta log named by an
+   atomically-replaced `CURRENT` pointer (§7). A reader resolves `CURRENT` (a whole-file rename, never
+   torn) and replays that log's framed records, stopping at the first torn/checksum-failing frame, so
+   it always reconstructs a consistent point-in-time segment set. Segments never mutate once written
+   (§10.11).
+2. **The WAL** — append-only framed records with an XXH3-64 checksum and a monotonic LSN (§7). Frame
+   scanning already stops at the first torn / checksum-failing / non-monotonic frame and returns
+   everything before it — exactly what a reader tailing a file the writer is actively appending to
+   needs.
+
+So a reader's queryable state is **manifest segments ∪ WAL-tail replay**, both on-disk,
+self-describing, and crash/torn-tolerant. Cross-process visibility of just-appended WAL bytes comes
+from the **shared OS page cache**: the writer's `write_all` is visible to a reader's `read` on the
+same file immediately, before any fsync — fsync governs crash durability, not inter-process
+visibility. Consequence: near-real-time reads require the WAL enabled; a `WalMode::Off` writer offers
+readers only segment-level (seal-interval) freshness, which a read-only open rejects by default (see
+below).
+
+**The reader snapshot protocol (correctness core).** A reader reads the manifest, replays WAL frames
+past its watermark, and re-reads the manifest — the standard "read metadata, read data, re-read
+metadata" bracket (`read_disk_snapshot`). A concurrent **seal** on the writer moves rows buffer → new
+segment, bumps the watermark, persists a new manifest, then **reclaims** (deletes) superseded WAL
+segments (`Storage::seal`, `Wal::reclaim`); a reader straddling that sequence could otherwise
+double-count a row (seen in both an old-manifest gap and the WAL) or drop one (WAL segment reclaimed
+before the reader saw the new manifest). The bracket:
+
+```
+loop (bounded retries):
+  (W,  S)  = read_manifest()          # atomic rename ⇒ complete file
+  buf      = replay(wal_frames where lsn > W)
+  (W2, _)  = read_manifest()
+  if W2 == W: break                    # stable bracket
+snapshot = S  ∪  buf                   # segments (lsn ≤ W) ∪ replayed (lsn > W)
+```
+
+Why it is exactly correct:
+
+- **No double-count.** `S` contains precisely the rows with `lsn ≤ W`; `buf` precisely those with
+  `lsn > W`. Disjoint by construction.
+- **No drop.** The writer reclaims a WAL segment only *after* the new manifest is durable, and only
+  for `max_lsn ≤ new_watermark`. If the bracket is stable at `W`, no seal committed a watermark past
+  `W` during the read, so every frame `> W` is still present. Frame reading also tolerates a raced
+  reclaim delete (`NotFound` ⇒ skip).
+
+**Incremental tailing.** A reader reuses a `WalTailCursor` (`read_disk_snapshot_incremental`) that
+tracks a per-WAL-segment read offset (always a clean frame boundary) plus a running max-LSN, so a
+refresh scans only newly-appended bytes rather than re-reading the whole tail, and prunes the
+now-sealed prefix (`lsn ≤ watermark`) each pass. A partially written trailing frame is ignored until
+its bytes complete; the cursor resumes from the stored boundary and the next refresh picks it up. This
+is cheap enough to run **on every query** (poll-on-query), keeping the no-background-threads guarantee
+intact. `read_disk_snapshot` is the same protocol with a throwaway cursor — a fresh scan and an
+incremental one return an identical snapshot, so the cursor is a pure performance cache, not a
+behavior change.
+
+**Refresh policy (`Refresh`).** Poll-on-query is the default (`Refresh::OnQuery`, near-real-time). A
+read-only handle may instead reuse one snapshot across queries: `Refresh::Ttl(d)` rebuilds at most
+every `d`; `Refresh::Manual` pins the snapshot until an explicit `Db::refresh()` (mirrored on
+`BlockingDb`). The knob trades a bounded, opt-in staleness for collapsing a query burst onto a single
+WAL scan; it is backed by a per-handle reader cache (the incremental cursor + the last-built table
+inputs, cloned per query). `Refresh` is ignored for read-write / in-memory handles, which query their
+own live buffers; the read-during-delete retry (below) force-rebuilds so a cached snapshot can never
+loop on a just-unlinked segment.
+
+**Read-during-delete (retention / compaction).** Retention and compaction delete Parquet files only
+after the manifest that drops them is durable (`retain`, `compact`). A reader holding a path from an
+older snapshot could open a since-unlinked file. POSIX unlink-after-open keeps the inode alive, so a
+read already in progress finishes; the only gap is *path captured, not yet opened*. Mitigation
+(built): the read-only query path (`collect_with_stats`) captures the snapshot's segment paths; if
+`run_sql` errors **and** any of those paths has since vanished, it re-derives the snapshot from the
+current manifest (which no longer lists the file) and retries, up to `READER_QUERY_TRIES` (4). A
+failure with every path still present is a real error, returned as-is — detecting the race by "did a
+snapshotted path disappear" (rather than by parsing error text) is robust to how DataFusion surfaces a
+missing file. An optional writer-side deletion grace period (defer unlink by N seconds, or a small
+tombstone generation) would make retries rare under heavy retention; not required for correctness, a
+later footprint-cheap add.
+
+**Writer exclusivity — the lockfile.** A read-write `Db::open` acquires an **exclusive advisory lock**
+on `<dir>/writer.lock` (`fs4::fs_std::FileExt::try_lock_exclusive`, non-blocking;
+`flock(LOCK_EX|LOCK_NB)` on POSIX / `LockFileEx` on Windows); if held, open fails fast with
+`Error::lock_held`. The lock releases on handle drop / process exit (OS-cleaned even on crash — no
+stale-lock cleanup logic). Readers take no lock. Footprint: zero net new crates — `fs4` is already in
+the transitive tree.
+
+**WAL-mode advertisement.** A read-write open writes a `db.info` marker advertising its WAL mode
+(atomically, at open). A read-only open reads it and **rejects by default** with
+`Error::reader_wal_disabled` when the writer's WAL is off (the reader could only ever see
+seal-interval freshness); `DbBuilder::allow_stale_reads()` opts in. A missing/unparseable marker reads
+as "unknown" and never rejects (pre-marker DBs open as before).
+
+**Public API.** `DbBuilder::access(Access)` with `Access::{ReadWrite (default), ReadOnly}`;
+`Db::open_read_only(path)` convenience. Read-write open may return `Error::lock_held`. On a read-only
+`Db`, ingest/seal/maintain/retain/compact return `Error::read_only`; the query APIs work unchanged and
+transparently re-derive the snapshot per query. A read-only `Storage` has `wal: None` for appends but
+owns a tailer that populates the private replay buffer.
+
+**Intra-process note.** The writer's own query path solves the analogous buffer∪segments atomicity
+problem with `Storage::query_snapshot` under a single lock, plus the `Inner::sealing` staging that also
+covers the off-lock segment write (§5, §7). The cross-process reader path never has that mid-seal
+*drop* window — it reads manifest ∪ WAL-tail, and the WAL still holds the rows until the seal bumps the
+watermark and reclaims them.
+
+**Residual risks / open questions.**
+
+- **Retry-on-missing bound** vs. a very aggressive retention loop: capped at `READER_QUERY_TRIES`,
+  surfacing a clear error if exceeded.
+- **Windows advisory-lock semantics** differ from POSIX; validate `fs4`'s behavior on supported
+  platforms.
+- **Manifest format** is line-based text with no checksum. Atomic rename makes torn reads impossible,
+  but a truncated *rename source* on an odd filesystem is not caught; a trailing checksum line would
+  harden the reader. Low priority.
+
+Validated end-to-end by a real two-*process* integration test (`crates/imbh/tests/cross_process.rs`):
+the parent re-execs the test binary as the writer and acts as the read-only reader over one temp dir,
+asserting cross-process `writer.lock` rejection, page-cache WAL freshness, and no drop / no
+double-count (`count(*) == count(DISTINCT)`, monotonic, terminal `== N`) across the writer's live
+seals + WAL reclaims. No network or daemons (per TESTING.md).
+
+## 8. Search: Tantivy integration
+
+One Tantivy index per sealed segment of `logs` and `spans` (never metrics), aligned lifecycles,
+no cross-segment merges. `imbh-index` is the only crate that knows Tantivy. Schema per index:
+
+- `body`: text field, custom lightweight tokenizer (lowercase + split on non-alphanumerics, no
+  stemming, no stopwords — observability tokens are identifiers, not prose). **The tokenizer is a
+  standalone function**, so the row-wise `matches` fallback (§9.2) tokenizes identically and
+  buffer vs. sealed results are byte-identical. Span `name` is indexed into the same `body` field,
+  so one search path serves both tables.
+- `service`, `severity_text` (logs): raw fields.
+- `row`: u64 fast field = row ordinal within the segment's Parquet file. This is the bridge; the
+  ordinal is stored as data, never assumed from doc order.
+- Nothing is **stored** in Tantivy (docstore stays empty) — Parquet is the store; the index is
+  purely a row-pruning accelerator.
+- **`NoMergePolicy`.** Each `.tidx` is write-once (one commit per sealed/compacted segment,
+  rebuilt wholesale on compaction), so the writer runs with `NoMergePolicy`: no background merge
+  thread is ever spawned (honoring the no-background-threads guarantee), `Drop` is trivially clean,
+  and no seal blocks on a merge.
+
+> *Deviation:* the original design added an `attrs` JSON object field indexing all attribute maps
+> for exact-term filtering. That field is **not built** — the index covers `body`/`name` text
+> only; attribute filtering runs as `json_get_str` scans (§6.1).
+
+Query bridge: `matches(col, 'query')` is compiled to a Tantivy query, executed per segment to a
+sorted row-id set, and converted to a Parquet `RowSelection`. **Honest cost model:** because
+segments are time-sorted, text matches scatter across pages, so the `RowSelection` skips whole
+pages only when a page has zero matches and otherwise saves per-row decode CPU within a touched
+page, not I/O. The provider makes this **cost-based**: it estimates hit fraction from Tantivy's
+term-frequency stats and applies the `RowSelection` only below a selectivity threshold; above it,
+a plain filtered scan runs (still correct — Parquet is ground truth). The `row` fast field maps a
+hit to a global row ordinal, which the provider translates to `(row_group, offset)` against the
+Parquet layout before building the `RowSelection`.
+
+## 9. Query layer: DataFusion integration
+
+`imbh-query` is the only crate that knows DataFusion.
+
+### 9.1 Session setup
+
+One long-lived `SessionContext` per `Db`: `target_partitions = 1` (cooperative on the caller's
+runtime), a modest `batch_size` (RSS over throughput), a memory pool sized from `MemoryBudget`,
+dictionary/string-view preservation on. All arrow/parquet types are consumed **via DataFusion's
+re-exports** so version skew between arrow, parquet, and datafusion is impossible. DataFusion is
+trimmed: `default-features = false`, enabling `parquet`, `sql`, and the datetime/string/nested/
+regex expression packages + `recursive_protection`; compression, crypto/encoding/unicode
+expressions, avro, and serde are off.
+
+### 9.2 Custom `TableProvider` + pushdown contract
+
+Each table gets one provider that unions the mutable-buffer snapshot with manifest segments.
+`supports_filters_pushdown` claims:
+
+- **Exact**: time-range predicates on the time/sort column (segment prune via manifest, row-group/
+  page prune via Parquet stats).
+- **Exact**: `matches(col, 'query')` on indexed tables (`logs`, `spans`) — compiled to a Tantivy
+  query and applied as a cost-gated `RowSelection` (§8).
+- **Unsupported** → plain filtered scan, always correct because Parquet is ground truth. This
+  includes attribute equality (no Tantivy attrs field) and `service`/`severity` filters, which run
+  as ordinary DataFusion filters / `json_get_str` scans.
+
+> *Deviation:* the original design also pushed attribute-term equality and `match_all` into
+> Tantivy. Neither is built — only `matches` pushes down.
+
+### 9.3 UDFs shipped
+
+Registered on the session: `matches(column, query)` (text search — Tantivy pushdown marker +
+row-wise fallback), `json_get_str(json, key)` (attribute access over canonical JSON),
+`histogram_quantile(phi, explicit_bounds, bucket_counts)` (explicit-bucket histograms), and
+`hex(binary)` (id rendering). *Deviation / not built:* `match_all`, `json_get_int/float/bool`,
+`rate_delta` window helper, and `span_end_time` — the plan listed these; they are not registered.
+
+### 9.4 Typed query APIs
+
+*Deviation:* the original design had each typed API build a `LogicalPlan` directly. In the
+implementation, **every typed method composes a SQL string and calls `db.sql()`** — still one
+query path, two front doors, but the consequence is that the `sql`/sqlparser frontend is **not
+severable**, which is why there is no `sql` feature (§10.13).
+
+## 10. Public API surface
+
+The product is a **library**; any HTTP server is wiring the host owns. The typed API is
+*endpoint-shaped* — it mirrors the query surfaces of Loki, Tempo, Mimir/Prometheus, SigNoz, and
+VictoriaMetrics closely enough that mapping a method to a route is mechanical. `imbhd` (§10.16) is
+one reference wiring. The host-integration guide is [docs/EMBEDDING.md](../../docs/EMBEDDING.md).
+
+Load-bearing shape decisions: one `Db` handle with per-signal namespaces; **async is primary,
+blocking is a facade**; SQL is lazy (`db.sql(q).collect()`), typed queries are eager
+(`async fn -> Result<T>`).
+
+**Endpoint → method quick reference** (routes the reference server or a host would map):
+
+| Surface | Library call |
+|---|---|
+| Loki `query_range` (logs) | `logs().query(LogQuery)` → `LogPage` |
+| Loki `index/volume` | `logs().volume(LogQuery, step)` / `logs().volume_by(LogQuery, step, &[keys])` |
+| Loki labels / values | `attrs().names()`, `attrs().values(key)` |
+| Tempo `traces/{id}` | `traces().get(TraceId)` → `Option<Trace>` |
+| Tempo `search` | `traces().search(TraceQuery)` → `Vec<TraceSummary>` |
+| Tempo/TraceQL metrics (RED) | `traces().span_metrics(SpanMetricsQuery)` → `SpanMetrics` |
+| Prom `query_range` / `query` | `metrics().range(MetricQuery)` → `Matrix` / `metrics().instant(…)` → `Vector` |
+| Prom histogram quantiles | `metrics().histogram_quantile(HistogramQuery)` / `exp_histogram_quantile(ExpHistogramQuery)` → `Matrix` |
+| Prom `series` / `metadata` / exemplars | `metrics().series(metric)`, `metrics().catalog()`, `metrics().exemplars(metric)` |
+| VM `export` / zero-copy handoff | `db.export(Table, range)` (Arrow IPC bytes) / `db.segment_files(Table)` (Parquet paths) |
+| VM `status/tsdb`, force-merge, snapshot | `db.stats()`, `db.compact()`, `db.snapshot(dir)` |
+| SigNoz raw SQL | `db.sql(…)` |
+
+### 10.2 `Db` & lifecycle
+
+```rust
+pub struct Db { /* concrete struct; Send + Sync; not Clone — share via Arc<Db> */ }
+
+impl Db {
+    pub fn builder(path: impl AsRef<Path>) -> DbBuilder;   // sync open (WAL replay, manifest load)
+    pub fn in_memory() -> DbBuilder;                        // ephemeral: no WAL, no on-disk segments
+
+    // per-signal query namespaces
+    pub fn logs(&self)    -> LogsApi<'_>;
+    pub fn traces(&self)  -> TracesApi<'_>;
+    pub fn metrics(&self) -> MetricsApi<'_>;
+    pub fn attrs(&self)   -> AttrsApi<'_>;
+
+    // ingest (async awaits acceptance; try_ never blocks / never fsyncs)
+    pub async fn ingest_otlp_logs(&self,    body: &[u8]) -> Result<IngestReceipt>;  // + traces/metrics
+    pub fn     try_ingest_otlp_logs(&self,  body: &[u8]) -> Result<IngestReceipt>;  // + traces/metrics
+    pub async fn durable_through(&self) -> Option<Lsn>;   // None until anything is durable
+
+    // cross-cutting / ops
+    pub fn sql(&self, sql: &str) -> Query;
+    pub async fn flush(&self) -> Result<()>;
+    pub async fn maintain(&self) -> Result<MaintenanceReport>;
+    pub async fn compact(&self) -> Result<CompactionReport>;
+    pub async fn snapshot(&self, dir: impl AsRef<Path>) -> Result<SnapshotInfo>;
+    pub async fn stats(&self) -> Result<DbStats>;
+    pub async fn export(&self, table: Table, range: TimeRange) -> Result<Vec<u8>>;  // Arrow IPC
+    pub fn segments(&self) -> Vec<SegmentRef>;
+    pub fn segment_files(&self, table: Table) -> Vec<PathBuf>;                       // zero-copy handoff
+    pub fn refresh(&self) -> Result<()>;   // read-only: rebuild the snapshot now (no-op for a writer)
+    pub fn blocking(&self) -> BlockingDb;
+    pub async fn close(&self) -> Result<()>;   // idempotent: set closed, join maintenance thread, final seal
+}
+
+pub struct DbBuilder { /* … */ }
+impl DbBuilder {
+    pub fn memory_budget(self, b: MemoryBudget) -> Self;   // caps buffer + query pool + writer heap
+    pub fn compression(self, c: Compression) -> Self;      // Zstd(i32) | Lz4 | None
+    pub fn wal(self, mode: WalMode) -> Self;               // Off | Interval(Duration) | Always
+    pub fn retention(self, r: Retention) -> Self;          // Retention::days(n).max_disk_bytes(b)
+    pub fn maintenance(self, m: Maintenance) -> Self;      // Manual | Background(Duration)
+    pub fn refresh(self, r: Refresh) -> Self;              // read-only freshness: OnQuery | Ttl(Duration) | Manual
+    pub fn open(self) -> Result<Arc<Db>>;         // handles are shared as Arc<Db>
+    pub async fn open_async(self) -> Result<Arc<Db>>;
+}
+```
+
+> *Deviations vs the original design:* `DbBuilder` has `promote()` (§6.1) but no `signals()` or
+> `runtime()`; `export` takes one `Table` and returns `Vec<u8>` (not a stream over `&[Table]`);
+> `segments()` takes no arguments; and there is no `db.resources()`.
+
+`Db` is a **concrete, non-`Clone`** `Send + Sync` struct; `open()` / `open_read_only()` return an
+`Arc<Db>` and you share that `Arc` across the app (the DB owns no second internal refcount — consumers
+already hold it inside an `Arc`). The typed query namespaces (`logs()`/`traces()`/`metrics()`/`attrs()`),
+`sql()`, `export()`, and `blocking()` take `self: &Arc<Self>` so the returned `'static` handle keeps an
+owned share; the direct ops (`ingest_*`, `flush`, `compact`, `stats`, `close`, …) are `&self` and reach
+through the `Arc`. Dropping the last `Arc<Db>` without `close()` is safe — the WAL recovers on next open.
+
+### 10.3 Error model
+
+`Result<T> = std::result::Result<T, Error>`, with `Error` categories for open/ingest/query/
+storage/config plus a terminal `Closed` (returned by every op after `close()`). The reference
+server maps errors to HTTP status via error-classification helpers.
+
+### 10.4 Shared vocabulary
+
+- **Time.** `Timestamp` (i64 epoch-nanos, UTC; serializes as a decimal string — the OTLP-JSON /
+  Loki convention that dodges the 2^53 precision loss on nanos), `DurationNs` (u64 nanoseconds),
+  `TimeRange` (`between` / `since` / `all`, `.step(d)` for bucketing), `Direction`
+  (logs default newest-first).
+- **Attribute matching.** *Deviation:* rather than a single `AttrMatcher`/`MatchOp` vocabulary
+  type, each query builder exposes matcher **methods** directly:
+  `attr_eq`, `attr_exists`, `attr_matches` (term search), `attr_in`, `attr_not_in`,
+  `attr_gt`/`attr_ge`/`attr_lt`/`attr_le`, `attr_regex`. `service.name` hits the promoted column;
+  everything else resolves via `json_get_str` (there is no attrs Tantivy index, §8).
+- **Ids & enums.** `TraceId([u8;16])` / `SpanId([u8;8])` (lowercase hex), `Lsn` (a
+  `NonZero<u64>` type alias — 0 is never a valid LSN, so "nothing durable / not yet written" is
+  `Option<Lsn>` = `None` rather than an in-band `Lsn(0)` sentinel),
+  `SeverityNumber(u8)`, and the `Table` enum: `Logs`, `Spans`, `MetricsGauge`, `MetricsSum`,
+  `MetricsHistogram`, `MetricsExpHistogram`, `MetricsSummary`.
+- **Values.** OTel `AnyValue` is the value model in `imbh-core`, serde-free by default (no
+  `serde_json` in every build; canonical JSON is handled by `imbh-core::json`); row DTOs carry owned
+  `Attributes` (key-ordered `(String, AnyValue)` pairs) with `get`/`get_str`/`iter`. `Serialize`/
+  `Deserialize` are derived only under the optional `serde` feature (§10.13).
+
+### 10.5 Ingest
+
+`ingest_otlp_{logs,traces,metrics}` decode protobuf OTLP/HTTP bodies (uncompressed), append to
+the buffer + WAL, and await *acceptance*; under `WalMode::Always` the awaiting path also fsyncs
+(`receipt.durable == true`). `try_ingest_*` never blocks and never fsyncs. For an inline receipt,
+confirm durability with `durable_through().await >= receipt.lsn` (both `Option<Lsn>`) or force it with
+`flush()`; a queued receipt has `lsn == None` (`is_queued()`), so use `flush()` / `close()`.
+
+```rust
+pub struct IngestReceipt {
+    pub accepted: u64,        // records parsed and appended
+    pub rejected: u64,        // per-point drops
+    pub lsn: Option<Lsn>,     // Some(assigned lsn) inline; None while queued for the async worker
+    pub durable: bool,        // fsync'd before return (only the awaiting path under WalMode::Always)
+}
+impl IngestReceipt {
+    pub fn is_queued(&self) -> bool { self.lsn.is_none() }   // enqueued for Ingest::Async, not written
+}
+```
+
+**Async ingest (opt-in, §5).** With `Ingest::Async { handle, capacity, overflow }` the decode still
+runs on the caller (so `accepted` and a malformed-body error are still synchronous), then the WAL +
+buffer write is handed to one background worker task. The receipt is then a *queued acknowledgement*
+— `is_queued()` is true, `accepted` is real, but `lsn == None` and `durable == false`, so the per-call
+`durable_through() >= receipt.lsn` handshake does not apply; confirm durability globally with
+`flush()`/`close()`. The worker drains the queue in bursts: it appends each job's WAL frame with
+`sync_now = false`, then calls `Storage::group_commit()` **once per burst** — a single fsync that
+makes the whole batch durable and advances `durable_through` to the highest appended LSN. So
+`WalMode::Always` durability is preserved (the fsync moves off the caller *and* is amortized across
+the burst rather than paid per job); `Interval`/`Off` are unaffected (they never fsync per-append, and
+`group_commit` is a no-op for them). The bounded queue overflow policy is:
+
+- `Overflow::Block` — the async `ingest_otlp_*` call awaits a free slot (natural backpressure); the
+  non-blocking `try_ingest_otlp_*` cannot await and so fails fast when full.
+- `Overflow::Fail` — return a backpressure `Error::queue_full` (`is_backpressure()`) when full.
+- `Overflow::DropOldest` — evict the oldest un-processed job, then enqueue (load-shed; counted in
+  `stats().ingest_dropped`).
+
+`stats()` also exposes `ingest_queue_depth` and `ingest_errors` (worker-side WAL/buffer failures, which
+have no caller to return to). A clean `close()` drains the queue before the final seal; dropping the
+last `Db` handle without `close()` discards any in-flight queued jobs (same `Weak` lifecycle as the
+maintenance worker).
+
+> *Deviation:* there is no `partial_errors` field and `rejected` is currently always `0` — the
+> OTLP partial-success surface is not built.
+
+### 10.6 Logs API
+
+```rust
+impl LogsApi<'_> {
+    pub async fn query(&self, q: LogQuery) -> Result<LogPage>;
+    pub async fn volume(&self, filter: LogQuery, step: Duration) -> Result<Vec<VolumeBucket>>;
+    pub async fn volume_by(&self, filter: LogQuery, step: Duration, keys: &[&str]) -> Result<…>;
+    pub async fn count(&self, filter: LogQuery) -> Result<u64>;
+    pub async fn query_batches(&self, q: LogQuery) -> Result<Vec<RecordBatch>>;
+}
+```
+
+`query_batches` is the raw-Arrow twin of `query`: same SQL, but it stops before row-DTO
+materialization and hands back the `RecordBatch`es. It is **not** feature-gated — the `imbh-lgtm`
+source adapter reads logs through it (§10.18) — unlike the stats-returning
+`query_batches_with_stats` under the `proto` feature (§10.17).
+
+`LogQuery` is built with `new()` + `service`, `severity_at_least`, `matches` (full-text), the
+`attr_*` matchers (§10.4), `trace_id`/`span_id` (raw-binary correlation equality — the trace→log
+drill-down partner of `traces().get`, bloom-prunable like §10.7), `range`/`since`, `limit`,
+`direction`, and `after(cursor)` for paging. `LogPage` carries the entries and a next-page cursor.
+
+> *Deviations:* `PageCursor` is a numeric **offset**, not the `(timestamp, segment, ordinal)`
+> keyset the design specified (paging is not the immutable, tie-safe cursor originally intended);
+> `LogPage`'s query-stats counters are not populated; and there is **no `tail` or `query_stream`**
+> (live/streaming log APIs are not built).
+
+### 10.7 Traces API
+
+```rust
+impl TracesApi<'_> {
+    pub async fn get(&self, id: TraceId) -> Result<Option<Trace>>;         // None → 404
+    pub async fn search(&self, q: TraceQuery) -> Result<Vec<TraceSummary>>;
+    pub async fn span_metrics(&self, q: SpanMetricsQuery) -> Result<SpanMetrics>;  // RED rollups
+}
+```
+
+`TraceQuery` builds with `service`, `name`, `kind`, `status`, `min_duration`/`max_duration`,
+`matches`, the `attr_*` matchers, `range`/`since`, `limit`. `SpanMetricsQuery` reuses that filter
+plus `group_by(key)` and `step`.
+
+> *Deviations:* `Trace` is a flat span list — no `roots`, no `SpanTree`/`.tree()` waterfall
+> assembly. `TraceSummary` is flat — no `span_sets`/`SpanSet`/`SpanSummary` and no
+> `spans_per_trace`. `span_metrics` returns a bespoke `SpanMetrics` struct, not `Matrix`, and there
+> is no `SpanMetric` selector enum (`Rate`/`ErrorRate`/`Duration(q)`).
+
+### 10.8 Metrics API
+
+```rust
+impl MetricsApi<'_> {
+    pub async fn catalog(&self) -> Result<Vec<MetricMeta>>;                 // name, kind, unit
+    pub async fn range(&self, q: MetricQuery) -> Result<Matrix>;            // Prometheus range
+    pub async fn instant(&self, q: MetricQuery) -> Result<Vector>;          // Prometheus instant
+    pub async fn histogram_quantile(&self, q: HistogramQuery) -> Result<Matrix>;
+    pub async fn exp_histogram_quantile(&self, q: ExpHistogramQuery) -> Result<Matrix>;
+    pub async fn series(&self, metric: &str) -> Result<Vec<Attributes>>;    // distinct label sets
+    pub async fn exemplars(&self, metric: &str) -> Result<Vec<Exemplar>>;   // trace links
+}
+```
+
+`MetricQuery` is built from a kind constructor — `MetricQuery::gauge("cpu")` /
+`MetricQuery::sum("requests")` — plus `aggregation`, `group_by`, `filter`/`filter_ne`/
+`filter_regex`/`filter_not_regex`, `range`/`since`, `step`, and `.rate()` (per-second over delta) /
+`.rate_counter()` (over cumulative). `HistogramQuery`/`ExpHistogramQuery` add `.quantile(phi)`.
+`Matrix`/`Vector` are Prometheus-shaped (`metric` label map + `[secs, "value"]` samples, the
+string encoding letting NaN/±Inf survive).
+
+> *Deviation:* the original single `MetricQuery { selector, rate: Rate, time_agg: TimeAgg,
+> space_agg: SpaceAgg, … }` with the `Rate`/`TimeAgg`/`SpaceAgg` enums is replaced by the
+> constructor + builder-method style above.
+
+### 10.9 Attribute discovery
+
+```rust
+impl AttrsApi<'_> {
+    pub async fn names(&self) -> Result<Vec<String>>;          // distinct attribute keys
+    pub async fn values(&self, key: &str) -> Result<Vec<String>>;
+}
+```
+
+> *Deviation:* simpler than the scoped design — no `Signal`/`AttrScope`/`TimeRange`/filter
+> parameters and no typed `AttrName`/`AttrValue` results.
+
+### 10.10 SQL escape hatch
+
+`db.sql(&str) -> Query`; `Query::collect().await -> Vec<RecordBatch>` (via `imbh::arrow`
+re-exports). Tables: `logs`, `spans`, `metrics_{gauge,sum,histogram,exp_histogram,summary}`. UDFs
+`matches`, `json_get_str`, `histogram_quantile`, `hex` are registered (§9.3). This is the same
+query path the typed APIs build on — no second engine.
+
+### 10.11 Ops & admin
+
+`export(Table, range)` returns Arrow-IPC bytes; `segment_files(Table)` hands back live immutable
+Parquet paths (safe to read concurrently — segments never mutate) for zero-copy handoff to
+DuckDB/pandas/polars; `segments()` returns `SegmentRef`s (table, path, time range, rows, bytes);
+`compact()`, `snapshot(dir)` (manifest copy + hard-linked segments), `stats()` (per-table totals +
+buffer/WAL/durable-LSN), `maintain()`, `flush()`, `durable_through()`. No delete-series API by
+design.
+
+### 10.12 Async, blocking, streaming
+
+Async is the native surface (a query is driven by whoever awaits it — no hidden execution pool,
+which is how the no-background-threads guarantee holds for query execution). The **blocking
+facade** (`db.blocking() -> BlockingDb`) owns a private current-thread runtime and exposes
+`ingest_otlp_*`, `sql`, `flush`, `maintain`, `compact`, `snapshot`, `stats`, `export`, `close`.
+
+`Query::collect` materializes the whole result; `Query::stream` (and `stream_with_stats`, which also
+returns a `StreamStatsHandle` for the read-side counters) returns a **bounded-memory**
+`SendableRecordBatchStream`. The scan is genuinely lazy — the custom `SegmentTableProvider` hands a
+`PartitionStream` to `StreamingTableExec` that reads one Parquet batch per `poll_next` (never a
+collect-then-`MemTable`), so the executor yields after each batch. Two residual quanta are bounded and
+expected: a pipeline-breaker (`ORDER BY`, hash-aggregate, `DISTINCT`) drains its input before the
+first output batch, and a cold segment's `std::fs` read blocks for that read. The streamed snapshot is
+pinned at plan time (no read-during-delete retry — the caller must not unlink streamed segments until
+the stream is drained/dropped).
+
+> *Deviations:* `BlockingDb` does **not** expose the typed query namespaces
+> (`logs()`/`traces()`/`metrics()`) — sync hosts use `blocking().sql(…)` for queries. Blocking
+> `ingest_otlp_*` calls the non-fsync `try_` path, so a blocking ingest receipt is **never
+> `durable`** even under `WalMode::Always` (use `flush()` to force durability). There are no
+> streaming/`tail` iterators.
+
+### 10.13 Feature gating
+
+*Deviation:* two cargo features exist on the `imbh` facade: **`search`** (default on) and
+**`serde`** (default off). Turning `search` off drops the whole Tantivy subtree (~59 crates);
+`matches()` then falls back to a full tokenized scan (identical results, no pruning), and
+promoted-column filters are unaffected. The **`serde`** feature derives `Serialize`/`Deserialize`
+for the typed query builders (`LogQuery`/`TraceQuery`/`MetricQuery`/`HistogramQuery`/
+`ExpHistogramQuery`/`SpanMetricsQuery` and their operator enums) and the result DTOs
+(`LogEntry`/`LogPage`/`QueryStats`/`VolumeBucket`, `Trace`/`TraceSummary`/`Span`/`SpanMetrics*`,
+`Matrix`/`Vector`/`Sample`/`MetricSeries`/`MetricMeta`/`Exemplar`); it forwards to `imbh-core/serde`
+so the embedded domain types serialize too (`TraceId`/`SpanId` as lowercase-hex strings). Enabling
+it adds no new crate to the graph — serde is already compiled transitively. The **`proto`** feature
+(default off) is the query-binding surface (§10.17): it pulls the first-party `imbh-proto` crate
+(protobuf wire types for the query inputs) plus `TryFrom` mappings and Arrow-`RecordBatch` query
+entry points; it adds no new *runtime* third-party crate (prost is already compiled; protox/prost-build
+are build-time only); `proto` implies `query` (its `TryFrom` mappings target the typed query builders).
+
+**Producer / consumer split (the primary footprint lever).** The `imbh` facade carries two role
+features, both default-on: **`ingest`** (producer — OTLP decode via `imbh-otlp` + the `Db::ingest_otlp_*`
+write paths) and **`query`** (consumer — the DataFusion query engine via `imbh-query`/`datafusion` + the
+`sql`/`logs()`/`traces()`/`metrics()`/`attrs()`/`export` surface). `search` implies `query` (it is a
+query-side accelerator). Storage-level ops (`open`/`stats`/`compact`/`maintain`/`snapshot`/
+`segment_files`) need neither and stay in every build. A host compiles only the role it plays; a
+**producer** build (`--no-default-features --features ingest`) drops the entire DataFusion + sqlparser +
+tantivy subtree, a **consumer** build (`--features query`) drops the OTLP decoder. Measured unique
+crates (`cargo tree -e no-dev -p imbh`): **default 287 → producer 104 (−64%) / consumer 221 /
+storage-only 80**. This is enabled by imbh-storage depending on `arrow`+`parquet` *directly* (not via
+`datafusion::{arrow,parquet}` re-exports), so the storage/ingest paths carry Arrow types without pulling
+the query engine; the workspace pins one arrow/parquet 58.3.0 (datafusion 54's exact versions) so the
+tree still unifies to a single arrow. The CI `feature-matrix` job builds + clippy-checks the reduced
+configs and asserts the cuts via `cargo tree`. **Consequence:** a *pure* consumer (`query` without
+`ingest`) reads **sealed segments only** — WAL-tail replay is `ingest`-gated because WAL frames store raw
+OTLP bytes that only the imbh-otlp decoder can replay (§7); a host wanting near-real-time cross-process
+reads keeps `ingest` on (the default has both). Per-signal `logs`/`traces`/`metrics` gates were
+prototyped then dropped in favor of this axis; `sql` off is not implemented (`sql` is not severable —
+the typed APIs build SQL strings, §9.4); `zstd`/`mimalloc` gates give no user-facing win.
+
+### 10.14 Stability
+
+Pre-1.0 the surface may change. Response structs and public enums are `#[non_exhaustive]`.
+Arrow/Parquet types reach users only through `imbh::arrow` / `imbh::parquet` re-exports (the facade
+depends on `arrow`/`parquet` directly, workspace-pinned to datafusion 54's exact 58.3.0 so the tree
+unifies to a single arrow — this is what lets a producer build re-export Arrow types with no DataFusion).
+
+### 10.15 Worked examples
+
+```rust
+use imbh::{Db, MemoryBudget, Retention, WalMode, Maintenance};
+use std::time::Duration;
+
+// Open (durable, on disk). Or Db::in_memory() for an ephemeral, WAL-less DB.
+let db = Db::builder("./telemetry")
+    .memory_budget(MemoryBudget::total(128 << 20))
+    .retention(Retention::days(7).max_disk_bytes(20 << 30))
+    .wal(WalMode::Interval(Duration::from_secs(1)))
+    .maintenance(Maintenance::Background(Duration::from_secs(30)))
+    .open()?;
+
+db.ingest_otlp_logs(&otlp_bytes).await?;               // ExportLogsServiceRequest protobuf
+
+// Logs: service + full-text + attribute equality, newest first.
+let page = db.logs().query(
+    imbh::LogQuery::new().service("checkout").matches("timeout error")
+        .attr_eq("peer.service", "cart").since(Duration::from_secs(900)).limit(100),
+).await?;
+
+// Traces: slow spans, then the full trace.
+let slow = db.traces().search(
+    imbh::TraceQuery::new().service("checkout").min_duration(Duration::from_millis(500)),
+).await?;
+if let Some(t) = slow.first() { let trace = db.traces().get(t.trace_id).await?; }
+
+// Metrics: p99 by route (histogram), 60s steps.
+let p95 = db.metrics().histogram_quantile(
+    imbh::HistogramQuery::new("http.server.duration").quantile(0.95)
+        .group_by("http.route").step(Duration::from_secs(60)),
+).await?;
+
+// Cross-signal SQL (lazy).
+let rows = db.sql(
+    "SELECT service, count(*) FROM logs WHERE matches(body, 'error') GROUP BY service"
+).collect().await?;
+
+// Sync host: the blocking facade owns a private runtime (queries via SQL).
+let b = db.blocking();
+b.ingest_otlp_logs(&otlp_bytes)?;
+let batches = b.sql("SELECT count(*) FROM logs")?;
+```
+
+Server wiring is a thin adapter: decode the request, call the matching `db` method, encode the
+result — see §10.16 and `docs/EMBEDDING.md`.
+
+### 10.16 Reference server
+
+`imbh-server` / `imbhd` is a worked example, not the product: a minimal `std::net` HTTP/1.1 server
+(zero heavy web deps) exposing OTLP/HTTP ingest on `/v1/{logs,traces,metrics}` (protobuf), a SQL
+query endpoint `POST /api/query` (JSON rows or Arrow IPC out), `GET /stats`, admin
+`POST /admin/{flush,compact}`, and `GET /health`.
+
+OTLP/gRPC ingest is available behind the **optional, off-by-default `grpc` feature** (`cargo build -p
+imbh-server --features grpc`). Since gRPC is HTTP/2 + protobuf framing that the hand-rolled HTTP/1.1
+server cannot speak, the feature pulls **tonic** and serves the three OTLP collector services
+(`LogsService` / `TraceService` / `MetricsService`) on a second port (default `127.0.0.1:4317`,
+alongside HTTP on `4318`). Both share one `Arc<Db>`; each gRPC `export` re-encodes the decoded request
+and funnels into the same `Db::ingest_otlp_*` path the HTTP routes use, so there is one ingest and
+validation story. Errors map to gRPC status via the §10.3 classifiers (not-found → `NotFound`, user
+error → `InvalidArgument`, else `Internal`), mirroring the HTTP status mapping. The whole tonic/hyper
+subtree is confined to that feature, so the **default build (the footprint gate) carries no gRPC
+transport** and its crate/binary graph is unchanged.
+
+> *Deviations vs the original design:* there is **no HTTP mapping of the typed §10 APIs**
+> (Loki/Tempo/Prom-shaped routes) — only OTLP ingest + SQL + stats/admin; **no TOML config file**;
+> and no in-process TLS (front with a proxy). OTLP/gRPC is now supported, but only under the optional
+> `grpc` feature (the default build is HTTP-only). Health is `/health` (not `/healthz`).
+
+### 10.17 Query-binding surface (`proto` feature)
+
+The scaffolding for out-of-process language bindings (a Go binding is the motivating case), gated
+behind the off-by-default `proto` feature. The split follows the shape of the data:
+
+- **Inputs = protobuf.** The typed query builders (`LogQuery`/`TraceQuery`/`MetricQuery`/
+  `HistogramQuery`/`ExpHistogramQuery`/`SpanMetricsQuery`) are small, nested, heterogeneous values —
+  a row/tree codec, not a columnar one. `imbh-proto` holds their protobuf wire types (generated from
+  `crates/imbh-proto/proto/imbh/v1/query.proto` by **protox** at build time — pure-Rust, no system
+  `protoc`), and `imbh` provides `TryFrom<imbh_proto::…>` for each builder (re-exported as
+  `imbh::proto`). A single `.proto` schema is the source of truth, so the Rust and binding types stay
+  byte-compatible by construction. The mappings go through the builders' public setters and validate
+  the wire→domain narrowing (out-of-range enum discriminant, severity > 255, negative duration,
+  `usize` overflow) as user errors. The scalar operators become proto enums (`NumOp`, `LabelOp`,
+  `Aggregation`, `RateMode`, `Direction`, `MetricTable`).
+- **Results = Arrow, out of band.** Bulk result rows are *not* modeled in protobuf: the
+  `*_batches` query entry points (`LogsApi::query_batches_with_stats`, `MetricsApi::range_batches`,
+  `TracesApi::span_metrics_batches`) run the same SQL as their DTO twins but return the raw
+  DataFusion `RecordBatch`es (plus a `QueryStats`), skipping row-DTO materialization. A binding then
+  shares those batches **zero-copy** via the Arrow C Data Interface (or serializes them to Arrow IPC
+  bytes as a fallback where a real serialization boundary is unavoidable). Zero-copy is preferred over
+  ABI simplicity, so the columnar payload never round-trips through protobuf. Only the small
+  `QueryStats` envelope crosses back as protobuf (`imbh::proto::encode_query_stats`). Canonical batch
+  schemas: logs → the `logs` projection in schema order; metric range / span RED → `bucket` +
+  `g0..gN` label columns + the value/aggregate columns. The logs entry point is the stats-returning
+  twin of the **ungated** `LogsApi::query_batches` (§10.6): the two must differ in *name*, not only
+  in feature gate, or they collide as duplicate inherent methods as soon as `proto` is enabled.
+
+The FFI layer itself (the `extern "C"` / Arrow C Data Interface `cdylib`) and the Go package are a
+**separate project**, out of scope for this repo; this feature is only the in-repo foundation they
+consume. Histogram-quantile and trace-assembly (`search`/`get`) batch variants are a deliberate
+follow-up (they involve UDF post-processing / Rust-side reshaping rather than a batch passthrough).
+
+### 10.18 Query-language semantics, translators, and companion TUI
+
+Language compatibility is an optional top-tier surface. Native typed builders retain their existing
+IMBH semantics; they are not silently reinterpreted as PromQL, LogQL, or TraceQL.
+
+`imbh-lgtm` is the LGTM-stack query-language compatibility crate: it targets the query surfaces of
+Loki (LogQL), Tempo (TraceQL), and Prometheus/Mimir (PromQL), and is deliberately stack-specific
+rather than a neutral cross-ecosystem layer (the "G", Grafana, is a dashboard UI with no query
+language, so the crate implements the L/T/M languages). It splits into two modules: `model` owns
+parser- and engine-independent expression models, reference evaluators, and — under the optional
+`source` feature — the IMBH source adapter; `syntax` owns the parsers/translators (below).
+Production execution is source-backed: `plan_prom_fetch`,
+`plan_log_fetch`, and `plan_trace_fetch` derive bounded storage requests from `EvalRange` and
+`EvalLimits`, then `execute_prom`, `execute_log_range`, and `execute_traceql` enforce the source
+contract. A reference evaluator may receive a complete *bounded working set*; no production API
+requires an entire retained series, log history, or trace corpus in memory.
+
+The first compatibility profiles are explicit and immutable:
+
+| Capability id | Reference version | Implemented surface |
+|---|---|---|
+| `imbh.promql.p1.v1` | Prometheus 3.12.0 | selectors and four matchers; instant/range boundaries and lookback; `rate`; `sum`/`avg`/`min`/`max`/`count` with `by`/`without`; cumulative classic-histogram `histogram_quantile` |
+| `imbh.logql.l1.v1` | Loki 3.7.2 | explicit stream schema; four stream matchers and four exact line filters; sliding `count_over_time`/`rate`; offset; grouping; pipeline error/state contract |
+| `imbh.traceql.t1.v1` | Tempo 2.10.5 | typed scoped attributes and intrinsics; spanset logic; child/parent/ancestor/descendant/sibling relations and union variants; `count()` comparison |
+
+Within a profile, boundary and absence behaviour follows the reference implementation exactly, even
+where it disagrees with the other two languages or with SQL. Two rules are load-bearing enough to
+state here, because both are easy to "simplify" into a divergence:
+
+- **PromQL lookback is left-open**, `(at - lookback, at]`. A sample exactly `lookback` old is
+  *dropped*, matching Prometheus's `vectorSelectorSingle` rule (`t <= refTime - lookbackDelta`);
+  instant and range selection use the same open lower bound.
+- **A TraceQL condition never matches a span that lacks the referenced attribute** — negated
+  operators included. `!=` / `!~` on a missing attribute evaluate to *not matched*, not true; this is
+  Tempo's semantics, not SQL/PromQL three-valued NULL logic. The only presence test is the explicit
+  `nil` literal: `{ .foo = nil }` matches a span missing `foo`, `{ .foo != nil }` does not.
+
+The contrast with the native surface is deliberate and must not be homogenized: IMBH's own
+`attr_not_in` matcher *is* NULL-aware and keeps rows lacking the key (§10.4), and PromQL label
+negation keeps label-absent series. Absence semantics belong to each language, not to the engine.
+
+The native facade is semantics-independent. It exposes bounded `MetricPointsQuery`, exact
+`LogQuery` string predicates, inclusive storage ranges, and assembled-trace-start candidate bounds.
+These typed models compile all user-supplied metric names, label keys/values, regexes, text, and time
+bounds as DataFusion bind parameters; only fixed structural SQL is emitted internally.
+
+Under its opt-in `source` feature, `imbh-lgtm` depends on `imbh` and owns
+`build_metric_point_queries`, `build_log_query`, `build_trace_query`, plus the
+`MetricsSemanticsExt`, `LogsSemanticsExt`, and `TracesSemanticsExt` execution traits. The adapter
+contains no SQL. Histogram execution accepts only cumulative OTLP histograms with stable explicit
+bounds; incompatible temporality or boundary changes are errors. Trace execution fetches candidate
+trace ids first and then complete bounded traces, so structural operations never run over partial
+traces.
+
+`imbh-lgtm`'s `syntax` module is a dependency-light syntax adapter. `translate_promql`,
+`translate_logql`, and `translate_traceql` lower only the profiles above into
+`ImbhQueryModel`; unsupported valid constructs return a source-positioned stable `Diagnostic`.
+`TranslateContext` resolves Prometheus metric names to exact IMBH storage names and kinds. Missing
+or ambiguous catalog metadata is `NeedsResolution`, never a guess.
+
+`imbh-tui` is an optional read-only host above the facade and the `imbh-lgtm` crate. Its binary opens a
+local directory with `Db::open_read_only`; its library exposes `run(Arc<Db>, Options)`. It renders
+overview statistics, PromQL metric series, TraceQL results with a client-side waterfall, and a log
+viewer plus LogQL-derived count/rate charts. It coalesces refreshes to one query in flight and rejects
+stale generations. Ratatui/Crossterm dependencies remain confined to this crate and do not enter the
+`imbh` or `imbhd` graphs.
+
+The exact capability and deferred-construct matrices live in
+[QUERY_SEMANTICS_CONFORMANCE_PLAN.md](./QUERY_SEMANTICS_CONFORMANCE_PLAN.md),
+[QUERY_LANGUAGE_TRANSLATORS_PLAN.md](./QUERY_LANGUAGE_TRANSLATORS_PLAN.md), and
+[TUI_PLAN.md](./TUI_PLAN.md). Expanding a profile requires evaluator tests before parser support.
+
+## 11. Footprint engineering (continuous, not a phase)
+
+- **Feature matrix.** `search` (§10.13), `tracing` (self-observability), `serde` (DTO derives,
+  §10.13), and `proto` (query-binding surface, §10.17) exist today, all off by default except
+  `search`; per-signal / `sql` gates are planned levers, not built.
+- **Profiles.** Shipped binaries use `opt-level = "s"`, `lto = "fat"`, `codegen-units = 1`,
+  `strip = "symbols"`, `panic = "abort"`. Library crates never force `panic` settings on hosts.
+- **Dependency policy.** No openssl anywhere; C code allowed only for libzstd (shared by parquet
+  and tantivy, linked once). *Correction:* lz4 is Parquet's built-in `LZ4_RAW`, **not** the
+  pure-Rust `lz4_flex` (which is not a dependency). **Self-observability uses the `tracing` facade,
+  feature-gated (`tracing`, off by default), never `log`** (superseding the earlier `log`-not-`tracing`
+  rule — see the 2026-07-19 JOURNAL entry): library crates emit spans/events through an optional
+  `tracing` dependency that compiles away entirely when the feature is off, and the `tracing`
+  facade itself adds **zero** crates on top of the default graph (DataFusion already pulls
+  `tracing`/`tracing-core`). The heavier `tracing-subscriber` renderer is opt-in only, with two
+  owners: the `imbh` facade's stderr console collector (its off-by-default `tracing-console` feature,
+  the `imbh::console` module) and the `imbh-tracing` helper crate's `DbLayer`. `imbh-server`/`imbhd`
+  pull it via `imbh/tracing-console` under their own `tracing` feature (§12 containment — keep it out
+  of the default library graph); measured cost is +5 crates on `imbhd` (281, well under the 300 hard limit) with
+  the default facade build unchanged at 275. serde is present transitively but the default facade
+  graph stays serde-free; the optional `serde` feature (§10.13) turns on DTO derives without adding a
+  crate (serde is already compiled). `cargo-deny` gates licenses + duplicate-version creep (`deny.toml`); a `cargo tree`
+  count budget is enforced in the footprint gate.
+- **Measurement rig.** `scripts/footprint-gate.sh` checks binary size and crate count against the
+  §2 budgets (see [QUALITY_GATE.md](./QUALITY_GATE.md)); `cargo bloat` / RSS soak as needed.
+- **Allocator.** System allocator by default.
+
+## 12. Workspace layout
+
+```
+imbh/
+  Cargo.toml               # workspace, shared lints, release-small profile
+  crates/
+    imbh-core/             # schemas, ids, config, errors, manifest types, canonical JSON,
+                           # dependency-free JSON parser, time utils (arrow-free)
+    imbh-otlp/             # OTLP decode → normalized rows (prost types), all 3 signals
+    imbh-storage/          # WAL, mutable buffer, seal, segments, manifest IO, retention,
+                           # compaction; owns the Arrow schemas
+    imbh-index/            # tantivy schema/build/search + row-ordinal bridge (only Tantivy crate)
+    imbh-query/            # DataFusion: providers, UDFs, session config (only DataFusion crate)
+    imbh-lgtm/             # LGTM-stack (Loki/Tempo/Mimir) query languages: expression models +
+                           # reference evaluators (`model`), P1/L1/T1 parsers/lowering (`syntax`),
+                           # and the optional native-IMBH `source` adapter (feature-gated)
+    imbh-tui/              # optional read-only local companion TUI
+    imbh/                  # facade crate embedders use: Db, blocking + async API; optional stderr
+                           # console renderer (`imbh::console`, `tracing-console` feature)
+    imbh-proto/            # protobuf wire types for the query inputs (protox build.rs); the
+                           # `proto` binding surface (§10.17) (optional, prost-only)
+    imbh-otel-exporter/    # opentelemetry-rust SDK exporter adapters (optional)
+    imbh-server/           # reference imbhd binary + example HTTP wiring (optional)
+    imbh-tracing/          # in-process `tracing` plumbing: `DbLayer` sinking tracing spans/events
+                           # into a `Db` (self-observation, depends on imbh) (optional)
+  examples/                # replay-otlp-file, embed-in-app, …
+  docs/                    # EMBEDDING.md, PROMQL_TO_SQL.md
+  .agents/docs/            # OVERVIEW.md, ARCHITECTURE.md (this file), JOURNAL.md, TODO.md, …
+```
+
+Dependency direction: `core ← {otlp, storage, index, query} ← imbh ← {exporter, server}`. The
+LGTM query languages live in `imbh-lgtm`, whose `syntax` (parsers) depends on its own `model`
+(expression types + evaluators); the optional `imbh-lgtm/source` adapter depends on `imbh`, and
+`tui` depends on `imbh` and `imbh-lgtm` with that feature. `imbh` never depends on `imbh-lgtm` or
+terminal crates.
+`imbh-proto` is a prost-only leaf that `imbh` depends on **optionally**, under its `proto` feature
+(§10.17); it depends on nothing else in the workspace.
+`imbh-tracing` sits at the top tier alongside `{exporter, server}` and depends on `imbh`. It provides
+`DbLayer`, a `tracing_subscriber::Layer` that sinks `tracing` spans/events into an embedded `Db`
+in-process (events → `logs`, span closes → `spans`) over the same `Db::try_ingest_otlp_*` path
+`imbh-otel-exporter` uses. It is *not* internally feature-gated — the crate is itself the opt-in
+boundary (a host depends on it only to wire tracing to IMBH). Crucially it depends on `imbh` with
+default features, so it does **not** enable `imbh/tracing`: the sink (collect) and IMBH's
+self-instrumentation (emit) stay independent opt-ins. The companion stderr *console collector* (a
+`fmt` subscriber that renders IMBH's instrumentation to the terminal — `imbh::console`, the
+`env_filter`/`directives`/`IMBH_TARGETS` helpers) lives in the `imbh` facade instead, behind its
+off-by-default `tracing-console` feature, so hosts that only want console output never pull the
+`imbh-tracing` crate. The two compose on one `tracing_subscriber` registry.
+`imbh-index` is the only crate that knows Tantivy; `imbh-query` the only one that knows
+DataFusion — engine churn (DataFusion ships breaking majors ~monthly) is absorbed behind these two
+crates. **Engine-boundary note:** `imbh-core` is arrow-free; `imbh-storage` owns the Arrow schema
+and hands the `SchemaRef` + buffer `RecordBatch` to `imbh-query` *through the facade*, so
+`imbh-query` stays the sole DataFusion-aware crate without either sibling depending on the other.
+
+## 14. Risks & mitigations
+
+| Risk | Status |
+|---|---|
+| DataFusion size budget (204/269 crates) | **Owned.** ~30 MB is the price of the query engine; levers are per-signal/`search`/`sql` gates (mostly still to build). |
+| Tantivy↔Parquet row misalignment (silent wrong results) | **Mitigated.** Row ordinal stored as data; index rebuilt (not merged) on compaction; shared tokenizer + differential tests. |
+| Delta→cumulative accumulator | **Open / not built.** Delta series stored as-is; querying delta as cumulative is a known gap (§6.4). |
+| Manifest write amplification at high segment counts | **Mitigated (built).** The manifest is an append-only delta log with a compacted checkpoint (`CURRENT` → `MANIFEST-<N>`), so a seal appends O(change) not O(total segments); the log is rolled into a fresh checkpoint past a size threshold (§7). |
+| No single-writer lockfile | **Built.** A read-write open holds an exclusive advisory lock on `writer.lock`; a second writer fails fast with `Error::lock_held` (§5/§7). Enables cross-process read-only readers (§5). |
+| Reader reads a segment retention/compaction just deleted | **Mitigated (Phase 3).** The read-only query path detects a segment path it snapshotted then vanished and re-derives from the current manifest, retrying up to `READER_QUERY_TRIES`; a genuine error (all paths present) is surfaced as-is. Optional writer-side deletion grace period remains a later add. See §7.1. |
+| Query racing a seal double-counts or drops rows (intra-process) | **Mitigated (Phase 3).** `Storage::query_snapshot` captures buffer∪segments under one lock (no double-count) and unions the in-flight seal's `Inner::sealing` staging (no mid-seal drop during the off-lock write). §5/§7. |
+| `matches()` result depends on flush timing | **Mitigated.** `matches` = tokenized-term containment; index and row-wise fallback share one tokenizer. |
+| WAL replay double-counts sealed data | **Mitigated.** Per-generation LSN watermark; replay re-ingests only LSN > watermark (§7). |
+| Attribute analytics on non-promoted keys | **Partial.** `json_get_str` scans work; configurable key promotion to typed columns now lands via `DbBuilder::promote` (§6.1), but no Tantivy attrs index and no automatic promoted-column pushdown in the typed/LGTM query builders yet. |
+| DataFusion monthly breaking majors | **Contained.** Isolated in `imbh-query`; pinned; deliberate upgrade cadence. |
+
+Where the implementation is **ahead** of the original plan: the cost-gated `RowSelection` bridge,
+partition compaction with index rebuild, exp-histograms, exemplars, the `imbh-otel-exporter`
+crate, and the opt-in background maintenance thread with a `close()` join are all built.
+
+## 15. Open questions for review
+
+1. **Platforms.** Plan assumes Linux x86_64/aarch64 + macOS, musl static for the reference server;
+   Windows near v1?
+2. **Scale envelope.** Defaults tuned for ≤ ~20 GB/day ingest, ≤ 30 d retention, single node.
+3. **Name & license.** Keep `imbh` as the crate prefix? Apache-2.0?
+4. **PromQL.** Post-v1, or is a minimal subset a v1 requirement? (A PromQL→SQL recipe exists in
+   `docs/PROMQL_TO_SQL.md`.)
+5. **Wire-shape fidelity.** Are DTOs "deliberately near" the Prometheus/Tempo/Loki JSON shapes
+   enough, or should they aim for byte-compatibility so existing Grafana datasources work with zero
+   translation once HTTP is wired?
+
+Resolved by review: the deliverable is the library and server wiring belongs to the host (`imbhd`
+is reference only); the API surface follows the Loki/Tempo/Mimir/SigNoz/VictoriaMetrics designs.
+
+## Appendix A — Pinned toolchain & versions
+
+| Component | Version | Note |
+|---|---|---|
+| Rust | 1.96 (edition 2024) | MSRV policy: track DataFusion's MSRV |
+| datafusion | 54.0.0 | `default-features = false` + the list in §9.1 |
+| tantivy | 0.26.1 | `default-features = false` + `mmap`, `lz4-compression` |
+| opentelemetry-proto | 0.32.0 | prost messages only, per-signal features |
+| opentelemetry / opentelemetry_sdk | 0.32.0 | used only by `imbh-otel-exporter` |
+| prost | 0.14 | |
+| tokio | 1.x (`rt`, `macros`) | |
+| xxhash-rust | 0.8 (`xxh3`) | WAL/manifest checksums |
+| arrow / parquet | 58.3.0 via `datafusion::` re-exports | never a direct dependency |
+
+## Appendix C — M0 footprint measurements & probe
+
+**Status:** M0 gate complete (2026-07-18). **Decision: GO** on architecture and engine choice;
+budgets revised to measured reality (OVERVIEW.md §2); "SQLite-tiny" framing tempered to "compact".
+
+A probe crate that **links and exercises** the full mandated stack (a real DataFusion SQL
+aggregation over a Parquet round-trip, a Tantivy mmap index build+search, an OTLP protobuf
+round-trip) — so dead-code elimination can't flatter the result — was built at the shipping
+profile and measured.
+
+| Metric (aarch64-glibc, shipping profile) | Measured |
+|---|---|
+| Binary size (stripped) | **33,474,928 bytes = 31.9 MiB** |
+| Anonymous RSS while exercised (`VmRSS`) | 36.0 MB |
+| Peak RSS (`VmHWM`) | 45.6 MB |
+| Unique crates (normal edges) | **269** (datafusion 204, tantivy 110 overlapping, otel-proto 36, sqlparser 13, prost 10, tokio 8) |
+
+**Caveats — this is a floor, not the final server number.** Measured on aarch64-glibc, not the
+server's x86_64-musl (musl bundles libc; different codegen). The probe omits hyper/serde_json/toml
+and all business logic, so real `imbhd` is larger. The 36 MB RSS is "exercised" (a 50 MB Tantivy
+writer heap + transient Arrow batches in play), an active-use upper bound at tiny data, not the
+clean idle figure — a dedicated idle harness is an M1 task. What the probe proves: sub-12 MB idle
+(the original guess) is unreachable once DataFusion's `SessionContext` and a Tantivy writer exist.
+
+**Decision detail.** DataFusion is 204/269 crates and the bulk of the binary with no cheap lever
+(dropping `sql` saves ~13 crates); `opt-level="z"` yields single digits, not a halving. The honest
+move is to own ~30 MB as the cost of the query engine and ship it. Real levers for the constrained
+embedder (documented, not default): `search` off (drop Tantivy's subtree; `matches()` degrades to
+scan), and the planned per-signal / `sql` gates. The revised budgets these produced are in
+OVERVIEW.md §2.

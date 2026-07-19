@@ -1,0 +1,26 @@
+[package]
+name = "gen-demo-db"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "Generate an imbh database populated with demo metrics, traces, and logs (e.g. to explore with imbh-tui)."
+
+# Keep this crate out of the cargo-release plan entirely. `publish = false` above already stops the
+# crates.io upload, but a plan member still shows up in `cargo release`'s "Publishing ..." status
+# line (cargo-release builds that message from every selected package, then filters by `publish`
+# only when assembling the actual `cargo publish --package` args). The shared version bump still
+# reaches this crate through `version.workspace = true`.
+[package.metadata.release]
+release = false
+
+[dependencies]
+imbh.workspace = true
+opentelemetry-proto.workspace = true
+prost.workspace = true
+
+[[bin]]
+name = "gen-demo-db"
+path = "src/main.rs"

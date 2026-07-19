@@ -1,0 +1,20 @@
+[package]
+name = "imbh-proto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Protobuf wire types for imbh's query-API inputs (the Go/FFI binding control plane). Generated from proto/ via protox at build time (ARCHITECTURE.md §10.17)."
+
+[dependencies]
+# Runtime prost support for the generated message types. No other deps: this crate is the wire
+# schema, nothing more — mappings onto the domain builders live in the `imbh` facade.
+prost.workspace = true
+
+[build-dependencies]
+# Pure-Rust proto compilation: protox parses `proto/**` (no system `protoc`), prost-build emits the
+# Rust types. Both are build-time only and never ship in the runtime graph.
+prost-build.workspace = true
+protox.workspace = true

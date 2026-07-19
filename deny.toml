@@ -1,0 +1,55 @@
+# cargo-deny configuration (ARCHITECTURE.md §11 dependency policy, OVERVIEW.md §13 M6).
+#
+# Run: cargo deny check
+# Gates: license compatibility, duplicate-version creep, and (when online) advisories.
+
+[graph]
+# Check the default host target; add server targets here as they are set up (e.g. musl).
+all-features = false
+
+[licenses]
+# imbh is Apache-2.0 (ARCHITECTURE.md §15 q3); the whole dependency ecosystem is permissive.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Zlib",
+    "MPL-2.0",
+    "CC0-1.0",
+]
+confidence-threshold = 0.9
+
+[bans]
+# ARCHITECTURE.md §11: keep duplicate versions from creeping in; forbid openssl anywhere.
+multiple-versions = "warn"
+wildcards = "deny"
+# The dev-only `imbh-test-support` is intentionally an unversioned path dependency (publish = false;
+# it is stripped from published dev-deps — see the workspace `[workspace.dependencies]` note), which
+# cargo-deny would otherwise flag as a `*` wildcard. Allow wildcards ONLY for in-tree path deps; a
+# wildcard on a crates.io dependency is still denied.
+allow-wildcard-paths = true
+deny = [
+    { name = "openssl" },
+    { name = "openssl-sys" },
+]
+
+[advisories]
+# Requires the advisory DB (network). CI fetches it; local offline runs can skip this section.
+yanked = "warn"
+# Transitive-only advisories with no actionable fix on imbh's side. Review on each dependency bump.
+ignore = [
+    # `paste` (proc-macro) is unmaintained but not vulnerable. It is pulled transitively by the
+    # arrow/datafusion stack (imbh-query/imbh-storage), with no maintained drop-in replacement; it
+    # runs at build time only and ships no runtime code. Reassess when arrow/datafusion drop it.
+    "RUSTSEC-2024-0436",
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

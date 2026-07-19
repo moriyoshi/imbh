@@ -1,0 +1,23 @@
+[package]
+name = "rss-probe"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false  # example crate, not published to crates.io
+description = "Example: idle/steady RSS soak harness for imbh (OVERVIEW.md §2 idle/steady RSS budgets; reads VmRSS from /proc/self/status)."
+
+# Keep this crate out of the cargo-release plan entirely. `publish = false` above already stops the
+# crates.io upload, but a plan member still shows up in `cargo release`'s "Publishing ..." status
+# line (cargo-release builds that message from every selected package, then filters by `publish`
+# only when assembling the actual `cargo publish --package` args). The shared version bump still
+# reaches this crate through `version.workspace = true`.
+[package.metadata.release]
+release = false
+
+[dependencies]
+imbh.workspace = true
+opentelemetry-proto.workspace = true
+prost.workspace = true
+tempfile.workspace = true

@@ -1,0 +1,183 @@
+// Protobuf wire schema for imbh's typed query-API *inputs* — the control plane a Go / FFI binding
+// sends across the boundary. Results travel out-of-band as Arrow (zero-copy C Data Interface, or
+// Arrow IPC bytes as a fallback); only small result metadata (QueryStats) is modeled here.
+//
+// This schema mirrors the builder types in the `imbh` facade (LogQuery/TraceQuery/MetricQuery/…).
+// The mapping onto those builders lives in `imbh` behind its `proto` feature. Field numbers are
+// append-only: never renumber or reuse a tag.
+
+syntax = "proto3";
+
+package imbh.v1;
+
+// A half-open UTC window `[start, end)` in unix nanoseconds. i64::MIN / i64::MAX mean "unbounded"
+// on that side (matching `imbh_core::TimeRange`).
+message TimeRange {
+  int64 start = 1;
+  int64 end = 2;
+}
+
+// Scan direction for log queries (logs default to newest-first).
+enum Direction {
+  DIRECTION_BACKWARD = 0; // default
+  DIRECTION_FORWARD = 1;
+}
+
+// Numeric-comparison operator for an attribute value (attr_gt/ge/lt/le).
+enum NumOp {
+  NUM_OP_GT = 0;
+  NUM_OP_GE = 1;
+  NUM_OP_LT = 2;
+  NUM_OP_LE = 3;
+}
+
+// A PromQL-style label selector operator.
+enum LabelOp {
+  LABEL_OP_EQ = 0;
+  LABEL_OP_NE = 1;
+  LABEL_OP_REGEX = 2;
+  LABEL_OP_NOT_REGEX = 3;
+}
+
+// The aggregation applied to a metric value within each bucket/series.
+enum Aggregation {
+  AGGREGATION_SUM = 0;
+  AGGREGATION_AVG = 1;
+  AGGREGATION_MIN = 2;
+  AGGREGATION_MAX = 3;
+  AGGREGATION_COUNT = 4;
+}
+
+// How a range query turns per-bucket samples into a value.
+enum RateMode {
+  RATE_MODE_OFF = 0;
+  RATE_MODE_DELTA = 1;   // per-second rate of a delta-temporality sum
+  RATE_MODE_COUNTER = 2; // per-second rate of a cumulative monotonic counter
+}
+
+// The scalar metric family a MetricQuery targets. Only gauge/sum are addressable by MetricQuery
+// (histograms/summaries have their own query messages).
+enum MetricTable {
+  METRIC_TABLE_GAUGE = 0;
+  METRIC_TABLE_SUM = 1;
+}
+
+// key = value.
+message KeyValue {
+  string key = 1;
+  string value = 2;
+}
+
+// key ∈ {values} / key ∉ {values}.
+message KeyValues {
+  string key = 1;
+  repeated string values = 2;
+}
+
+// A numeric comparison `key <op> value` on an attribute value.
+message NumFilter {
+  string key = 1;
+  NumOp op = 2;
+  double value = 3;
+}
+
+// A metric-label selector `key <op> value` (op is `=`/`!=`/`=~`/`!~`).
+message LabelFilter {
+  string key = 1;
+  LabelOp op = 2;
+  string value = 3;
+}
+
+// A log query (mirrors `imbh::LogQuery`).
+message LogQuery {
+  optional string service = 1;
+  optional uint32 min_severity = 2; // OTel severity number 1..=24 (u8)
+  optional string text = 3;         // full-text `matches` over the body
+  repeated KeyValue attr_eq = 4;
+  repeated string attr_exists = 5;
+  repeated KeyValue attr_matches = 6;
+  repeated KeyValues attr_in = 7;
+  repeated KeyValues attr_not_in = 8;
+  repeated NumFilter attr_num = 9;
+  repeated KeyValue attr_regex = 10;
+  optional TimeRange range = 11;
+  uint64 limit = 12;      // 0 → builder default (100)
+  Direction direction = 13;
+  uint64 offset = 14;     // cursor offset (0 → from the start)
+}
+
+// A trace search query (mirrors `imbh::TraceQuery`).
+message TraceQuery {
+  optional string service = 1;
+  optional string name = 2;
+  optional string text = 3;             // full-text `matches` over span name
+  optional uint64 min_duration_ns = 4;
+  optional uint64 max_duration_ns = 5;
+  optional string status = 6;           // UNSET / OK / ERROR
+  optional string kind = 7;             // SERVER / CLIENT / …
+  repeated KeyValue attr_eq = 8;
+  repeated string attr_exists = 9;
+  repeated KeyValue attr_matches = 10;
+  repeated KeyValues attr_in = 11;
+  repeated KeyValues attr_not_in = 12;
+  repeated NumFilter attr_num = 13;
+  repeated KeyValue attr_regex = 14;
+  optional TimeRange range = 15;
+  uint64 limit = 16; // 0 → builder default (20)
+}
+
+// A span-metrics (RED) query (mirrors `imbh::SpanMetricsQuery`).
+message SpanMetricsQuery {
+  optional string service = 1;
+  optional string name = 2;
+  optional string kind = 3;
+  optional string status = 4;
+  repeated KeyValue attr_eq = 5;
+  repeated string group_by = 6;
+  optional TimeRange range = 7;
+  optional int64 step_nanos = 8; // absent → builder default (60s)
+}
+
+// A typed metric range query (mirrors `imbh::MetricQuery`).
+message MetricQuery {
+  MetricTable table = 1;
+  string metric = 2;
+  optional Aggregation aggregation = 3; // absent → family default (gauge→avg, sum→sum)
+  repeated string group_by = 4;
+  repeated LabelFilter filters = 5;
+  optional TimeRange range = 6;
+  optional int64 step_nanos = 7; // absent → builder default (60s)
+  RateMode rate = 8;
+}
+
+// A histogram-quantile query (mirrors `imbh::HistogramQuery`).
+message HistogramQuery {
+  string metric = 1;
+  optional double phi = 2; // absent → builder default (0.95)
+  repeated string group_by = 3;
+  repeated LabelFilter filters = 4;
+  optional TimeRange range = 5;
+  optional int64 step_nanos = 6; // absent → per-data-point (no bucket merge)
+}
+
+// An exponential-histogram-quantile query (mirrors `imbh::ExpHistogramQuery`).
+message ExpHistogramQuery {
+  string metric = 1;
+  optional double phi = 2; // absent → builder default (0.95)
+  repeated string group_by = 3;
+  repeated LabelFilter filters = 4;
+  optional TimeRange range = 5;
+  optional int64 step_nanos = 6; // absent → per-data-point (no bucket merge)
+}
+
+// Read-side scan statistics for a query result (mirrors `imbh::QueryStats`). The bulk result rows
+// travel as Arrow, out of band; this is the small metadata envelope.
+message QueryStats {
+  uint64 segments_scanned = 1;
+  uint64 segments_pruned = 2;
+  uint64 rows_scanned = 3;
+  uint64 rows_returned = 4;
+  uint64 bytes_scanned = 5;
+  uint64 elapsed_ns = 6;
+  bool used_index = 7;
+}

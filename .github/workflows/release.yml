@@ -1,0 +1,36 @@
+name: Release gate
+
+# Release-time checks (QUALITY_GATE.md §3): license compatibility (cargo-deny) and third-party
+# notice generation (cargo-about). Both tools are installed here so the graceful-skip fallbacks in
+# the scripts do not trigger. Runs on version tags and on manual dispatch. The generated
+# THIRD-PARTY-NOTICES.txt is uploaded as a build artifact.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  licenses:
+    name: License + notices
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny,cargo-about
+      - name: License-compatibility gate
+        run: ./scripts/license-gate.sh
+      - name: Generate third-party notices
+        run: ./scripts/gen-notices.sh
+      - name: Upload notices
+        uses: actions/upload-artifact@v4
+        with:
+          name: third-party-notices
+          path: THIRD-PARTY-NOTICES.txt
+          if-no-files-found: warn
