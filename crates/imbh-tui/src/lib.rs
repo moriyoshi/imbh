@@ -2617,20 +2617,18 @@ fn handle_detail_key(
             KeyCode::Up | KeyCode::Down => {}
             // Exemplar → trace drill-down: jump to the trace of the exemplar nearest the chart cursor.
             // With no exemplar in view, fall through (Enter is otherwise inert on a metric detail).
-            KeyCode::Enter => match app.nearest_exemplar_trace() {
-                Some(trace_id) => {
-                    app.push_history();
-                    app.focus_trace_id = Some(trace_id);
-                    switch_screen(
-                        app,
-                        Screen::Traces,
-                        db.clone(),
-                        options.clone(),
-                        sender.clone(),
-                    );
-                }
-                None => return None,
-            },
+            KeyCode::Enter => {
+                let trace_id = app.nearest_exemplar_trace()?;
+                app.push_history();
+                app.focus_trace_id = Some(trace_id);
+                switch_screen(
+                    app,
+                    Screen::Traces,
+                    db.clone(),
+                    options.clone(),
+                    sender.clone(),
+                );
+            }
             _ => return None,
         }
         return Some(Control::Continue);
