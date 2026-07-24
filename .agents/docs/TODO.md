@@ -14,6 +14,12 @@ git history); this file tracks only what is still open.
       workspace tests must remain daemon-free and offline. Deferred by explicit user request. —
       *source: JOURNAL (LGTM differential-testing follow-up)*
 
+- [ ] **Dependabot for the SHA-pinned GitHub Actions.** All five actions in
+      `.github/workflows/{ci,release,soak}.yml` are now pinned to commit SHAs, so patch/security
+      updates no longer arrive on their own. Add `.github/dependabot.yml` with a
+      `package-ecosystem: github-actions` entry so the pins are refreshed by PR. Offered to the
+      user, not yet added. — *source: JOURNAL (Actions SHA-pinning, 2026-07-24)*
+
 ## Recently Swept (2026-07-24 good-sleep)
 
 Six items completed on 2026-07-24 were removed from the open list; their durable knowledge is in

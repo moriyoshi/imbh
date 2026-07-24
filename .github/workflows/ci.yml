@@ -27,11 +27,12 @@ jobs:
     name: Rust gate + E2E
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
+          toolchain: stable
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - name: Format check
         run: cargo fmt --all --check
       - name: Clippy (workspace, all targets)
@@ -54,11 +55,12 @@ jobs:
     # clippy + dependency-cut gate: a producer can't run query tests (and vice-versa), so functional
     # tests stay in the default `--workspace` job above.
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
+          toolchain: stable
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       # Producer: ingest-only. Must drop the entire query engine.
       - name: Build producer (--features ingest)
         run: cargo build -p imbh --no-default-features --features ingest
@@ -91,9 +93,11 @@ jobs:
     name: Footprint gate
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - name: Footprint gate (crate count + release imbhd size)
         run: ./scripts/footprint-gate.sh
 
@@ -103,10 +107,12 @@ jobs:
     # Default-branch pushes only — skipped on PRs (release.yml also runs it, plus notices, on tags).
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: taiki-e/install-action@7572810d7dd469b651bb7793945692cf78da5dd7 # v2.85.0
         with:
           tool: cargo-deny
       - name: License-compatibility gate

@@ -262,3 +262,84 @@ exactly one `## [Unreleased]` and one heading per version before re-running.**
 back to a single amended `Initial.`), so an early `cat CHANGELOG.md` and a later `Read` of the same
 file disagreed. Re-read every edit target after noticing the divergence rather than trusting the
 earlier snapshot.
+
+## 2026-07-24 — Clippy arm refactor (PR #1) and SHA-pinning the GitHub Actions
+
+**Trigger.** A staged working-tree change in `crates/imbh-tui/src/lib.rs` (a clippy cleanup) needed
+to be branched, committed, pushed, and turned into a PR. A follow-on request upgraded every GitHub
+Action to its latest release and pinned each one to a commit SHA.
+
+**Finding — the staged clippy "cleanup" was not behavior-preserving.** The exemplar → trace
+drill-down arm in `handle_detail_key` originally matched on `app.nearest_exemplar_trace()` with a
+`None` branch that only did `return None` — the question-mark-able pattern clippy flags. The staged
+rewrite collapsed it correctly but placed `app.push_history()` *before* the fallible
+`app.nearest_exemplar_trace()?`. With no exemplar in view, Enter would then push a history entry and
+immediately return `None`, where the original arm was a true no-op. Fixed by hoisting the lookup:
+
+```rust
+KeyCode::Enter => {
+    let trace_id = app.nearest_exemplar_trace()?;
+    app.push_history();
+    app.focus_trace_id = Some(trace_id);
+    switch_screen(app, Screen::Traces, db.clone(), options.clone(), sender.clone());
+}
+```
+
+**Generalizable rule.** When a `match` → `?` refactor collapses a `None` arm, the `?` must sit at or
+before the first side effect the old `None` branch skipped. `?` returns from the *function*, not the
+arm, so any statement hoisted above it silently gains an execution path it never had. Worth checking
+on every `let x = expr?;` clippy rewrite that touches mutable state.
+
+**Delivered.** Branch `fix/clippy-metric-detail-enter-arm`, one commit, PR
+<https://github.com/moriyoshi/imbh/pull/1>. Gate before commit — `cargo fmt --all --check`,
+`cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace` — all clean.
+
+**Environment finding — SSH push does not work here; use the `gh` token over HTTPS.** `origin` is
+`git@github.com:moriyoshi/imbh.git` and pushing over SSH fails with `Permission denied (publickey)`
+(no `ssh-agent`, no usable key). `gh` is authenticated with a `repo`-scoped token, so the working
+one-off is a push that rewrites the URL and borrows gh's credential helper *without* mutating repo
+config:
+
+```
+git -c url."https://github.com/".insteadOf="git@github.com:" \
+    -c credential.helper='!gh auth git-credential' push -u origin <branch>
+```
+
+`gh auth setup-git` would make this permanent, but it edits global git config — left to the user.
+
+**GitHub Actions upgraded and pinned** (`.github/workflows/{ci,release,soak}.yml`). Every `uses:` now
+carries a 40-hex SHA plus a `# vX.Y.Z` comment.
+
+| Action | Was | Now | SHA |
+| --- | --- | --- | --- |
+| `actions/checkout` | `@v4` | v7.0.1 | `3d3c42e5aac5ba805825da76410c181273ba90b1` |
+| `actions/upload-artifact` | `@v4` | v7.0.1 | `043fb46d1a93c77aae656e7c1c64a875d1fc6a0a` |
+| `Swatinem/rust-cache` | `@v2` | v2.9.1 | `c19371144df3bb44fab255c43d04cbc2ab54d1c4` |
+| `taiki-e/install-action` | `@v2` | v2.85.0 | `7572810d7dd469b651bb7793945692cf78da5dd7` |
+| `dtolnay/rust-toolchain` | `@stable` | `stable` head | `4cda84d5c5c54efe2404f9d843567869ab1699d4` |
+
+**Finding — `dtolnay/rust-toolchain` has no usable version tag to pin.** Its `v1` tag is 12 commits
+behind the `stable` branch, and on `v1` the `toolchain` input is `required: true` with no default —
+pinning that tag would have broken all six call sites. The per-toolchain *branches* (`stable`,
+`nightly`, `1.x`) are the real interface, and each branch's `action.yml` sets the matching
+`toolchain` default. So the pin is the `stable` branch head, with an explicit `toolchain: stable`
+added to every step: once the ref is an opaque SHA, nothing else records which toolchain is
+installed. This freezes the *action*, not the toolchain — it still resolves `stable` at run time.
+
+**Finding — two three-major jumps, both benign for this repo.** `checkout` v7 blocks fork-PR checkout
+under `pull_request_target` / `workflow_run`; these workflows only trigger on `push` and
+`pull_request`, so they are unaffected (v4.4.0/v5.1.0/v6.1.0 also backported the
+`allow-unsafe-pr-checkout` breaking change, so staying on v4 was not an escape). `upload-artifact`
+v6/v7 moved to Node 24 + ESM and require Actions Runner ≥ 2.327.1, satisfied by GitHub-hosted
+`ubuntu-latest`; the inputs in use (`name`, `path`, `if-no-files-found`) are unchanged.
+
+**Verification.** All three workflows re-parsed with `yaml.safe_load`, and every pinned SHA was
+confirmed to resolve via `gh api repos/<repo>/commits/<sha>` (guards against a typo'd pin, which
+fails only at run time). Note that `Swatinem/rust-cache`'s release tag is an *annotated* tag, so
+`git/ref/tags/<tag>` yields a tag object — it must be dereferenced through `git/tags/<sha>` to get
+the commit. The other four are lightweight tags pointing straight at commits.
+
+**Open follow-up.** SHA pins do not float, so patch updates stop arriving silently. There is no
+`.github/dependabot.yml`; a `package-ecosystem: github-actions` entry would keep the pins refreshed
+by PR. Not added — offered to the user. The workflow edits are also still uncommitted (deliberately
+kept off the PR #1 branch, since they are an unrelated concern).
