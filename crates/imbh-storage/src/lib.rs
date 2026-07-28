@@ -2443,12 +2443,27 @@ fn write_parquet(
 }
 
 /// fsync a directory so a preceding create/rename inside it is durable (the standard
-/// write-temp → fsync-temp → rename → fsync-dir pattern). Best-effort on platforms that reject
-/// `open` of a directory: an error here is surfaced so the caller can treat the write as failed.
+/// write-temp → fsync-temp → rename → fsync-dir pattern). An error here is surfaced so the caller
+/// can treat the write as failed.
+#[cfg(not(windows))]
 pub(crate) fn fsync_dir(dir: &Path) -> Result<()> {
     let f = std::fs::File::open(dir).map_err(|e| Error::storage_io(Some(dir.to_path_buf()), e))?;
     f.sync_all()
         .map_err(|e| Error::storage_io(Some(dir.to_path_buf()), e))
+}
+
+/// No-op counterpart of [`fsync_dir`] on Windows, which has no directory-fsync primitive: opening a
+/// directory as a `File` fails with `ERROR_ACCESS_DENIED` (os error 5), `FlushFileBuffers` takes a
+/// file handle, and the only volume-wide flush needs administrator rights — none of which a library
+/// can use. SQLite, LMDB and RocksDB no-op their directory sync on Windows for the same reason.
+/// File-content durability is unaffected: the `sync_all` on the temp file before the rename still
+/// runs. What is *assumed* rather than enforced is that NTFS's metadata journal carries the
+/// completed rename across a power loss — this is the more exposed of the two no-op sites (a durable
+/// manifest edit pointing at a lost rename is a dangling reference, not just lost data). See
+/// ARCHITECTURE.md §7 "Directory fsync (platform note)".
+#[cfg(windows)]
+pub(crate) fn fsync_dir(_dir: &Path) -> Result<()> {
+    Ok(())
 }
 
 /// Put `restored` elements back at the front of `buffer`. Used on the seal error path over the

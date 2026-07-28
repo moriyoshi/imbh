@@ -285,6 +285,23 @@ Metrics tables are **not** Tantivy-indexed (attr cardinality is low; dictionary/
   makes row alignment correct by construction. Optional — a DB that never compacts is still
   correct. Built.
 - **Retention**: age + max-disk-bytes, oldest-first. Built.
+- **Directory fsync (platform note)**: every step above that makes a file *appear* (a new WAL segment,
+  a `rename` of a Parquet temp into its day partition, the `CURRENT` swap) fsyncs the containing
+  directory afterwards so the directory entry is durable, not just the file contents. That step is
+  **skipped on Windows**, which offers no equivalent primitive: opening a directory as a file fails
+  with `ERROR_ACCESS_DENIED` without `FILE_FLAG_BACKUP_SEMANTICS`, `FlushFileBuffers` takes a file
+  handle, and the only volume-wide flush (`\\.\C:`) needs administrator rights and flushes the entire
+  volume cache — not something a library can call. SQLite, LMDB and RocksDB all no-op their directory
+  sync on Windows for the same reason (RocksDB's `WinDirectory::Fsync` is a literal `return OK`).
+  Only the directory-entry ordering step is dropped; every file-content sync is unchanged (the WAL
+  fsync policy above, the pre-rename segment and `CURRENT` syncs), so a `WalMode::Always` receipt on
+  Windows still means the frame bytes were flushed. **What imbh does not independently guarantee on
+  Windows** is that the *directory entry* for a just-created segment or a just-completed rename
+  survives a power loss: that rests on NTFS's metadata journal being flushed in write-ahead order
+  with the file's own flush, which is the prevailing understanding of NTFS but is not something this
+  project has measured. The exposure is hard power loss only (a process crash is unaffected — the OS
+  page cache still holds the entry), and the renames in the seal path and the `CURRENT` swap are the
+  sensitive cases, not the WAL segment create.
 - **Locking**: Built. A read-write open acquires an exclusive advisory lock on `<dir>/writer.lock`
   (`fs4::fs_std::FileExt::try_lock_exclusive`, non-blocking); a second writer fails fast with
   `Error::lock_held`. The lock releases on handle drop / process exit, so a crashed writer leaves no

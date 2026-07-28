@@ -20,6 +20,17 @@ git history); this file tracks only what is still open.
       `package-ecosystem: github-actions` entry so the pins are refreshed by PR. Offered to the
       user, not yet added. — *source: JOURNAL (Actions SHA-pinning, 2026-07-24)*
 
+- [ ] **Windows portability beyond the directory fsync (issue #3 follow-up).** The `windows-latest`
+      job added to `ci.yml` has never run — it was written without a Windows host to verify against
+      (cross-compiling locally is blocked by `zstd-sys` needing mingw). It may surface further
+      Windows-specific issues; deletion/rename of open or memory-mapped files during compaction and
+      retention are the plausible next candidates. Watch the first run and fix what it finds. —
+      *source: JOURNAL (issue #3, 2026-07-28)*
+
+- [ ] **Release carrying the Windows fix.** `imbh-storage` 0.1.0 on crates.io cannot open an on-disk
+      DB on Windows at all. The fix is on `main`; cutting the release is the user's call
+      (`cargo release`, see `README.md`). — *source: JOURNAL (issue #3, 2026-07-28)*
+
 ## Recently Swept (2026-07-24 good-sleep)
 
 Six items completed on 2026-07-24 were removed from the open list; their durable knowledge is in
