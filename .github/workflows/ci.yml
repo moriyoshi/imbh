@@ -89,6 +89,28 @@ jobs:
       - name: Build storage-only (--no-default-features)
         run: cargo build -p imbh --no-default-features
 
+  windows:
+    name: Windows portability gate
+    runs-on: windows-latest
+    # Every other job here is ubuntu-latest, so a Unix-shaped call in the on-disk path can ship
+    # unnoticed — issue #3 was exactly that (fsync of a directory handle, which Windows rejects), and
+    # it broke *every* on-disk `Db::open`. Deliberately narrow rather than a second full gate: build
+    # the workspace, then run the two suites that actually touch the filesystem — `imbh-storage`
+    # (WAL segment create/rotate, manifest `CURRENT` swap, seal → rename) and the facade's
+    # open → seal → reopen → compact lifecycle. Not a substitute for the ubuntu gate above.
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Build
+        run: cargo build --workspace
+      - name: Test (imbh-storage — on-disk WAL / manifest / seal path)
+        run: cargo test -p imbh-storage
+      - name: Test (facade lifecycle — on-disk open, seal, reopen, compact)
+        run: cargo test -p imbh --test lifecycle
+
   footprint:
     name: Footprint gate
     runs-on: ubuntu-latest

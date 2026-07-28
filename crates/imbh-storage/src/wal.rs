@@ -312,9 +312,22 @@ fn remove_if_exists(path: &Path) -> Result<()> {
 
 /// fsync a directory so a preceding create/rename inside it is durable (the new current segment's
 /// directory entry must persist before appends to it are acknowledged).
+#[cfg(not(windows))]
 fn fsync_dir(dir: &Path) -> Result<()> {
     let f = File::open(dir).map_err(|e| Error::wal(WalPhase::DirFsync, e))?;
     f.sync_all().map_err(|e| Error::wal(WalPhase::DirFsync, e))
+}
+
+/// No-op counterpart of [`fsync_dir`] on Windows, which has no directory-fsync primitive: opening a
+/// directory as a `File` fails with `ERROR_ACCESS_DENIED` (os error 5), `FlushFileBuffers` takes a
+/// file handle, and the only volume-wide flush needs administrator rights — none of which a library
+/// can use. SQLite, LMDB and RocksDB no-op their directory sync on Windows for the same reason.
+/// Frame durability is unaffected: [`Wal::sync`]'s `sync_data` on the segment file still runs. What
+/// is *assumed* rather than enforced is that NTFS's metadata journal carries the segment's directory
+/// entry across a power loss — see ARCHITECTURE.md §7 "Directory fsync (platform note)".
+#[cfg(windows)]
+fn fsync_dir(_dir: &Path) -> Result<()> {
+    Ok(())
 }
 
 /// An open, append-only WAL over numbered segment files in one DB directory.

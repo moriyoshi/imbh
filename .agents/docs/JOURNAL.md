@@ -343,3 +343,75 @@ the commit. The other four are lightweight tags pointing straight at commits.
 `.github/dependabot.yml`; a `package-ecosystem: github-actions` entry would keep the pins refreshed
 by PR. Not added — offered to the user. The workflow edits are also still uncommitted (deliberately
 kept off the PR #1 branch, since they are an unrelated concern).
+
+## 2026-07-28 — Issue #3: on-disk `Db::open` was broken on Windows (directory fsync)
+
+**Symptom.** Every on-disk open on `windows/amd64` failed with `storage error: WAL dir fsync: Access
+is denied. (os error 5)`; in-memory DBs were fine. Found by a native Windows CI gate in the `imbh-go`
+binding — the triple builds and the whole suite passes there except the five tests that need a
+durable DB, all failing at open.
+
+**Cause.** `fsync_dir` opens the *directory* as a `File` to fsync it. That is a Unix idiom: on Windows
+`File::open` on a directory returns `ERROR_ACCESS_DENIED` without `FILE_FLAG_BACKUP_SEMANTICS`. The
+first call site is `Wal::open_with_rotate`'s fresh-DB branch (creating `wal.00000001.log`), so no
+on-disk DB could be created at all.
+
+**Fix.** `fsync_dir` is now `#[cfg(not(windows))]` with an `Ok(())` `#[cfg(windows)]` counterpart.
+
+**The justification has one solid leg and one soft one — worth keeping straight.** Solid: Win32 has no
+directory-fsync primitive at all. `FlushFileBuffers` takes a file handle; the only volume-wide flush
+(`\\.\C:`) needs administrator rights and flushes the whole volume cache, so it is unavailable to a
+library. The choice is therefore no-op vs. no on-disk DB on Windows, not no-op vs. a correct
+implementation. Soft: the claim that NTFS's metadata journal makes the directory sync *unnecessary* —
+that the create/rename log record is flushed in write-ahead order along with the file's own
+`FlushFileBuffers`. That is the prevailing understanding of NTFS and is why RocksDB's
+`WinDirectory::Fsync` is a literal `return Status::OK()` and SQLite's Windows VFS has no
+directory-sync path, but neither the issue author nor this change measured it. Note journaling
+guarantees filesystem *consistency* after a crash, which is not the same claim as *durability at the
+time of the call*; the `$LogFile` is itself written lazily. Likewise, that `FlushFileBuffers` rejects
+a directory handle opened with `FILE_FLAG_BACKUP_SEMANTICS` is received guidance here, not measured —
+though it does not change the outcome, since the volume-flush point already rules the flag route out.
+
+**Residual risk, and it is not uniform across the call sites.** Exposure is hard power loss only (a
+process crash is unaffected — the OS page cache still holds the entry). The WAL segment create is the
+mild case: a lost entry costs recently acknowledged writes, and for a fresh DB the result is
+indistinguishable from the state before the create. The renames are the sharp case — a durable
+manifest edit pointing at a seal-path segment whose temp→final rename did not survive is a dangling
+reference rather than merely lost data. It degrades better than it sounds (the manifest edit rides the
+same journal, and the reader already tolerates torn frames), but it is what to test first given a
+Windows host.
+
+**Finding — the issue named one `fsync_dir`; there are two.** `wal.rs:315` (WAL segment create +
+rotation, errors as `WalPhase::DirFsync`) and `lib.rs:2448` `pub(crate) fn fsync_dir` (the seal path's
+Parquet temp→final rename in `lib.rs:1196`, and the manifest `CURRENT` swap in `manifest.rs:338`,
+erroring as `storage_io`). CI only ever reached the first because it fires during open. Both are
+fixed; fixing only the reported one would have moved the failure to the first seal.
+
+**Durability contract is unchanged on Windows.** Only the directory-entry ordering step is dropped.
+Every file-content sync still runs: the WAL's `sync_data` under the `WalMode` policy, the Parquet
+segment's `sync_all` before its rename, and `CURRENT`'s temp `sync_all`. Written up as a new
+"Directory fsync (platform note)" bullet in ARCHITECTURE.md §7.
+
+**Finding — cross-compiling to verify locally is blocked by `zstd-sys`, not by the code.** The
+`x86_64-pc-windows-gnu` target is installed, but `cargo check --target x86_64-pc-windows-gnu -p
+imbh-storage` dies in `zstd-sys`'s build script for want of `x86_64-w64-mingw32-gcc` (parquet's zstd
+compression is a C dep). So the Windows arms were verified with a standalone `rustc --target
+x86_64-pc-windows-gnu --emit=metadata` probe of the cfg pair instead. That probe also caught the real
+compile hazard in this shape of change: an import used *only* by the `not(windows)` arm becomes an
+unused-import error under the workspace's `-D warnings`. Not an issue here (`wal.rs` keeps `File` live
+via the `Wal::file` field, `lib.rs` fully-qualifies `std::fs::File`), but it is what to check first if
+another `#[cfg(windows)]` split is added.
+
+**CI — a `windows-latest` job was added to `ci.yml`.** Every other job is `ubuntu-latest`, which is
+why a bug that broke *all* on-disk opens shipped in 0.1.0. The new job is deliberately narrow rather
+than a second full gate: `cargo build --workspace`, then the two suites that actually touch the
+filesystem — `cargo test -p imbh-storage` (WAL create/rotate, manifest `CURRENT` swap, seal → rename)
+and `cargo test -p imbh --test lifecycle` (on-disk open → seal → reopen → compact). This is the
+regression gate for #3; no new Rust test is meaningful, since on Linux the bug is unreachable and on
+Windows every existing on-disk test failed.
+
+**Open follow-ups.** (1) The Windows job has never run — it is unverified locally for the reason
+above, and may surface further Windows-specific issues beyond this one (file locking, deletion of
+open/mapped files during compaction and retention are the plausible next candidates). (2) The fix is
+in `imbh-storage`, published at 0.1.0 with the bug; users on Windows need a release, which is the
+user's call to cut.
