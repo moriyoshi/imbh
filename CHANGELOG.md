@@ -13,6 +13,17 @@ release aborts if it is missing or duplicated.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Windows: every on-disk `Db::open` failed** with `storage error: WAL dir fsync: Access is denied.
+  (os error 5)`. The durability path fsync'd a directory by opening it as a `File` — a POSIX idiom
+  Windows rejects — so no on-disk database could be opened at all on that platform (in-memory was
+  unaffected). Both call sites are now compiled out on Windows: the WAL segment create/rotate
+  (`imbh-storage`'s `wal.rs`) and the seal/manifest rename (`imbh-storage`'s `lib.rs`), matching what
+  SQLite, LMDB, and RocksDB do. File-content durability is unchanged; see ARCHITECTURE.md §7
+  "Directory fsync (platform note)" for what is assumed rather than enforced on NTFS. A
+  `windows-latest` CI job now guards the on-disk path. ([#3](https://github.com/moriyoshi/imbh/issues/3))
+
 ## [0.1.0] - 2026-07-24
 
 ### Added

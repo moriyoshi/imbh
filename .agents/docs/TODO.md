@@ -28,8 +28,11 @@ git history); this file tracks only what is still open.
       *source: JOURNAL (issue #3, 2026-07-28)*
 
 - [ ] **Release carrying the Windows fix.** `imbh-storage` 0.1.0 on crates.io cannot open an on-disk
-      DB on Windows at all. The fix is on `main`; cutting the release is the user's call
-      (`cargo release`, see `README.md`). — *source: JOURNAL (issue #3, 2026-07-28)*
+      DB on Windows at all. The fix and the shared-version bump to **0.1.1** are on
+      `fix/windows-dir-fsync` (PR #4), with the changelog entry staged under `## [Unreleased]`.
+      Because the tree already carries 0.1.1, the release run is `cargo release` with **no** level
+      argument (`cargo release patch` would bump again, to 0.1.2). Cutting it is the user's call
+      (see `README.md` "Releasing"). — *source: JOURNAL (issue #3, 2026-07-28)*
 
 ## Recently Swept (2026-07-24 good-sleep)
 
