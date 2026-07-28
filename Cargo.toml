@@ -22,7 +22,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.96"
 license = "Apache-2.0"
@@ -47,19 +47,19 @@ dependent-version = "upgrade"
 # Internal crates. Each carries a `version` alongside `path` so `cargo publish` can rewrite the
 # path deps to crates.io version requirements; cargo-release keeps these in lockstep with the
 # shared workspace version on every bump (see [workspace.metadata.release]).
-imbh = { path = "crates/imbh", version = "0.1.0" }
-imbh-core = { path = "crates/imbh-core", version = "0.1.0" }
-imbh-lgtm = { path = "crates/imbh-lgtm", version = "0.1.0" }
-imbh-tui = { path = "crates/imbh-tui", version = "0.1.0" }
-imbh-otlp = { path = "crates/imbh-otlp", version = "0.1.0" }
+imbh = { path = "crates/imbh", version = "0.1.1" }
+imbh-core = { path = "crates/imbh-core", version = "0.1.1" }
+imbh-lgtm = { path = "crates/imbh-lgtm", version = "0.1.1" }
+imbh-tui = { path = "crates/imbh-tui", version = "0.1.1" }
+imbh-otlp = { path = "crates/imbh-otlp", version = "0.1.1" }
 # default-features = false so the `imbh` facade's own `search` feature governs the tantivy subtree
 # (the facade re-enables it via `imbh-storage/search` + `imbh-query/search`). Standalone builds of
 # these crates (`cargo test -p imbh-storage`) still use their own `default = ["search"]`.
-imbh-storage = { path = "crates/imbh-storage", version = "0.1.0", default-features = false }
-imbh-index = { path = "crates/imbh-index", version = "0.1.0" }
-imbh-query = { path = "crates/imbh-query", version = "0.1.0", default-features = false }
-imbh-tracing = { path = "crates/imbh-tracing", version = "0.1.0" }
-imbh-proto = { path = "crates/imbh-proto", version = "0.1.0" }
+imbh-storage = { path = "crates/imbh-storage", version = "0.1.1", default-features = false }
+imbh-index = { path = "crates/imbh-index", version = "0.1.1" }
+imbh-query = { path = "crates/imbh-query", version = "0.1.1", default-features = false }
+imbh-tracing = { path = "crates/imbh-tracing", version = "0.1.1" }
+imbh-proto = { path = "crates/imbh-proto", version = "0.1.1" }
 # Dev-only shared test harness (never a dependency of a shipping crate — see the crate's Cargo.toml).
 # Intentionally path-only (no version): it is `publish = false`, so `cargo publish` strips it from
 # the published dev-dependencies of the crates that use it.
