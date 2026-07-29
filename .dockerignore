@@ -1,0 +1,24 @@
+# Build-context excludes for `docker build` from the repository root.
+#
+# The Docker log-driver plugin's rootfs image (crates/imbh-server/docker-plugin/Dockerfile) builds
+# from the repo root, because compiling `imbhd` needs the whole Cargo workspace -- every member
+# manifest, not just crates/imbh-server. That makes `COPY . .` read the entire tree.
+#
+# Without this file the context includes `target/` and `.agents-workspace/`, which in a working
+# checkout are *hundreds of gigabytes* of build artifacts and scratch data. Docker hashes and
+# transfers the context before running the first instruction, so the build appears to hang
+# indefinitely with no output rather than failing. The sources themselves are a few megabytes.
+
+# Cargo build artifacts. Gitignored (ARCHITECTURE.md section 12); routinely 100 GB+.
+target/
+**/target/
+
+# Agent scratch space (AGENTS.md): probe crates, temporary target dirs, fixtures.
+.agents-workspace/
+
+# Version-control metadata and CI definitions -- not needed to compile.
+.git/
+.github/
+
+# rustfmt backups.
+**/*.rs.bk

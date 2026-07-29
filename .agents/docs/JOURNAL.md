@@ -415,3 +415,269 @@ above, and may surface further Windows-specific issues beyond this one (file loc
 open/mapped files during compaction and retention are the plausible next candidates). (2) The fix is
 in `imbh-storage`, published at 0.1.0 with the bug; users on Windows need a release, which is the
 user's call to cut.
+
+## 2026-07-30 — Docker logging-driver plugin (`imbh-server`, `docker` feature)
+
+**What.** `imbhd` can now run as a Docker `docker.logdriver/1.0` plugin: `docker run --log-driver
+imbh` writes a container's stdout/stderr into the embedded `Db`, and `docker logs` is served back out
+of it. New optional, off-by-default `docker` feature; Unix only. Code in
+`crates/imbh-server/src/docker/` (`mod.rs` protocol + FIFO readers, `entry.rs` wire format, `json.rs`
+protocol JSON, `ingest.rs` container→OTLP + batching worker, `readlogs.rs` `docker logs`), packaging
+in `crates/imbh-server/docker-plugin/`, operator guide in `docs/DOCKER_LOG_DRIVER.md`, design note in
+ARCHITECTURE.md §10.16.
+
+**Zero added crates — checked, not assumed.** `cargo tree -e no-dev -p imbh-server [--features
+docker] --prefix none | sort -u | wc -l` gives **294 either way**; the feature's two deps show up as
+new *direct* edges (`prost`, `opentelemetry-proto`) but both resolve to nodes already in the graph.
+Two things made that possible: prost and
+opentelemetry-proto's message types are already in the default graph via `imbh-otlp`, and Docker's
+`logdriver.LogEntry` schema is five frozen fields, so it is declared with prost's derive instead of
+generated from a `.proto` (no `build.rs`, no protox in this crate). Protocol JSON goes through
+`imbh::parse_json` — the dependency-free core parser — rather than serde_json. Binary cost, measured
+at the shipping release profile by rebuilding both configurations back to back: **33,736,592 →
+33,802,128 bytes — +64 KiB** for the whole feature (32.17 → 32.24 MiB). Crate count is unchanged, so
+the footprint gate's 275-crate budget is untouched. *Measurement caveat worth remembering:* the gate
+script reuses `target/release/imbhd` if it exists rather than rebuilding, so a first run after a
+source change reports a stale size — the pre-rebuild run here printed 33,539,984 bytes and would have
+made the feature look like +256 KiB. Rebuild explicitly before trusting a size delta. This is the same
+containment discipline §11 asks for, applied to a feature that could easily have pulled a web
+framework and a date-time crate.
+
+**Finding — the daemon opens the FIFO `O_RDWR` *before* calling `StartLogging`.** moby's
+`openPluginStream` does `fifo.OpenFifo(ctx, path, unix.O_RDWR|unix.O_CREAT|unix.O_NONBLOCK, 0700)` and
+only then calls the plugin, with the comment "Make sure to also open with read ... to avoid borking
+the fifo". Consequence for a Rust plugin: the plugin's `File::open` (O_RDONLY) returns immediately
+rather than blocking for a writer, so opening inline is safe — but only because of the daemon's
+ordering, which is not part of the documented contract. The implementation does not rely on it: the
+open happens on the reader thread and `StartLogging` waits on a channel with a 2 s cap
+(`OPEN_TIMEOUT`), so a genuine failure (unopenable path) is still reported in the response body while
+an unexpectedly blocking open delays one container's start instead of wedging the daemon.
+
+**Finding — Docker's `line` includes the trailing newline** (this is why `*-json.log` entries read
+`"log":"hello\n"`). Storing it verbatim would put a `\n` on the end of every `body`, which is wrong
+for `SELECT body`, for `matches()` tokenization, and for anything reading the DTO. Ingest strips one
+trailing terminator (`\n` or `\r\n`); `ReadLogs` appends one. Round-trip through `docker logs` is
+unchanged; the only lossy case is a final line that never had a newline, which gains one.
+
+**Finding — two spellings of the `ReadLogs` config object.** Docker's published plugin documentation
+shows `{"ReadConfig": {...}, "Info": {...}}`; the Go proxy struct marshals the field as `Config`.
+Rather than pick one and risk serving *unfiltered* logs to a daemon that used the other, the parser
+accepts `Config` with `ReadConfig` as a fallback. `Tail` follows Go's convention: negative = all
+history, 0 = none, positive = last N.
+
+**Two daemon dialects for split lines.** Lines over ~16 KiB arrive as multiple frames. Modern daemons
+tag every chunk with `partial_log_metadata{id, ordinal, last}`; older ones set `partial = true` on all
+but the final chunk. `PartialAssembler` handles both with one state machine (key by metadata id,
+empty key for the legacy dialect), caps a reassembled line at 1 MiB, and drains anything unterminated
+at end of stream so a container's last line is not lost.
+
+**Back-pressure, not loss.** The FIFO readers feed one batching ingest worker (512 records or 200 ms)
+over a bounded channel. On a full queue the reader *blocks* rather than dropping: back-pressure
+propagates into the container's stdout pipe, which is the behavior an operator wants from a log
+driver. Batching is what keeps this cheap — one WAL append per batch, not per line.
+
+**`ReadLogs` uses the typed `LogQuery` API, not hand-written SQL**, filtering on the `container.id`
+*resource* attribute via `LogStringField::ResourceAttribute` + `StringPredicate::Eq`. Container
+identity belongs on the resource per OTel semconv, and `attr_eq` only reaches record attributes — the
+`string_predicate` surface is what makes resource attributes queryable. History is streamed in
+1000-row pages against a time window fixed before the first query, so forward paging cannot be shifted
+by rows arriving mid-scan.
+
+**Follow mode termination.** `docker logs -f` polls every 200 ms for records strictly newer than the
+last one written. It exits when the container's streams are gone (`is_active` over the FIFO registry)
+and five consecutive polls came back empty — otherwise `-f` on a stopped container would hang until
+the client disconnected. Timestamp-based advancement means two records sharing one nanosecond would be
+reported once; Docker's timestamps are wall-clock ns, so this does not occur in practice. Written up
+as a known gap in §10.16.
+
+**Refactor in `lib.rs`.** `read_request` became generic over `BufRead` and `write_response` generic
+over `Write`, so the plugin's `AF_UNIX` endpoint reuses the same HTTP/1.1 parser as the TCP server
+instead of growing a second one. `json_string` is now `pub(crate)`. No behavior change to the existing
+routes.
+
+**Tests.** 36 unit tests across the five modules (framing round-trip, truncated/oversized frames, both
+partial dialects, interleaved split ids, resource mapping, log-opt parsing, newline handling, RFC 3339
+including Go's zero time and numeric offsets, every protocol endpoint under malformed JSON) plus a
+5-case E2E over a **real Unix socket**: handshake, a container stream ingested and asserted *in the
+DB*, `ReadLogs` history/`--tail`/`--since`, follow mode delivering a live line and terminating on
+stop, and a genuine `mkfifo` FIFO exercising the blocking-open interlock (skipped where `mkfifo` is
+unavailable). The E2E also runs the two example queries from `docs/DOCKER_LOG_DRIVER.md`, so the
+documented SQL cannot rot. `docker` is off by default, so `ci.yml`'s gate job now lints and tests it
+explicitly — otherwise none of this would compile in CI.
+
+**Not implemented (deliberate).** Docker's `labels-regex`/`env-regex` log-opts (a regex engine for two
+options is not worth the footprint — name the keys) and `tag` (Docker's `{{.Name}}` template
+language). Labels and env are copied only when explicitly named, so a container's environment — which
+usually holds secrets — is never swept into the database wholesale.
+
+## 2026-07-30 — Docker plugin networking: measured, not assumed
+
+Follow-up to the log-driver entry above, prompted by "how do containers send traces/metrics to the
+plugin, without exposing it outside the machine?". Everything below was measured against the local
+daemon (Docker **29.2.1**, native Linux), not inferred.
+
+**Finding — `network.type: bridge` is accepted but unimplemented for managed plugins.** A probe
+plugin that dumped its own interfaces to a bind-mounted file, enabled once per setting:
+
+| `network.type` | what the plugin process sees |
+|----------------|------------------------------|
+| `host` | `lo`, the host LAN interface, `docker0` 172.17.0.1, every `br-*`, a default route |
+| `bridge` | **`lo` only — no addresses, no routes, no veth** |
+
+The value round-trips through `docker plugin inspect` (`{"Type":"bridge"}`), so it looks supported;
+moby just drops the plugin into an empty netns. `bridge` is therefore a synonym for `none`, *not*
+"give the plugin an IP on docker0". It does not break the log driver — the plugin socket and the
+per-container FIFOs are filesystem objects — but it makes the OTLP/query endpoint reachable by
+nothing. Recorded in §10.16 and in the operator guide, because the setting's name actively misleads.
+
+**Finding — `host-gateway` resolves to the *daemon's* `host-gateway-ip`, not the per-network
+gateway.** A container on a user-defined network whose gateway was `172.23.0.1` still got
+`172.17.0.1  host.docker.internal` in `/etc/hosts`. That is what makes a single bind address workable:
+binding docker0's address serves containers on *every* bridge network, including compose-created
+ones, with one endpoint value.
+
+**So the shipping posture is `host` netns + bind the bridge gateway.** Verified end to end: bound to
+`172.17.0.1:<port>` only (`ss -ltn`), REACHABLE from a default-bridge container and from a
+user-defined-network container, and refused from the host's own LAN address (192.168.10.131). "Not
+outside the computer" holds; "not reachable by other containers on the box" does not, and `/admin/*`
+is unauthenticated — stated as a caveat rather than papered over.
+
+**`docker plugin set` verified for the three cases that matter**: setting a `settable` env var works;
+setting it to the **empty string** works (this is the no-TCP posture); and a var declared
+`"settable": null` is refused by the daemon (`"IMBH_DOCKER_PLUGIN_SOCKET" is not settable`) — so the
+socket path genuinely cannot be repointed at runtime, which is what that declaration is for.
+
+**Design consequence — listen addresses had to become environment variables.** A managed plugin's
+`entrypoint` args are frozen in `config.json`; only `env` is settable. So `IMBH_LISTEN_ADDR` and
+`IMBH_GRPC_LISTEN_ADDR` now back the positional args (arg > env > default), with **empty meaning "do
+not listen"**. That forced `main` to stop treating one server as the foreground: every configured
+endpoint now runs on its own thread and `main` parks on all of them, which is what makes HTTP, gRPC,
+and the plugin socket independently optional. `listen_addr()` is a pure function in `lib.rs` with
+tests for precedence, emptiness, and trimming (a `docker plugin set` value arrives verbatim, and a
+stray space would fail to parse at bind time and take the server down).
+
+**gRPC belongs in the plugin build.** OTLP/gRPC on 4317 is the default transport for most OTel SDKs,
+so a plugin without it fails for anyone who does not know to say `http/protobuf`. The plugin
+Dockerfile now builds `--features docker,grpc,tracing`. Related trap worth remembering: `imbhd` does
+not decompress request bodies, and the **OTel Collector's** OTLP exporters default to
+`compression: gzip` (SDKs default to none) — a collector in front of imbh needs `compression: none`.
+
+**Doc bug found and fixed: there is no `docker plugin logs` command.** The first draft of the guide
+told operators to use it. Plugin stdout/stderr is captured by the Docker daemon's log
+(`journalctl -u docker`). Checked against `docker plugin --help`, which lists create/disable/enable/
+inspect/install/ls/push/rm/set/upgrade and nothing else.
+
+**`build.sh` now asks the daemon instead of hard-coding.** `docker network inspect bridge --format
+'{{range .IPAM.Config}}{{.Gateway}}{{end}}'` is the authority on its own bridge address (a daemon with
+a custom `bip` differs), and the result is applied with `docker plugin set` after create. `IMBH_BIND`
+overrides it; `IMBH_BIND=none` disables both listeners. The engine itself is the `DOCKER` variable,
+expanded **unquoted** on purpose so `DOCKER="sudo docker"` or `DOCKER=podman` works.
+
+## 2026-07-30 — Docker log driver: runtime verification, delivery state, conventions
+
+Closes out the two entries above (the plugin itself, and the networking measurements). Those record
+the design and the findings; this records what was actually *run*, what shipped, and one convention
+adopted along the way. No new design content.
+
+**Runtime verification of the reworked `main`.** Making the listeners individually optional changed
+process lifetime management, which no unit test covers — `listen_addr()` is pure, but "does the
+process stay alive with no TCP listener" is not. Exercised the built binary directly:
+
+| Configuration | Result |
+|---------------|--------|
+| both listeners empty + `IMBH_DOCKER_PLUGIN_SOCKET` set | process alive, socket created, **0 TCP ports** (`ss -ltnp` by pid) |
+| `IMBH_LISTEN_ADDR` from the environment only | serving; `GET /health` → 200 |
+| both listeners empty, no plugin socket | refuses to start, exits **1**, "nothing to serve: …" |
+
+The third case is the one worth keeping: an `imbhd` that starts, serves nothing, and sits there is
+strictly worse than one that fails loudly, and the empty-listener feature made that state reachable
+for the first time.
+
+**Footprint after the restructure: unchanged.** 275 crates, and the release `imbhd` came out at
+33,736,592 bytes — byte-identical to before the change. Moving the accept loops onto threads and
+adding the env plumbing cost nothing measurable.
+
+**Convention — brace-form shell variable references.** `crates/imbh-server/docker-plugin/build.sh`
+uses `${VAR}` everywhere, not bare `$VAR`, on the user's instruction. Braces keep the name boundary
+explicit (`"${BIND}:4318"`, `"${HERE}/config.json"`) and stay compatible with the deliberate
+unquoted `${DOCKER}` expansion that lets `DOCKER="sudo docker"` split into arguments. Audit with
+`grep -nE '\$[A-Za-z_][A-Za-z0-9_]*' file.sh | grep -v '\${'` — it should print nothing. Worth
+applying to any new script in this repo; the pre-existing `scripts/*.sh` were left alone.
+
+**Delivered on `feat/docker-log-driver`, PR #6**, as a single SSH-signed commit (verified on GitHub).
+It began as three — the plugin, the listen-address rework, then the fixes from real-daemon
+verification — squashed at the user's request before merge.
+
+*No SHA is cited here on purpose.* This entry lives inside the commit it would name, so every hash
+written into it is invalidated by the act of committing it: a first draft said `36c02c3`, which an
+amend immediately turned into a dangling reference, and the later squash would have broken a second
+one. The rule that survives: cite a branch's *parent* or a merged commit by hash if you need one, and
+cite the commit you are writing inside by subject. Local gate clean throughout: `fmt` /
+`build --workspace` / `clippy --workspace --all-targets` / `clippy -p imbh-server --all-features` /
+`test --workspace` (52 suites) / `test -p imbh-server --features docker` / `scripts/footprint-gate.sh`.
+
+*Local signature verification is misleading here:* `git log --format=%G?` prints `N` and errors with
+"gpg.ssh.allowedSignersFile needs to be configured", because this repo has `gpg.format = ssh` and a
+`user.signingkey` but no allowed-signers file. The commits **are** signed — `git cat-file -p HEAD`
+shows the `gpgsig` SSH block and the GitHub API reports `verified: true, reason: valid`. Do not read
+the local `N` as unsigned.
+
+**Still open** (tracked in `TODO.md`, unchanged): none of this has been driven by a real `dockerd`,
+and the rootfs image under `crates/imbh-server/docker-plugin/` has never been built or
+`plugin create`d. Every Docker-side fact in these three entries came from probing the local daemon
+(29.2.1) with throwaway plugins and containers, not from running imbh itself as a plugin. The
+alpine/musl build of `imbhd` (zstd-sys wants a C toolchain) is the most likely thing to break first.
+
+## 2026-07-30 — Docker log driver verified end to end against a real daemon (2 defects found)
+
+The TODO item "never driven by a real `dockerd`" is now closed. Built the plugin with the shipped
+`build.sh`, registered it, ran containers through it, and tore it all down again on Docker **29.2.1**
+(native Linux, x86_64). Two real defects surfaced — neither reachable by the hermetic suite.
+
+**Defect 1 — no `.dockerignore`: the plugin was unbuildable in a working checkout.** The Dockerfile
+builds from the repo root (it must: compiling `imbhd` needs every workspace member manifest, not just
+`crates/imbh-server`), so `COPY . .` ingested `target/` (**557 GB**) and `.agents-workspace/` (58 GB).
+Docker hashes and transfers the whole context *before* running the first instruction, so the build
+produced no output and looked like a hang rather than an error — the worst failure shape. Added a root
+`.dockerignore` (`target/`, `**/target/`, `.agents-workspace/`, `.git/`, `.github/`, `*.rs.bk`):
+**614 GB → 4.81 MB of context, transferred in 0.0s.** Checked first that no crate does
+`include_str!`/`include_bytes!` from `assets/` before deciding what to exclude. Generalizable lesson:
+any Dockerfile whose context is a Rust workspace root needs this, and its absence presents as a hang.
+
+**Defect 2 — `docker logs -f` silently dropped the first line.** Against the real daemon, a container
+printing `tick 1..5` gave 4 of 5 lines to `docker logs -f`; all 5 were queryable in the DB. Root
+cause in `readlogs.rs`: when the history query returned nothing, the follow watermark fell back to
+`history_end` (= `Timestamp::now()`), so the loop then asked only for records *strictly newer than
+that instant*. But a record's timestamp is when the **container emitted** the line, while ingest lands
+it up to one batch interval (200 ms) later — so any line already emitted and not yet stored was
+skipped **permanently**. `docker logs -f` on a freshly started container is exactly that race, which
+is why it cost the first line every time. Fix: the watermark is `Option<Timestamp>`; `None` (nothing
+written yet) keeps the request's *lower* bound rather than jumping to now. `--tail 0` still jumps to
+the present, because "only new lines" is its defined semantic, not a race.
+
+*The general shape is worth remembering:* **event time and ingest time are different clocks, and a
+tail must never use wall-clock time as a watermark over an event-time column.** Any batching ingest
+path has this hazard.
+
+Regression test `follow_delivers_a_line_timestamped_before_the_follow_began` reproduces it without
+timing luck — open the follow against an empty DB, *then* start a stream whose record carries an older
+timestamp. Verified it fails on the pre-fix code (read timeout, no frame) and passes after. Re-verified
+against the real daemon: 5/5 lines with `tick 1` first, three rounds running.
+
+**What passed, on the daemon** (15 checks, plus 6 more in a second pass): plugin `create`/`set`/
+`enable`; a container's stdout and stderr stored with the right severities; a 20 000-character line
+reassembled into **one** row, not five; `container.name` and a `--log-opt labels=` selection on the
+resource; `matches()` full-text search over container output; `docker logs` with `--tail` and
+`--since`; `docker logs -f`; OTLP/HTTP **and** OTLP/gRPC listening on the bridge gateway and reachable
+from a container via `host-gateway`; **not** reachable on the host's LAN address; and all rows
+surviving a plugin `disable`/`enable` (bind mount + WAL replay).
+
+**The shipped Dockerfile builds clean on musl** — `zstd-sys`, tantivy, DataFusion and tonic all
+compiled, 7m06s for the release profile (`lto = "fat"`, `codegen-units = 1`) on 20 cores. The
+toolchain risk this TODO flagged was not the problem; the build context was.
+
+**`build.sh`'s daemon interrogation works**: it printed `binding OTLP to 172.17.0.1 (this daemon's
+bridge gateway)` and applied it via `docker plugin set`, exactly as designed.
+
+Everything created was removed afterwards: plugin, rootfs image, containers, and the root-owned data
+directories (deleted from a throwaway container, since the plugin runs as root).

@@ -908,10 +908,48 @@ error → `InvalidArgument`, else `Internal`), mirroring the HTTP status mapping
 subtree is confined to that feature, so the **default build (the footprint gate) carries no gRPC
 transport** and its crate/binary graph is unchanged.
 
+A **Docker logging-driver plugin** is available behind the optional, off-by-default `docker` feature
+(`cargo build -p imbh-server --features docker`), turning `imbhd` into a `docker.logdriver/1.0`
+plugin: `--log-driver imbh` writes a container's stdout/stderr straight into the embedded `Db`. It is
+Unix-only (`#[cfg(unix)]`) and adds **no crate** to the graph — the plugin API is HTTP/1.1 over
+`AF_UNIX` (the same hand-rolled request parser the TCP server uses), its JSON goes through
+`imbh::parse_json`, and its wire format (Docker's length-prefixed `logdriver.LogEntry` frames) is
+declared with prost's derive rather than generated, so it rides on the prost + opentelemetry-proto
+message types already present via `imbh-otlp`. All five endpoints are implemented
+(`Plugin.Activate`, `LogDriver.{StartLogging,StopLogging,Capabilities,ReadLogs}`).
+
+Both `imbhd` listen addresses (`IMBH_LISTEN_ADDR`, `IMBH_GRPC_LISTEN_ADDR`) read from the environment
+as well as from positional args, because a managed plugin's `entrypoint` is frozen in its
+`config.json` while `env` entries declared `settable` can be changed with `docker plugin set`; an
+**empty** value disables that listener, and with both off the process serves only the plugin socket
+and opens no network port. `main` runs every configured endpoint on its own thread and parks on all
+of them, which is what makes them independently optional. The plugin defaults to binding the docker0
+bridge gateway -- reachable from containers on every bridge network, unroutable from the LAN -- and
+`build.sh` replaces the default with the address the daemon actually reports. *Measured, not assumed:*
+`network.type: bridge` is accepted by the daemon but unimplemented for managed plugins (the process
+gets an empty netns -- `lo` only, no routes), so `host` plus a bridge-gateway bind is the only way to
+be container-reachable; the empty-listener setting is the supported way to be reachable by nothing.
+
+Shape: one reader thread per container FIFO reassembles Docker's split lines, and all readers funnel
+into a single batching worker that ingests through `Db::ingest_otlp_logs` — the same entry point the
+HTTP/gRPC routes use, so there is still exactly one ingest path. Container identity becomes OTel
+**resource** attributes (`container.id`/`name`/`image.*`/`runtime`, plus operator-selected labels and
+env), the stream becomes `log.iostream` plus a configurable severity, and `ReadLogs` serves
+`docker logs` (history, `--tail`, `--since`/`--until`, follow) back out of the store through the typed
+`LogQuery` API. A full back-pressure-not-loss policy applies: a saturated ingest queue blocks the FIFO
+reader rather than dropping lines. The endpoint is off unless `IMBH_DOCKER_PLUGIN_SOCKET` names a
+socket, so a local `imbhd` built with the feature still never touches `/run/docker`. Packaging
+(`config.json`, rootfs `Dockerfile`, `build.sh`) lives in `crates/imbh-server/docker-plugin/`; the
+operator guide is `docs/DOCKER_LOG_DRIVER.md`.
+
 > *Deviations vs the original design:* there is **no HTTP mapping of the typed §10 APIs**
 > (Loki/Tempo/Prom-shaped routes) — only OTLP ingest + SQL + stats/admin; **no TOML config file**;
 > and no in-process TLS (front with a proxy). OTLP/gRPC is now supported, but only under the optional
-> `grpc` feature (the default build is HTTP-only). Health is `/health` (not `/healthz`).
+> `grpc` feature (the default build is HTTP-only). Health is `/health` (not `/healthz`). The Docker
+> log-driver plugin is a post-M6 addition, not part of the original plan. Its known gaps: Docker's
+> `labels-regex`/`env-regex` and `tag` log-opts are unsupported (a regex engine and a template
+> language are not worth the footprint), and follow mode advances by timestamp, so two records sharing
+> one nanosecond would be reported once.
 
 ### 10.17 Query-binding surface (`proto` feature)
 

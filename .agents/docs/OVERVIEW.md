@@ -178,7 +178,7 @@ Cargo workspace (ARCHITECTURE.md §12); dependency direction
 | `imbh` | the facade embedders use: `Db`, blocking + async API; optional stderr console renderer (`imbh::console`, `tracing-console` feature) |
 | `imbh-proto` | protobuf wire types for the query-API inputs (Go/FFI binding surface, `proto` feature); generated from `.proto` via protox, prost-only, optional |
 | `imbh-otel-exporter` | opentelemetry-rust SDK exporter adapters (span/log/metric), optional |
-| `imbh-server` | reference `imbhd` binary + example HTTP wiring, optional |
+| `imbh-server` | reference `imbhd` binary + example HTTP wiring, optional; optional OTLP/gRPC (`grpc`) and a Docker logging-driver plugin (`docker`, Unix-only, zero added crates) |
 | `imbh-tracing` | in-process `tracing` plumbing: `DbLayer` sinking `tracing` spans/events into an embedded `Db` (self-observation); depends on `imbh`, optional |
 
 Confining DataFusion to `imbh-query` and Tantivy to `imbh-index` absorbs engine churn
@@ -217,6 +217,11 @@ three signals, with the reference server and SDK exporter built. See
   heavy deps. (No typed-API HTTP mapping or TOML config; see ARCHITECTURE.md §10.16.)
 - **M6 — Polish + v0.1. Done.** Feature-matrix + `cargo-deny` + footprint gates; the embedding
   and PromQL→SQL guides; examples.
+
+Post-v0.1 additions (outside the original milestone plan): the **Docker logging-driver plugin** in
+`imbh-server` (optional `docker` feature) — `--log-driver imbh` writes container stdout/stderr into
+an embedded `Db` and serves `docker logs` back out of it, with no new crate in the graph
+(ARCHITECTURE.md §10.16, [docs/DOCKER_LOG_DRIVER.md](../../docs/DOCKER_LOG_DRIVER.md)).
 
 Post-v1 candidate tracks: broader query-language profiles; Parquet VARIANT for attributes;
 read-only cross-process opens; object-store tiering; downsampling; single-file segment bundles
