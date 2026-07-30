@@ -16,6 +16,10 @@ target/
 # Agent scratch space (AGENTS.md): probe crates, temporary target dirs, fixtures.
 .agents-workspace/
 
+# Staged build context for the *other* Dockerfile (docker/Dockerfile, the distribution image). It
+# holds a few hundred MB of release binaries and is irrelevant to the plugin rootfs built from here.
+docker/ctx/
+
 # Version-control metadata and CI definitions -- not needed to compile.
 .git/
 .github/

@@ -94,7 +94,11 @@ Two release-time checks, both wrapped in scripts that degrade gracefully when th
 
 `deny.toml` (repo root) configures license compatibility + duplicate-version + no-openssl checks.
 The allowlist there (`[licenses].allow`) is mirrored by `about.toml`'s `accepted` list — keep the
-two in sync whenever either changes.
+two in sync whenever either changes. `deny.toml`'s `[graph]` is equally load-bearing: it sets
+`all-features = true` and lists all six shipping targets, so the check covers what CD actually ships.
+It used to be host-only with default features, which silently exempted the entire tonic/hyper/h2/tower
+subtree behind `grpc` and every target-specific dependency. Keep `[graph].targets` in sync with
+`about.toml`'s `targets` and with `release.yml`'s build matrix.
 
 ```sh
 ./scripts/license-gate.sh            # cargo deny check licenses (skip-with-note if cargo-deny absent)
@@ -107,18 +111,27 @@ do, and can be skipped offline). It went green for the v0.1.0 release.
 
 ### 3b. Third-party notice generation
 
-`scripts/gen-notices.sh` renders `THIRD-PARTY-NOTICES.txt` for the shipped `imbhd` (`imbh-server`)
-binary graph via `cargo about generate` using the repo-root `about.toml` + `about.hbs`.
+`scripts/gen-notices.sh` renders `THIRD-PARTY-NOTICES.txt` for the binaries actually distributed —
+`imbhd` **and** `imbh-tui` — via `cargo about generate` using the repo-root `about.toml` + `about.hbs`.
 
 ```sh
 ./scripts/gen-notices.sh             # cargo about generate ... (skip-with-note if cargo-about absent)
 ```
 
+Scope is `--workspace --all-features` over `about.toml`'s six targets, deliberately a **superset** of
+any one build. That is not laziness: this file ships inside every release archive and in the container
+image (Apache-2.0 §4(d), README "License"), CD builds with `grpc,tracing` (+ `docker` on Linux), and
+`grpc` alone pulls the whole tonic/hyper/h2/tower subtree. Scoping to `crates/imbh-server/Cargo.toml`
+with default features — which is what this script did before CD existed — attributed none of that and
+nothing of `imbh-tui`'s ratatui/crossterm subtree. Over-attributing is safe; under-attributing is a
+licence breach. **Do not narrow this to "just what this build links".**
+
 Offline caveat: `cargo about generate` needs network (it resolves license text from the crates.io
 index), so run it in a networked env — `release.yml` installs the tool and does this on every `v*`
-tag. The tracked `THIRD-PARTY-NOTICES.txt` was regenerated for v0.1.0; regenerate it whenever the
-shipped `imbhd` dependency graph changes, and before each release. This is the Rust analogue of
-cornus's `audit-licenses`.
+tag, and its `build` jobs package *that* freshly generated copy rather than the tracked one. Regenerate
+and commit whenever the shipped dependency graph or feature set changes; `release.yml` emits a warning
+into the run summary when the generated file differs from the tracked copy. This is the Rust analogue
+of cornus's `audit-licenses`.
 
 ### 3c. Packaging dry-run (`cargo package --workspace`)
 
@@ -155,6 +168,49 @@ Fix by dropping the cached units, then re-running: `rm -rf target/debug/.fingerp
 the registry-sourced `target/debug/deps/imbh_*` artifacts, identifiable by a dep-info file that
 references `~/.cargo/registry/src/`). Nothing under `crates/` needs to change.
 
+## 4. Distribution gate (release time, CI-only)
+
+Everything users install that is not a crates.io crate: the per-platform archives of `imbhd` +
+`imbh-tui` and the `ghcr.io/moriyoshi/imbh` container image. This gate lives in `release.yml`'s
+`build` / `publish` / `image` jobs and is **not** reproducible in full locally (it needs five runner
+platforms), but the two pieces that can be are:
+
+```sh
+# imbhd with the shipping feature set — ci.yml lints `docker` and `grpc` separately, never together
+cargo build --release -p imbh-server --features docker,grpc,tracing
+./scripts/build-image.sh              # host-arch container image (skip-with-note if docker absent)
+```
+
+Rehearse the rest with a `workflow_dispatch` run of `release.yml`: with `dry_run` at its default it
+builds and smoke-tests all five archives and both image architectures and publishes nothing. Do that
+after any change to the matrix, the feature set, `docker/Dockerfile`, or the base image.
+
+Two invariants worth restating, because breaking either produces a *silently* bad release:
+
+- **The glibc floor is a contract between two files.** The Linux legs build on `ubuntu-22.04`
+  runners (glibc 2.35) so the binaries also run on `docker/Dockerfile`'s `debian:bookworm-slim` base
+  (glibc 2.36). Moving either one moves the other.
+- **The image must not compile anything.** It copies binaries the matrix already built and
+  smoke-tested. Introducing a `RUN cargo build` would put a fat-LTO compile under QEMU on the release
+  path (hours, per architecture). The one `RUN` in the Dockerfile is pinned to `$BUILDPLATFORM`
+  precisely so no emulation is needed at all.
+- **The build-context layout is a contract with two implementations.** `docker/Dockerfile`'s header
+  block is the contract (`linux/<goarch>/{imbhd,imbh-tui}` plus `LICENSE` and
+  `THIRD-PARTY-NOTICES.txt` at the context root). `scripts/build-image.sh` implements it for a local
+  single-arch build; `release.yml`'s `image` job implements it inline for the multi-arch release. CI
+  stages inline **by choice** — that job stays readable without following a script whose default mode
+  compiles the workspace — so the price is that a layout change must be made in the Dockerfile header
+  first and then applied to both. A `workflow_dispatch` dry run catches a CI-side mismatch; a bare
+  `./scripts/build-image.sh` catches a local one. Run both after touching the layout.
+
+On caching: the release build job caches **only the cargo registry** (`cache-targets: "false"`), and
+that is deliberate — see the comment on the step. GitHub scopes Actions caches by ref and will not
+restore one created for a *different tag name*, falling back only to the default branch's scope; since
+this job never runs on `main`, the first run of a new tag is cold whatever is stored, while five legs
+of fat-LTO `target/` caches would evict the `ci.yml` caches that make every PR fast. Corollary worth
+knowing: a `workflow_dispatch` rehearsal **from `main`** writes into main's scope, so it both validates
+the pipeline and warms the registry cache for the tag run that follows.
+
 ## CI (GitHub Actions)
 
 The gate is wired into `.github/workflows/`, mapping the sections above:
@@ -166,9 +222,14 @@ The gate is wired into `.github/workflows/`, mapping the sections above:
   (skipped on PRs).
 - **`soak.yml`** (nightly + `workflow_dispatch`) — the opt-in RSS soak and the long interleave-stress
   variant (both `#[ignore]`, Linux). Kept off the per-push path so they don't slow PRs.
-- **`release.yml`** (version tags `v*` + `workflow_dispatch`) — §3 license gate (`cargo-deny`) and
-  third-party notice generation (`cargo-about`), installing both tools so the scripts run for real;
-  uploads `THIRD-PARTY-NOTICES.txt` as an artifact.
+- **`release.yml`** (version tags `v*` + `workflow_dispatch`) — §3 **and** §4. Job `licenses` runs the
+  license gate (`cargo-deny`) and notice generation (`cargo-about`), installing both tools so the
+  scripts run for real, and uploads `THIRD-PARTY-NOTICES.txt` as an artifact; job `build` (5-leg
+  matrix) builds and smoke-tests `imbhd` + `imbh-tui` per target and packages that notices file into
+  each archive; job `publish` attaches the archives + `SHA256SUMS` to the tag's GitHub Release; job
+  `image` pushes the multi-arch image to GHCR. `build` depends on `licenses` deliberately — no binary
+  ships from a run whose license gate failed. A `workflow_dispatch` run with `dry_run` (the default)
+  builds everything and publishes nothing.
 
 Locally, still run the level matching what you touched:
 
@@ -184,4 +245,8 @@ Locally, still run the level matching what you touched:
   workspace run).
 - **Footprint / memory-sensitive change**: also run the opt-in RSS soak —
   `cargo test -p imbh --test soak_rss -- --ignored --nocapture`.
-- **Release**: sections 1–3, including the §3c packaging dry-run.
+- **Packaging / distribution change** (`release.yml`, `docker/Dockerfile`, `scripts/build-image.sh`,
+  the shipped feature set, `about.toml`/`deny.toml` targets): section 4, plus regenerate the notices
+  (§3b) if the feature set or target list moved.
+- **Release**: sections 1–4, including the §3c packaging dry-run. Sections 1–3 are the human's
+  pre-`cargo release` checklist; section 4 then runs itself on the tag push.

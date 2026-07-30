@@ -23,13 +23,19 @@ accepted = [
     "CC0-1.0",
 ]
 
-# Resolve the license graph for the host plus the shipping target. x86_64-unknown-linux-musl is
-# the release target for imbhd (OVERVIEW.md §2 footprint budgets are the musl numbers); the host
-# (aarch64/x86_64 glibc) is included so notices also cover a local dev build.
+# Every target we publish a binary for, so target-specific dependencies (windows-sys, ntapi,
+# core-foundation, ...) get attributed too — a notices file generated only for Linux would ship
+# incomplete inside the Windows and macOS release archives. Mirrors deny.toml's [graph].targets;
+# keep the two in sync. The five release-archive targets come from
+# .github/workflows/release.yml's build matrix; musl is kept because it is the documented footprint
+# target (OVERVIEW.md §2) and what the Docker log-driver plugin rootfs builds.
 targets = [
-    "aarch64-unknown-linux-gnu",
     "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
     "x86_64-unknown-linux-musl",
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "x86_64-pc-windows-msvc",
 ]
 
 # Ignore workspace-private (publish = false) crates — first-party code is not a third-party notice.

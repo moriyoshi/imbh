@@ -14,11 +14,38 @@ git history); this file tracks only what is still open.
       workspace tests must remain daemon-free and offline. Deferred by explicit user request. —
       *source: JOURNAL (LGTM differential-testing follow-up)*
 
-- [ ] **Dependabot for the SHA-pinned GitHub Actions.** All five actions in
-      `.github/workflows/{ci,release,soak}.yml` are now pinned to commit SHAs, so patch/security
-      updates no longer arrive on their own. Add `.github/dependabot.yml` with a
+- [ ] **Dependabot for the SHA-pinned GitHub Actions.** Now **nine** actions across
+      `.github/workflows/{ci,release,soak}.yml` are pinned to commit SHAs (the CD work added
+      `actions/download-artifact` plus the four `docker/*` actions), so patch/security updates no
+      longer arrive on their own. Add `.github/dependabot.yml` with a
       `package-ecosystem: github-actions` entry so the pins are refreshed by PR. Offered to the
-      user, not yet added. — *source: JOURNAL (Actions SHA-pinning, 2026-07-24)*
+      user, not yet added. — *source: JOURNAL (Actions SHA-pinning, 2026-07-24; CD, 2026-07-30)*
+
+- [ ] **The CD pipeline has never run.** `release.yml`'s `build`/`publish`/`image` jobs were written
+      and verified as far as a single host allows (the Dockerfile was built for both arches and the
+      image run; the glibc guard, the smoke assertions, and the `docker,grpc,tracing` build were all
+      checked locally), but no five-platform run has happened. Before the next release, do a
+      `workflow_dispatch` run with `dry_run` left at its default — it builds and smoke-tests all five
+      archives and both image arches and publishes nothing. Specific unknowns: whether
+      `x86_64-apple-darwin` cross-compiles cleanly (`zstd-sys` under Apple clang with `-arch x86_64`),
+      whether `zstd-sys` builds under MSVC on `windows-latest`, and whether the `ubuntu-22.04-arm`
+      label is available to this repository. — *source: JOURNAL (CD, 2026-07-30)*
+
+- [ ] **Publish the Docker logging-driver plugin too.** `crates/imbh-server/docker-plugin/build.sh`
+      still only registers the plugin on the local daemon, so users must clone and build it, while
+      `imbhd`/`imbh-tui` now have a prebuilt path. A managed plugin is pushed with
+      `docker plugin push`, which is a different artifact and lifecycle from the `ghcr.io/moriyoshi/imbh`
+      image (`docker plugin install` vs `docker run`) — hence deliberately out of scope for the first CD
+      pass. Its rootfs also builds on musl/alpine, so it would not reuse the release matrix's glibc
+      binaries. — *source: JOURNAL (CD, 2026-07-30)*
+
+- [ ] **Measure the footprint budgets on the published targets.** `scripts/footprint-gate.sh` still
+      measures only the CI host, and `OVERVIEW.md` §2's budgets are musl numbers that nothing has ever
+      verified (`x86_64-unknown-linux-musl` is in `about.toml`/`deny.toml` but is not a release-archive
+      target). CD's `Package` step now writes per-target binary sizes into the run summary, so the
+      first real cross-platform numbers will exist after one dispatch run — fold them into Appendix C,
+      and decide whether a musl archive is worth adding alongside the glibc ones. — *source: JOURNAL
+      (CD, 2026-07-30)*
 
 - [ ] **Windows portability beyond the directory fsync (issue #3 follow-up).** The `windows-latest`
       job added to `ci.yml` has never run — it was written without a Windows host to verify against

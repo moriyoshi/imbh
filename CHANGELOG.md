@@ -15,6 +15,24 @@ release aborts if it is missing or duplicated.
 
 ### Added
 
+- **Prebuilt binaries and a container image on every release (CD).** `imbhd` and `imbh-tui` no longer
+  have to be built from source. `.github/workflows/release.yml` now builds both in the release profile
+  for five targets — `x86_64`/`aarch64-unknown-linux-gnu` (glibc 2.35 floor, built natively on
+  22.04 runners), `aarch64`/`x86_64-apple-darwin`, and `x86_64-pc-windows-msvc` — with the
+  `grpc,tracing` feature set (plus `docker` on Linux), smoke-tests each artifact on the runner that
+  produced it, and attaches one archive per platform plus a `SHA256SUMS` to the GitHub Release for the
+  tag. Each archive carries `LICENSE` and `THIRD-PARTY-NOTICES.txt`. A multi-arch
+  (amd64 + arm64) image containing both binaries is published to `ghcr.io/moriyoshi/imbh` as
+  `X.Y.Z`, `X.Y`, and `latest`; it copies in the already-built binaries rather than compiling, so the
+  arm64 leg costs no emulated fat-LTO build. `workflow_dispatch` runs the whole path as a rehearsal
+  that publishes nothing. See README.md "Install the binaries".
+
+- **`docker/Dockerfile` + `scripts/build-image.sh`** for that image, so it is reproducible locally and
+  not only in CI: run the script bare and it compiles both binaries for the host architecture with the
+  release feature set and builds a single-arch image. The Dockerfile's header states the build-context
+  contract that both it and the release workflow satisfy. Distinct from
+  `crates/imbh-server/docker-plugin/`, which builds the logging *plugin* rootfs.
+
 - **A flush scheduler with selectable strategies (`FlushPolicy`).** `Maintenance` already chose *who*
   runs the background loop; the new `DbBuilder::flush(FlushPolicy)` chooses *when* it seals the buffer.
   The triggers OR together and are each optional: periodic (`FlushPolicy::periodic(d)`), buffered heap
@@ -61,6 +79,20 @@ release aborts if it is missing or duplicated.
   of them, so HTTP, gRPC, and the plugin socket are independently optional.
 
 ### Fixed
+
+- **`THIRD-PARTY-NOTICES.txt` did not cover the binaries actually distributed.** It was generated for
+  `imbh-server` with *default* features, so it attributed none of the tonic/hyper/h2/tower subtree
+  that the `grpc` feature links, nothing from `tracing-subscriber`, and nothing of `imbh-tui`'s
+  ratatui/crossterm/rand subtree -- while README.md "License" promises those notices ship with every
+  binary distribution (Apache-2.0 §4(d)). `scripts/gen-notices.sh` now generates across the whole
+  workspace with all features for every published target (267 Apache-2.0 / 94 MIT crates, up from
+  210 / 59), and the file ships inside every release archive and in the image at
+  `/usr/share/doc/imbh/`.
+
+- **The license gate only ever vetted the host target with default features.** `deny.toml`'s `[graph]`
+  now sets `all-features = true` and lists all six shipping targets, so the `grpc`/`docker` subtrees
+  and target-specific dependencies (`windows-sys`, `core-foundation`, ...) are covered. This found no
+  violations, but the previous configuration could not have found any.
 
 - **Docker log driver: `docker logs -f` dropped the first line.** When the history query came back
   empty, follow mode set its watermark to the wall clock and then asked only for records newer than

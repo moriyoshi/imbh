@@ -5,6 +5,10 @@
 # pins exact dependency versions for footprint reproducibility (ARCHITECTURE.md
 # Appendix A). Do not add it here.
 
+# Staged build context for docker/Dockerfile — binaries assembled by release.yml's `image` job
+# (scripts/build-image.sh stages under /target/ instead, already covered above).
+/docker/ctx/
+
 # Rustfmt backups.
 **/*.rs.bk
 

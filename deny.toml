@@ -4,8 +4,23 @@
 # Gates: license compatibility, duplicate-version creep, and (when online) advisories.
 
 [graph]
-# Check the default host target; add server targets here as they are set up (e.g. musl).
-all-features = false
+# Vet the licenses of everything actually SHIPPED, not just the host's default-feature build. The
+# release pipeline (.github/workflows/release.yml) builds `imbhd` + `imbh-tui` for the five targets
+# below with the `grpc,tracing` (+ `docker` on Linux) feature set. With the previous host-only,
+# `all-features = false` graph, the entire tonic/hyper/h2/tower subtree behind `grpc` and every
+# target-specific dependency (windows-sys, core-foundation, ...) went unchecked — so the gate did
+# not cover the binaries we hand to users. Mirrors about.toml's `targets`; keep the two in sync.
+all-features = true
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    # Not a release-archive target, but still the documented footprint target (OVERVIEW.md §2) and
+    # what the Docker log-driver plugin rootfs builds (crates/imbh-server/docker-plugin/Dockerfile).
+    "x86_64-unknown-linux-musl",
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+]
 
 [licenses]
 # imbh is Apache-2.0 (ARCHITECTURE.md §15 q3); the whole dependency ecosystem is permissive.
