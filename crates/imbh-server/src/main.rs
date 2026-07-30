@@ -11,6 +11,14 @@
 //! the **empty string** disables that listener; disabling both leaves a process with no network port
 //! at all, which is a supported configuration when the Docker plugin endpoint is on.
 //!
+//! `imbhd` runs a **flush scheduler** (the library leaves that to the host; a collector process wants
+//! one). `IMBH_FLUSH` picks the strategy — a spec of triggers that OR together, e.g.
+//! `interval=5s,buffer=16MiB,rows=50000,wal=64MiB,idle=2s`, or `manual` to seal only on
+//! `POST /admin/flush` and shutdown; the default is `interval=5s` plus the engine's memory-budget byte
+//! threshold. `IMBH_MAINTENANCE_INTERVAL` (default `60s`) sets how often retention runs. Until the
+//! buffer is sealed, rows live in the WAL + memory only, so this is also what bounds `imbhd`'s RSS and
+//! WAL growth.
+//!
 //! Built with `--features docker`, `imbhd` additionally serves the Docker logging-driver plugin API
 //! when `IMBH_DOCKER_PLUGIN_SOCKET` is set (a managed plugin's `config.json` sets it to
 //! `/run/docker/plugins/imbh.sock`); container output then lands in the same DB the query endpoint
@@ -48,9 +56,20 @@ fn main() -> Result<(), Box<dyn Error>> {
         "127.0.0.1:4317",
     );
 
-    let db = imbh::Db::builder(&dir).open()?;
+    // The flush scheduler: what turns buffered rows into Parquet segments (and lets the WAL be
+    // reclaimed) without waiting for an operator to POST /admin/flush. A malformed spec is fatal —
+    // silently falling back to a different flush cadence than the deployment asked for is worse than
+    // refusing to start.
+    let flush = imbh_server::flush_policy(std::env::var("IMBH_FLUSH").ok())?;
+    let maintenance_interval =
+        imbh_server::maintenance_interval(std::env::var("IMBH_MAINTENANCE_INTERVAL").ok())?;
 
-    banner(&dir, addr.as_deref());
+    let db = imbh::Db::builder(&dir)
+        .maintenance(imbh::Maintenance::Background(maintenance_interval))
+        .flush(flush)
+        .open()?;
+
+    banner(&dir, addr.as_deref(), &flush, maintenance_interval);
 
     // Every configured endpoint runs on its own thread and `main` parks on all of them. The uniform
     // shape is what makes the listeners independently optional: the process stays alive as long as
@@ -120,7 +139,12 @@ fn fatal(message: &str) -> ! {
 
 /// The startup banner. With `tracing` on it flows through the subscriber as structured events;
 /// otherwise the default build prints to stdout so `imbhd` stays self-describing.
-fn banner(dir: &str, addr: Option<&str>) {
+fn banner(
+    dir: &str,
+    addr: Option<&str>,
+    flush: &imbh::FlushPolicy,
+    maintenance_interval: std::time::Duration,
+) {
     #[cfg(feature = "tracing")]
     {
         match addr {
@@ -131,14 +155,27 @@ fn banner(dir: &str, addr: Option<&str>) {
             }
             None => tracing::info!(%dir, "imbhd started with no HTTP listener"),
         }
+        tracing::info!(
+            policy = %flush,
+            retention_interval_secs = maintenance_interval.as_secs(),
+            "flush scheduler"
+        );
     }
     #[cfg(not(feature = "tracing"))]
-    match addr {
-        Some(addr) => {
-            println!("imbhd listening on http://{addr}  (data dir: {dir})");
-            println!("  OTLP/HTTP: POST /v1/logs · /v1/traces · /v1/metrics");
-            println!("  query:     POST /api/query  (SQL body → JSON)");
+    {
+        match addr {
+            Some(addr) => {
+                println!("imbhd listening on http://{addr}  (data dir: {dir})");
+                println!("  OTLP/HTTP: POST /v1/logs · /v1/traces · /v1/metrics");
+                println!("  query:     POST /api/query  (SQL body → JSON)");
+            }
+            None => println!("imbhd started, no HTTP listener  (data dir: {dir})"),
         }
-        None => println!("imbhd started, no HTTP listener  (data dir: {dir})"),
+        // The effective policy, in the same syntax IMBH_FLUSH accepts — so an operator can copy it
+        // back out, tweak one trigger, and know exactly what is running.
+        println!(
+            "  flush:     {flush}  (retention every {}s)",
+            maintenance_interval.as_secs()
+        );
     }
 }

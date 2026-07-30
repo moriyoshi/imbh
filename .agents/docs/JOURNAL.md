@@ -732,3 +732,111 @@ cursor → Enter → span detail → `L` → `Logs for trace 18c6edde span e449b
 
 **No dependency change**, so the footprint gate is untouched (`ratatui`'s `List`, `attrs_to_pairs`,
 and `push_attr_section` were all already in the graph).
+
+## 2026-07-30 — Flush scheduler (`FlushPolicy`), and `imbhd` never sealed
+
+**The report.** "imbhd never tries to flush the WALs." Confirmed, and worse than the wording
+suggests. `crates/imbh-server/src/main.rs` opened the DB with `Db::builder(&dir).open()` — the
+library default is `Maintenance::Manual`, which spawns no scheduler at all. So a running `imbhd`:
+
+1. never sealed, so no row ever reached Parquet and the mutable buffer grew for the process's life;
+2. never reclaimed the WAL (reclaim happens *after* a seal advances the watermark), so the WAL grew
+   with it;
+3. never fsynced, because `WalMode::Interval(1s)` — the default — had **no timer anywhere in the
+   tree**. The M1 note in `config.rs` said "fsyncs opportunistically on `flush`/`close`; a
+   timer-driven flusher is a follow-up", and that follow-up had never landed.
+
+Only `POST /admin/flush` or shutdown broke the cycle. The library behavior was correct-by-design
+(embedders get "no background threads unless opted in"); the defect was that the *collector process*,
+the one host that should opt in, never did.
+
+**The design: two orthogonal knobs.** `Maintenance` already existed and answers *who runs the loop*
+(Manual / owned thread / host runtime) — leave it alone. The new `FlushPolicy` (imbh-core `config`)
+answers *when it seals*, with triggers that OR together: periodic `every(d)`, buffered heap
+`at_buffer_bytes(n)` (default `FlushSize::Budget` = today's `seal_threshold_bytes`), buffered rows
+`at_buffer_rows(n)`, on-disk WAL size `at_wal_bytes(n)`, and `after_idle(d)`. `tick(d)` sets the
+evaluation cadence, `manual()` disables all of them.
+
+Deliberately *not* an added variant on `Maintenance`: those crates are published, and a new variant
+on a public enum breaks downstream exhaustive matches. A new struct plus a new builder method is
+purely additive.
+
+**Backward compatibility hinges on one line.** `resolve_flush` maps "host set no policy" to
+`FlushPolicy::default().or_interval(maintenance_interval)`, so an existing
+`Maintenance::Background(30s)` user keeps sealing every 30s at the byte threshold, exactly as before.
+An *explicit* `FlushPolicy::manual()` never gets that interval grafted on — otherwise "manual" would
+silently mean "every 30s". That distinction is the reason the builder field is `Option<FlushPolicy>`
+rather than a `FlushPolicy` with a manual default.
+
+**Two things the loop must not do.** (a) The policy tick is clamped to [5ms, 60s], but the loop
+sleeps in slices of at most **1s** regardless, because `close()` joins it — a 60s tick would
+otherwise make shutdown take up to a minute. The tick then throttles only the *measurement* (one
+lock for `flush_gauges`, plus a directory scan for `wal_bytes`, which is why that one is measured
+only when a WAL trigger is configured). (b) The idle trigger is guarded on `buffer_rows > 0`, or a
+quiet DB would ask for a no-op seal every single tick forever.
+
+**The idle clock starts at open, not at first ingest.** `Inner::last_append` is `None` until an
+ingest, and replay deliberately does not set it; `flush_gauges` falls back to `Storage::opened_at`.
+A DB reopened with a WAL-replayed buffer is therefore sealable one idle window after open, instead
+of waiting for traffic that may never arrive.
+
+**`WalMode::Interval` now means something.** `Storage::sync_wal()` fsyncs and advances `durable_lsn`
+whatever the mode (`group_commit` is now a mode check plus a call to it), and
+`wal_sync_interval()` reports `Some(d)` only for `Interval` — the scheduler calls it on that clock.
+Consequence worth stating: interval durability is a *scheduler* property. A `Maintenance::Manual`
+embedder still only fsyncs on `flush`/`close`, which the `WalMode` docs now say outright.
+
+**`imbhd` defaults.** `IMBH_FLUSH` (default `interval=5s`) and `IMBH_MAINTENANCE_INTERVAL` (default
+`60s`). Environment rather than argument, for the same reason as the listen addresses: a managed
+Docker plugin's entrypoint args are frozen in `config.json` while `settable` env entries are not (both
+new variables are declared settable in the plugin's `config.json`). `FlushPolicy: FromStr` parses the
+spec (`interval=5s,buffer=16MiB,rows=50000,wal=64MiB,idle=2s,tick=250ms`, or `manual`), `Display`
+renders it back in the same syntax for the startup banner, and unknown keys are **errors** — a typo in
+a deployment's config must not silently leave the buffer unsealed. Empty means unset (so
+`docker plugin set IMBH_FLUSH=` reads like never having set it).
+
+**Verification.** Full workspace gate green. 8 new `imbh-core` config tests (trigger algebra, tick
+clamping, spec parse/round-trip, rejected typos), 2 new `imbh-storage` tests (gauges across all six
+table buffers + the idle clock; `sync_wal` vs `group_commit` under `Interval`), 7 new `imbh` tests
+(one per strategy — size/periodic/rows/WAL/idle/manual — plus the interval-WAL fsync proving the
+watermark advances with no seal), and 2 new `imbh-server` tests for the env resolution. The
+WAL-trigger test asserts convergence (`wait_until`) rather than a single reading: the scheduler can
+seal part-way through the ingest loop, which made a one-shot `wal_bytes < 4096` flake under a loaded
+`--workspace` run.
+
+**No dependency change**, so the footprint gate is untouched; the new code is std-only.
+
+### Addendum — end-to-end verification and final numbers
+
+Written after the entry above; the work it covers landed last.
+
+**A socket-level regression for the reported defect.** `crates/imbh-server/tests/http_e2e.rs` gained
+`ingested_rows_are_sealed_without_an_admin_flush`: it builds the DB the way `main` does
+(`IMBH_FLUSH` → `imbh_server::flush_policy` → `DbBuilder::flush`, plus
+`Maintenance::Background(maintenance_interval(None))`), serves it on a loopback port, POSTs one
+OTLP/HTTP log, and asserts a segment appears **without any `/admin/flush`** — then reads the row back
+through `POST /api/query`. The unit tests pin the *default* (`interval=5s`); this test overrides it to
+`interval=100ms` so it stays fast. It is the test that would have failed before this change.
+
+**Run against the real binary.** `IMBH_FLUSH=interval=1s ./target/debug/imbhd <dir> 127.0.0.1:14318`,
+one hand-encoded `ExportLogsServiceRequest` POSTed to `/v1/logs`, then `GET /stats` three seconds
+later: `buffer_bytes: 0`, `wal_bytes: 0`, `durable_lsn: 1`, one `logs/1970-01-01/*.parquet` on disk.
+All three of the failure modes in the entry above (unsealed buffer, un-reclaimed WAL, no fsync) are
+observably closed on the shipping wiring, not just in-process. The banner line it printed —
+`flush:     interval=1s,buffer=budget,tick=1s  (retention every 60s)` — is `FlushPolicy`'s `Display`,
+which is deliberately the same syntax `IMBH_FLUSH` parses, so an operator can copy it back out, change
+one trigger, and know exactly what is running.
+
+**Final gate.** `cargo fmt --all --check` clean, `cargo clippy --workspace --all-targets -D warnings`
+clean, `cargo test --workspace` **383 passed / 0 failed** (19 new: 8 `imbh-core`, 2 `imbh-storage`,
+7 `imbh`, 2 `imbh-server` unit + the e2e above). Two clippy lints were worth noting as house style
+here: `manual_is_multiple_of` (use `n.is_multiple_of(m)`, not `n % m == 0`) and `collapsible_if`
+(let-chains — `if let Some(d) = … && cond`), both of which the 1.96 toolchain enforces at
+`-D warnings`.
+
+**Files touched.** `imbh-core` (`config.rs` + re-exports), `imbh-storage` (gauges, `sync_wal`,
+`opened_at`/`last_append`), `imbh` (builder field + setter, `FlushScheduler`, both maintenance loops,
+re-exports), `imbh-server` (`flush_policy`/`maintenance_interval`, `main` wiring + banner,
+`docker-plugin/config.json`), and the docs: ARCHITECTURE.md §5/§7/§10.2/§10.14/§10.15/§10.16,
+README.md, `docs/EMBEDDING.md`, `docs/DOCKER_LOG_DRIVER.md`, CHANGELOG.md. Nothing committed — the
+tree is left dirty for the user's review.

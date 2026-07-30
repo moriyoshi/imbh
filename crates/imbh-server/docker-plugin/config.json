@@ -26,6 +26,18 @@
       "settable": ["value"]
     },
     {
+      "name": "IMBH_FLUSH",
+      "description": "When buffered rows are sealed into Parquet segments (which is also what lets the WAL be reclaimed). Triggers OR together: interval=5s, buffer=16MiB, rows=50000, wal=64MiB, idle=2s, tick=250ms. `manual` seals only on POST /admin/flush and shutdown.",
+      "value": "interval=5s",
+      "settable": ["value"]
+    },
+    {
+      "name": "IMBH_MAINTENANCE_INTERVAL",
+      "description": "How often the retention policy is applied.",
+      "value": "60s",
+      "settable": ["value"]
+    },
+    {
       "name": "RUST_LOG",
       "description": "Log filter for imbhd's own diagnostics. Output goes to the Docker daemon log.",
       "value": "info",

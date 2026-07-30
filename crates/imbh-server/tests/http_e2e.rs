@@ -191,3 +191,68 @@ fn http_wire_ingest_query_stats_and_errors() {
         empty.text()
     );
 }
+
+/// The scheduler wiring `imbhd`'s `main` builds — `IMBH_FLUSH` → [`imbh_server::flush_policy`] →
+/// `DbBuilder::flush`, with a background maintenance thread — over a real socket. This is the
+/// regression for the reported defect: `imbhd` opened its DB with the library default
+/// (`Maintenance::Manual`), so rows ingested over HTTP stayed in the buffer and the WAL forever unless
+/// an operator POSTed `/admin/flush`. A short interval keeps the test quick; the default (`interval=5s`)
+/// is asserted in the crate's unit tests.
+#[test]
+fn ingested_rows_are_sealed_without_an_admin_flush() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let policy = imbh_server::flush_policy(Some("interval=100ms".to_owned())).expect("policy");
+    let db: Arc<Db> = Db::builder(dir.path())
+        .maintenance(imbh::Maintenance::Background(
+            imbh_server::maintenance_interval(None).expect("interval"),
+        ))
+        .flush(policy)
+        .open()
+        .expect("open db");
+
+    let addr = free_addr();
+    let serve_db = db.clone();
+    let serve_addr = addr.clone();
+    std::thread::spawn(move || {
+        let _ = serve(serve_db, &serve_addr);
+    });
+    for _ in 0..200 {
+        if let Ok(resp) = http::get(&addr, "/health")
+            && resp.status == 200
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let resp = http::post(
+        &addr,
+        "/v1/logs",
+        "application/x-protobuf",
+        &otlp_log("checkout", "scheduled seal", 1),
+    )
+    .expect("POST /v1/logs");
+    assert_eq!(resp.status, 200, "{}", resp.text());
+
+    // No /admin/flush anywhere in this test: the scheduler has to do it.
+    let mut sealed = false;
+    for _ in 0..300 {
+        if !db.segments().is_empty() {
+            sealed = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(sealed, "imbhd's flush scheduler never sealed the buffer");
+
+    // And the sealed rows are still exactly what was ingested, read back over the wire.
+    let rows = http::post(
+        &addr,
+        "/api/query",
+        "text/plain",
+        b"SELECT count(*) AS n FROM logs",
+    )
+    .expect("POST /api/query");
+    assert_eq!(rows.status, 200);
+    assert!(rows.text().contains("\"n\":1"), "{}", rows.text());
+}

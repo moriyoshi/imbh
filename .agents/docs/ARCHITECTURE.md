@@ -77,6 +77,16 @@ Key properties:
   `Maintenance::Background(interval)`. That thread observes a `closed` flag and is joined by
   `db.close()`, so shutdown is synchronous with any in-flight seal. This is a hard guarantee for
   embedders.
+- **The flush scheduler picks *when* to seal (`FlushPolicy`, §10.2).** `Maintenance` says *who* runs
+  the loop and how often retention passes; `FlushPolicy` says what makes it seal. Its triggers OR
+  together — periodic (`every`), buffered bytes (`at_buffer_bytes`, defaulting to the
+  memory-budget-derived threshold), buffered rows (`at_buffer_rows`), on-disk WAL size
+  (`at_wal_bytes`), and idle (`after_idle`) — with `tick` setting how often they are evaluated and
+  `FlushPolicy::manual()` disabling all of them. The same loop also honors `WalMode::Interval(d)` by
+  fsyncing the WAL every `d`: without a scheduler running, interval mode can only fsync
+  opportunistically on `flush`/`close`. A host that sets no policy keeps the historical behavior
+  (seal on the maintenance interval + at the byte threshold). `imbhd` runs the scheduler by default
+  (§10.16) because a collector that never seals holds every row in buffer + WAL.
 - **Ingest is inline by default; async is opt-in.** By default ingest runs entirely on the caller's
   thread (decode → WAL append + fsync → buffer push), so data is queryable immediately and the
   receipt is durable under `WalMode::Always`. `Ingest::Async { handle, capacity, overflow }` (§10.5)
@@ -250,10 +260,11 @@ Metrics tables are **not** Tantivy-indexed (attr cardinality is low; dictionary/
   Arrow `RecordBatch` at seal time**. *Deviation:*
   the original design was an O(1) freeze-and-swap of live Arrow builders; the current design keeps
   rows as `Vec<Row>` and materializes Arrow at seal, so the seal cost is the batch build rather
-  than a pointer swap. The buffer is bounded by **bytes** (per-row JSON dominates). *Deviation:*
-  auto-seal at a byte threshold (`seal_threshold_bytes`) is **wired but dormant** — seals are
-  triggered explicitly: `flush()`, `maintain()`, `compact()`, `close()`, and the opt-in
-  background thread.
+  than a pointer swap. The buffer is bounded by **bytes** (per-row JSON dominates). Seals are
+  triggered explicitly (`flush()`, `maintain()`, `compact()`, `close()`) or by the opt-in flush
+  scheduler, whose default size trigger is that byte threshold (`seal_threshold_bytes`); a
+  `FlushPolicy` can replace it with an explicit byte/row/WAL-size/idle trigger or a periodic one
+  (§5/§10.2).
 - **Seal path**: sort by time → write Parquet to a temp path (zstd level 3 default; page index
   on; **no bloom filters**) → build the Tantivy index in a temp dir → fsync → update the manifest
   → rename temp → final. A crash mid-seal leaves an orphan temp dir invisible to the manifest,
@@ -585,7 +596,8 @@ impl DbBuilder {
     pub fn compression(self, c: Compression) -> Self;      // Zstd(i32) | Lz4 | None
     pub fn wal(self, mode: WalMode) -> Self;               // Off | Interval(Duration) | Always
     pub fn retention(self, r: Retention) -> Self;          // Retention::days(n).max_disk_bytes(b)
-    pub fn maintenance(self, m: Maintenance) -> Self;      // Manual | Background(Duration)
+    pub fn maintenance(self, m: Maintenance) -> Self;      // Manual | Background(Duration) | Runtime(Handle, Duration)
+    pub fn flush(self, p: FlushPolicy) -> Self;            // when the scheduler seals: periodic / bytes / rows / WAL / idle
     pub fn refresh(self, r: Refresh) -> Self;              // read-only freshness: OnQuery | Ttl(Duration) | Manual
     pub fn open(self) -> Result<Arc<Db>>;         // handles are shared as Arc<Db>
     pub async fn open_async(self) -> Result<Arc<Db>>;
@@ -595,6 +607,27 @@ impl DbBuilder {
 > *Deviations vs the original design:* `DbBuilder` has `promote()` (§6.1) but no `signals()` or
 > `runtime()`; `export` takes one `Table` and returns `Vec<u8>` (not a stream over `&[Table]`);
 > `segments()` takes no arguments; and there is no `db.resources()`.
+
+**Flush policy.** `FlushPolicy` (in `imbh-core::config`) is the *when* half of the scheduler pair
+described in §5; `Maintenance` is the *who*. Its triggers OR together and each is independently
+optional:
+
+| Strategy | Builder | Fires when |
+|----------|---------|-----------|
+| periodic | `FlushPolicy::periodic(d)` / `.every(d)` | `d` has passed since the last seal |
+| size (heap) | `.at_buffer_bytes(n)` / `.size(FlushSize::{Budget,Bytes,Off})` | buffered heap ≥ `n` (default: the memory-budget-derived `seal_threshold_bytes`) |
+| size (rows) | `.at_buffer_rows(n)` | buffered rows across all tables ≥ `n` |
+| WAL size | `.at_wal_bytes(n)` | the on-disk WAL ≥ `n` (sealing is what lets it be reclaimed) |
+| idle | `.after_idle(d)` | nothing ingested for `d` and the buffer is non-empty |
+
+`.tick(d)` sets the evaluation cadence (default 1s, clamped to [5ms, 60s]) and throttles the only
+measurement that costs anything — one lock for the buffer gauges, plus a directory scan when a
+WAL-size trigger is configured. The loop still *sleeps* in ≤1s slices whatever the tick, so `close()`
+never waits a full tick. `FlushPolicy::manual()` disables every trigger (retention and the WAL fsync
+timer still run); leaving `DbBuilder::flush` unset resolves to the default policy with the
+`Maintenance` interval as its seal cadence, which is the pre-`FlushPolicy` behavior. A policy also
+parses from a spec string (`"interval=5s,wal=64MiB"`, or `"manual"`) via `FromStr`, which is how
+`imbhd` exposes it as one environment variable (§10.16).
 
 `Db` is a **concrete, non-`Clone`** `Send + Sync` struct; `open()` / `open_read_only()` return an
 `Arc<Db>` and you share that `Arc` across the app (the DB owns no second internal refcount — consumers
@@ -845,7 +878,7 @@ unifies to a single arrow — this is what lets a producer build re-export Arrow
 ### 10.15 Worked examples
 
 ```rust
-use imbh::{Db, MemoryBudget, Retention, WalMode, Maintenance};
+use imbh::{Db, FlushPolicy, MemoryBudget, Retention, WalMode, Maintenance};
 use std::time::Duration;
 
 // Open (durable, on disk). Or Db::in_memory() for an ephemeral, WAL-less DB.
@@ -853,7 +886,10 @@ let db = Db::builder("./telemetry")
     .memory_budget(MemoryBudget::total(128 << 20))
     .retention(Retention::days(7).max_disk_bytes(20 << 30))
     .wal(WalMode::Interval(Duration::from_secs(1)))
-    .maintenance(Maintenance::Background(Duration::from_secs(30)))
+    .maintenance(Maintenance::Background(Duration::from_secs(30)))  // who schedules + retention cadence
+    .flush(FlushPolicy::periodic(Duration::from_secs(5))            // when to seal: any trigger fires
+        .at_wal_bytes(64 << 20)
+        .after_idle(Duration::from_secs(2)))
     .open()?;
 
 db.ingest_otlp_logs(&otlp_bytes).await?;               // ExportLogsServiceRequest protobuf
@@ -917,6 +953,15 @@ Unix-only (`#[cfg(unix)]`) and adds **no crate** to the graph — the plugin API
 declared with prost's derive rather than generated, so it rides on the prost + opentelemetry-proto
 message types already present via `imbh-otlp`. All five endpoints are implemented
 (`Plugin.Activate`, `LogDriver.{StartLogging,StopLogging,Capabilities,ReadLogs}`).
+
+Unlike the library, `imbhd` **runs a flush scheduler by default**: `Maintenance::Background` plus the
+`FlushPolicy` from `IMBH_FLUSH` (default `interval=5s`, i.e. seal every 5s or at the memory-budget byte
+threshold), with `IMBH_MAINTENANCE_INTERVAL` (default `60s`) as the retention cadence. The library's
+"no background threads unless opted in" rule is a promise to an *embedder*, and a collector process is
+the host that opts in — without it, `imbhd` accumulated every row in the buffer + WAL until an operator
+POSTed `/admin/flush`, so nothing reached Parquet and neither RSS nor WAL size was bounded. `IMBH_FLUSH`
+takes the §10.2 spec (`interval=`, `buffer=`, `rows=`, `wal=`, `idle=`, `tick=`, or `manual`); a
+malformed value is a startup error, never a silent fallback to a different cadence.
 
 Both `imbhd` listen addresses (`IMBH_LISTEN_ADDR`, `IMBH_GRPC_LISTEN_ADDR`) read from the environment
 as well as from positional args, because a managed plugin's `entrypoint` is frozen in its

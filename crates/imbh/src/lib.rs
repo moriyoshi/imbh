@@ -91,12 +91,13 @@ pub use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
 #[cfg(feature = "cdata")]
 pub use arrow::ffi_stream::FFI_ArrowArrayStream;
 pub use imbh_core::{
-    Access, AnyValue, Attributes, Compression, Direction, DurationNs, Error, Ingest, LogRow, Lsn,
-    Maintenance, MemoryBudget, Overflow, Promote, Refresh, Result, Retention, SegmentRef,
-    SeverityNumber, SpanId, Table, TimeRange, Timestamp, TraceId, WalMode, parse_json,
+    Access, AnyValue, Attributes, Compression, Direction, DurationNs, Error, FlushPolicy,
+    FlushSize, Ingest, LogRow, Lsn, Maintenance, MemoryBudget, Overflow, Promote, Refresh, Result,
+    Retention, SegmentRef, SeverityNumber, SpanId, Table, TimeRange, Timestamp, TraceId, WalMode,
+    parse_bytes, parse_duration, parse_json,
 };
 
-pub use imbh_storage::{CompactionReport, SnapshotInfo, TableStats};
+pub use imbh_storage::{CompactionReport, FlushGauges, SnapshotInfo, TableStats};
 #[cfg(feature = "ingest")]
 use ingest_queue::{IngestChannel, IngestJob};
 
@@ -192,6 +193,7 @@ impl Db {
             wal: WalMode::default(),
             retention: Retention::default(),
             maintenance: Maintenance::default(),
+            flush: None,
             ingest: Ingest::default(),
             access: Access::ReadWrite,
             promote: Promote::default(),
@@ -222,6 +224,7 @@ impl Db {
             wal: WalMode::Off,
             retention: Retention::default(),
             maintenance: Maintenance::default(),
+            flush: None,
             ingest: Ingest::default(),
             access: Access::ReadWrite,
             promote: Promote::default(),
@@ -668,6 +671,10 @@ pub struct DbBuilder {
     wal: WalMode,
     retention: Retention,
     maintenance: Maintenance,
+    /// When the opt-in scheduler seals the buffer (ARCHITECTURE.md §5/§7). `None` = the host never
+    /// chose one, in which case open resolves it to `FlushPolicy::default().or_interval(maintenance
+    /// interval)` — the historical behavior, where the maintenance interval was also the seal cadence.
+    flush: Option<FlushPolicy>,
     ingest: Ingest,
     access: Access,
     /// Attribute keys promoted to typed columns (ARCHITECTURE.md §6.1). Fixed at open; must match a
@@ -732,10 +739,34 @@ impl DbBuilder {
         self
     }
 
-    /// Maintenance policy (ARCHITECTURE.md §5/§10.2). `Maintenance::Background(interval)` spawns one owned
-    /// thread that periodically seals + applies retention. Ignored for in-memory DBs.
+    /// Maintenance policy (ARCHITECTURE.md §5/§10.2) — who runs the scheduler.
+    /// `Maintenance::Background(interval)` spawns one owned thread; `interval` is the retention
+    /// cadence (and, absent [`Self::flush`], the seal cadence too). Ignored for in-memory DBs.
     pub fn maintenance(mut self, m: Maintenance) -> Self {
         self.maintenance = m;
+        self
+    }
+
+    /// Flush policy (ARCHITECTURE.md §5/§7/§10.2) — *when* the scheduler configured by
+    /// [`Self::maintenance`] turns the buffer into a segment. Triggers OR together, so a policy can be
+    /// periodic, size-based (buffered bytes or rows), WAL-size-based, idle-based, or any mix:
+    ///
+    /// ```no_run
+    /// # use imbh::{Db, FlushPolicy, Maintenance};
+    /// # use std::time::Duration;
+    /// let db = Db::builder("./telemetry")
+    ///     .maintenance(Maintenance::Background(Duration::from_secs(300))) // retention cadence
+    ///     .flush(FlushPolicy::periodic(Duration::from_secs(5)).at_wal_bytes(64 << 20))
+    ///     .open()?;
+    /// # Ok::<(), imbh::Error>(())
+    /// ```
+    ///
+    /// With `Maintenance::Manual` there is no scheduler to consult it, so the policy is inert (the host
+    /// calls `flush()`/`maintain()` itself). Leaving this unset keeps the historical behavior: the
+    /// buffer seals on the maintenance interval and at the memory-budget-derived byte threshold.
+    /// Ignored for in-memory DBs.
+    pub fn flush(mut self, policy: FlushPolicy) -> Self {
+        self.flush = Some(policy);
         self
     }
 
@@ -861,17 +892,22 @@ impl DbBuilder {
         // no-op there). `Background` owns an OS thread; `Runtime` schedules onto the host runtime.
         if !self.in_memory && access == Access::ReadWrite {
             let weak = Arc::downgrade(&db);
+            // The flush policy decides *when* to seal; the maintenance interval decides how often
+            // retention runs. A host that set no policy inherits the maintenance interval as its seal
+            // cadence, which is exactly what the scheduler did before this knob existed.
             let worker = match &self.maintenance {
                 Maintenance::Background(interval) => {
                     let interval = *interval;
+                    let flush = resolve_flush(self.flush, interval);
                     Some(MaintHandle::Thread(std::thread::spawn(move || {
-                        run_maintenance(weak, interval)
+                        run_maintenance(weak, interval, flush)
                     })))
                 }
                 Maintenance::Runtime(handle, interval) => {
                     let interval = *interval;
+                    let flush = resolve_flush(self.flush, interval);
                     Some(MaintHandle::Task(
-                        handle.spawn(run_maintenance_async(weak, interval)),
+                        handle.spawn(run_maintenance_async(weak, interval, flush)),
                     ))
                 }
                 Maintenance::Manual => None,
@@ -1106,59 +1142,149 @@ fn writer_tables(storage: &Storage, snap: &imbh_storage::QuerySnapshot) -> Vec<T
     tables
 }
 
-/// The background-maintenance loop (ARCHITECTURE.md §5). Wakes at most every second to notice a close /
-/// drop promptly. On every tick it seals the buffer if it has crossed its byte threshold (prompt
-/// sealing under load); every `interval` it also seals + applies retention. Exits when the last
-/// `Db` handle is dropped (the `Weak` fails to upgrade) or the DB is closed.
-fn run_maintenance(weak: Weak<Db>, interval: std::time::Duration) {
-    let tick = interval
-        .min(std::time::Duration::from_secs(1))
-        .max(std::time::Duration::from_millis(5));
-    let mut since_last = std::time::Duration::ZERO;
+/// The flush policy the scheduler will actually run: the host's, or — when it configured maintenance
+/// but no policy — the default one with the maintenance interval as its seal cadence, which is what
+/// the scheduler did before `DbBuilder::flush` existed. An *explicit* `FlushPolicy::manual()` is
+/// honored as written and never gets an interval grafted on.
+fn resolve_flush(
+    policy: Option<FlushPolicy>,
+    maintenance_interval: std::time::Duration,
+) -> FlushPolicy {
+    match policy {
+        Some(policy) => policy,
+        None => FlushPolicy::default().or_interval(maintenance_interval),
+    }
+}
+
+/// The clockwork shared by the two maintenance loops (ARCHITECTURE.md §5/§7): it owns the elapsed-time
+/// bookkeeping for the flush policy's periodic trigger, the WAL fsync timer, and the retention pass,
+/// so the sync (owned-thread) and async (host-runtime) loops differ only in how they sleep.
+///
+/// Sleeping happens in slices of at most a second even when the policy's tick is longer, so `close()`
+/// never waits a whole tick for the loop to notice the `closed` flag. The policy's tick therefore
+/// throttles only the *gauge* evaluation — the one part that costs a lock (and, with a WAL-size
+/// trigger, a directory scan).
+struct FlushScheduler {
+    policy: FlushPolicy,
+    /// How often the buffer gauges are evaluated (the policy's effective tick).
+    tick: std::time::Duration,
+    /// How often `retain()` runs — the `Maintenance` interval.
+    retention_interval: std::time::Duration,
+    since_eval: std::time::Duration,
+    since_seal: std::time::Duration,
+    since_retention: std::time::Duration,
+    since_wal_sync: std::time::Duration,
+}
+
+impl FlushScheduler {
+    /// A second: the coarsest sleep that still keeps `close()` prompt.
+    const MAX_SLICE: std::time::Duration = std::time::Duration::from_secs(1);
+
+    fn new(policy: FlushPolicy, retention_interval: std::time::Duration) -> Self {
+        FlushScheduler {
+            tick: policy.effective_tick(),
+            policy,
+            retention_interval,
+            since_eval: std::time::Duration::ZERO,
+            since_seal: std::time::Duration::ZERO,
+            since_retention: std::time::Duration::ZERO,
+            since_wal_sync: std::time::Duration::ZERO,
+        }
+    }
+
+    /// How long to sleep before the next [`Self::advance`].
+    fn slice(&self) -> std::time::Duration {
+        self.tick.min(Self::MAX_SLICE)
+    }
+
+    /// Do whatever `elapsed` more time has made due: seal (per the policy), fsync a
+    /// `WalMode::Interval` WAL, and apply retention. Errors are swallowed exactly as they were before
+    /// this loop had a policy — a scheduled pass that fails must not kill the scheduler; the next
+    /// explicit `flush()`/`close()` surfaces the failure to the host.
+    fn advance(&mut self, db: &Db, elapsed: std::time::Duration) {
+        self.since_eval += elapsed;
+        self.since_seal += elapsed;
+        self.since_retention += elapsed;
+        self.since_wal_sync += elapsed;
+
+        // 1. Seal. The periodic trigger is our own bookkeeping; the rest read the live gauges, no more
+        // often than one policy tick.
+        let mut seal = self.policy.interval().is_some_and(|i| self.since_seal >= i);
+        if !seal && self.since_eval >= self.tick && !self.policy.is_manual() {
+            self.since_eval = std::time::Duration::ZERO;
+            let gauges = db.storage.flush_gauges();
+            let wal_bytes = self
+                .policy
+                .needs_wal_bytes()
+                .then(|| db.storage.wal_bytes());
+            seal = self.policy.triggered(
+                gauges.buffer_bytes,
+                gauges.buffer_rows,
+                wal_bytes,
+                gauges.idle_for,
+                db.storage.seal_threshold_bytes(),
+            );
+        }
+        if seal {
+            self.since_seal = std::time::Duration::ZERO;
+            self.since_eval = std::time::Duration::ZERO;
+            let _ = db.storage.seal();
+        }
+
+        // 2. The WAL fsync timer — what makes `WalMode::Interval(d)` mean something. `Always` already
+        // fsynced inline and `Off` asked us not to, so both report no interval.
+        if let Some(d) = db.storage.wal_sync_interval()
+            && self.since_wal_sync >= d
+        {
+            self.since_wal_sync = std::time::Duration::ZERO;
+            let _ = db.storage.sync_wal();
+        }
+
+        // 3. Retention, on the maintenance interval.
+        if self.since_retention >= self.retention_interval {
+            self.since_retention = std::time::Duration::ZERO;
+            let _ = db.storage.retain();
+        }
+    }
+}
+
+/// The background-maintenance loop (ARCHITECTURE.md §5), on an owned thread. Sleeps in slices of at
+/// most a second to notice a close / drop promptly, and on each slice lets the [`FlushScheduler`] do
+/// what has come due: seal per `flush`, fsync an interval-mode WAL, and apply retention every
+/// `interval`. Exits when the last `Db` handle is dropped (the `Weak` fails to upgrade) or the DB is
+/// closed.
+fn run_maintenance(weak: Weak<Db>, interval: std::time::Duration, flush: FlushPolicy) {
+    let mut sched = FlushScheduler::new(flush, interval);
     loop {
-        std::thread::sleep(tick);
+        let slice = sched.slice();
+        std::thread::sleep(slice);
         let Some(inner) = weak.upgrade() else {
             break; // all Db handles dropped
         };
         if inner.closed.load(Ordering::Acquire) {
             break;
         }
-        // Every tick: seal promptly if the buffer has grown past its byte threshold.
-        let _ = inner.storage.seal_if_full();
-        since_last += tick;
-        if since_last >= interval {
-            since_last = std::time::Duration::ZERO;
-            let _ = inner.storage.seal();
-            let _ = inner.storage.retain();
-        }
+        sched.advance(&inner, slice);
         drop(inner); // release the strong ref before sleeping again
     }
 }
 
-/// The async twin of [`run_maintenance`] for `Maintenance::Runtime`: same close/drop semantics and
-/// the same per-tick byte-threshold seal + interval-driven seal/retention, but scheduled on a
-/// host-provided tokio runtime (via `tokio::time::sleep`) instead of an owned OS thread. `close()`
-/// awaits the returned task, so shutdown stays synchronous with any in-flight seal.
-async fn run_maintenance_async(weak: Weak<Db>, interval: std::time::Duration) {
-    let tick = interval
-        .min(std::time::Duration::from_secs(1))
-        .max(std::time::Duration::from_millis(5));
-    let mut since_last = std::time::Duration::ZERO;
+/// The async twin of [`run_maintenance`] for `Maintenance::Runtime`: same close/drop semantics and the
+/// same [`FlushScheduler`], but scheduled on a host-provided tokio runtime (via `tokio::time::sleep`)
+/// instead of an owned OS thread. `close()` awaits the returned task, so shutdown stays synchronous
+/// with any in-flight seal.
+async fn run_maintenance_async(weak: Weak<Db>, interval: std::time::Duration, flush: FlushPolicy) {
+    let mut sched = FlushScheduler::new(flush, interval);
     loop {
-        tokio::time::sleep(tick).await;
+        let slice = sched.slice();
+        tokio::time::sleep(slice).await;
         let Some(inner) = weak.upgrade() else {
             break; // all Db handles dropped
         };
         if inner.closed.load(Ordering::Acquire) {
             break;
         }
-        let _ = inner.storage.seal_if_full();
-        since_last += tick;
-        if since_last >= interval {
-            since_last = std::time::Duration::ZERO;
-            let _ = inner.storage.seal();
-            let _ = inner.storage.retain();
-        }
+        sched.advance(&inner, slice);
         drop(inner); // release the strong ref before the next sleep (never held across `.await`)
     }
 }
@@ -5811,6 +5937,233 @@ mod tests {
             "byte-threshold seal did not fire before the interval elapsed"
         );
         assert_eq!(count(&db, "SELECT count(*) AS c FROM logs").await, 9);
+        db.close().await.unwrap();
+    }
+
+    /// Poll (with a timeout) for a condition the background scheduler is expected to bring about. The
+    /// `Background` loop runs on its own OS thread, so a thread sleep is the right wait even inside a
+    /// current-thread runtime — nothing here needs the test's runtime to be free.
+    fn wait_until(timeout: std::time::Duration, mut done: impl FnMut() -> bool) -> bool {
+        let step = std::time::Duration::from_millis(10);
+        let mut waited = std::time::Duration::ZERO;
+        while waited < timeout {
+            if done() {
+                return true;
+            }
+            std::thread::sleep(step);
+            waited += step;
+        }
+        done()
+    }
+
+    fn wait_for_segment(db: &Arc<Db>, timeout: std::time::Duration) -> bool {
+        wait_until(timeout, || !db.segments().is_empty())
+    }
+
+    /// A long maintenance interval means the *retention* clock cannot seal anything during the test;
+    /// every segment observed below is the flush policy's doing. 30s of slack is generous for a
+    /// millisecond-scale trigger while still failing rather than hanging.
+    const SLOW_MAINTENANCE: std::time::Duration = std::time::Duration::from_secs(3600);
+    const SEAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// The size-based strategy with an *explicit* threshold: a handful of small rows seals, where the
+    /// budget-derived default would have needed megabytes.
+    #[tokio::test(flavor = "current_thread")]
+    async fn flush_policy_size_trigger_seals_a_small_buffer() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::builder(dir.path())
+            .maintenance(Maintenance::Background(SLOW_MAINTENANCE))
+            .flush(FlushPolicy::size_based(512).tick(std::time::Duration::from_millis(10)))
+            .open()
+            .unwrap();
+        db.ingest_otlp_logs(&otlp_log("cart", &"x".repeat(600), 1))
+            .await
+            .unwrap();
+        assert!(
+            wait_for_segment(&db, SEAL_TIMEOUT),
+            "explicit byte threshold did not seal"
+        );
+        assert_eq!(count(&db, "SELECT count(*) AS c FROM logs").await, 1);
+        db.close().await.unwrap();
+    }
+
+    /// The periodic strategy, on the *policy's* clock rather than the maintenance interval — the two
+    /// cadences are independent, so a 3600s retention interval does not slow sealing down.
+    #[tokio::test(flavor = "current_thread")]
+    async fn flush_policy_periodic_trigger_is_independent_of_retention() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::builder(dir.path())
+            .maintenance(Maintenance::Background(SLOW_MAINTENANCE))
+            .flush(FlushPolicy::periodic(std::time::Duration::from_millis(20)))
+            .open()
+            .unwrap();
+        db.ingest_otlp_logs(&otlp_log("cart", "x", 1))
+            .await
+            .unwrap();
+        assert!(
+            wait_for_segment(&db, SEAL_TIMEOUT),
+            "periodic trigger did not seal inside the retention interval"
+        );
+        assert_eq!(count(&db, "SELECT count(*) AS c FROM logs").await, 1);
+        db.close().await.unwrap();
+    }
+
+    /// The row-count strategy: seal once N rows are buffered, whatever they weigh.
+    #[tokio::test(flavor = "current_thread")]
+    async fn flush_policy_row_trigger_seals_at_the_row_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::builder(dir.path())
+            .maintenance(Maintenance::Background(SLOW_MAINTENANCE))
+            .flush(
+                FlushPolicy::manual()
+                    .at_buffer_rows(3)
+                    .tick(std::time::Duration::from_millis(10)),
+            )
+            .open()
+            .unwrap();
+        // Two rows is under the threshold; give the scheduler ticks to prove it stays put.
+        for i in 1..=2u64 {
+            db.ingest_otlp_logs(&otlp_log("cart", "x", i))
+                .await
+                .unwrap();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(
+            db.segments().is_empty(),
+            "sealed below the configured row count"
+        );
+        db.ingest_otlp_logs(&otlp_log("cart", "x", 3))
+            .await
+            .unwrap();
+        assert!(
+            wait_for_segment(&db, SEAL_TIMEOUT),
+            "row-count trigger did not seal"
+        );
+        assert_eq!(count(&db, "SELECT count(*) AS c FROM logs").await, 3);
+        db.close().await.unwrap();
+    }
+
+    /// The WAL-size strategy: sealing is what lets the WAL be reclaimed, so this trigger is how a
+    /// long-running writer bounds WAL growth on disk.
+    #[tokio::test(flavor = "current_thread")]
+    async fn flush_policy_wal_trigger_seals_and_reclaims_the_wal() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::builder(dir.path())
+            .maintenance(Maintenance::Background(SLOW_MAINTENANCE))
+            .flush(
+                FlushPolicy::manual()
+                    .at_wal_bytes(4096)
+                    .tick(std::time::Duration::from_millis(10)),
+            )
+            .open()
+            .unwrap();
+        // Each record's raw OTLP payload goes into the WAL, so a few KiB of bodies crosses 4 KiB.
+        let big = "x".repeat(2048);
+        for i in 1..=4u64 {
+            db.ingest_otlp_logs(&otlp_log("cart", &big, i))
+                .await
+                .unwrap();
+        }
+        assert!(
+            wait_for_segment(&db, SEAL_TIMEOUT),
+            "WAL-size trigger did not seal"
+        );
+        assert_eq!(count(&db, "SELECT count(*) AS c FROM logs").await, 4);
+        // Each seal advances the watermark, so the covered WAL segments are reclaimed — the WAL has to
+        // fall back under the trigger, or it would fire forever. The scheduler may have sealed
+        // part-way through the ingest loop, so this converges over a tick or two rather than at once.
+        assert!(
+            wait_until(SEAL_TIMEOUT, || db.storage.wal_bytes() < 4096),
+            "sealing must let the WAL shrink, else the trigger would fire forever"
+        );
+        db.close().await.unwrap();
+    }
+
+    /// The idle strategy: a quiet workload's tail lands in Parquet without a short periodic timer, and
+    /// an empty buffer never asks for a no-op seal.
+    #[tokio::test(flavor = "current_thread")]
+    async fn flush_policy_idle_trigger_seals_after_quiet() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::builder(dir.path())
+            .maintenance(Maintenance::Background(SLOW_MAINTENANCE))
+            .flush(FlushPolicy::manual().after_idle(std::time::Duration::from_millis(50)))
+            .open()
+            .unwrap();
+        // Nothing ingested: the idle window passes with an empty buffer and nothing is sealed.
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        assert!(db.segments().is_empty(), "no rows, no segment");
+
+        db.ingest_otlp_logs(&otlp_log("cart", "x", 1))
+            .await
+            .unwrap();
+        assert!(
+            wait_for_segment(&db, SEAL_TIMEOUT),
+            "idle trigger did not seal the tail"
+        );
+        assert_eq!(count(&db, "SELECT count(*) AS c FROM logs").await, 1);
+        db.close().await.unwrap();
+    }
+
+    /// `FlushPolicy::manual()` is honored as written: the scheduler still runs (retention, WAL fsync)
+    /// but never seals on its own, even though the maintenance interval is short.
+    #[tokio::test(flavor = "current_thread")]
+    async fn flush_policy_manual_never_auto_seals() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::builder(dir.path())
+            .maintenance(Maintenance::Background(std::time::Duration::from_millis(
+                10,
+            )))
+            .flush(FlushPolicy::manual())
+            .open()
+            .unwrap();
+        db.ingest_otlp_logs(&otlp_log("cart", "x", 1))
+            .await
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(
+            db.segments().is_empty(),
+            "an explicit manual policy must not inherit the maintenance interval"
+        );
+        // The rows are still queryable from the buffer, and an explicit flush still seals.
+        assert_eq!(count(&db, "SELECT count(*) AS c FROM logs").await, 1);
+        db.flush().await.unwrap();
+        assert_eq!(db.segments().len(), 1);
+        db.close().await.unwrap();
+    }
+
+    /// `WalMode::Interval(d)` is a promise the scheduler keeps: with one running, the durable watermark
+    /// advances on the timer, with no `flush()`/`close()` and no per-ingest fsync.
+    #[tokio::test(flavor = "current_thread")]
+    async fn wal_interval_is_fsynced_by_the_scheduler() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::builder(dir.path())
+            .wal(WalMode::Interval(std::time::Duration::from_millis(20)))
+            // Manual flushing keeps the seal path out of it: any durability we observe came from the
+            // WAL fsync timer, not from a segment write advancing the watermark.
+            .flush(FlushPolicy::manual())
+            .maintenance(Maintenance::Background(SLOW_MAINTENANCE))
+            .open()
+            .unwrap();
+        let receipt = db
+            .ingest_otlp_logs(&otlp_log("cart", "x", 1))
+            .await
+            .unwrap();
+        assert!(!receipt.durable, "interval mode does not fsync inline");
+
+        let mut durable = None;
+        for _ in 0..300 {
+            durable = db.durable_through().await;
+            if durable.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(
+            durable.map(|l| l.get()),
+            Some(1),
+            "the scheduler never fsynced an interval-mode WAL"
+        );
+        assert!(db.segments().is_empty(), "the fsync timer must not seal");
         db.close().await.unwrap();
     }
 

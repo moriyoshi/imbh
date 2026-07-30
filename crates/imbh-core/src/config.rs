@@ -1,9 +1,13 @@
 //! DB configuration knobs (ARCHITECTURE.md §10.2). Honored today: [`MemoryBudget`] (query pool),
 //! [`Compression`] (segment codec), [`WalMode`] (fsync policy), [`Retention`]
-//! (age + disk-budget), and [`Promote`] (attribute keys lifted to typed columns). The
-//! maintenance-scheduler knob lands later.
+//! (age + disk-budget), [`Promote`] (attribute keys lifted to typed columns), [`Maintenance`] (who
+//! runs the scheduler) and [`FlushPolicy`] (when that scheduler seals the buffer).
 
+use std::fmt;
+use std::str::FromStr;
 use std::time::Duration;
+
+use crate::error::{Error, Result};
 
 /// Attribute keys promoted to typed columns at rest (ARCHITECTURE.md §6.1). Each key becomes a
 /// nullable `Dictionary(Int32,Utf8)` column appended to **every** signal's schema (uniform across
@@ -112,9 +116,9 @@ pub enum Access {
 /// WAL fsync policy (ARCHITECTURE.md §7/§10.2).
 ///
 /// - `Always` — fsync every ingest before returning (durable receipts).
-/// - `Interval(d)` — fsync at most every `d`. M1 fsyncs opportunistically on `flush`/`close`
-///   (no background timer thread yet — the embedder "no background threads" guarantee, §5);
-///   a timer-driven flusher is a follow-up.
+/// - `Interval(d)` — fsync at most every `d`, on the flush scheduler's clock. Because the scheduler
+///   is opt-in ([`Maintenance::Background`] / [`Maintenance::Runtime`] — the embedder "no background
+///   threads" guarantee, §5), a `Manual` DB fsyncs only opportunistically, on `flush`/`close`.
 /// - `Off` — never fsync inline; durability follows the OS. The WAL frames are still written,
 ///   so a clean restart still replays them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -179,11 +183,13 @@ impl Default for Retention {
 }
 
 /// Maintenance policy (ARCHITECTURE.md §5/§10.2) — the knob behind "no background threads unless opted
-/// in". `Manual` means the host must call `db.maintain()`; `Background(interval)` spawns one owned
-/// thread that periodically seals + applies retention; `Runtime(handle, interval)` runs that same
-/// loop on a host-provided tokio runtime instead of owning an OS thread. Both `Background` and
-/// `Runtime` also seal promptly the moment the buffer crosses its byte threshold — the `interval`
-/// only governs the periodic seal + retention.
+/// in". It picks **who runs the scheduler**: `Manual` means the host must call `db.maintain()`;
+/// `Background(interval)` spawns one owned thread; `Runtime(handle, interval)` runs that same loop on a
+/// host-provided tokio runtime instead of owning an OS thread.
+///
+/// The `interval` is the **retention** cadence (the periodic `retain()` pass). **When** the buffer is
+/// sealed is a separate decision, owned by [`FlushPolicy`] — and when the host sets no policy, the
+/// same `interval` doubles as the periodic seal cadence, which is the historical behavior.
 ///
 /// Carrying a [`tokio::runtime::Handle`] makes this enum non-`Copy` (it stays `Clone`).
 #[derive(Debug, Clone, Default)]
@@ -192,9 +198,438 @@ pub enum Maintenance {
     Manual,
     Background(Duration),
     /// Schedule the maintenance loop onto a host-provided tokio runtime (no owned OS thread), at the
-    /// given periodic seal + retention `interval`. The buffer-byte seal fires on every tick
+    /// given retention `interval`. Sealing follows [`FlushPolicy`], evaluated every policy tick
     /// regardless of `interval`. Ignored for in-memory DBs.
     Runtime(tokio::runtime::Handle, Duration),
+}
+
+/// How big the mutable buffer may get before the flush scheduler seals it — the *size-based* trigger
+/// of a [`FlushPolicy`] (ARCHITECTURE.md §7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum FlushSize {
+    /// Derive the threshold from the [`MemoryBudget`] (a quarter of it, floored at 8 MiB) — the
+    /// default, and what the engine has always used.
+    #[default]
+    Budget,
+    /// An explicit buffered-heap threshold in bytes.
+    Bytes(usize),
+    /// No size-based sealing at all (time/row/WAL triggers, if any, still apply).
+    Off,
+}
+
+/// When the flush scheduler turns the mutable buffer into an immutable segment (ARCHITECTURE.md
+/// §5/§7/§10.2).
+///
+/// A [`Db`] never seals on its own: sealing happens on an explicit `flush()`/`maintain()`/`close()`,
+/// or on the opt-in scheduler thread/task chosen by [`Maintenance`]. This type is what that scheduler
+/// consults — the strategies are **independent triggers, OR-ed together**, so a policy can be purely
+/// periodic, purely size-based, or any mix:
+///
+/// - **Periodic** — [`every`](Self::every): seal every `d`, regardless of how little is buffered.
+/// - **Size (heap)** — [`at_buffer_bytes`](Self::at_buffer_bytes) / [`size`](Self::size): seal once the
+///   buffered rows hold at least `n` bytes. Defaults to [`FlushSize::Budget`].
+/// - **Size (rows)** — [`at_buffer_rows`](Self::at_buffer_rows): seal once at least `n` rows are
+///   buffered across all tables.
+/// - **WAL size** — [`at_wal_bytes`](Self::at_wal_bytes): seal once the on-disk WAL reaches `n` bytes.
+///   Sealing is what lets the WAL be reclaimed, so this bounds WAL growth directly.
+/// - **Idle** — [`after_idle`](Self::after_idle): seal once nothing has been ingested for `d` (and
+///   something is buffered). Lands a quiet workload's tail in Parquet without a short periodic timer.
+///
+/// [`tick`](Self::tick) sets how often the triggers are evaluated (default 1s); the periodic trigger is
+/// rounded up to it.
+///
+/// The [`Default`] is [`FlushSize::Budget`] with no trigger of its own beyond that: a host that never
+/// calls `DbBuilder::flush` keeps the historical behavior, where the [`Maintenance`] interval supplies
+/// the periodic seal. [`manual`](Self::manual) disables every trigger, so only explicit `flush()`
+/// seals.
+///
+/// A policy also parses from a compact spec string (`"interval=5s,wal=64MiB"`, or `"manual"`) via
+/// [`FromStr`], which is how a host exposes it as one config value; [`fmt::Display`] renders the same
+/// syntax back.
+///
+/// [`Db`]: https://docs.rs/imbh
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FlushPolicy {
+    size: FlushSize,
+    interval: Option<Duration>,
+    rows: Option<u64>,
+    wal_bytes: Option<u64>,
+    idle: Option<Duration>,
+    tick: Duration,
+}
+
+impl FlushPolicy {
+    /// The scheduler's default evaluation cadence.
+    pub const DEFAULT_TICK: Duration = Duration::from_secs(1);
+    /// Ticks are clamped into this range: fast enough to honor a sub-second trigger, slow enough that
+    /// a mistyped `tick=0` cannot spin the scheduler.
+    const MIN_TICK: Duration = Duration::from_millis(5);
+    const MAX_TICK: Duration = Duration::from_secs(60);
+
+    /// No automatic sealing: only `flush()` / `maintain()` / `close()` seal. A scheduler configured
+    /// with this policy still applies retention on the [`Maintenance`] interval and still fsyncs the
+    /// WAL under [`WalMode::Interval`].
+    pub fn manual() -> Self {
+        FlushPolicy {
+            size: FlushSize::Off,
+            interval: None,
+            rows: None,
+            wal_bytes: None,
+            idle: None,
+            tick: Self::DEFAULT_TICK,
+        }
+    }
+
+    /// Seal every `d` (the periodic strategy). Keeps the default size trigger; chain the other
+    /// setters to add more.
+    pub fn periodic(d: Duration) -> Self {
+        FlushPolicy::default().every(d)
+    }
+
+    /// Seal once the buffered rows hold at least `bytes` (the size-based strategy), with no periodic
+    /// timer of its own.
+    pub fn size_based(bytes: usize) -> Self {
+        FlushPolicy::default().at_buffer_bytes(bytes)
+    }
+
+    /// Add/replace the periodic trigger: seal every `d`.
+    pub fn every(mut self, d: Duration) -> Self {
+        self.interval = Some(d);
+        self
+    }
+
+    /// Set the size-based trigger explicitly (including [`FlushSize::Off`]).
+    pub fn size(mut self, size: FlushSize) -> Self {
+        self.size = size;
+        self
+    }
+
+    /// Add/replace the size-based trigger: seal at `bytes` of buffered heap.
+    pub fn at_buffer_bytes(self, bytes: usize) -> Self {
+        self.size(FlushSize::Bytes(bytes))
+    }
+
+    /// Add/replace the row-count trigger: seal at `rows` buffered rows (summed across tables).
+    pub fn at_buffer_rows(mut self, rows: u64) -> Self {
+        self.rows = Some(rows);
+        self
+    }
+
+    /// Add/replace the WAL-size trigger: seal once the on-disk WAL reaches `bytes`. Sealing advances
+    /// the watermark, which is what allows the covered WAL to be reclaimed.
+    pub fn at_wal_bytes(mut self, bytes: u64) -> Self {
+        self.wal_bytes = Some(bytes);
+        self
+    }
+
+    /// Add/replace the idle trigger: seal once nothing has been ingested for `d` and the buffer is
+    /// non-empty.
+    pub fn after_idle(mut self, d: Duration) -> Self {
+        self.idle = Some(d);
+        self
+    }
+
+    /// How often the triggers are evaluated. Clamped to [5ms, 60s]; a `tick` longer than the periodic
+    /// interval is additionally clamped to it by [`Self::effective_tick`].
+    pub fn tick(mut self, d: Duration) -> Self {
+        self.tick = d.clamp(Self::MIN_TICK, Self::MAX_TICK);
+        self
+    }
+
+    pub fn size_trigger(&self) -> FlushSize {
+        self.size
+    }
+
+    pub fn interval(&self) -> Option<Duration> {
+        self.interval
+    }
+
+    pub fn buffer_rows(&self) -> Option<u64> {
+        self.rows
+    }
+
+    pub fn wal_bytes(&self) -> Option<u64> {
+        self.wal_bytes
+    }
+
+    pub fn idle(&self) -> Option<Duration> {
+        self.idle
+    }
+
+    /// The scheduler's sleep granularity: the configured tick, never longer than the periodic
+    /// interval (so `interval=200ms` is honored without also setting `tick`), and never outside
+    /// [5ms, 60s].
+    pub fn effective_tick(&self) -> Duration {
+        let mut tick = self.tick;
+        if let Some(interval) = self.interval {
+            tick = tick.min(interval);
+        }
+        if let Some(idle) = self.idle {
+            tick = tick.min(idle);
+        }
+        tick.clamp(Self::MIN_TICK, Self::MAX_TICK)
+    }
+
+    /// `true` when no trigger is enabled — the scheduler then never seals on its own.
+    pub fn is_manual(&self) -> bool {
+        self.size == FlushSize::Off
+            && self.interval.is_none()
+            && self.rows.is_none()
+            && self.wal_bytes.is_none()
+            && self.idle.is_none()
+    }
+
+    /// `true` when a trigger needs the on-disk WAL size, which costs a directory scan — the scheduler
+    /// skips that measurement otherwise.
+    pub fn needs_wal_bytes(&self) -> bool {
+        self.wal_bytes.is_some()
+    }
+
+    /// Fill in the periodic trigger from the [`Maintenance`] interval when the policy has none. Used
+    /// at open for a host that configured maintenance but no explicit policy: sealing then keeps
+    /// following the maintenance interval, as it did before this knob existed.
+    pub fn or_interval(mut self, d: Duration) -> Self {
+        if self.interval.is_none() {
+            self.interval = Some(d);
+        }
+        self
+    }
+
+    /// Evaluate the size/row/WAL/idle triggers against a set of gauges. The periodic trigger is the
+    /// scheduler's own bookkeeping, so it is not decided here.
+    ///
+    /// `size_threshold` is the budget-derived threshold the engine would use for [`FlushSize::Budget`];
+    /// `wal_bytes` may be `None` when [`Self::needs_wal_bytes`] said not to measure it. `idle_for` is
+    /// the time since the last ingest.
+    pub fn triggered(
+        &self,
+        buffer_bytes: usize,
+        buffer_rows: u64,
+        wal_bytes: Option<u64>,
+        idle_for: Duration,
+        size_threshold: usize,
+    ) -> bool {
+        // Nothing buffered → nothing to seal. Cheap guard that also keeps the idle trigger from
+        // re-firing on an empty buffer every tick of a quiet DB.
+        if buffer_rows == 0 {
+            return false;
+        }
+        let size_hit = match self.size {
+            FlushSize::Budget => buffer_bytes >= size_threshold,
+            FlushSize::Bytes(n) => buffer_bytes >= n,
+            FlushSize::Off => false,
+        };
+        size_hit
+            || self.rows.is_some_and(|n| buffer_rows >= n)
+            || wal_bytes
+                .zip(self.wal_bytes)
+                .is_some_and(|(measured, limit)| measured >= limit)
+            || self.idle.is_some_and(|d| idle_for >= d)
+    }
+}
+
+impl Default for FlushPolicy {
+    fn default() -> Self {
+        FlushPolicy {
+            size: FlushSize::Budget,
+            interval: None,
+            rows: None,
+            wal_bytes: None,
+            idle: None,
+            tick: Self::DEFAULT_TICK,
+        }
+    }
+}
+
+/// Parse a flush-policy spec: comma-separated `key=value` pairs, or the single word `manual` (aliases
+/// `off` / `none` / `never`).
+///
+/// Keys: `interval` / `every` (duration), `buffer` / `bytes` (size, or `budget` / `off`), `rows`
+/// (integer), `wal` (size), `idle` (duration), `tick` (duration). Unknown keys are an error rather
+/// than a silent no-op, so a typo in a deployment's config surfaces at startup.
+///
+/// ```
+/// use imbh_core::FlushPolicy;
+/// let p: FlushPolicy = "interval=5s,wal=64MiB".parse().unwrap();
+/// assert_eq!(p.interval(), Some(std::time::Duration::from_secs(5)));
+/// assert_eq!(p.wal_bytes(), Some(64 << 20));
+/// assert!("manual".parse::<FlushPolicy>().unwrap().is_manual());
+/// ```
+impl FromStr for FlushPolicy {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        let spec = s.trim();
+        if spec.is_empty() {
+            return Ok(FlushPolicy::default());
+        }
+        if matches!(
+            spec.to_ascii_lowercase().as_str(),
+            "manual" | "off" | "none" | "never"
+        ) {
+            return Ok(FlushPolicy::manual());
+        }
+        let mut policy = FlushPolicy::default();
+        for field in spec.split(',') {
+            let field = field.trim();
+            if field.is_empty() {
+                continue; // tolerate a trailing comma
+            }
+            let (key, value) = field.split_once('=').ok_or_else(|| {
+                Error::config_msg(format!(
+                    "flush policy: expected `key=value` in `{field}` (or the single word `manual`)"
+                ))
+            })?;
+            let (key, value) = (key.trim().to_ascii_lowercase(), value.trim());
+            match key.as_str() {
+                "interval" | "every" => policy = policy.every(parse_duration(value)?),
+                "buffer" | "bytes" => {
+                    policy = match value.to_ascii_lowercase().as_str() {
+                        "budget" | "default" => policy.size(FlushSize::Budget),
+                        "off" | "none" => policy.size(FlushSize::Off),
+                        _ => policy
+                            .at_buffer_bytes(parse_bytes(value)?.min(usize::MAX as u64) as usize),
+                    }
+                }
+                "rows" => policy = policy.at_buffer_rows(parse_count(value)?),
+                "wal" => policy = policy.at_wal_bytes(parse_bytes(value)?),
+                "idle" => policy = policy.after_idle(parse_duration(value)?),
+                "tick" => policy = policy.tick(parse_duration(value)?),
+                other => {
+                    return Err(Error::config_msg(format!(
+                        "flush policy: unknown key `{other}` (expected interval/buffer/rows/wal/idle/tick)"
+                    )));
+                }
+            }
+        }
+        Ok(policy)
+    }
+}
+
+/// Renders the spec syntax [`FromStr`] accepts, so a host can log the effective policy.
+impl fmt::Display for FlushPolicy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.is_manual() {
+            return f.write_str("manual");
+        }
+        let mut sep = "";
+        let mut field = |f: &mut fmt::Formatter<'_>, text: String| -> fmt::Result {
+            f.write_str(sep)?;
+            sep = ",";
+            f.write_str(&text)
+        };
+        if let Some(d) = self.interval {
+            field(f, format!("interval={}", DurationSpec(d)))?;
+        }
+        match self.size {
+            FlushSize::Budget => field(f, "buffer=budget".to_owned())?,
+            FlushSize::Bytes(n) => field(f, format!("buffer={n}"))?,
+            FlushSize::Off => field(f, "buffer=off".to_owned())?,
+        }
+        if let Some(n) = self.rows {
+            field(f, format!("rows={n}"))?;
+        }
+        if let Some(n) = self.wal_bytes {
+            field(f, format!("wal={n}"))?;
+        }
+        if let Some(d) = self.idle {
+            field(f, format!("idle={}", DurationSpec(d)))?;
+        }
+        field(f, format!("tick={}", DurationSpec(self.tick)))
+    }
+}
+
+/// A [`Duration`] in the spec's own syntax (`500ms` / `5s` / `2m`), for [`FlushPolicy`]'s `Display`.
+struct DurationSpec(Duration);
+
+impl fmt::Display for DurationSpec {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let ms = self.0.as_millis();
+        // Prefer the coarsest unit that stays exact, so a round-trip through `FromStr` is lossless
+        // and the rendering reads the way it was written.
+        if ms == 0 {
+            f.write_str("0s")
+        } else if ms.is_multiple_of(3_600_000) {
+            write!(f, "{}h", ms / 3_600_000)
+        } else if ms.is_multiple_of(60_000) {
+            write!(f, "{}m", ms / 60_000)
+        } else if ms.is_multiple_of(1_000) {
+            write!(f, "{}s", ms / 1_000)
+        } else {
+            write!(f, "{ms}ms")
+        }
+    }
+}
+
+/// Parse a duration in the config spec's syntax: an integer with an optional `ms` / `s` / `m` / `h`
+/// suffix (bare numbers are seconds). Fractions are deliberately not accepted — `500ms` is
+/// unambiguous where `0.5` is not.
+pub fn parse_duration(s: &str) -> Result<Duration> {
+    let s = s.trim();
+    let (digits, unit) = split_unit(s);
+    let n: u64 = digits.parse().map_err(|_| {
+        Error::config_msg(format!(
+            "`{s}` is not a duration (expected e.g. 500ms, 5s, 2m, 1h)"
+        ))
+    })?;
+    match unit.to_ascii_lowercase().as_str() {
+        "" | "s" | "sec" | "secs" => Ok(Duration::from_secs(n)),
+        "ms" => Ok(Duration::from_millis(n)),
+        "m" | "min" | "mins" => Ok(Duration::from_secs(n * 60)),
+        "h" | "hr" | "hrs" => Ok(Duration::from_secs(n * 3600)),
+        other => Err(Error::config_msg(format!(
+            "`{s}` has an unknown duration unit `{other}` (expected ms, s, m or h)"
+        ))),
+    }
+}
+
+/// Parse a byte size: an integer with an optional binary (`KiB`/`MiB`/`GiB`) or decimal
+/// (`KB`/`MB`/`GB`) suffix; a bare number is bytes. `K`/`M`/`G` alone are binary, matching how
+/// operators usually mean them.
+pub fn parse_bytes(s: &str) -> Result<u64> {
+    let s = s.trim();
+    let (digits, unit) = split_unit(s);
+    let n: u64 = digits.parse().map_err(|_| {
+        Error::config_msg(format!(
+            "`{s}` is not a byte size (expected e.g. 8388608, 16MiB, 1GB)"
+        ))
+    })?;
+    let scale: u64 = match unit.to_ascii_lowercase().as_str() {
+        "" | "b" => 1,
+        "k" | "kib" => 1 << 10,
+        "m" | "mib" => 1 << 20,
+        "g" | "gib" => 1 << 30,
+        "kb" => 1_000,
+        "mb" => 1_000_000,
+        "gb" => 1_000_000_000,
+        other => {
+            return Err(Error::config_msg(format!(
+                "`{s}` has an unknown size unit `{other}` (expected KiB, MiB, GiB, KB, MB or GB)"
+            )));
+        }
+    };
+    n.checked_mul(scale)
+        .ok_or_else(|| Error::config_msg(format!("`{s}` overflows a byte count")))
+}
+
+/// Parse a plain count (`rows=`), allowing `_` separators for readability.
+fn parse_count(s: &str) -> Result<u64> {
+    let cleaned: String = s.chars().filter(|c| *c != '_').collect();
+    cleaned
+        .trim()
+        .parse()
+        .map_err(|_| Error::config_msg(format!("`{s}` is not a row count")))
+}
+
+/// Split a config scalar into its leading digits and its unit suffix. Underscores in the number are
+/// dropped so `16_384` parses.
+fn split_unit(s: &str) -> (String, &str) {
+    let split = s
+        .find(|c: char| !c.is_ascii_digit() && c != '_')
+        .unwrap_or(s.len());
+    let digits = s[..split].chars().filter(|c| *c != '_').collect();
+    (digits, s[split..].trim())
 }
 
 /// Ingest execution policy (ARCHITECTURE.md §5/§10.5) — the second knob behind "no background threads
@@ -261,4 +696,182 @@ pub enum Refresh {
     /// Never auto-rebuild — queries see a fixed snapshot until an explicit `Db::refresh()`. Gives a
     /// reader a stable view across many queries (e.g. a dashboard render) with no implicit drift.
     Manual,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const S: fn(u64) -> Duration = Duration::from_secs;
+
+    #[test]
+    fn default_policy_is_budget_sized_with_no_timer() {
+        let p = FlushPolicy::default();
+        assert_eq!(p.size_trigger(), FlushSize::Budget);
+        assert_eq!(p.interval(), None);
+        assert!(!p.is_manual(), "the budget size trigger is a trigger");
+        assert_eq!(p.effective_tick(), FlushPolicy::DEFAULT_TICK);
+        // A host that configured maintenance but no policy keeps the historical behavior: the
+        // maintenance interval becomes the periodic seal cadence.
+        assert_eq!(p.or_interval(S(30)).interval(), Some(S(30)));
+        // …and an explicit interval is never overwritten by it.
+        assert_eq!(
+            FlushPolicy::periodic(S(5)).or_interval(S(30)).interval(),
+            Some(S(5))
+        );
+    }
+
+    #[test]
+    fn manual_disables_every_trigger() {
+        let p = FlushPolicy::manual();
+        assert!(p.is_manual());
+        assert!(!p.triggered(1 << 30, 1_000_000, Some(1 << 30), S(60), 8 << 20));
+    }
+
+    #[test]
+    fn triggers_are_or_ed_and_need_a_non_empty_buffer() {
+        let threshold = 8 << 20;
+        let z = Duration::ZERO;
+        // Size (budget-derived).
+        assert!(FlushPolicy::default().triggered(threshold, 1, None, z, threshold));
+        assert!(!FlushPolicy::default().triggered(threshold - 1, 1, None, z, threshold));
+        // Size (explicit) overrides the budget-derived threshold in both directions.
+        let small = FlushPolicy::size_based(1024);
+        assert!(small.triggered(1024, 1, None, z, threshold));
+        assert!(!FlushPolicy::default().triggered(1024, 1, None, z, threshold));
+        // Rows.
+        let rows = FlushPolicy::manual().at_buffer_rows(10);
+        assert!(rows.triggered(0, 10, None, z, threshold));
+        assert!(!rows.triggered(0, 9, None, z, threshold));
+        // WAL bytes — and an unmeasured WAL size never fires the trigger.
+        let wal = FlushPolicy::manual().at_wal_bytes(4096);
+        assert!(wal.triggered(0, 1, Some(4096), z, threshold));
+        assert!(!wal.triggered(0, 1, Some(4095), z, threshold));
+        assert!(!wal.triggered(0, 1, None, z, threshold));
+        // Idle.
+        let idle = FlushPolicy::manual().after_idle(S(2));
+        assert!(idle.triggered(0, 1, None, S(2), threshold));
+        assert!(!idle.triggered(0, 1, None, S(1), threshold));
+        // An empty buffer never seals, whatever the triggers say — an idle policy would otherwise
+        // ask for a no-op seal every tick of a quiet DB.
+        assert!(!idle.triggered(0, 0, None, S(60), threshold));
+        assert!(!small.triggered(1 << 30, 0, None, z, threshold));
+    }
+
+    #[test]
+    fn tick_tracks_the_shortest_trigger_and_is_clamped() {
+        // A sub-tick interval pulls the tick down with it, so `interval=200ms` needs no `tick=`.
+        assert_eq!(
+            FlushPolicy::periodic(Duration::from_millis(200)).effective_tick(),
+            Duration::from_millis(200)
+        );
+        assert_eq!(
+            FlushPolicy::default()
+                .after_idle(Duration::from_millis(50))
+                .effective_tick(),
+            Duration::from_millis(50)
+        );
+        // `tick=0` cannot spin the scheduler, and an absurd tick cannot stall a close().
+        assert_eq!(
+            FlushPolicy::default().tick(Duration::ZERO).effective_tick(),
+            FlushPolicy::MIN_TICK
+        );
+        assert_eq!(
+            FlushPolicy::default().tick(S(86_400)).effective_tick(),
+            FlushPolicy::MAX_TICK
+        );
+        // An explicit long tick still yields to a short interval.
+        assert_eq!(
+            FlushPolicy::periodic(Duration::from_millis(10))
+                .tick(S(60))
+                .effective_tick(),
+            Duration::from_millis(10)
+        );
+    }
+
+    #[test]
+    fn spec_parses_every_strategy() {
+        let p: FlushPolicy = "interval=5s,buffer=16MiB,rows=50_000,wal=64MiB,idle=2s,tick=250ms"
+            .parse()
+            .unwrap();
+        assert_eq!(p.interval(), Some(S(5)));
+        assert_eq!(p.size_trigger(), FlushSize::Bytes(16 << 20));
+        assert_eq!(p.buffer_rows(), Some(50_000));
+        assert_eq!(p.wal_bytes(), Some(64 << 20));
+        assert_eq!(p.idle(), Some(S(2)));
+        assert_eq!(p.effective_tick(), Duration::from_millis(250));
+        assert!(p.needs_wal_bytes());
+
+        // Aliases, whitespace, a trailing comma, and the size-trigger words.
+        let p: FlushPolicy = " every = 2m , buffer = off , ".parse().unwrap();
+        assert_eq!(p.interval(), Some(S(120)));
+        assert_eq!(p.size_trigger(), FlushSize::Off);
+        assert_eq!(
+            "buffer=budget"
+                .parse::<FlushPolicy>()
+                .unwrap()
+                .size_trigger(),
+            FlushSize::Budget
+        );
+        // The empty spec is "unset", not an error: an unset environment variable and an empty one
+        // should mean the same thing to a host.
+        assert_eq!("".parse::<FlushPolicy>().unwrap(), FlushPolicy::default());
+        assert_eq!("  ".parse::<FlushPolicy>().unwrap(), FlushPolicy::default());
+        for word in ["manual", "MANUAL", "off", "none", "never"] {
+            assert!(word.parse::<FlushPolicy>().unwrap().is_manual(), "{word}");
+        }
+    }
+
+    #[test]
+    fn spec_rejects_typos_rather_than_ignoring_them() {
+        for bad in [
+            "intervl=5s",                  // unknown key
+            "interval",                    // no `=`
+            "interval=5x",                 // unknown duration unit
+            "interval=abc",                // not a number
+            "wal=16TiB",                   // unknown size unit
+            "buffer=1.5MiB",               // fractions are not accepted
+            "rows=lots",                   // not a count
+            "wal=99999999999999999999GiB", // overflows
+        ] {
+            let err = bad.parse::<FlushPolicy>().unwrap_err();
+            assert!(err.is_user_error(), "{bad} -> {err}");
+        }
+    }
+
+    #[test]
+    fn display_round_trips_through_from_str() {
+        for spec in [
+            "manual",
+            "interval=5s,buffer=budget,tick=1s",
+            "interval=90m,buffer=1024,rows=100,wal=1000000,idle=500ms,tick=5ms",
+            "buffer=off,idle=2h,tick=1s",
+        ] {
+            let parsed: FlushPolicy = spec.parse().unwrap();
+            let rendered = parsed.to_string();
+            assert_eq!(
+                rendered.parse::<FlushPolicy>().unwrap(),
+                parsed,
+                "{spec} rendered as {rendered}"
+            );
+        }
+        assert_eq!(FlushPolicy::manual().to_string(), "manual");
+        assert_eq!(
+            FlushPolicy::periodic(S(5)).to_string(),
+            "interval=5s,buffer=budget,tick=1s"
+        );
+    }
+
+    #[test]
+    fn size_and_duration_units() {
+        assert_eq!(parse_bytes("8388608").unwrap(), 8 << 20);
+        assert_eq!(parse_bytes("16MiB").unwrap(), 16 << 20);
+        assert_eq!(parse_bytes("16m").unwrap(), 16 << 20); // bare M means binary
+        assert_eq!(parse_bytes("2GB").unwrap(), 2_000_000_000);
+        assert_eq!(parse_bytes("4 KiB").unwrap(), 4096);
+        assert_eq!(parse_duration("30").unwrap(), S(30)); // bare number = seconds
+        assert_eq!(parse_duration("250ms").unwrap(), Duration::from_millis(250));
+        assert_eq!(parse_duration("2M").unwrap(), S(120)); // units are case-insensitive
+        assert_eq!(parse_duration("1h").unwrap(), S(3600));
+    }
 }
