@@ -194,6 +194,19 @@ Two invariants worth restating, because breaking either produces a *silently* ba
   smoke-tested. Introducing a `RUN cargo build` would put a fat-LTO compile under QEMU on the release
   path (hours, per architecture). The one `RUN` in the Dockerfile is pinned to `$BUILDPLATFORM`
   precisely so no emulation is needed at all.
+- **The build-context layout is defined once, in `scripts/build-image.sh`.** `docker/Dockerfile`
+  depends on `linux/<goarch>/{imbhd,imbh-tui}` plus `LICENSE` and `THIRD-PARTY-NOTICES.txt` at the
+  context root. The `image` job stages that by calling the same script with `--stage-only --prebuilt
+  <goarch>=<dir>`, so a local build and a release build cannot drift apart in a way the Dockerfile
+  would notice. Do not re-inline the staging into the workflow.
+
+On caching: the release build job caches **only the cargo registry** (`cache-targets: "false"`), and
+that is deliberate — see the comment on the step. GitHub scopes Actions caches by ref and will not
+restore one created for a *different tag name*, falling back only to the default branch's scope; since
+this job never runs on `main`, the first run of a new tag is cold whatever is stored, while five legs
+of fat-LTO `target/` caches would evict the `ci.yml` caches that make every PR fast. Corollary worth
+knowing: a `workflow_dispatch` rehearsal **from `main`** writes into main's scope, so it both validates
+the pipeline and warms the registry cache for the tag run that follows.
 
 ## CI (GitHub Actions)
 

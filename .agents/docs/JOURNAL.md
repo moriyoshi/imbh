@@ -995,3 +995,53 @@ MSVC, and whether the `ubuntu-22.04-arm` label is available to this repository.
 (disambiguating the published image from the logging plugin), and `.agents/docs/TODO.md` — four
 follow-ups: the dependabot item's action count is now nine, the pipeline has never run, the log-driver
 plugin is still local-build-only, and the footprint budgets remain unmeasured on the published targets.
+
+## 2026-07-30 — CD caching: why the release build caches the registry and not the target dirs
+
+Review feedback on PR #9: the pipeline did not appear to use the Actions cache, and the staging logic
+duplicated `scripts/build-image.sh`. Both were fair; the caching answer turned out to be the opposite
+of "add `type=gha` everywhere", so the reasoning is recorded here rather than only in a step comment.
+
+**GitHub scopes Actions caches by ref, and tags do not share.** A run can restore a cache created in
+the current ref or in the **default branch**, and explicitly *cannot* restore one created for a
+different tag name. `release.yml`'s `build` job only ever runs on a tag or a dispatch, so there is
+normally no `main`-scoped entry for its key to fall back to. The consequence is structural: **the first
+run of a new tag is cold no matter what is cached**, and that is usually the only run a release gets.
+
+Combine that with the 10 GB per-repository cache budget, evicted LRU and shared with `ci.yml`: five
+legs of fat-LTO release `target/` directories would be multiple GB, would almost never be restored, and
+would evict the caches that make every PR fast. Paying for a rare release by slowing every push is the
+wrong trade. So the build job sets `cache-targets: "false"` (a real `Swatinem/rust-cache` input —
+"only the cargo registry will be cached"). The registry cache is small, *does* hit, and still saves
+fetching a ~275-crate graph on five runners.
+
+One useful corollary: a `workflow_dispatch` rehearsal **from `main`** writes into main's scope, so the
+dry run I already recommend for validation doubles as the thing that warms the registry cache for the
+tag run after it. Worth knowing, because it makes the rehearsal strictly better than free.
+
+**The Docker layer cache is bounded, and the comment says so.** Added `cache-from: type=gha` /
+`cache-to: type=gha,mode=min`, with the honest caveat that the binary `COPY` layers change on every
+build, so a *new* release never reuses them. It pays for re-runs of the same commit — a transient GHCR
+push failure, or repeated dry runs. `mode=min` rather than `max` on purpose: the only extra thing `max`
+would store is the `prep` stage's `useradd` layer, worth nothing, while the store competes with the
+Rust caches for the same 10 GB.
+
+**Staging is now defined once.** `scripts/build-image.sh` grew `--ctx DIR`, `--stage-only`, and a
+repeatable `--prebuilt GOARCH=DIR`; the `image` job unpacks the two Linux archives and calls it instead
+of open-coding the layout. `docker/Dockerfile`'s contract (`linux/<goarch>/{imbhd,imbh-tui}` plus
+`LICENSE` and `THIRD-PARTY-NOTICES.txt` at the context root) therefore lives in exactly one place, and
+a local build cannot drift from a release build in a way the Dockerfile would notice. The image build
+itself stays in `docker/build-push-action`, which owns registry auth, the GHA cache backend, multi-arch,
+and provenance — moving that into the script would mean hand-rolling the cache backend's runtime-token
+plumbing for no gain.
+
+Two incidental improvements fell out of the refactor. The docker-absence graceful skip now applies only
+to the local path: `--stage-only` must fail loudly, because a CI job that silently skips staging would
+hand `build-push-action` an empty context. And the notices in the image are now the artifact the
+`licenses` job generated, downloaded into the repository root where the script reads them, replacing a
+`mv`/`rm` shuffle that pulled them back out of one of the archives.
+
+Verified: both script paths (compile-for-host and `--stage-only` with two `--prebuilt` arches), the
+argument validation and its exit codes (2 for usage, 1 for a missing binary), the graceful skip in
+local mode versus no skip in stage-only mode, and a Dockerfile build over a script-staged context on the
+emulator-free builder. Workflow references re-validated; all nine actions still SHA-pinned.

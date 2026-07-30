@@ -28,7 +28,10 @@ release aborts if it is missing or duplicated.
   that publishes nothing. See README.md "Install the binaries".
 
 - **`docker/Dockerfile` + `scripts/build-image.sh`** for that image, so it is reproducible locally
-  and not only in CI. Distinct from `crates/imbh-server/docker-plugin/`, which builds the logging
+  and not only in CI. The script is the single definition of the build-context layout the Dockerfile
+  consumes: run bare it compiles for the host and builds the image, while the release workflow calls
+  it as `--stage-only --prebuilt <goarch>=<dir>` over the binaries the matrix already produced, so the
+  two paths cannot drift. Distinct from `crates/imbh-server/docker-plugin/`, which builds the logging
   *plugin* rootfs.
 
 - **A flush scheduler with selectable strategies (`FlushPolicy`).** `Maintenance` already chose *who*
