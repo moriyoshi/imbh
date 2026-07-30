@@ -16,11 +16,23 @@ container stdout/stderr
    dockerd  ──FIFO──▶  imbhd (plugin socket)  ──OTLP──▶  imbh Db  ──▶  SQL / matches() / docker logs
 ```
 
+> **Not the same thing as `ghcr.io/moriyoshi/imbh`.** That published image runs `imbhd` as an ordinary
+> container you `docker run` and point OTLP exporters at (see README.md "Install the binaries"). A
+> logging-driver plugin is a different Docker artifact with a different lifecycle: it is installed with
+> `docker plugin install`, the daemon starts it, and it is addressed by `--log-driver` rather than by a
+> port. The two can be used together — and the plugin is still built locally, per the quick start
+> below; it is not published yet.
+
 The feature is **off by default**. Build it with:
 
 ```sh
 cargo build --release -p imbh-server --features docker
 ```
+
+The prebuilt Linux binaries from a GitHub release already include it (`--features docker,grpc,tracing`),
+so you can register the plugin without a Rust toolchain if you supply the rootfs yourself; the macOS
+builds omit it, since a plugin socket must be reachable by a *local* daemon and on macOS the daemon
+runs inside a VM.
 
 It adds no crate to the dependency graph (the protobuf and OTLP message types are already there via
 `imbh-otlp`) and is **Unix only** — the module is `#[cfg(unix)]`.

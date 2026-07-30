@@ -176,10 +176,73 @@ to the SQL surface directly. Full/unbounded PromQL/LogQL/TraceQL engines remain 
 profiles grow only with evaluator tests preceding parser support. See
 [`.agents/docs/ARCHITECTURE.md`](./.agents/docs/ARCHITECTURE.md) §10.18 for the full contract.
 
+## Install the binaries
+
+Embedding the library needs none of this — that is `cargo add imbh` and the [quick
+start](#quick-start-embed-the-library) above. This section is for the two **companion binaries**:
+the reference server `imbhd` and the terminal explorer `imbh-tui`.
+
+Every `vX.Y.Z` [GitHub release](https://github.com/moriyoshi/imbh/releases) carries a prebuilt
+archive per platform, containing both binaries plus `LICENSE` and `THIRD-PARTY-NOTICES.txt`:
+
+| Platform | Archive | `docker` log driver |
+|---|---|---|
+| Linux x86_64 (glibc ≥ 2.35) | `imbh-<version>-x86_64-unknown-linux-gnu.tar.gz` | yes |
+| Linux aarch64 (glibc ≥ 2.35) | `imbh-<version>-aarch64-unknown-linux-gnu.tar.gz` | yes |
+| macOS Apple silicon | `imbh-<version>-aarch64-apple-darwin.tar.gz` | — |
+| macOS Intel | `imbh-<version>-x86_64-apple-darwin.tar.gz` | — |
+| Windows x86_64 | `imbh-<version>-x86_64-pc-windows-msvc.zip` | — |
+
+The binaries are built with `--features grpc,tracing` (plus `docker` on Linux), so OTLP/gRPC on 4317
+and `RUST_LOG` diagnostics work out of the box — unlike a bare `cargo build`, where those features
+are off to keep the [footprint](#footprint) gate honest. Each release also publishes a `SHA256SUMS`
+file:
+
+```
+VERSION=0.1.1; TARGET=x86_64-unknown-linux-gnu
+BASE=https://github.com/moriyoshi/imbh/releases/download/v${VERSION}
+curl -fLO ${BASE}/imbh-${VERSION}-${TARGET}.tar.gz
+curl -fLO ${BASE}/SHA256SUMS
+sha256sum --ignore-missing -c SHA256SUMS
+tar xzf imbh-${VERSION}-${TARGET}.tar.gz
+./imbh-${VERSION}-${TARGET}/imbhd ./imbh-data      # then point an OTLP exporter at :4318
+```
+
+`docker` and `macOS`: the log-driver feature is deliberately omitted from the macOS builds. A
+logging-driver plugin talks to a *local* Docker daemon over a Unix socket, and on macOS that daemon
+lives inside a VM, so the feature could not be used there even though it compiles.
+
+### Container image
+
+`ghcr.io/moriyoshi/imbh` is a multi-arch (amd64 + arm64) image containing **both** binaries. It
+holds no build toolchain — the release binaries are copied into a `debian:bookworm-slim` base — and
+it runs as an unprivileged user with the database on a volume at `/var/lib/imbh`:
+
+```
+docker run -d --name imbh \
+  -p 4318:4318 -p 4317:4317 \
+  -v imbh-data:/var/lib/imbh \
+  ghcr.io/moriyoshi/imbh:0.1.1
+
+curl -s 127.0.0.1:4318/api/query --data "SELECT count(*) FROM logs"
+
+# The TUI opens the same volume read-only, so it never contends with the server's writer:
+docker exec -it imbh imbh-tui /var/lib/imbh
+```
+
+Unlike the bare binary, the image binds both listeners to `0.0.0.0` (`IMBH_LISTEN_ADDR` /
+`IMBH_GRPC_LISTEN_ADDR`), since loopback inside a container is unreachable. Tags: `X.Y.Z`, the
+floating `X.Y`, and `latest`. Build it yourself for the host architecture with
+`./scripts/build-image.sh` (see [`docker/Dockerfile`](./docker/Dockerfile)).
+
+> This image is **not** the Docker logging-driver plugin, which is a separate artifact with its own
+> install path (`docker plugin install`) — see the [log-driver guide](./docs/DOCKER_LOG_DRIVER.md).
+
 ## Reference server (`imbhd`)
 
 `imbhd` is an example wiring of the library API over a minimal `std::net` HTTP stack (zero heavy
-deps), not a mandatory component:
+deps), not a mandatory component. To just *run* it, take a [prebuilt binary or the container
+image](#install-the-binaries); to hack on it, build from source:
 
 ```
 cargo run -p imbh-server            # imbhd [DB_DIR] [ADDR]
@@ -241,7 +304,8 @@ cargo run -p imbh-tui -- ./imbh-data
 ```
 
 The Ratatui/Crossterm dependencies stay confined to this crate and never enter the `imbh` or
-`imbhd` graphs. Its library entry point is `run(Arc<Db>, Options)` if you want to embed it.
+`imbhd` graphs. Its library entry point is `run(Arc<Db>, Options)` if you want to embed it. It ships
+in every [release archive and in the container image](#install-the-binaries) alongside `imbhd`.
 
 ### Screenshots
 
@@ -369,10 +433,21 @@ compile error that contradicts a green `cargo build --workspace`. Clearing
 `target/debug/.fingerprint/imbh-*` first (as above) avoids it; see
 [`.agents/docs/QUALITY_GATE.md`](./.agents/docs/QUALITY_GATE.md) §3c for the diagnosis recipe.
 
-Pushing the resulting `v*` tag triggers `.github/workflows/release.yml`, which re-runs the license
-gate and notice generation with both tools installed and uploads `THIRD-PARTY-NOTICES.txt` as a
-build artifact. See [`.agents/docs/QUALITY_GATE.md`](./.agents/docs/QUALITY_GATE.md) §3 for the full
-release gate.
+crates.io is only half of a release. Pushing the resulting `v*` tag triggers
+`.github/workflows/release.yml`, which re-runs the license gate and notice generation with both tools
+installed and then does the CD:
+
+1. builds `imbhd` + `imbh-tui` in the release profile for all five [published
+   targets](#install-the-binaries), smoke-testing each artifact on the runner that produced it;
+2. attaches the per-platform archives and a `SHA256SUMS` to the GitHub Release for the tag, creating
+   that Release (with generated notes) if it does not exist yet;
+3. pushes the multi-arch `ghcr.io/moriyoshi/imbh` image.
+
+Nothing needs configuring for this — GHCR authenticates with the workflow's own `GITHUB_TOKEN`. To
+rehearse the whole path without publishing, run the workflow manually (`workflow_dispatch`): with its
+`dry_run` input left at the default it builds and smoke-tests every archive and both image arches,
+uploads the archives as workflow artifacts, and pushes nothing. See
+[`.agents/docs/QUALITY_GATE.md`](./.agents/docs/QUALITY_GATE.md) §3–4 for the full release gate.
 
 ## FAQ
 
