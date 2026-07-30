@@ -224,7 +224,9 @@ by default, and it adds **no crate** to the dependency graph. See the
 of a host built on the facade plus `imbh-lgtm`, not a required component. It opens a directory with
 `Db::open_read_only` (so it never contends with the writer) and renders overview stats, PromQL
 metric charts, TraceQL results with a client-side waterfall, and a log viewer with LogQL-derived
-count/rate charts:
+count/rate charts. `Enter` drills down: a trace opens a full-screen scrollable waterfall with a span
+cursor, a span opens all of its fields, and `L` from either shows the logs correlated to that exact
+span:
 
 ```
 cargo run -p imbh-tui -- ./imbh-data

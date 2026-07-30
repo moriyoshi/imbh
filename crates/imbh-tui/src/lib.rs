@@ -849,6 +849,56 @@ struct WaterfallRow {
     suffix: String,
 }
 
+/// One span of a materialized trace, cloned out of [`imbh::Span`] into display-ready fields so an open
+/// [`Route::TraceDetail`] / [`Route::SpanDetail`] is self-contained (like [`LogRecord`]) and survives
+/// background refreshes. Aligned to the trace's [`Waterfall`] rows, one record per row.
+#[derive(Debug, Clone)]
+struct SpanRecord {
+    name: String,
+    span_id: String,
+    parent_span_id: Option<String>,
+    service: Option<String>,
+    kind: String,
+    status_code: String,
+    status_message: Option<String>,
+    start_time_ns: i64,
+    /// Offset of the span's start from the trace start, so the detail can place it within the trace.
+    offset_ns: i64,
+    duration_ns: u64,
+    attributes: Vec<(String, String)>,
+    resource: Vec<(String, String)>,
+    scope: Vec<(String, String)>,
+    /// Events/links as the canonical JSON the storage layer keeps them in (ARCHITECTURE.md §6.3).
+    events: Option<String>,
+    links: Option<String>,
+    /// Whether the span's parent chain is broken (an orphan or a cycle). Such spans stay visible as
+    /// malformed roots rather than being dropped (TUI_PLAN.md §3.3).
+    malformed: bool,
+}
+
+impl SpanRecord {
+    /// Whether the span carries a non-OK status (drives the red waterfall row).
+    fn is_error(&self) -> bool {
+        self.status_code.eq_ignore_ascii_case("error")
+    }
+}
+
+/// A whole materialized trace: the width-independent [`Waterfall`] plus the structured per-span
+/// records behind it. Cloned into [`Route::TraceDetail`] when the full-screen trace view opens, so the
+/// view keeps its data across refreshes and the navigation history captures it for free.
+#[derive(Debug, Clone)]
+struct TraceDetail {
+    /// Lowercase-hex trace id.
+    trace_id: String,
+    root_service: Option<String>,
+    root_name: Option<String>,
+    start_time_ns: i64,
+    duration_ns: u64,
+    /// Rows aligned to `spans` (`waterfall.rows[i]` ↔ `spans[i]`).
+    waterfall: Waterfall,
+    spans: Vec<SpanRecord>,
+}
+
 /// Fixed width (terminal cells) of the waterfall name column; the status marker prepends one more.
 const WATERFALL_NAME_W: usize = 20;
 /// Cells kept to the right of the bar for the ` 12.345ms STATUS` column, so the bar never crowds it.
@@ -945,6 +995,17 @@ enum Route {
         detail: MetricDetail,
     },
     Traces,
+    /// The full-screen view of one trace: a scrollable, span-selectable waterfall plus the selected
+    /// span's summary. Opened with Enter on the Traces list.
+    TraceDetail {
+        detail: TraceDetail,
+    },
+    /// The full field detail of one span within a trace. Opened with Enter on the trace detail's
+    /// waterfall; carries the trace id so the span→log correlation has both ids.
+    SpanDetail {
+        trace_id: String,
+        span: SpanRecord,
+    },
     Logs,
     /// The full detail of one log record.
     LogDetail {
@@ -958,7 +1019,7 @@ impl Route {
         match self {
             Route::Overview => Screen::Overview,
             Route::Metrics | Route::MetricDetail { .. } => Screen::Metrics,
-            Route::Traces => Screen::Traces,
+            Route::Traces | Route::TraceDetail { .. } | Route::SpanDetail { .. } => Screen::Traces,
             Route::Logs | Route::LogDetail { .. } => Screen::Logs,
         }
     }
@@ -975,7 +1036,13 @@ impl Route {
 
     /// Whether this route renders as full-content detail (no query pane, its own hint bar).
     fn is_detail(&self) -> bool {
-        matches!(self, Route::MetricDetail { .. } | Route::LogDetail { .. })
+        matches!(
+            self,
+            Route::MetricDetail { .. }
+                | Route::LogDetail { .. }
+                | Route::TraceDetail { .. }
+                | Route::SpanDetail { .. }
+        )
     }
 }
 
@@ -1051,11 +1118,14 @@ enum Update {
     /// Completion vocabulary (metric names) fetched from the catalog.
     Vocabulary(Vec<String>),
     /// The waterfall for the selected trace, fetched on demand. `generation`/`trace_id` guard against
-    /// applying a stale result after the selection or query moved on.
+    /// applying a stale result after the selection or query moved on. `trace` is the materialized trace
+    /// behind the pane (`None` when the fetch failed or the trace is gone); retained by the app so
+    /// Enter can open the full trace detail without a second fetch.
     Waterfall {
         generation: u64,
         trace_id: String,
         detail: DetailPane,
+        trace: Option<TraceDetail>,
     },
     /// The discovered dimensions for a catalog metric, loaded when the metric is first expanded.
     MetricDims { metric: String, dims: Vec<DimNode> },
@@ -1142,6 +1212,8 @@ struct NavEntry {
     focus_trace_id: Option<String>,
     selected: usize,
     scroll: u16,
+    /// The selected span row of a `Route::TraceDetail` view (view context, like `metric_cursor`).
+    span_cursor: usize,
     /// The trace→log drill-down active in this view, so Back into a correlated Logs view restores it.
     log_correlation: Option<LogCorrelation>,
 }
@@ -1192,6 +1264,15 @@ struct App {
     /// Trace id whose waterfall is currently shown in the detail pane (or in flight), so the selected
     /// trace's waterfall is fetched only when the selection actually moves to a different trace.
     detail_trace_id: Option<String>,
+    /// The materialized trace behind the Traces preview pane (matching `detail_trace_id`), retained so
+    /// Enter opens the full trace detail from memory instead of re-querying. `None` while in flight.
+    trace_detail: Option<TraceDetail>,
+    /// Set when Enter is pressed on the Traces list before the selected trace has finished loading: the
+    /// full trace detail then opens as soon as the fetch lands. Cleared by any navigation.
+    pending_trace_open: bool,
+    /// The selected span row in an open `Route::TraceDetail` (view context, so the history captures it
+    /// while it lives flat here — the same shape as `metric_cursor`).
+    span_cursor: usize,
     /// The x-axis cursor index into the `Route::MetricDetail` series' points (view context, so it is
     /// captured by the history but lives flat here rather than inside the route).
     metric_cursor: usize,
@@ -1290,6 +1371,9 @@ impl App {
             metric_names: Vec::new(),
             completion: None,
             detail_trace_id: None,
+            trace_detail: None,
+            pending_trace_open: false,
+            span_cursor: 0,
             metric_cursor: 0,
             focus_trace_id: None,
             metric_tree: Vec::new(),
@@ -1329,6 +1413,15 @@ impl App {
                 detail.query.hash(&mut h);
             }
             Route::LogDetail { .. } => 2u8.hash(&mut h),
+            Route::TraceDetail { detail } => {
+                3u8.hash(&mut h);
+                detail.trace_id.hash(&mut h);
+            }
+            Route::SpanDetail { trace_id, span } => {
+                4u8.hash(&mut h);
+                trace_id.hash(&mut h);
+                span.span_id.hash(&mut h);
+            }
             _ => 0u8.hash(&mut h),
         }
         h.finish()
@@ -1365,6 +1458,31 @@ impl App {
             Route::MetricDetail { detail } => Some(detail),
             _ => None,
         }
+    }
+
+    /// The trace if the current route is the full-screen trace detail.
+    fn route_trace_detail(&self) -> Option<&TraceDetail> {
+        match &self.route {
+            Route::TraceDetail { detail } => Some(detail),
+            _ => None,
+        }
+    }
+
+    /// The `(trace_id, span)` pair if the current route is the span field detail.
+    fn route_span_detail(&self) -> Option<(&str, &SpanRecord)> {
+        match &self.route {
+            Route::SpanDetail { trace_id, span } => Some((trace_id.as_str(), span)),
+            _ => None,
+        }
+    }
+
+    /// The span the trace detail's waterfall cursor is on (clamped), or `None` off that route / for an
+    /// empty trace.
+    fn selected_span(&self) -> Option<&SpanRecord> {
+        let detail = self.route_trace_detail()?;
+        detail
+            .spans
+            .get(self.span_cursor.min(detail.spans.len().saturating_sub(1)))
     }
 
     /// Activate the menu bar (`F9`), starting the highlight on the current screen.
@@ -1465,6 +1583,7 @@ impl App {
             focus_trace_id: self.focus_trace_id.clone(),
             selected: self.selected,
             scroll: self.scroll,
+            span_cursor: self.span_cursor,
             log_correlation: self.log_correlation.clone(),
         }
     }
@@ -1478,9 +1597,13 @@ impl App {
         self.focus_trace_id = entry.focus_trace_id;
         self.selected = entry.selected;
         self.scroll = entry.scroll;
+        self.span_cursor = entry.span_cursor;
         self.log_correlation = entry.log_correlation;
         // Exemplar markers are view-specific; a metric detail restored by history refetches them.
         self.metric_exemplars.clear();
+        // A trace-open intent belongs to the view it was issued from; history navigation abandons it so
+        // a late waterfall never yanks the user into a detail they navigated away from.
+        self.pending_trace_open = false;
         self.mode = Mode::Normal;
         self.completion = None;
         self.focus = Focus::Primary;
@@ -2120,6 +2243,83 @@ impl App {
         true
     }
 
+    /// Open the full-screen trace detail for the trace the Traces list is pointing at (the log→trace
+    /// focus, else the row cursor). The trace is the one already materialized for the preview pane, so
+    /// this is a pure in-memory navigation; it returns `false` when the fetch has not landed yet (or is
+    /// for another trace), which the caller turns into a `pending_trace_open` intent. History is
+    /// recorded here, so a no-op Enter never disturbs the Forward stack.
+    fn open_trace_detail(&mut self) -> bool {
+        if !matches!(self.route, Route::Traces) {
+            return false;
+        }
+        let Some(target) = self
+            .focus_trace_id
+            .clone()
+            .or_else(|| self.selected_trace_id())
+        else {
+            return false;
+        };
+        let Some(detail) = self
+            .trace_detail
+            .clone()
+            .filter(|detail| detail.trace_id == target)
+        else {
+            return false;
+        };
+        self.push_history();
+        self.route = Route::TraceDetail { detail };
+        self.span_cursor = 0;
+        self.scroll = 0;
+        self.focus = Focus::Primary;
+        true
+    }
+
+    /// Move the trace detail's span cursor by `delta` rows, clamped to the trace's span count. A no-op
+    /// off the trace detail route.
+    fn move_span_cursor(&mut self, delta: isize) {
+        let Some(last) = self
+            .route_trace_detail()
+            .map(|detail| detail.spans.len().saturating_sub(1))
+        else {
+            return;
+        };
+        let current = self.span_cursor.min(last) as isize;
+        self.span_cursor = current.saturating_add(delta).clamp(0, last as isize) as usize;
+    }
+
+    /// The trace/span correlation the span→log drill-down uses: the span under the trace detail's
+    /// cursor, or the open span detail's span. `None` off both routes.
+    fn span_log_correlation(&self) -> Option<LogCorrelation> {
+        match &self.route {
+            Route::TraceDetail { detail } => self.selected_span().map(|span| LogCorrelation {
+                trace_id: detail.trace_id.clone(),
+                span_id: Some(span.span_id.clone()),
+            }),
+            Route::SpanDetail { trace_id, span } => Some(LogCorrelation {
+                trace_id: trace_id.clone(),
+                span_id: Some(span.span_id.clone()),
+            }),
+            _ => None,
+        }
+    }
+
+    /// Open the field detail of the span under the trace detail's waterfall cursor. Returns `false`
+    /// (no-op, no history) off the trace detail or for a trace with no spans.
+    fn open_span_detail(&mut self) -> bool {
+        let Some(detail) = self.route_trace_detail() else {
+            return false;
+        };
+        let trace_id = detail.trace_id.clone();
+        let Some(span) = self.selected_span().cloned() else {
+            return false;
+        };
+        self.push_history();
+        self.route = Route::SpanDetail { trace_id, span };
+        self.scroll = 0;
+        self.focus = Focus::Primary;
+        true
+    }
+
     /// After a fresh Traces result, move the cursor onto the focused trace (if it is in the result
     /// set) and clear the focus so the selection drives the waterfall again. When the focused trace is
     /// not listed, the focus is kept so `request_waterfall` still shows its waterfall.
@@ -2500,13 +2700,20 @@ pub async fn run(db: Arc<Db>, options: Options) -> io::Result<()> {
                                 app.metric_exemplars = markers;
                             }
                         }
-                        Update::Waterfall { generation, trace_id, detail } => {
+                        Update::Waterfall { generation, trace_id, detail, trace } => {
                             // Apply only if still current: same query generation and the selection has
                             // not moved to a different trace since the fetch was issued.
                             if generation == app.generation
                                 && app.detail_trace_id.as_deref() == Some(trace_id.as_str())
                             {
                                 app.snapshot.detail = Some(detail);
+                                app.trace_detail = trace;
+                                // An Enter pressed while this fetch was in flight opens the full trace
+                                // detail now that the data is here.
+                                if app.pending_trace_open {
+                                    app.pending_trace_open = false;
+                                    app.open_trace_detail();
+                                }
                             }
                         }
                     }
@@ -2564,6 +2771,45 @@ fn handle_detail_key(
     options: &Options,
     sender: &mpsc::UnboundedSender<Update>,
 ) -> Option<Control> {
+    // Trace detail: the waterfall is a span-selectable list (the cursor scrolls the pane), Enter opens
+    // the selected span's fields, and `L` correlates logs to that span.
+    if let Some(count) = app.route_trace_detail().map(|detail| detail.spans.len()) {
+        let last = count.saturating_sub(1);
+        let page = app.page_rows.get().max(1) as isize;
+        match key.code {
+            KeyCode::Down => app.move_span_cursor(1),
+            KeyCode::Up => app.move_span_cursor(-1),
+            KeyCode::PageDown => app.move_span_cursor(page),
+            KeyCode::PageUp => app.move_span_cursor(-page),
+            KeyCode::Home => app.span_cursor = 0,
+            KeyCode::End => app.span_cursor = last,
+            KeyCode::Enter => {
+                app.open_span_detail();
+            }
+            KeyCode::Char('L') => span_logs_drilldown(app, db, options, sender),
+            _ => return None,
+        }
+        return Some(Control::Continue);
+    }
+    // Span detail: a scrolled field dump, plus the span-granular log drill-down.
+    if app.route_span_detail().is_some() {
+        match key.code {
+            KeyCode::Down => app.scroll = (app.scroll + 1).min(app.max_scroll.get()),
+            KeyCode::Up => app.scroll = app.scroll.saturating_sub(1),
+            KeyCode::PageDown => {
+                app.scroll = app
+                    .scroll
+                    .saturating_add(app.page_rows.get())
+                    .min(app.max_scroll.get());
+            }
+            KeyCode::PageUp => app.scroll = app.scroll.saturating_sub(app.page_rows.get()),
+            KeyCode::Home => app.scroll = 0,
+            KeyCode::End => app.scroll = app.max_scroll.get(),
+            KeyCode::Char('L') | KeyCode::Enter => span_logs_drilldown(app, db, options, sender),
+            _ => return None,
+        }
+        return Some(Control::Continue);
+    }
     if app.route_log_record().is_some() {
         match key.code {
             // Enter is the explicit forward navigation to the trace viewer (when the log has a trace).
@@ -2634,6 +2880,29 @@ fn handle_detail_key(
         return Some(Control::Continue);
     }
     None
+}
+
+/// Span → logs drill-down: open the Logs screen correlated to the current span (trace id *and* span
+/// id), the span-granular partner of the trace-level `L` on the Traces list. Works from either the
+/// trace detail (the span under the waterfall cursor) or the span detail; a no-op elsewhere.
+fn span_logs_drilldown(
+    app: &mut App,
+    db: &Arc<Db>,
+    options: &Options,
+    sender: &mpsc::UnboundedSender<Update>,
+) {
+    let Some(correlation) = app.span_log_correlation() else {
+        return;
+    };
+    app.push_history();
+    app.log_correlation = Some(correlation);
+    switch_screen(
+        app,
+        Screen::Logs,
+        db.clone(),
+        options.clone(),
+        sender.clone(),
+    );
 }
 
 /// Apply a single key press to the app, dispatching refreshes/screen switches as needed.
@@ -2859,6 +3128,14 @@ fn handle_key(
                 app.push_history();
                 app.route = Route::LogDetail { record };
                 app.scroll = 0;
+            }
+        }
+        // Traces list → trace detail (Enter): open the full-screen waterfall for the selected trace.
+        // The trace is normally already materialized for the preview pane, so this is instant; when the
+        // fetch is still in flight the intent is remembered and the view opens as soon as it lands.
+        KeyCode::Enter if matches!(app.route, Route::Traces) => {
+            if !app.open_trace_detail() {
+                app.pending_trace_open = app.detail_trace_id.is_some();
             }
         }
         // Space expands/collapses the selected metric or dimension in the catalog tree, lazily
@@ -3107,8 +3384,11 @@ fn switch_screen(
     app.route = Route::list(screen);
     app.scroll = 0;
     app.selected = 0;
+    app.span_cursor = 0;
     app.completion = None;
     app.focus = Focus::Primary;
+    // A trace-open intent is scoped to the Traces list it was issued from.
+    app.pending_trace_open = false;
     // A log→trace jump sets `focus_trace_id` just before switching to Traces; drop a stale focus when
     // switching anywhere else.
     if screen != Screen::Traces {
@@ -3363,15 +3643,21 @@ fn request_waterfall(
         return;
     }
     app.detail_trace_id = Some(trace_id.clone());
+    // The retained trace belongs to the *previous* selection; drop it so Enter cannot open a detail for
+    // a trace the cursor has already left. A fetch is only issued when the selection actually moved, so
+    // this is also where a pending Enter intent is abandoned (it was meant for the trace just left).
+    app.trace_detail = None;
+    app.pending_trace_open = false;
     let generation = app.generation;
     let db = db.clone();
     let sender = sender.clone();
     tokio::spawn(async move {
-        let detail = build_waterfall_detail(&db, &trace_id, ascii).await;
+        let (detail, trace) = build_waterfall_detail(&db, &trace_id, ascii).await;
         let _ = sender.send(Update::Waterfall {
             generation,
             trace_id,
             detail,
+            trace,
         });
     });
 }
@@ -3526,23 +3812,29 @@ fn skip_paren_group(bytes: &[u8], open: usize) -> usize {
 }
 
 /// Fetch a single trace by hex id and render its waterfall into a detail pane, degrading to a short
-/// message on a missing/invalid id or a source error.
-async fn build_waterfall_detail(db: &Arc<Db>, trace_id_hex: &str, ascii: bool) -> DetailPane {
+/// message on a missing/invalid id or a source error. The materialized trace is returned alongside the
+/// pane so the app can open the full trace detail (`Route::TraceDetail`) without a second fetch.
+async fn build_waterfall_detail(
+    db: &Arc<Db>,
+    trace_id_hex: &str,
+    ascii: bool,
+) -> (DetailPane, Option<TraceDetail>) {
     // Success carries a structured `Waterfall` so the bars reflow to the pane width at draw time;
     // the miss/error branches only have a message, delivered through `lines`.
-    let (lines, waterfall) = match TraceId::from_hex(trace_id_hex) {
+    let (lines, trace) = match TraceId::from_hex(trace_id_hex) {
         Some(trace_id) => match db.traces().get(trace_id).await {
-            Ok(Some(trace)) => (Vec::new(), Some(build_waterfall(&trace, ascii))),
+            Ok(Some(trace)) => (Vec::new(), Some(build_trace_detail(&trace, ascii))),
             Ok(None) => (vec!["trace not found.".to_owned()], None),
             Err(error) => (vec![format!("error: {error}")], None),
         },
         None => (vec!["invalid trace id.".to_owned()], None),
     };
-    DetailPane {
-        title: format!("Waterfall: {trace_id_hex}"),
+    let pane = DetailPane {
+        title: format!("Waterfall: {trace_id_hex}  (enter: detail)"),
         lines,
-        waterfall,
-    }
+        waterfall: trace.as_ref().map(|trace| trace.waterfall.clone()),
+    };
+    (pane, trace)
 }
 
 /// How many progressively narrower windows to try after the full window overflows the trace cap.
@@ -4075,9 +4367,11 @@ async fn load_snapshot(
     }
 }
 
-/// Reduce a trace to width-independent waterfall rows (see [`WaterfallRow`]). The bars are stored as
-/// fractions of the trace duration; [`render_waterfall`] paints them onto the pane's actual width.
-fn build_waterfall(trace: &imbh::Trace, ascii: bool) -> Waterfall {
+/// Reduce a trace to width-independent waterfall rows (see [`WaterfallRow`]) plus the structured
+/// per-span records behind them (aligned index-for-index). The bars are stored as fractions of the
+/// trace duration; [`render_waterfall`] paints them onto the pane's actual width. Spans whose parent
+/// chain is broken (orphans, cycles) stay visible as malformed roots rather than being dropped.
+fn build_trace_detail(trace: &imbh::Trace, ascii: bool) -> TraceDetail {
     let parents = trace
         .spans
         .iter()
@@ -4089,7 +4383,7 @@ fn build_waterfall(trace: &imbh::Trace, ascii: bool) -> Waterfall {
         })
         .collect::<HashMap<_, _>>();
     let duration = trace.duration_ns.0.max(1) as f64;
-    let rows = trace
+    let (rows, spans): (Vec<WaterfallRow>, Vec<SpanRecord>) = trace
         .spans
         .iter()
         .map(|span| {
@@ -4110,10 +4404,10 @@ fn build_waterfall(trace: &imbh::Trace, ascii: bool) -> Waterfall {
                 depth = depth.saturating_add(1).min(16);
                 parent = next.clone();
             }
-            let relative = span.start_time.0.saturating_sub(trace.start_time.0).max(0) as f64;
+            let offset_ns = span.start_time.0.saturating_sub(trace.start_time.0).max(0);
             // The bar's position and length as fractions of the trace duration — resolution-free, so
             // the same row renders correctly at any pane width.
-            let start = (relative / duration).clamp(0.0, 1.0);
+            let start = (offset_ns as f64 / duration).clamp(0.0, 1.0);
             let frac = (span.duration_ns.0 as f64 / duration).clamp(0.0, 1.0);
             // Fold the depth indent into the name and clamp the pair to WATERFALL_NAME_W (char-aware,
             // with an ellipsis) so the fixed-width prefix keeps every bar starting at the same column.
@@ -4121,7 +4415,7 @@ fn build_waterfall(trace: &imbh::Trace, ascii: bool) -> Waterfall {
                 &format!("{}{}", "  ".repeat(depth), span.name),
                 WATERFALL_NAME_W,
             );
-            WaterfallRow {
+            let row = WaterfallRow {
                 prefix: format!("{}{label}", if malformed { "!" } else { " " }),
                 start,
                 frac,
@@ -4130,12 +4424,39 @@ fn build_waterfall(trace: &imbh::Trace, ascii: bool) -> Waterfall {
                     span.duration_ns.0 as f64 / 1_000_000.0,
                     span.status_code
                 ),
-            }
+            };
+            let record = SpanRecord {
+                name: span.name.clone(),
+                span_id: id,
+                parent_span_id: span.parent_span_id.map(|parent| parent.to_hex()),
+                service: span.service.clone(),
+                kind: span.kind.clone(),
+                status_code: span.status_code.clone(),
+                status_message: span.status_message.clone(),
+                start_time_ns: span.start_time.0,
+                offset_ns,
+                duration_ns: span.duration_ns.0,
+                attributes: attrs_to_pairs(&span.attributes),
+                resource: attrs_to_pairs(&span.resource),
+                scope: attrs_to_pairs(&span.scope),
+                events: span.events.clone(),
+                links: span.links.clone(),
+                malformed,
+            };
+            (row, record)
         })
-        .collect();
-    Waterfall {
-        rows,
-        marker: if ascii { '#' } else { '━' },
+        .unzip();
+    TraceDetail {
+        trace_id: trace.trace_id.to_hex(),
+        root_service: trace.root_service.clone(),
+        root_name: trace.root_name.clone(),
+        start_time_ns: trace.start_time.0,
+        duration_ns: trace.duration_ns.0,
+        waterfall: Waterfall {
+            rows,
+            marker: if ascii { '#' } else { '━' },
+        },
+        spans,
     }
 }
 
@@ -4634,6 +4955,31 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &App, options: &Options) {
         draw_global_overlays(frame, app, indicator_area, area, options.ascii);
         return;
     }
+    if let Some(detail) = app.route_trace_detail() {
+        draw_trace_detail(
+            frame,
+            app,
+            detail,
+            content_area,
+            focus == Focus::Primary,
+            &g,
+        );
+        draw_global_overlays(frame, app, indicator_area, area, options.ascii);
+        return;
+    }
+    if let Some((trace_id, span)) = app.route_span_detail() {
+        draw_span_detail(
+            frame,
+            app,
+            trace_id,
+            span,
+            content_area,
+            focus == Focus::Primary,
+            &g,
+        );
+        draw_global_overlays(frame, app, indicator_area, area, options.ascii);
+        return;
+    }
 
     // List views: query pane (except Overview) + main + status, within the content area.
     let has_query = app.screen() != Screen::Overview;
@@ -4825,6 +5171,9 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &App, options: &Options) {
     }
 
     if let Some((detail_area, detail)) = detail {
+        // The bare title line costs the pane's first row; the rest is where waterfall rows land.
+        let visible = detail_area.height.saturating_sub(1) as usize;
+        let mut title = detail.title.clone();
         let detail_text = if let Some(waterfall) = &detail.waterfall {
             // The pane has no side borders, so the full width is usable text. Give the bar every cell
             // left after the fixed prefix (marker + name), the two `|`, and the trailing duration
@@ -4832,7 +5181,19 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &App, options: &Options) {
             let bar_cells = (detail_area.width as usize)
                 .saturating_sub(1 + WATERFALL_NAME_W + 2 + WATERFALL_SUFFIX_W)
                 .max(1);
-            render_waterfall(waterfall, bar_cells).join("\n")
+            let rows = render_waterfall(waterfall, bar_cells);
+            // This preview pane is a fixed slice of the results area and does not scroll: say so when a
+            // deep trace overflows it, so the hidden spans are never silently dropped. The full,
+            // scrolling waterfall is one Enter away (`Route::TraceDetail`).
+            if rows.len() > visible {
+                title = format!(
+                    "Waterfall: {} of {} spans {} enter: all",
+                    visible,
+                    rows.len(),
+                    g.dash
+                );
+            }
+            rows.join("\n")
         } else if detail.lines.is_empty() {
             "No data".to_owned()
         } else {
@@ -4843,7 +5204,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &App, options: &Options) {
                 .wrap(Wrap { trim: false })
                 // No border box on the waterfall pane: a bare title line keeps the trace id visible
                 // while freeing the left/right/bottom edge cells so the bars sit flush against them.
-                .block(Block::default().title(detail.title.as_str())),
+                .block(Block::default().title(title)),
             detail_area,
         );
     }
@@ -4863,6 +5224,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &App, options: &Options) {
         let sep = g.sep;
         let detail_hint = match app.screen() {
             Screen::Logs => format!(" {sep} enter detail"),
+            Screen::Traces => format!(" {sep} enter trace detail {sep} L logs"),
             Screen::Metrics if app.active_query().trim().is_empty() => {
                 format!(" {sep} space expand/select series {sep} enter visualize")
             }
@@ -5761,6 +6123,341 @@ fn draw_log_detail(
     frame.render_widget(Paragraph::new(hint).wrap(Wrap { trim: true }), rows[2]);
 }
 
+/// Height (rows, borders included) the selected-span summary pane claims on the trace detail. Below
+/// [`TRACE_DETAIL_SUMMARY_MIN_ROWS`] of content the pane is dropped entirely so the waterfall keeps
+/// enough rows to be useful — the same fields are one Enter away in the span detail.
+const TRACE_SPAN_SUMMARY_H: u16 = 7;
+/// Content height at/above which the trace detail shows the span summary pane (header 3 + summary 7 +
+/// hint 2 leaves 6 waterfall rows).
+const TRACE_DETAIL_SUMMARY_MIN_ROWS: u16 = 18;
+
+/// Render the full-screen trace detail into the content area beneath the menu bar: a trace header, the
+/// whole span waterfall as a scrolling span-selectable list (so a deep trace is fully reachable, unlike
+/// the fixed half-height preview pane on the Traces list), and — when the terminal is tall enough — a
+/// summary of the span under the cursor. Enter opens that span's full fields.
+fn draw_trace_detail(
+    frame: &mut ratatui::Frame<'_>,
+    app: &App,
+    detail: &TraceDetail,
+    area: Rect,
+    focused: bool,
+    g: &Glyphs,
+) {
+    let with_summary = area.height >= TRACE_DETAIL_SUMMARY_MIN_ROWS && !detail.spans.is_empty();
+    let constraints = if with_summary {
+        vec![
+            Constraint::Length(3),
+            Constraint::Min(3),
+            Constraint::Length(TRACE_SPAN_SUMMARY_H),
+            Constraint::Length(2),
+        ]
+    } else {
+        vec![
+            Constraint::Length(3),
+            Constraint::Min(3),
+            Constraint::Length(2),
+        ]
+    };
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(constraints)
+        .split(area);
+    let hint_area = *rows.last().expect("hint row");
+
+    // Header: the trace id and its shape. The root service/operation ride the block title so the id
+    // line stays short enough to fit an 80-column terminal.
+    let root = match (&detail.root_service, &detail.root_name) {
+        (Some(service), Some(name)) => format!("{service} {} {name}", g.sep),
+        (Some(service), None) => service.clone(),
+        (None, Some(name)) => name.clone(),
+        (None, None) => "(no root span)".to_owned(),
+    };
+    let header = format!(
+        "{}  {sep} {} spans  {sep} {}  {sep} {}",
+        detail.trace_id,
+        detail.spans.len(),
+        format_duration_ns(detail.duration_ns, g.ascii),
+        format_timestamp_ns(detail.start_time_ns),
+        sep = g.sep,
+    );
+    frame.render_widget(
+        Paragraph::new(header)
+            .wrap(Wrap { trim: true })
+            .block(g.block().title(format!("Trace {} {root}", g.sep))),
+        rows[0],
+    );
+
+    // The waterfall as a List: the cursor selects a span and the widget scrolls to keep it in view, so
+    // the pane is navigable however many spans the trace has. Bars fill the width left after the
+    // fixed-width prefix, the two `|`, and the trailing duration column.
+    let list_area = rows[1];
+    let viewport = list_area.height.saturating_sub(2);
+    app.page_rows.set(viewport.max(1));
+    let bar_cells = (list_area.width as usize)
+        .saturating_sub(2 + 1 + WATERFALL_NAME_W + 2 + WATERFALL_SUFFIX_W)
+        .max(1);
+    let cursor = app.span_cursor.min(detail.spans.len().saturating_sub(1));
+    let items = if detail.spans.is_empty() {
+        // A trace with no spans is a real (if degenerate) result, not a blank pane.
+        vec![ListItem::new(Span::styled(
+            "(no spans)",
+            Style::default().fg(Color::DarkGray),
+        ))]
+    } else {
+        render_waterfall(&detail.waterfall, bar_cells)
+            .into_iter()
+            .enumerate()
+            .map(|(index, line)| {
+                // Non-OK spans read red so the interesting rows stand out in a long waterfall.
+                let style = if detail.spans.get(index).is_some_and(SpanRecord::is_error) {
+                    Style::default().fg(Color::Red)
+                } else {
+                    Style::default()
+                };
+                ListItem::new(Span::styled(line, style))
+            })
+            .collect::<Vec<_>>()
+    };
+    let title = if detail.spans.is_empty() {
+        "Spans".to_owned()
+    } else {
+        format!(
+            "Spans  [{}/{} {}]",
+            cursor + 1,
+            detail.spans.len(),
+            g.scroll()
+        )
+    };
+    let mut state = ListState::default();
+    state.select((!detail.spans.is_empty()).then_some(cursor));
+    frame.render_stateful_widget(
+        List::new(items)
+            .block(g.block().border_style(focus_border(focused)).title(title))
+            .highlight_style(
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        list_area,
+        &mut state,
+    );
+
+    if with_summary && let Some(span) = detail.spans.get(cursor) {
+        frame.render_widget(
+            Paragraph::new(span_summary_lines(span, g).join("\n"))
+                .wrap(Wrap { trim: false })
+                .block(g.block().title(format!("Span {} enter: fields", g.sep))),
+            rows[2],
+        );
+    }
+
+    let (sep, left, right, scroll_hint) = (g.sep, g.left, g.right, g.scroll());
+    frame.render_widget(
+        Paragraph::new(format!(
+            "esc/{left} back {sep} {scroll_hint} span {sep} enter span fields {sep} L logs for span \
+             {sep} {right} fwd"
+        ))
+        .wrap(Wrap { trim: true }),
+        hint_area,
+    );
+}
+
+/// Render the full field detail of one span (the `Route::SpanDetail` content): a scrollable dump of
+/// every stored field, mirroring the log detail's shape.
+fn draw_span_detail(
+    frame: &mut ratatui::Frame<'_>,
+    app: &App,
+    trace_id: &str,
+    span: &SpanRecord,
+    area: Rect,
+    focused: bool,
+    g: &Glyphs,
+) {
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(3),
+            Constraint::Length(2),
+        ])
+        .split(area);
+
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            format!(" {} ", span.name),
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )))
+        .block(g.block().title("Span detail")),
+        rows[0],
+    );
+
+    let lines = span_detail_lines(trace_id, span, g);
+    let body_area = rows[1];
+    let inner_width = body_area.width.saturating_sub(2);
+    let viewport = body_area.height.saturating_sub(2);
+    let total_rows: u16 = lines
+        .iter()
+        .map(|line| wrapped_rows(line, inner_width))
+        .sum::<u32>()
+        .min(u16::MAX as u32) as u16;
+    let max_scroll = total_rows.saturating_sub(viewport);
+    app.max_scroll.set(max_scroll);
+    app.page_rows.set(viewport.max(1));
+    let scroll = app.scroll.min(max_scroll);
+    let title = if max_scroll > 0 {
+        format!("Fields  [{scroll}/{max_scroll} {}]", g.scroll())
+    } else {
+        "Fields".to_owned()
+    };
+    frame.render_widget(
+        Paragraph::new(lines.join("\n"))
+            .wrap(Wrap { trim: false })
+            .scroll((scroll, 0))
+            .block(g.block().border_style(focus_border(focused)).title(title)),
+        body_area,
+    );
+
+    let (sep, left, right, scroll_hint) = (g.sep, g.left, g.right, g.scroll());
+    frame.render_widget(
+        Paragraph::new(format!(
+            "esc/{left} back {sep} L logs for this span {sep} {scroll_hint} scroll {sep} {right} fwd"
+        ))
+        .wrap(Wrap { trim: true }),
+        rows[2],
+    );
+}
+
+/// The compact summary of the span under the trace detail's cursor (the bottom pane).
+fn span_summary_lines(span: &SpanRecord, g: &Glyphs) -> Vec<String> {
+    let sep = g.sep;
+    let mut status = span.status_code.clone();
+    if let Some(message) = &span.status_message {
+        status.push_str(&format!(" {sep} {message}"));
+    }
+    if span.malformed {
+        status.push_str(&format!(" {sep} {} malformed parent chain", g.warn));
+    }
+    vec![
+        format!(
+            "Span    {} {sep} {} {sep} {}",
+            span.name,
+            span.service.as_deref().unwrap_or("(no service)"),
+            if span.kind.is_empty() {
+                "(no kind)"
+            } else {
+                &span.kind
+            }
+        ),
+        format!(
+            "IDs     {} {sep} parent {}",
+            span.span_id,
+            span.parent_span_id.as_deref().unwrap_or("(root)")
+        ),
+        format!(
+            "Timing  +{} into trace {sep} {} long",
+            format_duration_ns(span.offset_ns.max(0) as u64, g.ascii),
+            format_duration_ns(span.duration_ns, g.ascii),
+        ),
+        format!("Status  {status}"),
+        format!(
+            "Fields  attrs {} {sep} resource {} {sep} scope {}{}{}",
+            span.attributes.len(),
+            span.resource.len(),
+            span.scope.len(),
+            if span.events.is_some() {
+                format!(" {sep} events")
+            } else {
+                String::new()
+            },
+            if span.links.is_some() {
+                format!(" {sep} links")
+            } else {
+                String::new()
+            },
+        ),
+    ]
+}
+
+/// The lines of the span field detail: header fields, then the raw events/links JSON and the attribute
+/// sections (the same layout as [`log_detail_lines`]).
+fn span_detail_lines(trace_id: &str, span: &SpanRecord, g: &Glyphs) -> Vec<String> {
+    let mut lines = vec![
+        format!("Trace ID  {trace_id}"),
+        format!("Span ID   {}", span.span_id),
+        format!(
+            "Parent    {}",
+            span.parent_span_id.as_deref().unwrap_or("(root)")
+        ),
+        format!("Name      {}", span.name),
+        format!("Service   {}", span.service.as_deref().unwrap_or("-")),
+        format!(
+            "Kind      {}",
+            if span.kind.is_empty() {
+                "-"
+            } else {
+                &span.kind
+            }
+        ),
+        format!("Status    {}", span.status_code),
+    ];
+    if let Some(message) = &span.status_message {
+        lines.push(format!("Message   {message}"));
+    }
+    lines.push(format!(
+        "Start     {}",
+        format_timestamp_ns(span.start_time_ns)
+    ));
+    lines.push(format!(
+        "Offset    +{} into the trace",
+        format_duration_ns(span.offset_ns.max(0) as u64, g.ascii)
+    ));
+    lines.push(format!(
+        "Duration  {}",
+        format_duration_ns(span.duration_ns, g.ascii)
+    ));
+    if span.malformed {
+        lines.push(format!(
+            "{}  parent chain is broken (orphan or cycle) {} shown as a malformed root",
+            g.warn, g.dash
+        ));
+    }
+    push_attr_section(&mut lines, "Attributes", &span.attributes);
+    push_attr_section(&mut lines, "Resource", &span.resource);
+    push_attr_section(&mut lines, "Scope", &span.scope);
+    // Events/links are stored as canonical JSON (ARCHITECTURE.md §6.3); show them verbatim rather than
+    // half-parsing them here.
+    for (title, json) in [("Events", &span.events), ("Links", &span.links)] {
+        if let Some(json) = json.as_deref().filter(|json| !json.is_empty()) {
+            lines.push(String::new());
+            lines.push(title.to_owned());
+            lines.push(format!("  {json}"));
+        }
+    }
+    lines
+}
+
+/// Format a nanosecond duration, scaling the unit so both a sub-microsecond span and a multi-second one
+/// read naturally. `ascii` spells the microsecond unit `us` instead of `µs` (the `--ascii` guarantee).
+fn format_duration_ns(ns: u64, ascii: bool) -> String {
+    if ns < 1_000 {
+        format!("{ns}ns")
+    } else if ns < 1_000_000 {
+        format!(
+            "{:.3}{}",
+            ns as f64 / 1_000.0,
+            if ascii { "us" } else { "µs" }
+        )
+    } else if ns < 1_000_000_000 {
+        format!("{:.3}ms", ns as f64 / 1_000_000.0)
+    } else {
+        format!("{:.3}s", ns as f64 / 1_000_000_000.0)
+    }
+}
+
 /// Render the detailed time-series viewer for one selected metric series into the content area beneath
 /// the menu bar: a header, a line chart of the series over the query window (with a movable vertical
 /// cursor), and a readout of the point under the cursor plus summary stats. ASCII fallback via
@@ -6273,6 +6970,23 @@ mod tests {
         assert_eq!(mascot_phase(-1), 1);
     }
 
+    /// A flat, ASCII-named trace with more spans than a short pane fits — the fixture for the `--ascii`
+    /// render sweep over the trace views (their own chrome must stay ASCII, including the µs unit and
+    /// the preview pane's truncation note).
+    fn ascii_trace() -> imbh::Trace {
+        let spans = (0..10u8)
+            .map(|i| waterfall_span(i + 1, None, &format!("span-{i}"), i as i64 * 1_000, 900))
+            .collect::<Vec<_>>();
+        imbh::Trace {
+            trace_id: TraceId([0xaa; 16]),
+            root_service: Some("api".to_owned()),
+            root_name: Some("root".to_owned()),
+            start_time: Timestamp(0),
+            duration_ns: imbh::DurationNs(10_000),
+            spans,
+        }
+    }
+
     #[test]
     fn ascii_mode_renders_only_ascii_across_the_ui() {
         use ratatui::Terminal;
@@ -6356,6 +7070,45 @@ mod tests {
                 app.route = Route::MetricDetail {
                     detail: metric_detail.clone(),
                 };
+                app
+            }),
+            ("trace detail", {
+                let mut app = App::new();
+                app.route = Route::TraceDetail {
+                    detail: build_trace_detail(&ascii_trace(), true),
+                };
+                app.span_cursor = 1;
+                app
+            }),
+            ("span detail", {
+                let mut app = App::new();
+                let detail = build_trace_detail(&ascii_trace(), true);
+                app.route = Route::SpanDetail {
+                    trace_id: detail.trace_id.clone(),
+                    span: detail.spans[1].clone(),
+                };
+                app
+            }),
+            ("traces list with a waterfall preview", {
+                let mut app = App::new();
+                let detail = build_trace_detail(&ascii_trace(), true);
+                app.route = Route::Traces;
+                app.snapshot = Snapshot {
+                    title: "TraceQL".to_owned(),
+                    lines: vec![
+                        "1 matching traces".into(),
+                        format!("{}  ts", detail.trace_id),
+                    ],
+                    list_from: Some(1),
+                    // A deeper trace than the short preview pane fits, so the truncation note renders.
+                    detail: Some(DetailPane {
+                        title: "Waterfall".to_owned(),
+                        lines: Vec::new(),
+                        waterfall: Some(detail.waterfall.clone()),
+                    }),
+                    ..Default::default()
+                };
+                app.selected = 1;
                 app
             }),
         ];
@@ -6826,7 +7579,7 @@ mod tests {
         };
         // Render the width-independent rows at two different bar widths: alignment must hold at any
         // size, and the bar must actually stretch to the width it is given.
-        let waterfall = build_waterfall(&trace, true);
+        let waterfall = build_trace_detail(&trace, true).waterfall;
         for cells in [40usize, 77] {
             let lines = render_waterfall(&waterfall, cells);
             assert_eq!(lines.len(), 2);
@@ -6841,6 +7594,247 @@ mod tests {
             assert_eq!(bar(&lines[0]), cells);
             assert_eq!(bar(&lines[1]), cells);
         }
+    }
+
+    /// A three-span trace: a root, a nested child, and an orphan (its parent is not in the trace) that
+    /// carries an error status, attributes, and events — enough to exercise every detail section.
+    fn sample_trace() -> imbh::Trace {
+        let mut child = waterfall_span(2, Some(1), "db.query", 200_000, 400_000);
+        child.service = Some("api".to_owned());
+        child.attributes = Attributes::from_canonical_json(r#"{"db.system":"postgres"}"#);
+        let mut orphan = waterfall_span(3, Some(9), "orphan", 600_000, 100_000);
+        orphan.status_code = "ERROR".to_owned();
+        orphan.status_message = Some("boom".to_owned());
+        orphan.events = Some(r#"[{"name":"exception"}]"#.to_owned());
+        imbh::Trace {
+            trace_id: TraceId([0xaa; 16]),
+            root_service: Some("api".to_owned()),
+            root_name: Some("GET /users".to_owned()),
+            start_time: Timestamp(0),
+            duration_ns: imbh::DurationNs(1_000_000),
+            spans: vec![waterfall_span(1, None, "root", 0, 1_000_000), child, orphan],
+        }
+    }
+
+    /// An App parked on the Traces list with one result row whose trace is already materialized — the
+    /// state Enter opens the trace detail from.
+    fn traces_app_with_trace() -> App {
+        let detail = build_trace_detail(&sample_trace(), true);
+        let mut app = App::new();
+        app.route = Route::Traces;
+        app.snapshot = Snapshot {
+            lines: vec![
+                "1 matching traces".into(),
+                format!("{}  ts", detail.trace_id),
+            ],
+            list_from: Some(1),
+            ..Default::default()
+        };
+        app.selected = 1;
+        app.detail_trace_id = Some(detail.trace_id.clone());
+        app.trace_detail = Some(detail);
+        app
+    }
+
+    #[test]
+    fn trace_detail_records_align_with_the_waterfall_rows() {
+        let detail = build_trace_detail(&sample_trace(), true);
+        assert_eq!(detail.spans.len(), detail.waterfall.rows.len());
+        assert_eq!(detail.trace_id, TraceId([0xaa; 16]).to_hex());
+        assert_eq!(detail.root_name.as_deref(), Some("GET /users"));
+        assert_eq!(detail.duration_ns, 1_000_000);
+
+        // The root: no parent, at the trace start, and the row is not flagged malformed.
+        assert_eq!(detail.spans[0].parent_span_id, None);
+        assert_eq!(detail.spans[0].offset_ns, 0);
+        assert!(!detail.spans[0].malformed);
+        assert!(detail.waterfall.rows[0].prefix.starts_with(' '));
+
+        // The child: parented, offset into the trace, and indented one level in its row prefix.
+        assert_eq!(
+            detail.spans[1].parent_span_id.as_deref(),
+            Some(imbh::SpanId([1; 8]).to_hex().as_str())
+        );
+        assert_eq!(detail.spans[1].offset_ns, 200_000);
+        assert_eq!(
+            detail.spans[1].attributes,
+            vec![("db.system".to_owned(), "postgres".to_owned())]
+        );
+        assert!(detail.waterfall.rows[1].prefix.starts_with("   "));
+
+        // The orphan stays visible, flagged malformed (`!` marker) rather than dropped, and reads as an
+        // error so the waterfall row can be coloured.
+        assert!(detail.spans[2].malformed);
+        assert!(detail.spans[2].is_error());
+        assert!(detail.waterfall.rows[2].prefix.starts_with('!'));
+    }
+
+    #[test]
+    fn enter_opens_the_retained_trace_detail_and_records_history() {
+        let mut app = traces_app_with_trace();
+        assert!(app.open_trace_detail());
+        let detail = app.route_trace_detail().expect("trace detail route");
+        assert_eq!(detail.spans.len(), 3);
+        assert_eq!(app.span_cursor, 0);
+        // The departing Traces list is on the back stack, so Esc/← returns to it.
+        assert_eq!(app.back.len(), 1);
+        assert!(matches!(app.back[0].route, Route::Traces));
+    }
+
+    #[test]
+    fn opening_a_trace_detail_is_a_noop_until_its_trace_lands() {
+        // Fetch still in flight: no route change and no history entry, so the Enter is free to be
+        // remembered as a `pending_trace_open` intent instead.
+        let mut app = traces_app_with_trace();
+        app.trace_detail = None;
+        assert!(!app.open_trace_detail());
+        assert!(matches!(app.route, Route::Traces));
+        assert!(app.back.is_empty());
+
+        // A retained trace for a *different* selection is equally not openable.
+        let mut other = build_trace_detail(&sample_trace(), true);
+        other.trace_id = TraceId([0xbb; 16]).to_hex();
+        app.trace_detail = Some(other);
+        assert!(!app.open_trace_detail());
+        assert!(matches!(app.route, Route::Traces));
+    }
+
+    #[test]
+    fn span_cursor_moves_within_the_trace_and_drives_the_span_detail() {
+        let mut app = traces_app_with_trace();
+        assert!(app.open_trace_detail());
+
+        app.move_span_cursor(1);
+        assert_eq!(app.span_cursor, 1);
+        app.move_span_cursor(10); // saturates at the last span
+        assert_eq!(app.span_cursor, 2);
+        app.move_span_cursor(-10); // saturates at the first
+        assert_eq!(app.span_cursor, 0);
+
+        // Enter on the cursor's span opens its field detail, carrying the trace id along.
+        app.move_span_cursor(2);
+        assert_eq!(
+            app.selected_span().map(|span| span.name.as_str()),
+            Some("orphan")
+        );
+        assert!(app.open_span_detail());
+        let (trace_id, span) = app.route_span_detail().expect("span detail route");
+        assert_eq!(trace_id, TraceId([0xaa; 16]).to_hex());
+        assert_eq!(span.name, "orphan");
+        // Both trace views belong to the Traces screen and render as detail content.
+        assert_eq!(app.screen(), Screen::Traces);
+        assert!(app.route.is_detail());
+        // Back through the span detail lands on the trace detail, then the list.
+        assert!(app.go_back());
+        assert!(app.route_trace_detail().is_some());
+        assert_eq!(app.span_cursor, 2, "the waterfall cursor survives Back");
+        assert!(app.go_back());
+        assert!(matches!(app.route, Route::Traces));
+    }
+
+    #[test]
+    fn span_log_correlation_is_span_granular_from_both_trace_views() {
+        let mut app = traces_app_with_trace();
+        assert_eq!(app.span_log_correlation(), None, "not on a trace view");
+        assert!(app.open_trace_detail());
+        app.move_span_cursor(1);
+        let expected = LogCorrelation {
+            trace_id: TraceId([0xaa; 16]).to_hex(),
+            span_id: Some(imbh::SpanId([2; 8]).to_hex()),
+        };
+        assert_eq!(app.span_log_correlation(), Some(expected.clone()));
+        // The span detail correlates to the same span.
+        assert!(app.open_span_detail());
+        assert_eq!(app.span_log_correlation(), Some(expected));
+    }
+
+    #[test]
+    fn span_detail_lines_show_ids_timing_and_every_section() {
+        let detail = build_trace_detail(&sample_trace(), true);
+        let g = Glyphs::new(true);
+        let text = span_detail_lines(&detail.trace_id, &detail.spans[2], &g).join("\n");
+        assert!(text.contains(&detail.trace_id));
+        assert!(text.contains(&detail.spans[2].span_id));
+        assert!(text.contains("Status    ERROR"));
+        assert!(text.contains("Message   boom"));
+        assert!(text.contains("Offset    +600.000us into the trace"));
+        assert!(text.contains("Duration  100.000us"));
+        assert!(
+            text.contains("parent chain is broken"),
+            "malformed note: {text}"
+        );
+        assert!(text.contains("Events"));
+        assert!(text.contains("exception"));
+
+        // The child's attributes render as a titled section.
+        let child = span_detail_lines(&detail.trace_id, &detail.spans[1], &g).join("\n");
+        assert!(child.contains("Attributes (1)"));
+        assert!(child.contains("db.system = postgres"));
+        // A root span says so rather than showing an empty parent.
+        let root = span_detail_lines(&detail.trace_id, &detail.spans[0], &g).join("\n");
+        assert!(root.contains("Parent    (root)"));
+    }
+
+    #[test]
+    fn durations_scale_their_unit() {
+        assert_eq!(format_duration_ns(900, false), "900ns");
+        assert_eq!(format_duration_ns(1_500, false), "1.500µs");
+        assert_eq!(format_duration_ns(1_500, true), "1.500us");
+        assert_eq!(format_duration_ns(2_500_000, false), "2.500ms");
+        assert_eq!(format_duration_ns(3_000_000_000, false), "3.000s");
+    }
+
+    #[test]
+    fn trace_detail_waterfall_scrolls_to_keep_the_span_cursor_visible() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        // A trace with far more spans than fit the pane: the row the cursor is on must be on screen,
+        // which the fixed preview pane on the Traces list cannot do.
+        let spans = (0..40u8)
+            .map(|i| waterfall_span(i + 1, None, &format!("span-{i}"), i as i64 * 1_000, 1_000))
+            .collect::<Vec<_>>();
+        let trace = imbh::Trace {
+            trace_id: TraceId([0xaa; 16]),
+            root_service: Some("api".to_owned()),
+            root_name: Some("root".to_owned()),
+            start_time: Timestamp(0),
+            duration_ns: imbh::DurationNs(40_000),
+            spans,
+        };
+        let mut app = App::new();
+        app.route = Route::TraceDetail {
+            detail: build_trace_detail(&trace, true),
+        };
+        let options = Options {
+            ascii: true,
+            ..Options::default()
+        };
+
+        let rendered = |app: &App| -> String {
+            let mut terminal = Terminal::new(TestBackend::new(80, 14)).unwrap();
+            terminal.draw(|frame| draw(frame, app, &options)).unwrap();
+            let buffer = terminal.backend().buffer().clone();
+            (0..buffer.area.height)
+                .map(|y| {
+                    (0..buffer.area.width)
+                        .map(|x| buffer[(x, y)].symbol().to_owned())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        // At the top the first span shows and the last is far below the fold.
+        let top = rendered(&app);
+        assert!(top.contains("span-0"), "{top}");
+        assert!(!top.contains("span-39"), "{top}");
+
+        // With the cursor on the last span the list has scrolled it into view.
+        app.span_cursor = 39;
+        let bottom = rendered(&app);
+        assert!(bottom.contains("span-39"), "{bottom}");
+        assert!(bottom.contains("[40/40"), "row counter: {bottom}");
     }
 
     #[test]
@@ -7048,6 +8042,17 @@ mod tests {
         };
         assert_eq!(ld.screen(), Screen::Logs);
         assert!(ld.is_detail());
+        let trace = build_trace_detail(&sample_trace(), true);
+        let span = trace.spans[0].clone();
+        let td = Route::TraceDetail { detail: trace };
+        assert_eq!(td.screen(), Screen::Traces);
+        assert!(td.is_detail());
+        let sd = Route::SpanDetail {
+            trace_id: "aa".into(),
+            span,
+        };
+        assert_eq!(sd.screen(), Screen::Traces);
+        assert!(sd.is_detail());
 
         // `list` round-trips through `screen`.
         for screen in [

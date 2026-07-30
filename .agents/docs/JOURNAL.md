@@ -681,3 +681,54 @@ bridge gateway)` and applied it via `docker plugin set`, exactly as designed.
 
 Everything created was removed afterwards: plugin, rootfs image, containers, and the root-owned data
 directories (deleted from a throwaway container, since the plugin runs as root).
+
+---
+
+## 2026-07-30 — imbh-tui: a trace detail screen (scrollable waterfall + span drill-down)
+
+**The problem, as reported:** on the Traces screen the span waterfall lives in a fixed slice of the
+results area (a 55/45 vertical split) and does not scroll, so any trace deeper than ~10 spans is
+partly invisible with no way to reach the rest.
+
+**What landed.** Two new full-content routes on the Traces screen, following the existing non-modal
+detail pattern (`Route::MetricDetail` / `Route::LogDetail`) exactly:
+
+* `Route::TraceDetail { detail: TraceDetail }` — the whole trace: a header (trace id, span count,
+  duration, start; root service/operation in the block title), the complete waterfall rendered as a
+  ratatui `List` with a span cursor, and (when the terminal is at least 18 content rows tall) a
+  five-line summary of the span under the cursor. Because the waterfall is a `List` with a selected
+  index, the widget scrolls it — `↑`/`↓`/PageUp/PageDown/Home/End walk all spans at any terminal
+  size, which is the actual fix for the report. Non-OK spans render red.
+* `Route::SpanDetail { trace_id, span }` — every stored field of one span (ids, parent, service,
+  kind, status + message, absolute start, offset into the trace, duration, the malformed-parent
+  note, the three attribute maps, and the raw events/links JSON), scrolled like the log detail.
+
+**Navigation.** `Enter` on the Traces list opens the trace detail; `Enter` on a waterfall row opens
+the span detail; `L` from either opens the Logs screen correlated by **trace id *and* span id** —
+which closes the "per-span waterfall cursor is the remaining piece" gap left by the 2026-07-23
+trace→log drill-down (that one was trace-granular). `←`/Esc/`→` history, `F9`, `1`-`4` and `t` keep
+working from inside both views, as for the other detail routes.
+
+**No second fetch.** The Traces list already materializes the selected trace to draw its preview
+pane (`request_waterfall` → `traces().get()`). That fetch now returns the structured trace alongside
+the pane (`build_trace_detail`, which emits the width-independent `Waterfall` rows *and* an aligned
+`Vec<SpanRecord>` in one pass), and the app retains it (`App::trace_detail`). So Enter is a pure
+in-memory navigation. The retained trace is dropped the moment the row cursor moves to another trace,
+so Enter can never open a detail for a trace the cursor has left. When Enter beats the in-flight
+fetch, the intent is remembered (`pending_trace_open`) and the view opens when the result lands —
+cleared by any navigation or by a newer fetch, so a late waterfall never yanks the user somewhere.
+
+**The preview pane no longer lies.** It still does not scroll (it is a preview), but when a trace has
+more spans than the pane's rows it now titles itself `Waterfall: N of M spans — enter: all` instead
+of silently cutting the tail. Silent truncation was the real defect; the full view is one key away.
+
+**Verification.** 95 unit tests in `imbh-tui` (8 new: record/row alignment including the orphan
+`!` marker, the open/no-op/pending paths, span cursor clamping + Back restoring it, the span-granular
+correlation from both routes, the field lines, duration-unit scaling, and a `TestBackend` render
+asserting span 40/40 is on screen at 80×14 — the regression for "the pane doesn't scroll"). Both new
+routes joined the `--ascii` render sweep (the µs unit spells `us` there). Full workspace gate green.
+Also driven end-to-end against a `gen-demo-db` database in a pty: list → Enter → trace detail → span
+cursor → Enter → span detail → `L` → `Logs for trace 18c6edde span e449b973`, then Esc back.
+
+**No dependency change**, so the footprint gate is untouched (`ratatui`'s `List`, `attrs_to_pairs`,
+and `push_attr_section` were all already in the graph).
