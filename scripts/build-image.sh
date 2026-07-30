@@ -1,38 +1,24 @@
 #!/usr/bin/env bash
-# Stage the build context for docker/Dockerfile, and (locally) build the image from it.
+# Build the distribution container image (docker/Dockerfile) locally, for the host architecture.
 #
-# This is the ONE definition of the context layout that docker/Dockerfile consumes:
+# This is the local half of the image story, and the only way to exercise docker/Dockerfile without
+# pushing a version tag. It compiles both shipped binaries with the release feature set, stages the
+# build context the Dockerfile expects, and builds.
 #
-#   <ctx>/linux/<goarch>/{imbhd,imbh-tui}
-#   <ctx>/LICENSE
-#   <ctx>/THIRD-PARTY-NOTICES.txt
-#
-# Both callers go through it, so that layout cannot drift between a local build and a release:
-#
-#   local     ./scripts/build-image.sh
-#             compiles both binaries for the host architecture with the release feature set, stages
-#             them, and runs `docker build` -> $IMAGE.
-#   release   .github/workflows/release.yml's `image` job
-#             `--stage-only` with one `--prebuilt` per architecture, pointing at the binaries the
-#             build matrix already produced and smoke-tested; docker/build-push-action then does the
-#             multi-arch build and push (it owns the registry auth, GHA layer cache, and provenance).
+# The multi-arch release image is built by .github/workflows/release.yml's `image` job, which stages
+# the same context inline from the archives the build matrix produced -- it does not call this script,
+# so that job stays readable on its own. Both satisfy the BUILD CONTEXT CONTRACT documented in
+# docker/Dockerfile's header; that block is the source of truth, and a layout change has to be applied
+# here and there.
 #
 # Usage:
-#   ./scripts/build-image.sh [--ctx DIR] [--stage-only] [--prebuilt GOARCH=DIR]...
+#   ./scripts/build-image.sh                              # -> imbh:dev
+#   IMAGE=ghcr.io/moriyoshi/imbh:0.1.1 ./scripts/build-image.sh
+#   DOCKER="sudo docker" ./scripts/build-image.sh          # rootful daemon
+#   FEATURES=grpc,tracing ./scripts/build-image.sh         # trim the imbhd feature set
 #
-#     --ctx DIR             where to stage (default: target/image-ctx, gitignored via /target/)
-#     --stage-only          stage and exit; do not run docker at all
-#     --prebuilt GOARCH=DIR take imbhd/imbh-tui from DIR instead of compiling; repeatable, and the
-#                           only way to stage more than one architecture
-#
-# Environment (local path only):
-#   IMAGE     image tag to build         (default imbh:dev)
-#   DOCKER    docker command             (default docker; e.g. DOCKER="sudo docker")
-#   FEATURES  imbhd feature set          (default docker,grpc,tracing)
-#
-# Like the other scripts here, the local path degrades gracefully (prints a hint, exits 0) when
-# docker is absent, so a containerless dev environment never breaks the gate. `--stage-only` never
-# skips: CI must fail loudly.
+# Like the other scripts here it degrades gracefully (prints a hint, exits 0) when the tool is
+# absent, so an offline/containerless dev environment never breaks the gate.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -40,99 +26,57 @@ cd "$(dirname "$0")/.."
 # Deliberately unquoted at the call sites so DOCKER="sudo docker" word-splits, matching
 # crates/imbh-server/docker-plugin/build.sh.
 : "${DOCKER:=docker}"
-# The release feature set. `docker` (log-driver plugin API) and `tracing` (stderr diagnostics) add
-# no crate and ~5 crates respectively; `grpc` is what makes OTLP/gRPC on 4317 — the default
-# transport for most OTel SDKs — work at all. All three are off by default so the footprint gate
-# measures the minimal graph, so a shipping build has to name them. Mirrors release.yml.
+# The release feature set, mirroring release.yml's Linux legs. `docker` (log-driver plugin API) and
+# `tracing` (stderr diagnostics) add no crate and ~5 crates respectively; `grpc` is what makes
+# OTLP/gRPC on 4317 -- the default transport for most OTel SDKs -- work at all. All three are off by
+# default so the footprint gate measures the minimal graph, so a shipping build has to name them.
 : "${FEATURES:=docker,grpc,tracing}"
 
-CTX="target/image-ctx"
-STAGE_ONLY=0
-PREBUILT=()
-
-usage() { sed -n '2,34p' "$0" | sed 's/^# \{0,1\}//'; }
-
-while [ $# -gt 0 ]; do
-  case "$1" in
-    --ctx)
-      [ $# -ge 2 ] || { echo "build-image: --ctx needs a directory" >&2; exit 2; }
-      CTX="$2"; shift 2 ;;
-    --stage-only) STAGE_ONLY=1; shift ;;
-    --prebuilt)
-      [ $# -ge 2 ] || { echo "build-image: --prebuilt needs GOARCH=DIR" >&2; exit 2; }
-      case "$2" in
-        *=*) PREBUILT+=("$2") ;;
-        *) echo "build-image: --prebuilt wants GOARCH=DIR, got '$2'" >&2; exit 2 ;;
-      esac
-      shift 2 ;;
-    -h | --help) usage; exit 0 ;;
-    *) echo "build-image: unknown argument '$1' (try --help)" >&2; exit 2 ;;
-  esac
-done
-
-# Only the local path needs docker; --stage-only must not silently skip in CI.
-if [ "${STAGE_ONLY}" -eq 0 ] && ! command -v "${DOCKER%% *}" > /dev/null 2>&1; then
-  echo "build-image: ${DOCKER%% *} not found — skipping image build."
+if ! command -v "${DOCKER%% *}" > /dev/null 2>&1; then
+  echo "build-image: ${DOCKER%% *} not found -- skipping image build."
   echo "  Install Docker, then re-run: ./scripts/build-image.sh"
   exit 0
 fi
 
 if [ ! -f THIRD-PARTY-NOTICES.txt ]; then
-  echo "build-image: THIRD-PARTY-NOTICES.txt is missing — it must ship in the image (Apache-2.0 §4(d))." >&2
+  echo "build-image: THIRD-PARTY-NOTICES.txt is missing -- it must ship in the image (Apache-2.0 §4(d))." >&2
   echo "  Generate it first (networked env): ./scripts/gen-notices.sh" >&2
   exit 1
 fi
 
-# No --prebuilt: compile for the host. docker/Dockerfile selects the binary by BuildKit's
-# ${TARGETARCH}, whose values are Go-style, so translate uname's spelling.
-if [ "${#PREBUILT[@]}" -eq 0 ]; then
-  case "$(uname -m)" in
-    x86_64 | amd64) host_arch=amd64 ;;
-    aarch64 | arm64) host_arch=arm64 ;;
-    *)
-      echo "build-image: unsupported host architecture $(uname -m)" >&2
-      exit 1
-      ;;
-  esac
-  echo "build-image: cargo build --release (imbhd features: ${FEATURES}) ..."
-  cargo build --release -p imbh-server --features "${FEATURES}"
-  cargo build --release -p imbh-tui
-  PREBUILT=("${host_arch}=target/release")
-fi
+# docker/Dockerfile selects the binary with BuildKit's ${TARGETARCH}, whose values are Go-style, so
+# translate uname's spelling to match.
+case "$(uname -m)" in
+  x86_64 | amd64) arch=amd64 ;;
+  aarch64 | arm64) arch=arm64 ;;
+  *)
+    echo "build-image: unsupported host architecture $(uname -m)" >&2
+    exit 1
+    ;;
+esac
 
-rm -rf "${CTX}"
-mkdir -p "${CTX}"
-for entry in "${PREBUILT[@]}"; do
-  arch="${entry%%=*}"
-  dir="${entry#*=}"
-  mkdir -p "${CTX}/linux/${arch}"
-  for b in imbhd imbh-tui; do
-    if [ ! -f "${dir}/${b}" ]; then
-      echo "build-image: ${dir}/${b} not found (staging linux/${arch})" >&2
-      exit 1
-    fi
-    install -m 0755 "${dir}/${b}" "${CTX}/linux/${arch}/${b}"
-  done
-done
-# Apache-2.0 §4(d): the notices travel with every binary distribution, the image included. In CI
-# these are the copies generated by this run's `licenses` job, not whatever is committed.
-install -m 0644 LICENSE "${CTX}/LICENSE"
-install -m 0644 THIRD-PARTY-NOTICES.txt "${CTX}/THIRD-PARTY-NOTICES.txt"
+echo "build-image: cargo build --release (imbhd features: ${FEATURES}) ..."
+cargo build --release -p imbh-server --features "${FEATURES}"
+cargo build --release -p imbh-tui
 
-echo "build-image: staged ${CTX}"
-find "${CTX}" -type f -exec ls -l {} + | awk '{printf "  %10d  %s\n", $5, $NF}'
+# Under target/ so it inherits .gitignore; the context root is this directory, so the repo-root
+# .dockerignore (which excludes target/) does not apply to it.
+ctx="target/image-ctx"
+rm -rf "${ctx}"
+mkdir -p "${ctx}/linux/${arch}"
+install -m 0755 "target/release/imbhd" "${ctx}/linux/${arch}/imbhd"
+install -m 0755 "target/release/imbh-tui" "${ctx}/linux/${arch}/imbh-tui"
+# Apache-2.0 §4(d): the notices travel with every binary distribution, the image included.
+install -m 0644 LICENSE "${ctx}/LICENSE"
+install -m 0644 THIRD-PARTY-NOTICES.txt "${ctx}/THIRD-PARTY-NOTICES.txt"
 
-if [ "${STAGE_ONLY}" -eq 1 ]; then
-  exit 0
-fi
-
-echo "build-image: docker build -> ${IMAGE} ..."
+echo "build-image: docker build -> ${IMAGE} (linux/${arch}) ..."
 # BuildKit is required, not merely preferred: ${TARGETARCH} and `FROM --platform=$BUILDPLATFORM` are
 # BuildKit features and silently expand to nothing under the legacy builder.
 DOCKER_BUILDKIT=1 ${DOCKER} build \
   -f docker/Dockerfile \
   -t "${IMAGE}" \
-  "${CTX}"
+  "${ctx}"
 
 echo "build-image: built ${IMAGE}"
 echo "  serve:   ${DOCKER} run --rm -p 4318:4318 -p 4317:4317 -v imbh-data:/var/lib/imbh ${IMAGE}"

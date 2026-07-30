@@ -374,45 +374,49 @@ jobs:
       # Pushing to GHCR.
       packages: write
     steps:
-      # docker/Dockerfile, scripts/build-image.sh, and the repo-root LICENSE (sparse-checkout cone
-      # mode always includes top-level files). The image compiles nothing, so no toolchain here.
+      # Only docker/Dockerfile is needed from the repository — the image compiles nothing, so there is
+      # no toolchain and no source checkout here.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          sparse-checkout: |
-            docker
-            scripts
+          sparse-checkout: docker
       - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           pattern: dist-*-unknown-linux-gnu
           merge-multiple: true
           path: archives
-      # The notices that go into the image are the ones this run generated, matching the archives —
-      # not the committed copy the checkout above brought along. build-image.sh reads it from the
-      # repository root, so overwrite it there.
-      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
-        with:
-          name: third-party-notices
 
+      # Deliberately inline rather than calling scripts/build-image.sh: this job should be readable
+      # top to bottom, with no indirection into a script whose default mode is to compile the
+      # workspace. docker/Dockerfile's header is the contract for the layout below; keep the two in
+      # step (`./scripts/build-image.sh` stages the same shape for a local single-arch build).
       - name: Stage the build context
         shell: bash
         run: |
           set -euo pipefail
           version="${{ needs.meta.outputs.version }}"
-          # Unpack each Linux archive, then let scripts/build-image.sh lay out the context. The
-          # layout itself lives in that script and nowhere else, so a local `./scripts/build-image.sh`
-          # and this job cannot drift apart in a way docker/Dockerfile would notice.
-          # This Go-arch-to-Rust-triple mapping is the one thing that is genuinely CI-only; keep it in
-          # step with the Linux legs of the build matrix and with `platforms:` below.
-          args=()
+          ctx=docker/ctx
+
+          # docker/Dockerfile selects a binary with BuildKit's ${TARGETARCH}, so each architecture
+          # goes to linux/<goarch>/. This goarch-to-Rust-triple mapping is CI's alone; keep it in step
+          # with the Linux legs of the build matrix above and with `platforms:` below.
           for pair in 'amd64 x86_64-unknown-linux-gnu' 'arm64 aarch64-unknown-linux-gnu'; do
             arch="${pair%% *}"
             target="${pair##* }"
-            dir="unpacked/${target}"
-            mkdir -p "${dir}"
-            tar -xzf "archives/imbh-${version}-${target}.tar.gz" -C "${dir}" --strip-components=1
-            args+=(--prebuilt "${arch}=${dir}")
+            mkdir -p "${ctx}/linux/${arch}"
+            tar -xzf "archives/imbh-${version}-${target}.tar.gz" \
+              -C "${ctx}/linux/${arch}" --strip-components=1
+            chmod 0755 "${ctx}/linux/${arch}/imbhd" "${ctx}/linux/${arch}/imbh-tui"
           done
-          ./scripts/build-image.sh --stage-only --ctx docker/ctx "${args[@]}"
+
+          # Both archives carry the same LICENSE + notices, and they are the copies this run's
+          # `licenses` job generated -- so lifting them out of an archive is precisely what guarantees
+          # the image and the downloadable archives carry identical attribution. Move rather than copy
+          # so they do not linger beside the binaries.
+          mv "${ctx}/linux/amd64/LICENSE" "${ctx}/LICENSE"
+          mv "${ctx}/linux/amd64/THIRD-PARTY-NOTICES.txt" "${ctx}/THIRD-PARTY-NOTICES.txt"
+          rm -f "${ctx}/linux/arm64/LICENSE" "${ctx}/linux/arm64/THIRD-PARTY-NOTICES.txt"
+
+          find "${ctx}" -type f -printf '  %10s  %p\n'
 
       - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
       - name: Log in to GHCR

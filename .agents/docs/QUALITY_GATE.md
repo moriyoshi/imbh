@@ -194,11 +194,14 @@ Two invariants worth restating, because breaking either produces a *silently* ba
   smoke-tested. Introducing a `RUN cargo build` would put a fat-LTO compile under QEMU on the release
   path (hours, per architecture). The one `RUN` in the Dockerfile is pinned to `$BUILDPLATFORM`
   precisely so no emulation is needed at all.
-- **The build-context layout is defined once, in `scripts/build-image.sh`.** `docker/Dockerfile`
-  depends on `linux/<goarch>/{imbhd,imbh-tui}` plus `LICENSE` and `THIRD-PARTY-NOTICES.txt` at the
-  context root. The `image` job stages that by calling the same script with `--stage-only --prebuilt
-  <goarch>=<dir>`, so a local build and a release build cannot drift apart in a way the Dockerfile
-  would notice. Do not re-inline the staging into the workflow.
+- **The build-context layout is a contract with two implementations.** `docker/Dockerfile`'s header
+  block is the contract (`linux/<goarch>/{imbhd,imbh-tui}` plus `LICENSE` and
+  `THIRD-PARTY-NOTICES.txt` at the context root). `scripts/build-image.sh` implements it for a local
+  single-arch build; `release.yml`'s `image` job implements it inline for the multi-arch release. CI
+  stages inline **by choice** — that job stays readable without following a script whose default mode
+  compiles the workspace — so the price is that a layout change must be made in the Dockerfile header
+  first and then applied to both. A `workflow_dispatch` dry run catches a CI-side mismatch; a bare
+  `./scripts/build-image.sh` catches a local one. Run both after touching the layout.
 
 On caching: the release build job caches **only the cargo registry** (`cache-targets: "false"`), and
 that is deliberate — see the comment on the step. GitHub scopes Actions caches by ref and will not

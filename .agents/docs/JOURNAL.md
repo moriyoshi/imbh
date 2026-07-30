@@ -1045,3 +1045,57 @@ Verified: both script paths (compile-for-host and `--stage-only` with two `--pre
 argument validation and its exit codes (2 for usage, 1 for a missing binary), the graceful skip in
 local mode versus no skip in stage-only mode, and a Dockerfile build over a script-staged context on the
 emulator-free builder. Workflow references re-validated; all nine actions still SHA-pinned.
+
+## 2026-07-30 — CD: the image job stages inline; build-image.sh is local-only again
+
+**Supersedes the "Staging is now defined once" paragraph in the entry above.** That entry describes
+`scripts/build-image.sh` growing `--ctx` / `--stage-only` / `--prebuilt` so the `image` job could call
+it. The user's requirement is the opposite and takes precedence: **the CI job must be transparent and
+self-contained.** So the staging is inlined back into `release.yml`, and `build-image.sh` returns to
+being the local-only tool it started as, with those three flags deleted -- they existed solely to serve
+CI, and with CI no longer calling it they were dead surface.
+
+This came from misreading "consider embedding build-image.sh in the workflow steps" as "call the script
+from the workflow" when it meant "inline its logic into the steps". Worth recording because the two
+readings produce opposite structures and the wrong one survived a whole review cycle.
+
+**How the drift risk is handled now that there are two implementations.** The build-context layout
+(`linux/<goarch>/{imbhd,imbh-tui}` plus `LICENSE` and `THIRD-PARTY-NOTICES.txt` at the context root) is
+declared in a `BUILD CONTEXT CONTRACT` block in `docker/Dockerfile`'s header -- the *consumer* owns the
+contract, and the two producers reference it:
+
+- `scripts/build-image.sh` -- local, single-arch, compiles first.
+- `release.yml`'s `image` job -- release, multi-arch, unpacks the archives.
+
+A layout change is made in the Dockerfile header first and then applied to both. Each side has a cheap
+detector: a `workflow_dispatch` dry run catches a CI-side mismatch, a bare `./scripts/build-image.sh`
+catches a local one. That is a real cost of the inlining and is written down rather than papered over.
+
+Inlining also simplified two things. The `image` job no longer needs `scripts` in its sparse-checkout,
+and it no longer downloads the notices artifact separately: LICENSE and the notices are lifted straight
+out of one of the unpacked archives, which is a *stronger* guarantee than the previous arrangement --
+it makes the attribution in the image byte-identical to what a user downloads, by construction, rather
+than by both happening to come from the same run.
+
+**First full run of the local path, and it paid for itself twice.** `./scripts/build-image.sh` had
+never been executed end to end (earlier verification used raw buildx over hand-staged contexts). It
+works -- and because it builds *release* binaries, it produced two things the debug-based testing could
+not:
+
+1. **The glibc finding confirmed on release artifacts**, which is what the guard actually gates:
+   `imbhd` requires at most `GLIBC_2.34`, `imbh-tui` requires `GLIBC_2.39` (34 MB and 33 MB
+   respectively). The 2.36 threshold therefore rejects the real shipping `imbh-tui` when built on a
+   2.39 host, exactly as intended. Previously this was only measured on debug builds.
+2. **A usability bug in the image.** `docker run <image> mydata` -- a *relative* database path -- died
+   with a bare `Storage(... PermissionDenied)` from deep inside storage, because `imbhd` resolves a
+   relative `DB_DIR` against the working directory, which was `/` and is not writable by uid 10001.
+   Fixed with `WORKDIR /var/lib/imbh`, so a relative path lands in the writable volume. Verified: the
+   same command now opens the database and proceeds to "nothing to serve".
+
+**Verified.** The inlined staging run verbatim against archives built in the exact shape the `Package`
+step produces (top-level `imbh-<version>-<target>/`, `--strip-components=1`), yielding the contracted
+layout; a Dockerfile build over that context on the emulator-free builder; the simplified
+`build-image.sh` end to end twice; the `WORKDIR` fix against the failing command; and the finished image
+serving `/health` and `/api/query` with the database initialised on the volume by the unprivileged user.
+Workflow references re-validated, all nine actions still SHA-pinned, and the `image` job now contains no
+reference to the script outside a comment.

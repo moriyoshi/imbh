@@ -8,14 +8,26 @@
 #
 # This image COMPILES NOTHING. It assembles binaries the release matrix already built and gated, so
 # a multi-arch manifest costs no emulated Rust build — the workspace's fat-LTO release profile takes
-# tens of minutes natively and hours under QEMU. The build context is therefore a small staged
-# directory, *not* the repository root:
+# tens of minutes natively and hours under QEMU.
+#
+# ── BUILD CONTEXT CONTRACT ───────────────────────────────────────────────────────────────
+# The context is a small staged directory, *not* the repository root:
 #
 #   <context>/
 #     linux/amd64/{imbhd,imbh-tui}
 #     linux/arm64/{imbhd,imbh-tui}      # only the arches you are building
 #     LICENSE
 #     THIRD-PARTY-NOTICES.txt
+#
+# This block is the contract, and it has TWO independent implementations on purpose:
+#
+#   ../scripts/build-image.sh          local, single-arch: compiles for the host, then builds
+#   release.yml's `image` job          release, multi-arch: unpacks the archives, then pushes
+#
+# CI stages inline rather than shelling out to the script, so that job stays readable on its own.
+# The cost is that both producers have to match this block -- so if you change the layout, change it
+# here first and then update both. A `workflow_dispatch` dry run catches a CI-side mismatch; a bare
+# `./scripts/build-image.sh` catches a local one.
 
 # `prep` exists purely so the image needs no RUN step on the *target* platform: it is pinned to
 # $BUILDPLATFORM, so `useradd` executes natively even when producing the linux/arm64 leg on an amd64
@@ -67,6 +79,10 @@ LABEL org.opencontainers.image.source="https://github.com/moriyoshi/imbh" \
       org.opencontainers.image.description="imbhd (reference OTLP server) + imbh-tui, for the embeddable observability database imbh"
 
 USER 10001:10001
+# So a *relative* database path resolves somewhere the unprivileged user can actually write.
+# `imbhd` defaults DB_DIR to `./imbh-data`, and without this the working directory is `/`, so
+# `docker run <image> mydata` failed with a bare "Permission denied" from deep inside storage.
+WORKDIR /var/lib/imbh
 # `imbhd [DB_DIR] [ADDR] [GRPC_ADDR]`; CMD supplies only DB_DIR so the ENV addresses above apply.
 # Override the whole thing for the explorer:
 #   docker run -it --rm -v imbh-data:/var/lib/imbh --entrypoint imbh-tui <image> /var/lib/imbh
