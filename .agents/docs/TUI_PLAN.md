@@ -1,5 +1,23 @@
 # Companion TUI plan
 
+> **Trace detail screen (2026-07-30):** the Traces screen gained two full-content routes, so a trace is
+> no longer confined to the non-scrolling half-height preview pane on the list. `Route::TraceDetail`
+> shows the whole trace — header (trace id, span count, duration, start; root service/operation in the
+> block title), the complete waterfall as a span-selectable ratatui `List` (so `↑`/`↓`/PageUp/PageDown/
+> Home/End walk every span and the widget scrolls it, at any terminal size; non-OK spans in red), and,
+> when the content area is at least 18 rows tall, a five-line summary of the span under the cursor.
+> `Route::SpanDetail` shows one span's full fields (ids/parent, service, kind, status + message,
+> absolute start, offset into the trace, duration, the malformed-parent note, the three attribute maps,
+> and the raw events/links JSON), scrolled like the log detail. `Enter` on the Traces list opens the
+> trace detail, `Enter` on a waterfall row opens the span detail, and `L` from either opens Logs
+> correlated by trace id **and** span id — closing the per-span drill-down gap the 2026-07-23 note left
+> open (§3.3). No extra query: the list already materializes the selected trace for its preview pane, so
+> `build_trace_detail` emits the width-independent `Waterfall` rows plus an aligned `Vec<SpanRecord>` in
+> one pass and the app retains it (dropped as soon as the row cursor moves; an Enter that beats the
+> in-flight fetch opens when it lands). The preview pane itself still does not scroll, but now reports
+> `Waterfall: N of M spans — enter: all` rather than silently cutting deep traces. See JOURNAL
+> 2026-07-30.
+>
 > **Interaction follow-up (2026-07-23):** the five remaining interaction features landed — time
 > pan/zoom (`[`/`]` pan, `-`/`+` zoom, via an absolute-window freeze), older/newer log paging (`n`/`p`
 > over the facade offset `PageCursor`), trace→log drill-down (`L` on the Traces list, powered by the new
