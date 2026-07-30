@@ -13,6 +13,8 @@ release aborts if it is missing or duplicated.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-07-30
+
 ### Added
 
 - **Prebuilt binaries and a container image on every release (CD).** `imbhd` and `imbh-tui` no longer
@@ -56,6 +58,18 @@ release aborts if it is missing or duplicated.
   durability window on an otherwise idle writer. New `Storage::sync_wal` / `Storage::wal_sync_interval`
   back it; `Storage::flush_gauges` (buffered bytes/rows + idle clock) and `Storage::seal_threshold_bytes`
   expose what the policy's triggers compare against.
+
+- **`imbh-tui`: a full-content trace detail screen, and a per-span drill-down.** The Traces screen
+  drew a selected trace's waterfall into a fixed 45% slice of the results area with no scroll offset,
+  so any trace deeper than that pane was partly unreachable. Enter on the trace list now opens
+  `Route::TraceDetail` — the whole waterfall as a scrolling list with a span cursor, a header
+  (trace id, span count, duration, start), and a summary of the cursored span when the area is tall
+  enough — and Enter on a waterfall row opens `Route::SpanDetail` with that span's full fields
+  (ids/parent, service, kind, status, offset into the trace, the three attribute maps, raw
+  events/links). `L` from either correlates Logs by trace id *and* span id, closing the per-span
+  drill-down gap. Both follow the existing non-modal detail pattern and cost no extra query: the
+  list already materializes the selected trace to draw its preview. The preview pane itself still
+  does not scroll, but now reports "Waterfall: N of M spans" instead of silently truncating.
 
 - **`imbh-server`: a Docker logging-driver plugin**, behind the new optional, off-by-default
   `docker` feature (Unix only). `imbhd --features docker` serves the `docker.logdriver/1.0` plugin
@@ -109,6 +123,20 @@ release aborts if it is missing or duplicated.
   the build appeared to hang rather than fail. Added a root `.dockerignore`; the context drops from
   614 GB to 4.8 MB.
 
+## [0.1.1] - 2026-07-28
+
+### Changed
+
+- **Every GitHub Actions `uses:` is pinned to a 40-hex commit SHA** (with a trailing `# vX.Y.Z`
+  comment) across `ci.yml`, `release.yml`, and `soak.yml`, so a moving tag can no longer change what
+  CI — and therefore the release path — executes. The actions were upgraded to their current
+  releases at the same time (`actions/checkout` v4 -> v7.0.1, `actions/upload-artifact` v4 -> v7.0.1,
+  `Swatinem/rust-cache` v2 -> v2.9.1, `taiki-e/install-action` v2 -> v2.85.0); `dtolnay/rust-toolchain`
+  has no usable version tag, so it is pinned to the `stable` branch head with an explicit
+  `toolchain: stable` on every step — that freezes the action, not the toolchain.
+
+### Fixed
+
 - **Windows: every on-disk `Db::open` failed** with `storage error: WAL dir fsync: Access is denied.
   (os error 5)`. The durability path fsync'd a directory by opening it as a `File` — a POSIX idiom
   Windows rejects — so no on-disk database could be opened at all on that platform (in-memory was
@@ -128,4 +156,6 @@ release aborts if it is missing or duplicated.
   All 12 crates published to crates.io (`imbh-test-support` is dev-only and stays unpublished).
 
 <!-- next-url -->
+[0.2.0]: https://github.com/moriyoshi/imbh/releases/tag/v0.2.0
+[0.1.1]: https://github.com/moriyoshi/imbh/releases/tag/v0.1.1
 [0.1.0]: https://github.com/moriyoshi/imbh/releases/tag/v0.1.0
