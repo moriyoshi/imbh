@@ -34,6 +34,15 @@ git history); this file tracks only what is still open.
       argument (`cargo release patch` would bump again, to 0.1.2). Cutting it is the user's call
       (see `README.md` "Releasing"). — *source: JOURNAL (issue #3, 2026-07-28)*
 
+- [ ] **Docker log driver: `--tail 0 -f` has an inherent event-time race.** With `--tail 0` the
+      follow watermark deliberately jumps to `Timestamp::now()`, because "only new lines" is that
+      flag's defined semantic. But a record's timestamp is when the container emitted the line while
+      ingest lands it up to one batch interval later, so a line emitted just before the follow starts
+      can still be missed under `--tail 0` specifically. The general case was fixed (see JOURNAL
+      2026-07-30, defect 2); this residue is a semantics question, not a bug: closing it means either
+      accepting it, or tracking an ingest-time column alongside event time so the tail can watermark
+      on arrival order. — *source: JOURNAL (E2E against a real dockerd, 2026-07-30)*
+
 ## Recently Swept (2026-07-24 good-sleep)
 
 Six items completed on 2026-07-24 were removed from the open list; their durable knowledge is in

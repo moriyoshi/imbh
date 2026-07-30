@@ -45,6 +45,12 @@ jobs:
         run: cargo test --workspace
       - name: Crash-injection E2E (deterministic mid-seal hazards)
         run: cargo test -p imbh --features fault-injection --test crash_points
+      # The `docker` feature is off by default (footprint gate), so the workspace jobs above never
+      # compile it. Lint and run its suites explicitly — including the Unix-socket + FIFO E2E.
+      - name: Clippy (docker log-driver feature)
+        run: cargo clippy -p imbh-server --all-targets --features docker -- -D warnings
+      - name: Test (docker log-driver plugin)
+        run: cargo test -p imbh-server --features docker
 
   feature-matrix:
     name: Feature matrix (producer / consumer)

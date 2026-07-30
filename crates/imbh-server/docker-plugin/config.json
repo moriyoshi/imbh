@@ -1,0 +1,56 @@
+{
+  "description": "imbh — embeddable observability database as a Docker log driver",
+  "documentation": "https://github.com/moriyoshi/imbh/blob/main/docs/DOCKER_LOG_DRIVER.md",
+  "entrypoint": ["/usr/bin/imbhd", "/var/lib/imbh"],
+  "interface": {
+    "types": ["docker.logdriver/1.0"],
+    "socket": "imbh.sock"
+  },
+  "env": [
+    {
+      "name": "IMBH_DOCKER_PLUGIN_SOCKET",
+      "description": "Where imbhd serves the log-driver plugin API. Must match interface.socket.",
+      "value": "/run/docker/plugins/imbh.sock",
+      "settable": null
+    },
+    {
+      "name": "IMBH_LISTEN_ADDR",
+      "description": "OTLP/HTTP ingest + SQL query endpoint. Defaults to the docker0 bridge address, which containers can reach and the LAN cannot; build.sh replaces it with the address this daemon actually uses. Set to the empty string to open no TCP port at all.",
+      "value": "172.17.0.1:4318",
+      "settable": ["value"]
+    },
+    {
+      "name": "IMBH_GRPC_LISTEN_ADDR",
+      "description": "OTLP/gRPC ingest (the default transport for most OTel SDKs), same addressing rules as IMBH_LISTEN_ADDR. Empty disables it.",
+      "value": "172.17.0.1:4317",
+      "settable": ["value"]
+    },
+    {
+      "name": "RUST_LOG",
+      "description": "Log filter for imbhd's own diagnostics. Output goes to the Docker daemon log.",
+      "value": "info",
+      "settable": ["value"]
+    }
+  ],
+  "mounts": [
+    {
+      "name": "data",
+      "description": "Host directory holding the imbh database. Set with: docker plugin set <plugin> data.source=/path",
+      "source": "/var/lib/imbh",
+      "destination": "/var/lib/imbh",
+      "type": "none",
+      "options": ["rbind", "rw"],
+      "settable": ["source"]
+    }
+  ],
+  "network": {
+    "type": "host"
+  },
+  "linux": {
+    "capabilities": [],
+    "allowAllDevices": false,
+    "devices": null
+  },
+  "workdir": "/",
+  "propagatedMount": ""
+}

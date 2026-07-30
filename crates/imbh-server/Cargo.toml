@@ -29,7 +29,10 @@ tonic = { workspace = true, optional = true, features = [
     "router",
     "codegen",
 ] }
-opentelemetry-proto = { workspace = true, optional = true, features = ["gen-tonic"] }
+# Shared by `grpc` (which additionally turns on `gen-tonic` for the collector *services*) and
+# `docker` (messages only — it builds `ExportLogsServiceRequest` values by hand). Cargo unifies the
+# features, so enabling both is the union, not a conflict.
+opentelemetry-proto = { workspace = true, optional = true }
 prost = { workspace = true, optional = true }
 # Optional self-observability (ARCHITECTURE.md §11). The stderr subscriber wiring lives in the imbh
 # facade's `console` module (behind `imbh/tracing-console`, which owns the `tracing-subscriber` dep);
@@ -50,14 +53,23 @@ tracing = ["dep:tracing", "imbh/tracing", "imbh/tracing-console"]
 grpc = [
     "dep:tonic",
     "dep:opentelemetry-proto",
+    "opentelemetry-proto/gen-tonic",
     "dep:prost",
     "tokio/rt-multi-thread",
     "tokio/net",
     "tokio/time",
 ]
+# Docker logging-driver plugin: serve the `docker.logdriver/1.0` plugin API on a Unix socket, read
+# each container's log FIFO, and ingest the lines as OTLP logs (`docs/DOCKER_LOG_DRIVER.md`). Unix
+# only — the module is `#[cfg(unix)]`, so enabling this on Windows compiles to nothing. Off by
+# default so `cargo build -p imbh-server` (the footprint gate) stays at the measured crate count;
+# enable with `cargo build -p imbh-server --features docker`. Adds **no new crate** to the graph:
+# prost and opentelemetry-proto's message types are already in the default `imbh` tree via imbh-otlp.
+docker = ["dep:opentelemetry-proto", "dep:prost"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros"] }
 opentelemetry-proto.workspace = true
 prost.workspace = true
+tempfile.workspace = true
 imbh-test-support.workspace = true

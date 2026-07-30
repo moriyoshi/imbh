@@ -13,13 +13,16 @@
 //! - `GET /health` — liveness.
 //!
 //! OTLP/gRPC is available on a second port behind the optional `grpc` feature (see [`grpc`]); the
-//! default build carries no gRPC transport. Not handled here (follow-ups): gzip request bodies, TLS,
-//! and the OTLP partial-success response shape.
+//! default build carries no gRPC transport. A Docker logging-driver plugin endpoint is available
+//! behind the optional `docker` feature (see [`docker`]). Not handled here (follow-ups): gzip request
+//! bodies, TLS, and the OTLP partial-success response shape.
 
+#[cfg(all(feature = "docker", unix))]
+pub mod docker;
 #[cfg(feature = "grpc")]
 pub mod grpc;
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 
 use std::sync::Arc;
@@ -51,6 +54,37 @@ impl Response {
             body,
         }
     }
+    /// A response with an explicit content type — used by the Docker plugin endpoint, which must
+    /// answer in `application/vnd.docker.plugins.v1.1+json`.
+    #[cfg(all(feature = "docker", unix))]
+    pub(crate) fn with_content_type(status: u16, content_type: &str, body: Vec<u8>) -> Self {
+        Response {
+            status,
+            content_type: content_type.to_owned(),
+            body,
+        }
+    }
+}
+
+/// Resolve `imbhd`'s HTTP listen address from the positional argument and the `IMBH_LISTEN_ADDR`
+/// environment variable, in that order of precedence, falling back to `default`.
+///
+/// The environment variable exists for the Docker plugin (ARCHITECTURE.md §10.16). A managed
+/// plugin's `entrypoint` args are baked into its `config.json` and cannot be changed without
+/// rebuilding the plugin, whereas `env` entries declared `settable` can be changed at any time with
+/// `docker plugin set` — so the listen address has to arrive as an environment variable to be
+/// operator-tunable at all.
+///
+/// An **empty** value (`IMBH_LISTEN_ADDR=`) is not a missing value: it means *do not listen on TCP*.
+/// That is the private posture — the log-driver plugin keeps working over its Unix socket while the
+/// process opens no network port at all. Returns `None` in that case.
+pub fn listen_addr(arg: Option<String>, env: Option<String>, default: &str) -> Option<String> {
+    let chosen = arg
+        .or(env)
+        .unwrap_or_else(|| default.to_owned())
+        .trim()
+        .to_owned();
+    (!chosen.is_empty()).then_some(chosen)
 }
 
 /// Serve `db` on `addr` (e.g. `127.0.0.1:4318`) until the process exits. Thread-per-connection;
@@ -74,7 +108,8 @@ pub fn serve(db: Arc<Db>, addr: &str) -> std::io::Result<()> {
 }
 
 async fn handle_conn(db: Arc<Db>, mut stream: TcpStream) -> std::io::Result<()> {
-    let Some((method, path, body)) = read_request(&mut stream)? else {
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let Some((method, path, body)) = read_request(&mut reader)? else {
         return Ok(());
     };
     let resp = route(&db, &method, &path, &body).await;
@@ -266,7 +301,7 @@ fn is_numeric(dt: &imbh::arrow::datatypes::DataType) -> bool {
 }
 
 /// JSON-quote and escape a string.
-fn json_string(s: &str) -> String {
+pub(crate) fn json_string(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
     for c in s.chars() {
@@ -291,10 +326,10 @@ fn json_string(s: &str) -> String {
 
 type ParsedRequest = (String, String, Vec<u8>);
 
-fn read_request(stream: &mut TcpStream) -> std::io::Result<Option<ParsedRequest>> {
-    let peer = stream.try_clone()?;
-    let mut reader = BufReader::new(peer);
-
+/// Parse one HTTP/1.1 request (method, path, body) off `reader`; `None` on a clean EOF before the
+/// request line. Generic over the reader so the same parser serves the TCP server and the Unix-socket
+/// Docker plugin endpoint (`docker`), which speaks the same HTTP/1.1 dialect.
+pub(crate) fn read_request<R: BufRead>(reader: &mut R) -> std::io::Result<Option<ParsedRequest>> {
     let mut request_line = String::new();
     if reader.read_line(&mut request_line)? == 0 {
         return Ok(None);
@@ -326,7 +361,7 @@ fn read_request(stream: &mut TcpStream) -> std::io::Result<Option<ParsedRequest>
     Ok(Some((method, path, body)))
 }
 
-fn write_response(stream: &mut TcpStream, resp: &Response) -> std::io::Result<()> {
+pub(crate) fn write_response<W: Write>(stream: &mut W, resp: &Response) -> std::io::Result<()> {
     let reason = match resp.status {
         200 => "OK",
         400 => "Bad Request",
@@ -349,6 +384,59 @@ fn write_response(stream: &mut TcpStream, resp: &Response) -> std::io::Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn listen_address_precedence() {
+        let s = |v: &str| Some(v.to_owned());
+
+        // Positional argument wins over the environment.
+        assert_eq!(
+            listen_addr(s("0.0.0.0:1"), s("10.0.0.1:2"), "127.0.0.1:4318"),
+            s("0.0.0.0:1")
+        );
+        // Environment fills in when there is no argument — the Docker plugin's path, since a managed
+        // plugin cannot change its entrypoint args without a rebuild.
+        assert_eq!(
+            listen_addr(None, s("172.17.0.1:4318"), "127.0.0.1:4318"),
+            s("172.17.0.1:4318")
+        );
+        // Neither → the default.
+        assert_eq!(
+            listen_addr(None, None, "127.0.0.1:4318"),
+            s("127.0.0.1:4318")
+        );
+    }
+
+    #[test]
+    fn an_empty_listen_address_means_do_not_listen() {
+        // `IMBH_DOCKER_PLUGIN_SOCKET=… IMBH_LISTEN_ADDR= imbhd` is the private posture: the plugin
+        // serves over its Unix socket and no TCP port is opened. Whitespace counts as empty so a
+        // `docker plugin set IMBH_LISTEN_ADDR=" "` does not silently bind something.
+        assert_eq!(
+            listen_addr(None, Some(String::new()), "127.0.0.1:4318"),
+            None
+        );
+        assert_eq!(
+            listen_addr(None, Some("  ".to_owned()), "127.0.0.1:4318"),
+            None
+        );
+        assert_eq!(
+            listen_addr(Some(String::new()), None, "127.0.0.1:4318"),
+            None
+        );
+        // An empty *default* with nothing else set is the same statement.
+        assert_eq!(listen_addr(None, None, ""), None);
+    }
+
+    #[test]
+    fn listen_address_is_trimmed() {
+        // `docker plugin set` values arrive verbatim; a stray space would fail to parse as a socket
+        // address and take the whole server down at bind time.
+        assert_eq!(
+            listen_addr(None, Some(" 172.17.0.1:4318\n".to_owned()), "x"),
+            Some("172.17.0.1:4318".to_owned())
+        );
+    }
 
     fn otlp_log(service: &str, body_text: &str, time: u64) -> Vec<u8> {
         use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;

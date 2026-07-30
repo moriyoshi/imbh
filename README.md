@@ -199,6 +199,25 @@ OTLP/gRPC (the OTel SDK default) is available behind the optional `grpc` feature
 port via tonic. It is off by default so the base build stays at its measured footprint; enabling it
 pulls the tonic/hyper subtree.
 
+### Docker logging driver (`docker` feature)
+
+Built with `--features docker`, `imbhd` also speaks the Docker logging-driver plugin protocol, so
+container stdout/stderr is written directly into the embedded database — no collector, no sidecar:
+
+```
+docker run --log-driver imbh --log-opt imbh-service=web nginx
+
+docker logs <container>                       # served back out of the database
+curl -s 127.0.0.1:4318/api/query --data \
+  "SELECT service, body FROM logs WHERE matches(body, 'timeout')"
+```
+
+Container identity lands on the OTel resource (`container.id`, `container.name`,
+`container.image.name`, …), stdout/stderr map to severities, split lines are reassembled, and
+`docker logs` (including `--tail`, `--since`, and `-f`) is answered from stored rows. Unix only, off
+by default, and it adds **no crate** to the dependency graph. See the
+[Docker log-driver guide](./docs/DOCKER_LOG_DRIVER.md).
+
 ## Companion TUI (`imbh-tui`)
 
 `imbh-tui` is an optional, **read-only** terminal explorer for a local database — a worked example
@@ -244,7 +263,7 @@ Dependency direction:
 | `imbh-proto` | protobuf wire types for the typed query-API inputs (Go/FFI binding surface); pulled only by the facade's `proto` feature, prost-only, optional |
 | `imbh-otel-exporter` | opentelemetry-rust SDK exporter adapters (span/log/metric), optional |
 | `imbh-tracing` | `tracing` plumbing: `DbLayer` sinking `tracing` into a `Db`, optional |
-| `imbh-server` | reference `imbhd` binary + example HTTP wiring, optional |
+| `imbh-server` | reference `imbhd` binary + example HTTP wiring, optional; optional OTLP/gRPC (`grpc`) and Docker log-driver plugin (`docker`) |
 | `imbh-test-support` | shared OTLP fixture builders for cross-crate tests (dev-only) |
 
 Confining DataFusion to `imbh-query` and Tantivy to `imbh-index` absorbs engine churn behind two
@@ -466,6 +485,7 @@ the supermassive giants at galactic centers. The metaphor is the whole pitch:
   storage engine, search, query, full public API surface, footprint)
 - [Embedding guide](./docs/EMBEDDING.md) — host-integration paths
 - [PromQL → SQL](./docs/PROMQL_TO_SQL.md) — mapping PromQL patterns onto IMBH's SQL surface
+- [Docker log driver](./docs/DOCKER_LOG_DRIVER.md) — running `imbhd` as a Docker logging plugin
 
 ## License
 
