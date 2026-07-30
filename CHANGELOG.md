@@ -15,6 +15,30 @@ release aborts if it is missing or duplicated.
 
 ### Added
 
+- **A flush scheduler with selectable strategies (`FlushPolicy`).** `Maintenance` already chose *who*
+  runs the background loop; the new `DbBuilder::flush(FlushPolicy)` chooses *when* it seals the buffer.
+  The triggers OR together and are each optional: periodic (`FlushPolicy::periodic(d)`), buffered heap
+  (`.at_buffer_bytes(n)`, defaulting to the memory-budget-derived threshold), buffered rows
+  (`.at_buffer_rows(n)`), on-disk WAL size (`.at_wal_bytes(n)` — sealing is what lets the WAL be
+  reclaimed), and idle (`.after_idle(d)`); `.tick(d)` sets the evaluation cadence and
+  `FlushPolicy::manual()` disables automatic sealing entirely. A policy also parses from a spec string
+  (`"interval=5s,wal=64MiB"`, or `"manual"`) via `FromStr`. Leaving it unset preserves the previous
+  behavior exactly: seal on the `Maintenance` interval and at the byte threshold. See ARCHITECTURE.md
+  §5/§10.2.
+
+- **`imbhd` now flushes on its own**, configured by `IMBH_FLUSH` (default `interval=5s`) and
+  `IMBH_MAINTENANCE_INTERVAL` (default `60s`, the retention cadence). Previously the reference server
+  opened the DB with the library default `Maintenance::Manual`, so **nothing ever sealed** unless an
+  operator POSTed `/admin/flush`: rows stayed in the mutable buffer, the WAL was never reclaimed, and
+  neither RSS nor disk use was bounded. Both variables are `settable` on the Docker log-driver plugin.
+  A malformed spec fails startup rather than silently running a different cadence.
+
+- **`WalMode::Interval(d)` is honored by that scheduler.** It previously fsynced only opportunistically
+  on `flush`/`close` (no timer existed), so the default interval mode never delivered its 1s
+  durability window on an otherwise idle writer. New `Storage::sync_wal` / `Storage::wal_sync_interval`
+  back it; `Storage::flush_gauges` (buffered bytes/rows + idle clock) and `Storage::seal_threshold_bytes`
+  expose what the policy's triggers compare against.
+
 - **`imbh-server`: a Docker logging-driver plugin**, behind the new optional, off-by-default
   `docker` feature (Unix only). `imbhd --features docker` serves the `docker.logdriver/1.0` plugin
   API on a Unix socket, so `docker run --log-driver imbh` writes a container's stdout/stderr

@@ -12,6 +12,11 @@
 //!   segments). These are unauthenticated by design — a real deployment gates `/admin/*` itself.
 //! - `GET /health` — liveness.
 //!
+//! Unlike the library, `imbhd` runs a flush scheduler by default — see [`flush_policy`] and
+//! [`maintenance_interval`] for the `IMBH_FLUSH` / `IMBH_MAINTENANCE_INTERVAL` knobs behind it. A
+//! collector that never seals keeps every row in the buffer + WAL, so `/admin/flush` should be a
+//! manual override, not the only path to Parquet.
+//!
 //! OTLP/gRPC is available on a second port behind the optional `grpc` feature (see [`grpc`]); the
 //! default build carries no gRPC transport. A Docker logging-driver plugin endpoint is available
 //! behind the optional `docker` feature (see [`docker`]). Not handled here (follow-ups): gzip request
@@ -24,13 +29,14 @@ pub mod grpc;
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
+use std::time::Duration;
 
 use std::sync::Arc;
 
-use imbh::Db;
 use imbh::arrow::array::Array;
 use imbh::arrow::record_batch::RecordBatch;
 use imbh::arrow::util::display::{ArrayFormatter, FormatOptions};
+use imbh::{Db, FlushPolicy};
 
 /// A minimal HTTP response.
 pub struct Response {
@@ -85,6 +91,50 @@ pub fn listen_addr(arg: Option<String>, env: Option<String>, default: &str) -> O
         .trim()
         .to_owned();
     (!chosen.is_empty()).then_some(chosen)
+}
+
+/// `imbhd`'s default flush policy: seal at least every 5 seconds, plus the memory-budget byte
+/// threshold the engine applies anyway. A collector is a write-mostly process whose rows are only in
+/// Parquet (and whose WAL is only reclaimable) once the buffer is sealed, so it defaults to a
+/// scheduler, unlike the library — where an embedder must opt into every background thread.
+pub const DEFAULT_FLUSH: &str = "interval=5s";
+
+/// `imbhd`'s default retention cadence: how often the scheduler applies the retention policy. Nothing
+/// to do unless a retention policy is configured, so this can be relaxed.
+pub const DEFAULT_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Resolve `imbhd`'s flush policy from `IMBH_FLUSH`, falling back to [`DEFAULT_FLUSH`].
+///
+/// The value is a [`FlushPolicy`] spec — comma-separated triggers that OR together, e.g.
+/// `interval=5s`, `buffer=16MiB`, `rows=50000`, `wal=64MiB`, `idle=2s`, `tick=250ms` — or the single
+/// word `manual` to seal only on `POST /admin/flush` and shutdown. Like the listen addresses, it is an
+/// environment variable rather than an argument because a managed Docker plugin can retune `env`
+/// entries with `docker plugin set` but cannot change its frozen entrypoint arguments.
+///
+/// An **empty** value means "unset" (the default applies), matching how an unset variable reads. A
+/// malformed spec is an error, never a silent fallback: a typo in a deployment's config must not
+/// quietly leave the buffer unsealed.
+pub fn flush_policy(env: Option<String>) -> imbh::Result<FlushPolicy> {
+    let spec = env.unwrap_or_default();
+    let spec = spec.trim();
+    if spec.is_empty() {
+        DEFAULT_FLUSH.parse()
+    } else {
+        spec.parse()
+    }
+}
+
+/// Resolve the retention cadence from `IMBH_MAINTENANCE_INTERVAL` (a duration such as `60s`, `5m`),
+/// falling back to [`DEFAULT_MAINTENANCE_INTERVAL`]. Empty means unset; a malformed value is an error.
+pub fn maintenance_interval(env: Option<String>) -> imbh::Result<Duration> {
+    let value = env.unwrap_or_default();
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(DEFAULT_MAINTENANCE_INTERVAL);
+    }
+    // A zero interval would run retention every slice of the scheduler loop; treat it as "as often as
+    // the scheduler wakes" by flooring it at one tick rather than rejecting it.
+    Ok(imbh::parse_duration(value)?.max(FlushPolicy::DEFAULT_TICK))
 }
 
 /// Serve `db` on `addr` (e.g. `127.0.0.1:4318`) until the process exits. Thread-per-connection;
@@ -426,6 +476,48 @@ mod tests {
         );
         // An empty *default* with nothing else set is the same statement.
         assert_eq!(listen_addr(None, None, ""), None);
+    }
+
+    #[test]
+    fn flush_policy_defaults_to_a_periodic_seal() {
+        // Unset and empty both mean "use the default" — a `docker plugin set IMBH_FLUSH=` must read
+        // the same as never having set it.
+        for env in [None, Some(String::new()), Some("  ".to_owned())] {
+            let p = flush_policy(env).unwrap();
+            assert_eq!(p, DEFAULT_FLUSH.parse().unwrap());
+            assert_eq!(p.interval(), Some(Duration::from_secs(5)));
+            assert!(!p.is_manual(), "imbhd must seal without being asked to");
+        }
+        // An operator's spec wins, including the one that turns automatic sealing off.
+        let p = flush_policy(Some("interval=30s,wal=64MiB".to_owned())).unwrap();
+        assert_eq!(p.interval(), Some(Duration::from_secs(30)));
+        assert_eq!(p.wal_bytes(), Some(64 << 20));
+        assert!(flush_policy(Some("manual".to_owned())).unwrap().is_manual());
+        // A typo is fatal, not a silent fallback to a different cadence than was asked for.
+        let err = flush_policy(Some("intrval=5s".to_owned())).unwrap_err();
+        assert!(err.is_user_error(), "{err}");
+    }
+
+    #[test]
+    fn maintenance_interval_defaults_and_floors() {
+        assert_eq!(
+            maintenance_interval(None).unwrap(),
+            DEFAULT_MAINTENANCE_INTERVAL
+        );
+        assert_eq!(
+            maintenance_interval(Some(String::new())).unwrap(),
+            DEFAULT_MAINTENANCE_INTERVAL
+        );
+        assert_eq!(
+            maintenance_interval(Some(" 5m ".to_owned())).unwrap(),
+            Duration::from_secs(300)
+        );
+        // `0` would ask for retention on every scheduler slice; floor it at one tick instead.
+        assert_eq!(
+            maintenance_interval(Some("0".to_owned())).unwrap(),
+            imbh::FlushPolicy::DEFAULT_TICK
+        );
+        assert!(maintenance_interval(Some("soon".to_owned())).is_err());
     }
 
     #[test]

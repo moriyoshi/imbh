@@ -109,6 +109,10 @@ pub struct Storage {
     promote: Promote,
     /// Auto-seal trigger: `seal_if_full` seals once `buffer_bytes` reaches this (ARCHITECTURE.md §7).
     seal_threshold_bytes: usize,
+    /// When this handle opened, so the flush scheduler's idle trigger has a clock even before the
+    /// first ingest — a DB whose buffer was refilled by WAL replay is then sealable one idle window
+    /// after open, rather than waiting for traffic that may never come.
+    opened_at: std::time::Instant,
     seq: AtomicU64,
     /// Highest LSN whose data is durable (fsync'd WAL, or captured in a sealed segment).
     durable_lsn: AtomicU64,
@@ -201,6 +205,11 @@ struct Inner {
     next_lsn: u64,
     /// WAL records with `lsn > watermark`, awaiting decode+replay by the facade on open.
     pending_replay: Vec<WalRecord>,
+    /// When the last ingest appended to the buffer, for the flush scheduler's idle trigger
+    /// ([`Storage::flush_gauges`]). `None` until the first ingest — replay deliberately does not set
+    /// it, so a reopened DB's replayed rows are measured against [`Storage::opened_at`] and become
+    /// sealable one idle window after open (they are old rows; sealing them promptly is the point).
+    last_append: Option<std::time::Instant>,
     /// In-flight seals' taken-but-not-yet-registered batches, keyed by a per-seal generation
     /// ([`Inner::next_seal_gen`]). A [`Storage::query_snapshot`] unions these with the live buffers so
     /// no query misses rows mid-seal; each seal removes its entry once its segment is registered (or
@@ -253,6 +262,7 @@ impl Storage {
             retention,
             promote: Promote::default(),
             seal_threshold_bytes: seal_threshold(budget),
+            opened_at: std::time::Instant::now(),
             seq: AtomicU64::new(0),
             durable_lsn: AtomicU64::new(watermark),
             wal: Some(Mutex::new(wal)),
@@ -274,6 +284,7 @@ impl Storage {
                 buffer_max_lsn: watermark,
                 next_lsn,
                 pending_replay,
+                last_append: None,
                 sealing: BTreeMap::new(),
                 next_seal_gen: 0,
             }),
@@ -289,6 +300,7 @@ impl Storage {
             retention: Retention::none(),
             promote: Promote::default(),
             seal_threshold_bytes: seal_threshold(budget),
+            opened_at: std::time::Instant::now(),
             seq: AtomicU64::new(0),
             durable_lsn: AtomicU64::new(0),
             wal: None,
@@ -310,6 +322,7 @@ impl Storage {
                 buffer_max_lsn: 0,
                 next_lsn: 1,
                 pending_replay: Vec::new(),
+                last_append: None,
                 sealing: BTreeMap::new(),
                 next_seal_gen: 0,
             }),
@@ -347,6 +360,7 @@ impl Storage {
             retention: Retention::none(),
             promote: Promote::default(),
             seal_threshold_bytes: seal_threshold(budget),
+            opened_at: std::time::Instant::now(),
             seq: AtomicU64::new(0),
             durable_lsn: AtomicU64::new(watermark),
             wal: None,
@@ -368,6 +382,7 @@ impl Storage {
                 buffer_max_lsn: watermark,
                 next_lsn: watermark + 1,
                 pending_replay: Vec::new(),
+                last_append: None,
                 sealing: BTreeMap::new(),
                 next_seal_gen: 0,
             }),
@@ -481,6 +496,9 @@ impl Storage {
             }
         }
         inner.buffer_max_lsn = lsn;
+        // Every ingest path funnels through here, so this is the one place the idle trigger's clock
+        // has to be wound (replay deliberately does not touch it — see `Inner::last_append`).
+        inner.last_append = Some(std::time::Instant::now());
         #[cfg(feature = "tracing")]
         {
             let span = tracing::Span::current();
@@ -712,13 +730,7 @@ impl Storage {
         if !matches!(self.wal_mode, WalMode::Always) {
             return Ok(());
         }
-        let Some(wal) = &self.wal else {
-            return Ok(());
-        };
-        let max_lsn = self.inner.lock().unwrap().buffer_max_lsn;
-        wal.lock().unwrap().sync()?;
-        self.durable_lsn.fetch_max(max_lsn, Ordering::AcqRel);
-        Ok(())
+        self.sync_wal()
     }
 
     /// The sealed-segment watermark (highest LSN captured in segments).
@@ -738,6 +750,65 @@ impl Storage {
             Some(dir) => wal::total_bytes(dir),
             None => 0,
         }
+    }
+
+    /// The buffered-heap threshold this DB derives from its [`MemoryBudget`] — what
+    /// [`Self::seal_if_full`] compares against, and what `FlushSize::Budget` resolves to for the flush
+    /// scheduler (ARCHITECTURE.md §7).
+    pub fn seal_threshold_bytes(&self) -> usize {
+        self.seal_threshold_bytes
+    }
+
+    /// One consistent read of everything the flush scheduler's non-time triggers need
+    /// (ARCHITECTURE.md §5/§7). Taken under a single lock so the byte, row, and idle views cannot
+    /// disagree, and cheap: the row count sums each buffer's already-materialized batch metadata.
+    ///
+    /// The on-disk WAL size is **not** here — it costs a directory scan, so the scheduler measures it
+    /// with [`Self::wal_bytes`] only when a WAL-size trigger is configured.
+    pub fn flush_gauges(&self) -> FlushGauges {
+        let inner = self.inner.lock().unwrap();
+        let rows = |batches: &Vec<RecordBatch>| -> u64 {
+            batches.iter().map(|b| b.num_rows() as u64).sum()
+        };
+        let buffer_rows = rows(&inner.buffer)
+            + rows(&inner.spans_buffer)
+            + rows(&inner.histogram_buffer)
+            + rows(&inner.exp_histogram_buffer)
+            + rows(&inner.summary_buffer)
+            + inner.metric_buffers.values().map(rows).sum::<u64>();
+        FlushGauges {
+            buffer_bytes: inner.buffer_bytes,
+            buffer_rows,
+            idle_for: inner.last_append.unwrap_or(self.opened_at).elapsed(),
+        }
+    }
+
+    /// `Some(d)` when the WAL is in [`WalMode::Interval`] mode, i.e. the flush scheduler owes it an
+    /// fsync every `d` ([`Self::sync_wal`]). `None` for `Always` (already fsynced inline), `Off`, and
+    /// in-memory DBs — nothing for a timer to do.
+    pub fn wal_sync_interval(&self) -> Option<std::time::Duration> {
+        match self.wal_mode {
+            WalMode::Interval(d) if self.wal.is_some() => Some(d),
+            _ => None,
+        }
+    }
+
+    /// fsync the WAL now and advance `durable_lsn` to the highest LSN appended so far, whatever the
+    /// [`WalMode`]. This is the timer-driven counterpart to [`Self::group_commit`]: it is what makes
+    /// `WalMode::Interval(d)` mean something, by letting the flush scheduler force the OS to persist
+    /// the frames every `d` instead of leaving it to the page cache.
+    ///
+    /// Reading `buffer_max_lsn` before the fsync is the same durability lower bound `group_commit`
+    /// takes: an append that lands after the read is flushed too, but stays unadvertised until the next
+    /// sync (conservative, never overclaims).
+    pub fn sync_wal(&self) -> Result<()> {
+        let Some(wal) = &self.wal else {
+            return Ok(());
+        };
+        let max_lsn = self.inner.lock().unwrap().buffer_max_lsn;
+        wal.lock().unwrap().sync()?;
+        self.durable_lsn.fetch_max(max_lsn, Ordering::AcqRel);
+        Ok(())
     }
 
     /// A consistent snapshot of the `logs` buffer as one Arrow batch (ARCHITECTURE.md §7: queries see
@@ -1915,6 +1986,20 @@ fn link_dir(src: &Path, dst: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// A one-lock read of the mutable-buffer gauges a flush scheduler's non-time triggers compare
+/// against ([`Storage::flush_gauges`], ARCHITECTURE.md §5/§7).
+#[derive(Debug, Default, Clone, Copy)]
+#[non_exhaustive]
+pub struct FlushGauges {
+    /// Approximate live heap bytes held by every table's buffer.
+    pub buffer_bytes: usize,
+    /// Buffered rows summed across every table.
+    pub buffer_rows: u64,
+    /// Time since the last ingest — or since open, when this handle has ingested nothing (so a buffer
+    /// refilled by WAL replay counts as idle rather than as never-touched).
+    pub idle_for: std::time::Duration,
 }
 
 /// Outcome of a retention pass (ARCHITECTURE.md §7).
@@ -3264,6 +3349,76 @@ mod tests {
         // Buffer drained by the seal → back below the threshold, so no further seal.
         assert!(s.seal_if_full().unwrap().is_none());
         assert_eq!(s.segments().len(), 1);
+    }
+
+    /// The gauges the flush scheduler's size/row/idle triggers read (`FlushGauges`): they must count
+    /// every table's buffer, drop to zero on seal, and expose an idle clock that starts at open (so a
+    /// replayed buffer is sealable without waiting for new traffic).
+    #[test]
+    fn flush_gauges_track_all_buffers_and_the_idle_clock() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = open(dir.path(), WalMode::Off);
+        let g = s.flush_gauges();
+        assert_eq!((g.buffer_rows, g.buffer_bytes), (0, 0));
+        // Never ingested → measured from open, not "unknown": a WAL-replayed buffer must be idle.
+        assert!(g.idle_for < std::time::Duration::from_secs(60));
+
+        s.ingest(
+            SIGNAL_LOGS,
+            b"l",
+            vec![row(1, "a", "x"), row(2, "a", "y")],
+            false,
+        )
+        .unwrap();
+        s.ingest_traces(b"t", vec![span_row([7; 16], [7; 8])], false)
+            .unwrap();
+        let g = s.flush_gauges();
+        assert_eq!(g.buffer_rows, 3, "logs + spans buffers both counted");
+        assert!(g.buffer_bytes > 0);
+
+        // The threshold the scheduler resolves `FlushSize::Budget` against is the DB's own: a quarter
+        // of the memory budget, floored at DEFAULT_SEAL_BYTES.
+        assert_eq!(
+            s.seal_threshold_bytes(),
+            (MemoryBudget::default().total_bytes() / 4).max(DEFAULT_SEAL_BYTES)
+        );
+
+        s.seal().unwrap().expect("segment");
+        let g = s.flush_gauges();
+        assert_eq!(
+            (g.buffer_rows, g.buffer_bytes),
+            (0, 0),
+            "seal drains every buffer"
+        );
+    }
+
+    /// `WalMode::Interval` is the flush scheduler's job: nothing fsyncs inline, and one `sync_wal()`
+    /// advances the durable watermark to everything appended so far. `Off` has no interval to serve.
+    #[test]
+    fn sync_wal_is_what_makes_interval_mode_durable() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = open(
+            dir.path(),
+            WalMode::Interval(std::time::Duration::from_secs(1)),
+        );
+        assert_eq!(
+            s.wal_sync_interval(),
+            Some(std::time::Duration::from_secs(1))
+        );
+        let (_, durable) = s
+            .ingest(SIGNAL_LOGS, b"r1", vec![row(1, "a", "x")], true)
+            .unwrap();
+        assert!(!durable, "interval mode never fsyncs inline");
+        assert_eq!(s.durable_through(), None, "nothing durable yet");
+        s.ingest(SIGNAL_LOGS, b"r2", vec![row(2, "a", "y")], true)
+            .unwrap();
+        s.sync_wal().unwrap();
+        assert_eq!(s.durable_through().map(|l| l.get()), Some(2));
+
+        // WAL off / in-memory: no interval to serve, and syncing is a harmless no-op.
+        let off = Storage::in_memory(Compression::default(), MemoryBudget::default());
+        assert_eq!(off.wal_sync_interval(), None);
+        off.sync_wal().unwrap();
     }
 
     #[test]

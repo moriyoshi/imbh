@@ -195,6 +195,12 @@ Point a stock OTel SDK's OTLP/HTTP exporter at `http://ADDR` and query it:
 - **Query:** `POST /api/query` (SQL body → JSON)
 - **Ops:** `GET /stats` · `POST /admin/flush` · `/admin/compact` · `GET /health`
 
+`imbhd` runs a **flush scheduler** (the library leaves that choice to the host). `IMBH_FLUSH` picks the
+strategy — triggers that OR together, e.g. `interval=5s,buffer=16MiB,rows=50000,wal=64MiB,idle=2s`, or
+`manual` to seal only on `/admin/flush` and shutdown; the default is `interval=5s`.
+`IMBH_MAINTENANCE_INTERVAL` (default `60s`) sets how often retention runs. Until a seal happens, rows
+live in the buffer + WAL, so this is what bounds `imbhd`'s memory and WAL growth.
+
 OTLP/gRPC (the OTel SDK default) is available behind the optional `grpc` feature, served on a second
 port via tonic. It is off by default so the base build stays at its measured footprint; enabling it
 pulls the tonic/hyper subtree.

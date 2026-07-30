@@ -23,8 +23,8 @@ mod value;
 pub use attributes::{Attributes, json_get};
 pub use canonical::{canonical_json_object, canonical_json_value};
 pub use config::{
-    Access, Compression, Ingest, Maintenance, MemoryBudget, Overflow, Promote, Refresh, Retention,
-    WalMode,
+    Access, Compression, FlushPolicy, FlushSize, Ingest, Maintenance, MemoryBudget, Overflow,
+    Promote, Refresh, Retention, WalMode, parse_bytes, parse_duration,
 };
 pub use enums::{MetricKind, SeverityNumber, Signal, Table};
 pub use error::{

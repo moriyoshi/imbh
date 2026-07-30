@@ -137,6 +137,15 @@ docker plugin set     imbh/log-driver:latest IMBH_LISTEN_ADDR=172.17.0.1:4318
 docker plugin enable  imbh/log-driver:latest
 ```
 
+The same mechanism tunes the **flush scheduler**, which decides when buffered lines become Parquet
+segments (and when the WAL can be reclaimed). `IMBH_FLUSH` defaults to `interval=5s`; its triggers OR
+together, so a plugin capturing bursty containers can add a size or idle trigger, and
+`IMBH_MAINTENANCE_INTERVAL` (default `60s`) sets the retention cadence:
+
+```sh
+docker plugin set imbh/log-driver:latest IMBH_FLUSH=interval=10s,buffer=32MiB,idle=2s
+```
+
 ### Sending traces and metrics from an app container
 
 Point a stock OTel SDK at the same address. `--add-host=host.docker.internal:host-gateway` resolves

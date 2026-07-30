@@ -134,8 +134,31 @@ let files = db.segment_files(imbh::Table::Logs); // Parquet paths for zero-copy 
 let ipc   = db.export(imbh::Table::Logs, range).await?; // Arrow-IPC bytes for pandas/polars/DuckDB
 ```
 
-Opt into a background maintenance thread with `DbBuilder::maintenance(Maintenance::Background(d))`.
-The reference `imbhd` server also exposes these over HTTP (`GET /stats`, `POST /admin/{flush,compact}`).
+Opt into a background scheduler with `DbBuilder::maintenance(Maintenance::Background(d))` (an owned
+thread) or `Maintenance::Runtime(handle, d)` (a task on your runtime). `d` is the retention cadence;
+what makes it *seal* is `DbBuilder::flush(FlushPolicy)`, whose triggers OR together:
+
+```rust
+use imbh::{FlushPolicy, Maintenance};
+let db = Db::builder("./telemetry")
+    .maintenance(Maintenance::Background(Duration::from_secs(300)))  // retention every 5 min
+    .flush(
+        FlushPolicy::periodic(Duration::from_secs(5))   // …and seal every 5s,
+            .at_buffer_rows(50_000)                     // …or at 50k buffered rows,
+            .at_wal_bytes(64 << 20)                     // …or once the WAL reaches 64 MiB,
+            .after_idle(Duration::from_secs(2)),        // …or 2s after the traffic stops.
+    )
+    .open()?;
+```
+
+Without a policy the buffer seals on the maintenance interval and at the memory-budget-derived byte
+threshold; `FlushPolicy::manual()` turns automatic sealing off entirely. The scheduler is also what
+honors `WalMode::Interval(d)` — with no scheduler running, an interval-mode WAL is only fsynced by
+`flush()`/`close()`. Rows are queryable from the buffer either way; sealing is what puts them in
+Parquet and lets the WAL be reclaimed.
+
+The reference `imbhd` server runs that scheduler by default (`IMBH_FLUSH`, default `interval=5s`) and
+also exposes these over HTTP (`GET /stats`, `POST /admin/{flush,compact}`).
 
 ## Tuning
 
