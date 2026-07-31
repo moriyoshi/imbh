@@ -10,8 +10,10 @@
 //! line. A batch closes on whichever comes first — [`IngestConfig::batch_max`] records or
 //! [`IngestConfig::flush_interval`] since the batch opened.
 
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use imbh::{AnyValue as ImbhValue, Db};
@@ -244,57 +246,111 @@ struct Item {
     record: LogRecord,
 }
 
+/// What travels the queue between the FIFO readers and the worker. (Not `Message`: that name belongs
+/// to the prost trait this module encodes with.)
+enum Queued {
+    /// One log record with its container context.
+    Record(Item),
+    /// Wind down: ingest the batch in hand and exit. Sent by [`Ingestor::shutdown`], so — the channel
+    /// being FIFO — everything queued before it is ingested before the worker leaves.
+    Stop,
+}
+
 /// Handle on the batching ingest worker. Dropping it closes the queue, which drains the worker and
-/// ends its thread.
+/// ends its thread; [`Ingestor::shutdown`] does the same *synchronously*, which is what a shutting
+/// down plugin needs before the `Db` is closed under it.
 pub struct Ingestor {
-    tx: SyncSender<Item>,
+    tx: SyncSender<Queued>,
+    /// Set by [`Ingestor::shutdown`] so no record queues up behind the sentinel and gets dropped.
+    closing: AtomicBool,
+    worker: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl Ingestor {
     /// Start the worker thread.
     pub fn start(db: Arc<Db>, config: IngestConfig) -> Ingestor {
         let (tx, rx) = std::sync::mpsc::sync_channel(config.queue_capacity);
-        std::thread::Builder::new()
+        let worker = std::thread::Builder::new()
             .name("imbh-docker-ingest".to_owned())
             .spawn(move || run(db, rx, config))
             .expect("spawn docker ingest worker");
-        Ingestor { tx }
+        Ingestor {
+            tx,
+            closing: AtomicBool::new(false),
+            worker: Mutex::new(Some(worker)),
+        }
     }
 
-    /// Queue one record. Returns `false` once the worker is gone.
+    /// Queue one record. Returns `false` once the worker is gone or shutting down — the caller's cue
+    /// to stop reading its FIFO.
     ///
     /// A full queue **blocks** the calling FIFO reader rather than dropping the line: back-pressure
     /// propagates into the container's stdout pipe, which is what an operator wants from a log
     /// driver — slow logging, not silently missing logs.
     pub fn send(&self, container: Arc<Container>, record: LogRecord) -> bool {
-        match self.tx.try_send(Item { container, record }) {
+        if self.closing.load(Ordering::Relaxed) {
+            return false;
+        }
+        match self.tx.try_send(Queued::Record(Item { container, record })) {
             Ok(()) => true,
             Err(TrySendError::Full(item)) => self.tx.send(item).is_ok(),
             Err(TrySendError::Disconnected(_)) => false,
         }
     }
+
+    /// Drain the queue into the DB and join the worker. Idempotent.
+    ///
+    /// Called while the plugin winds down, *before* the caller closes the `Db`: every line a
+    /// container already wrote is ingested, and anything a still-parked FIFO reader produces after
+    /// this is refused by [`Ingestor::send`] rather than ingested into a closing DB.
+    pub fn shutdown(&self) {
+        // Refuse new records first: a reader that queues behind the sentinel would be dropped.
+        self.closing.store(true, Ordering::SeqCst);
+        // Blocks only if the queue is full, i.e. until the worker has made room by ingesting.
+        let _ = self.tx.send(Queued::Stop);
+        let worker = self
+            .worker
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(worker) = worker {
+            let _ = worker.join();
+        }
+    }
 }
 
 /// The worker loop: block for a record, keep filling until the batch is full or the flush interval
-/// expires, ingest, repeat. Exits when every sender is dropped.
-fn run(db: Arc<Db>, rx: Receiver<Item>, config: IngestConfig) {
+/// expires, ingest, repeat. Exits when every sender is dropped, or on the [`Queued::Stop`] sentinel.
+fn run(db: Arc<Db>, rx: Receiver<Queued>, config: IngestConfig) {
     let db = db.blocking();
     loop {
-        let Ok(first) = rx.recv() else { return };
+        let Ok(Queued::Record(first)) = rx.recv() else {
+            return; // disconnected, or asked to stop with nothing in hand
+        };
         let mut batch = vec![first];
+        let mut stopping = false;
         let deadline = Instant::now() + config.flush_interval;
         while batch.len() < config.batch_max {
             let Some(left) = deadline.checked_duration_since(Instant::now()) else {
                 break;
             };
             match rx.recv_timeout(left) {
-                Ok(item) => batch.push(item),
+                Ok(Queued::Record(item)) => batch.push(item),
+                // Stop: ingest what this batch holds, then leave — everything queued ahead of the
+                // sentinel is in `batch` already.
+                Ok(Queued::Stop) => {
+                    stopping = true;
+                    break;
+                }
                 // Disconnected: flush what we have, then the next `recv` ends the loop.
                 Err(_) => break,
             }
         }
         if let Err(e) = db.ingest_otlp_logs(&encode(batch)) {
             super::warn(&format!("ingest failed: {e}"));
+        }
+        if stopping {
+            return;
         }
     }
 }

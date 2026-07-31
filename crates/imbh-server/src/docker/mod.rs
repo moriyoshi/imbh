@@ -54,6 +54,7 @@ use entry::{EntryReader, PartialAssembler};
 use ingest::{Container, IngestConfig, Ingestor};
 
 use crate::Response;
+use crate::shutdown::{InFlight, Shutdown};
 
 /// The content type Docker's plugin client expects on every non-streaming reply.
 const PLUGIN_CONTENT_TYPE: &str = "application/vnd.docker.plugins.v1.1+json";
@@ -83,6 +84,8 @@ pub(crate) fn warn(message: &str) {
 ///
 /// Creates the socket's parent directory and replaces a stale socket left by a previous run. Blocks
 /// on the accept loop; run it on its own thread if the caller has other work (see `imbhd`'s `main`).
+///
+/// Never returns on its own; a host that wants to stop serving wants [`serve_plugin_until`].
 pub fn serve_plugin(db: Arc<Db>, socket: impl AsRef<Path>) -> std::io::Result<()> {
     serve_plugin_with(db, socket, IngestConfig::default())
 }
@@ -93,6 +96,35 @@ pub fn serve_plugin_with(
     socket: impl AsRef<Path>,
     ingest: IngestConfig,
 ) -> std::io::Result<()> {
+    serve_plugin_with_until(db, socket, ingest, Shutdown::new())
+}
+
+/// [`serve_plugin`], stopping when `shutdown` trips.
+pub fn serve_plugin_until(
+    db: Arc<Db>,
+    socket: impl AsRef<Path>,
+    shutdown: Arc<Shutdown>,
+) -> std::io::Result<()> {
+    serve_plugin_with_until(db, socket, IngestConfig::default(), shutdown)
+}
+
+/// [`serve_plugin_until`] with the ingest batching tuned — what `imbhd` runs on its plugin thread.
+///
+/// The wind-down order is what makes container output survive a `docker stop` of the plugin:
+///
+/// 1. stop accepting (a throwaway connect to our own socket unblocks `accept`, so a running plugin
+///    pays no poll tick while idle),
+/// 2. stop every container's FIFO reader and drain the ingest queue into the `Db` — the caller is
+///    about to close it, and a line already read must not be stranded in the queue,
+/// 3. let in-flight plugin requests finish, bounded by [`Shutdown::drain_timeout`] (a `docker logs -f`
+///    ends on its own once its container's stream is gone),
+/// 4. unlink the socket, so a restart binds a clean path instead of clearing someone else's leftover.
+pub fn serve_plugin_with_until(
+    db: Arc<Db>,
+    socket: impl AsRef<Path>,
+    ingest: IngestConfig,
+    shutdown: Arc<Shutdown>,
+) -> std::io::Result<()> {
     let socket = socket.as_ref();
     if let Some(parent) = socket.parent()
         && !parent.as_os_str().is_empty()
@@ -102,16 +134,40 @@ pub fn serve_plugin_with(
     remove_stale_socket(socket)?;
 
     let listener = UnixListener::bind(socket)?;
+    let wake = socket.to_path_buf();
+    shutdown.on_trigger(move || {
+        // Unblocks the `accept` below; the loop then sees the flag and drops the connection.
+        let _ = UnixStream::connect(&wake);
+    });
+
     let plugin = Arc::new(Plugin::new(db, ingest));
-    for stream in listener.incoming() {
-        let Ok(stream) = stream else { continue };
+    let in_flight = Arc::new(InFlight::default());
+    while !shutdown.is_triggered() {
+        let Ok((stream, _peer)) = listener.accept() else {
+            continue;
+        };
+        if shutdown.is_triggered() {
+            break;
+        }
         let plugin = plugin.clone();
+        let busy = in_flight.enter();
         std::thread::spawn(move || {
+            let _busy = busy;
             if let Err(e) = handle_conn(&plugin, stream) {
                 warn(&format!("connection error: {e}"));
             }
         });
     }
+
+    plugin.shutdown();
+    let left = in_flight.drain(shutdown.drain_timeout());
+    if left > 0 {
+        warn(&format!(
+            "{left} in-flight plugin request(s) abandoned after the {:?} shutdown drain",
+            shutdown.drain_timeout()
+        ));
+    }
+    let _ = std::fs::remove_file(socket);
     Ok(())
 }
 
@@ -127,7 +183,13 @@ fn remove_stale_socket(socket: &Path) -> std::io::Result<()> {
 }
 
 fn handle_conn(plugin: &Arc<Plugin>, mut stream: UnixStream) -> std::io::Result<()> {
-    let mut reader = BufReader::new(stream.try_clone()?);
+    // The same phase deadlines the HTTP server applies, so a plugin connection cannot park a thread
+    // either. Not operator-tunable here: the peer is `dockerd` over a local socket, which is prompt or
+    // gone. The write deadline matters most for `ReadLogs` — a `docker logs -f` client that vanishes
+    // without closing would otherwise hold its thread and stream open indefinitely.
+    let timeouts = crate::IoTimeouts::default();
+    stream.set_write_timeout(timeouts.socket_timeout())?;
+    let mut reader = BufReader::new(crate::Armed::new(stream.try_clone()?, timeouts));
     let Some((_method, path, body)) = crate::read_request(&mut reader)? else {
         return Ok(());
     };
@@ -187,6 +249,28 @@ impl Plugin {
             }
             _ => Response::text(404, "not found"),
         }
+    }
+
+    /// Wind the driver down: stop every container's FIFO reader and drain the ingest queue into the
+    /// DB, so the caller can close it knowing nothing read is still in flight.
+    ///
+    /// The readers are deliberately **not** joined. A reader is parked in a blocking read on a FIFO
+    /// whose writer — the still-running container — has it open, so only the process exiting ends
+    /// that read; waiting for one would turn a `docker stop` of the plugin into a hang. They observe
+    /// `stop` between frames, and `Ingestor::shutdown` refuses whatever a late one produces, so no
+    /// record reaches a DB that is closing.
+    ///
+    /// Clearing the stream registry also ends any `docker logs -f` this plugin is serving: follow mode
+    /// stops once the container has no live stream, which is what lets those connections drain.
+    pub(crate) fn shutdown(&self) {
+        let streams = {
+            let mut streams = self.streams.lock().expect("docker plugin stream registry");
+            std::mem::take(&mut *streams)
+        };
+        for (_fifo, stream) in streams {
+            stream.stop.store(true, Ordering::Relaxed);
+        }
+        self.ingest.shutdown();
     }
 
     /// Whether `container_id` still has a live FIFO reader — follow mode's "is it still running?".

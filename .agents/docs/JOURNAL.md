@@ -1099,3 +1099,213 @@ layout; a Dockerfile build over that context on the emulator-free builder; the s
 serving `/health` and `/api/query` with the database initialised on the volume by the unprivileged user.
 Workflow references re-validated, all nine actions still SHA-pinned, and the `image` job now contains no
 reference to the script outside a comment.
+
+## 2026-07-31 — `imbhd`: signal handling and graceful shutdown, and why `accept` is woken rather than polled
+
+`imbhd` had no signal handling at all. `SIGTERM` — which is what `docker stop`, systemd, and a plain
+`kill` send — took the default disposition and killed the process wherever it happened to be. Nothing
+was *lost*, because the WAL is the durability contract, but everything since the last seal was
+recoverable only by replay: every stop bought a replay on the next start, and an operator watching
+`/stats` saw a segment count that never advanced past the last scheduled seal. For a process that owns
+a flush scheduler (`FlushPolicy`, this same day's earlier entry), sealing on the way out is the whole
+point of owning it.
+
+**The shape.** A `Shutdown` token (`crates/imbh-server/src/shutdown.rs`) that every accept loop
+watches, plus `serve_until` / `serve_plugin_until` / `serve_grpc_until` alongside the existing
+`serve*` entry points (additive — the crates are published, so the old signatures and their "until the
+process exits" contract stay). `main` installs the signal handlers, parks on the token, and on trigger
+waits for each endpoint to report *stopped and drained* before calling `Db::close()`.
+
+**Why `accept` is woken, not polled.** The obvious implementation is `set_nonblocking(true)` plus a
+poll loop on the flag. It is wrong here: the reply carries `Connection: close`, so this protocol opens
+one connection per request, and a 100 ms tick would land on the latency of *every OTLP POST* — up to a
+tick between a connection arriving and `accept` noticing it. Instead a listener registers a waker with
+the token, and `trigger()` makes one throwaway connection to the listener's own address. Blocking
+`accept` stays blocking, idle cost is zero, and shutdown is immediate. Two details the implementation
+needs: a wildcard bind (`0.0.0.0`) is not a connectable destination, so the waker aims at loopback on
+the same port; and a waker registered *after* the token tripped runs immediately, or a listener that
+bound late would park in `accept` forever. The gRPC side is the one place that does poll (a 50 ms tick
+inside tonic's `serve_with_shutdown` future) — harmless, because HTTP/2 connections are long-lived, so
+that tick is not on any request's path.
+
+**Why the signal handler does almost nothing.** It stores an atomic and writes one byte to a self-pipe;
+a watcher thread parked on the read end takes the locks and notifies the condvar. Tripping the token
+directly from the handler would take a mutex inside a signal context, against a thread the handler may
+have interrupted while holding it. `sigaction` is installed with `SA_RESTART` so the arriving signal
+does not surface as `EINTR` in the middle of a FIFO read or a storage write — the news travels by pipe,
+never by an interrupted syscall. A **second** signal `_exit(128 + signum)`s from the handler itself
+(`_exit` is async-signal-safe and skips every destructor, which is the point).
+
+**Footprint.** std cannot catch `SIGTERM`, so this needs `libc` — which is **already in `imbhd`'s
+default graph** via `datafusion-common`, so the direct edge adds no crate. The footprint gate is
+unchanged at 275 crates. The dep is `[target.'cfg(unix)'.dependencies]`; on other targets
+`install_signal_handlers` reports `Unsupported` and `imbhd` warns and serves on, rather than silently
+pretending to handle signals.
+
+**Three things the drain forced open.**
+
+1. **The Docker plugin's ingest worker could not be drained.** `Ingestor` held only a `SyncSender` and
+   the worker exited when every sender dropped — which cannot happen while the `Ingestor` is alive
+   behind an `Arc`. Lines already read off a container's FIFO would have been stranded in the queue (or
+   in the worker's half-full batch) when `Db::close()` ran. Fixed with a `Queued::Stop` sentinel: the
+   channel is FIFO, so the sentinel is behind everything already queued, and the worker ingests its
+   batch and exits. `Ingestor::shutdown` then joins it, so the drain is *synchronous* with respect to
+   the close that follows. A `closing` flag makes `send` refuse afterwards, so a still-parked FIFO
+   reader cannot queue behind the sentinel and be dropped.
+2. **The container FIFO readers cannot be joined, and must not be.** A reader is parked in a blocking
+   read on a FIFO whose writer — the still-running container — holds it open; only the process exiting
+   ends that read. Waiting for one would turn `docker plugin disable` into a hang. They get their stop
+   flag set (observed between frames) and are then left to die with the process, which is safe
+   precisely because `Ingestor::shutdown` refuses their late records. Clearing the stream registry also
+   ends any `docker logs -f` this plugin is serving: follow mode stops once a container has no live
+   stream, which is what lets those connections drain instead of holding the door open.
+3. **`main` must not `join` its listeners.** A client that opens a socket and goes quiet parks a
+   connection thread in `read_line` indefinitely; the listener's own drain has a deadline and gives up,
+   but `JoinHandle::join` has none. So each thread reports completion on a channel and `main`
+   `recv_timeout`s, which means one wedged endpoint cannot hold up the final seal.
+
+**Verified.** Four new tests in `crates/imbh-server/tests/shutdown_e2e.rs` — prompt stop plus the port
+becoming re-bindable (a supervisor restart must not hit `AddrInUse`), an in-flight request completing
+*after* the trigger, a post-trigger connection getting no answer, and the binary under a real
+`libc::kill(SIGTERM)` exiting 0 with its rows in **sealed segments** (run with `IMBH_FLUSH=manual`, so
+the shutdown path is the only thing that could have sealed them — the assertion is unreachable without
+signal handling). Plus a plugin drain test that configures a 30-second flush interval, so any row that
+appears got there via the shutdown drain and nothing else, and asserts the socket is unlinked; a gRPC
+stop test; and a unit test that raises `SIGTERM` at the test binary and requires it to become a tripped
+token rather than a dead process. Full gate green (fmt/build/clippy `-D warnings`/`cargo test
+--workspace`, plus `-p imbh-server` under `grpc,docker,tracing`), footprint gate OK at 275 crates.
+
+**Deliberately not done.** No read/write timeouts on accepted connections: the drain deadline already
+bounds shutdown, and a timeout would change behaviour for slow clients posting large OTLP bodies —
+which is a separate decision from this one. A listener that dies with an error still `exit(1)`s without
+sealing: whatever broke the listener is a poor moment to start writing Parquet, and the WAL covers every
+accepted row.
+
+## 2026-08-01 — `imbhd` connection deadlines, and a bug the test design caught before the test did
+
+Closes the follow-up left open by the graceful-shutdown work (2026-07-31): `imbhd` is
+thread-per-connection and its hand-rolled parser blocked in `read_line`/`read_exact` with no deadline, so
+a client that connected and said nothing held a thread and a `Db` handle for as long as it liked. It also
+made the shutdown drain sit out its whole deadline on a connection that was never going to finish.
+
+**Two phases, two different rules.** The recorded intent was "a header/body deadline, not a blanket
+`set_read_timeout`", and working through it confirmed why neither rule alone is right:
+
+- The **head** must be bounded *in total*. A per-read allowance lets a client dribble one byte per
+  allowance — never idle long enough to trip it, never finishing the request — and hold a thread forever.
+- The **body** must be bounded *per read*. A total deadline there cannot distinguish a 50 MiB upload over
+  a slow link from a client that stopped mid-body; it would punish the first for its size. The rule that
+  matters is "do not stall", not "do not take a while".
+
+So: `IMBH_HEADER_TIMEOUT` (default `10s`, total) and `IMBH_BODY_TIMEOUT` (default `30s`, per read, and
+the response's write allowance), `0` disabling either, and a best-effort `408 Request Timeout` when one
+blows. The 408 is worth the two lines: a dropped connection is indistinguishable from a crash, and an
+OTLP exporter reads 408 as "retry".
+
+**The bug the test design caught.** The first implementation armed the socket's read timeout before each
+`read_line` — which reads correctly but is wrong, and the wrongness is invisible in the diff. `read_line`
+is a `BufReader` method: it may block on *several* underlying reads, and each one gets whatever timeout
+was armed before the call. So a trickling client resets the effective window on every byte and the
+"total" budget never expires. This surfaced not from reading the code but from trying to write the
+trickle test and working out what it would actually observe.
+
+The fix is placement: an `Armed<S>` reader wrapped **under** the `BufReader`
+(`BufReader<Armed<TcpStream>>`), which re-arms the socket against an *absolute* deadline on every real
+read. `read_request` flips it to the body phase through `reader.get_mut()` once the head is parsed. Two
+consequences worth noting: the phase switch has to be visible to the parser, so `read_request` gave up
+being generic over `BufRead` and is now generic over the *socket* (`ReadDeadline + Read`) — which is the
+genericity it actually needed, since its two callers are a `TcpStream` and a `UnixStream`; and the body
+allowance is a constant, so it is armed once at the switch rather than per read. Steady-state cost is one
+extra `setsockopt` per request, because a `BufReader` normally swallows a whole request head in a single
+read.
+
+**Verified.** Six tests in `crates/imbh-server/tests/timeouts_e2e.rs`, of which two discriminate against
+the bug above rather than merely exercising the feature: a trickling client (one byte per `HEADER/6`,
+indefinitely) must be cut off at ~`HEADER` — under the per-`read_line` arming it would have run the full
+6 s of trickle, so the assertion and the file's total runtime both fail — and a slow-but-progressing body
+whose *total* transfer exceeds `BODY` must still return 200 with the row in the DB. Plus a quiet client
+getting 408 at ~`HEADER`, a stalled body getting 408 with **nothing ingested**, `IoTimeouts::DISABLED`
+restoring the old never-time-out behaviour, and the shutdown payoff: with a 30 s drain and an idle
+connection, `serve_with_until` now returns in well under half of it instead of sitting out the deadline.
+
+A near-miss in the tests themselves: two assertions were written as
+`SELECT count(*) … .num_rows() == 1`, which is vacuously true — `count(*)` always returns exactly one
+row, so they asserted nothing about the count. Replaced with a helper that reads the `Int64` value, which
+is what turned "nothing was ingested from the truncated request" into a real assertion (it is 0, and the
+test would now catch a regression that ingested a partial body).
+
+Full gate green (fmt/build/clippy `-D warnings`/`cargo test --workspace`, 54 suites, plus
+`-p imbh-server` under `grpc,docker,tracing`); footprint untouched — this is std sockets only, no new
+dependency.
+
+**One thing deliberately left as is.** The Docker plugin socket applies the *defaults* and is not
+operator-tunable: its peer is the local `dockerd`, which is prompt or gone. That path did gain something
+for free, though — the response write deadline means a `docker logs -f` client that vanishes without
+closing no longer holds its thread and follow stream open indefinitely.
+
+## 2026-08-01 — Session summary: `imbhd` lifecycle hardening (shutdown + connection deadlines), and the knob interaction it exposed
+
+One arc across two entries above — signal handling and graceful shutdown (2026-07-31), then the
+per-connection deadlines that follow-up demanded (2026-08-01). The mechanisms are documented there; this
+records the shape of the whole change, the findings that belong to neither entry alone, and one honest
+caveat about the defaults.
+
+**What shipped.** `imbhd` now has a lifecycle: `SIGINT`/`SIGTERM` stop every listener, in-flight work
+drains, the Docker plugin's queued container lines land in the DB, `Db::close()` seals, exit 0 — and no
+client can park a server thread indefinitely while any of that happens. New public surface on
+`imbh-server`, all additive (the crate is published, so nothing changed shape):
+
+| Added | For |
+|-------|-----|
+| `Shutdown` (`trigger`/`wait`/`is_triggered`/`on_trigger`/`install_signal_handlers`/`drain_timeout`/`cause`), `shutdown::signal_name` | the token every endpoint watches |
+| `serve_until`, `serve_with_until` | HTTP, with and without explicit deadlines |
+| `docker::serve_plugin_until`, `docker::serve_plugin_with_until`, `docker::ingest::Ingestor::shutdown` | the plugin endpoint and its ingest drain |
+| `grpc::serve_grpc_until`, `grpc::serve_grpc_blocking_until` | the tonic listener |
+| `IoTimeouts` (+ `DISABLED`), `io_timeouts`, `DEFAULT_HEADER_TIMEOUT`, `DEFAULT_BODY_TIMEOUT`, `DEFAULT_SHUTDOWN_TIMEOUT`, `shutdown_timeout` | the knobs, and their env parsers |
+
+Four new environment variables (`IMBH_SHUTDOWN_TIMEOUT`, `IMBH_HEADER_TIMEOUT`, `IMBH_BODY_TIMEOUT` —
+plus all three declared `settable` in the managed plugin's `config.json`). Zero new crates: signal
+handling rides `libc`, already in the graph via DataFusion; the deadlines are std sockets. Footprint gate
+unchanged at 275 crates.
+
+**The caveat: the two knobs interact, and the defaults do not line up.** The follow-up item claimed an
+idle connection "makes the shutdown drain wait out its whole deadline". The deadlines fix that only when
+the header timeout is *shorter* than the drain — and the stock defaults are the other way round (header
+`10s`, drain `5s`), so with defaults an idle connection is still abandoned by the drain rather than cut
+off before it. The `timeouts_e2e` test that demonstrates the payoff uses a 600 ms header against a 30 s
+drain, i.e. it proves the mechanism, not the default configuration. Defaults were left alone (10s is the
+right head budget for a collector on its own; 5s is the right drain against Docker's 10s stop grace), and
+the relationship is now documented instead: set `IMBH_HEADER_TIMEOUT` below `IMBH_SHUTDOWN_TIMEOUT` if
+you want the drain to end early on idle connections. Worth knowing before treating "connections are
+bounded" as "shutdown is always prompt".
+
+**Findings worth keeping.**
+
+- **`Db::close()` seals even under `FlushPolicy::manual`** — confirmed, not assumed: the binary-level
+  SIGTERM test runs with `IMBH_FLUSH=manual` and finds three rows in sealed segments afterwards, so the
+  shutdown path is provably the only thing that could have sealed them. That property is what makes
+  `manual` safe to run in production rather than a data-stranding footgun.
+- **A binary can be signal-tested in-package with no fixtures.** `env!("CARGO_BIN_EXE_imbhd")` is
+  available to a package's own integration tests, so "spawn the real `imbhd`, `libc::kill` it, assert the
+  exit status *and* reopen the data directory read-only" is an ordinary hermetic test. This is the
+  strongest shape available for anything whose contract spans the process boundary (exit codes, signal
+  dispositions, on-disk state after exit) and it needs no daemon, no network, no privileges — worth
+  reaching for before settling on a unit test that can only approximate the property.
+- **Verifying a `#[cfg(not(unix))]` fallback without a Windows toolchain.** `cargo check --target
+  x86_64-pc-windows-gnu` cannot run here — `zstd-sys` needs `x86_64-w64-mingw32-gcc`, which is absent —
+  so the non-Unix branch was checked by *inverting the cfg on a Unix host*: rewrite `#[cfg(unix)]` to
+  `#[cfg(SOME_UNSET_CFG)]` and `#[cfg(not(unix))]` to `#[cfg(not(SOME_UNSET_CFG))]`, `cargo check`
+  (0 errors), then restore from a backup copy. Cheap, and it catches exactly the class of bug that
+  otherwise ships: a fallback arm nobody has ever compiled.
+- **Two small compile-time stumbles, recorded so the next reader does not re-derive them.** A local
+  `enum Message` collides with prost's `Message` trait under `use prost::Message` (E0255 — the enum is now
+  `Queued`), and a bare `handle_signal as libc::sighandler_t` trips the `function_casts_as_integer` lint
+  (cast via `as *const ()` first). tonic 0.14's graceful path is
+  `tonic::transport::server::Router::serve_with_shutdown(addr, signal)`, which is what the gRPC listener
+  hangs its token future on.
+- **Tests that discriminate beat tests that exercise.** Both entries above turned on assertions chosen
+  to fail against a specific wrong implementation — the trickle test against a per-`read_line` deadline,
+  the 30-second-flush-interval plugin test against a missing ingest drain, the `IMBH_FLUSH=manual` binary
+  test against absent signal handling. Two assertions written the other way (`count(*)` compared with
+  `num_rows()`, vacuously 1) proved nothing until rewritten. The habit that caught both: state what
+  wrong implementation the assertion is supposed to reject, before writing it.

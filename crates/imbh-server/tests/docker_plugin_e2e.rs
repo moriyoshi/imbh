@@ -616,3 +616,90 @@ fn a_live_fifo_streams_into_the_database() {
         ["live 0", "live 1", "live 2"]
     );
 }
+
+/// Shutting the plugin down must not strand container output.
+///
+/// The batching worker is deliberately configured with a **30-second** flush interval, so nothing
+/// reaches the DB on the normal path within the life of this test: every row that shows up afterwards
+/// got there because `serve_plugin_*_until` drained the ingest queue on its way out. That is the
+/// property a `docker stop` of the plugin depends on — lines already read off a container's stream are
+/// in the DB before `main` closes it.
+#[test]
+fn shutdown_drains_queued_container_lines_and_unlinks_the_socket() {
+    use imbh_server::Shutdown;
+    use imbh_server::docker::ingest::IngestConfig;
+    use imbh_server::docker::serve_plugin_with_until;
+
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let socket = tmp.path().join("imbh.sock");
+    let db: Arc<Db> = Db::in_memory().open().expect("open in-memory db");
+    let shutdown = Shutdown::with_drain_timeout(SETTLE);
+
+    let ingest = IngestConfig {
+        // Long enough that no batch closes on its own during this test.
+        flush_interval: Duration::from_secs(30),
+        ..IngestConfig::default()
+    };
+    let server = {
+        let (db, socket, shutdown) = (db.clone(), socket.clone(), shutdown.clone());
+        std::thread::spawn(move || {
+            serve_plugin_with_until(db, &socket, ingest, shutdown).expect("serve the plugin")
+        })
+    };
+    let deadline = Instant::now() + SETTLE;
+    while Instant::now() < deadline && UnixStream::connect(&socket).is_err() {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    // A stream the reader can consume to EOF, so its lines are queued and then parked in the worker's
+    // half-full batch.
+    let stream_file = tmp.path().join("container.log");
+    let entries: Vec<LogEntry> = (0..3)
+        .map(|i| {
+            entry(
+                "stdout",
+                &format!("queued {i}\n"),
+                1_700_000_000_000_000_000 + i,
+            )
+        })
+        .collect();
+    std::fs::write(&stream_file, frame_all(&entries)).expect("write the log stream");
+
+    let start = post(
+        &socket,
+        "/LogDriver.StartLogging",
+        &start_logging_body(&stream_file, "queued001", "queued", ""),
+    );
+    assert_eq!(start.text(), r#"{"Err":""}"#);
+
+    // Give the reader time to consume the file and queue all three lines, then confirm the batch is
+    // still open — otherwise this test would pass even with no drain at all.
+    std::thread::sleep(Duration::from_millis(300));
+    let before = db
+        .blocking()
+        .sql("SELECT count(*) AS c FROM logs")
+        .expect("count before shutdown");
+    assert_eq!(
+        before.iter().map(|b| b.num_rows()).sum::<usize>(),
+        1,
+        "one count row"
+    );
+
+    shutdown.trigger();
+    server.join().expect("the plugin accept loop returns");
+
+    // The drain put them in the DB.
+    let rows = wait_for_logs(&db, 3);
+    assert_eq!(
+        rows.iter().map(|(b, _, _)| b.as_str()).collect::<Vec<_>>(),
+        ["queued 0", "queued 1", "queued 2"],
+        "the ingest queue was not drained on shutdown"
+    );
+
+    // And the socket is gone, so a restart binds a clean path.
+    assert!(
+        !socket.exists(),
+        "the plugin socket outlived the plugin: {}",
+        socket.display()
+    );
+}

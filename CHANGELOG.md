@@ -13,6 +13,45 @@ release aborts if it is missing or duplicated.
 
 ## [Unreleased]
 
+### Added
+
+- **Per-connection deadlines for `imbhd` (`imbh-server`).** The server is thread-per-connection and its
+  parser blocked with no deadline, so a client that connected and said nothing held a thread (and a `Db`
+  handle) indefinitely. Two phase deadlines now bound it, with deliberately different rules:
+  `IMBH_HEADER_TIMEOUT` (new; default `10s`) caps the request line + headers **in total**, and
+  `IMBH_BODY_TIMEOUT` (new; default `30s`) is a **per-read** allowance for the body plus the write
+  allowance for the response. So a large OTLP body over a slow link still succeeds — the rule is "do not
+  stall", not "do not take a while" — while an idle, trickling, or stalled client is answered
+  `408 Request Timeout` and disconnected, having ingested nothing. `0` disables either phase.
+
+  New public API, additive: `IoTimeouts` (with `DISABLED`), `io_timeouts`, `DEFAULT_HEADER_TIMEOUT` /
+  `DEFAULT_BODY_TIMEOUT`, and `serve_with_until` (`serve` / `serve_until` use `IoTimeouts::default()`).
+  The Docker plugin endpoint applies the defaults to its own socket, which also means a `docker logs -f`
+  client that vanishes without closing no longer holds its thread and stream open.
+
+- **Signal handling and graceful shutdown for `imbhd` (`imbh-server`).** `SIGINT`/`SIGTERM` (Ctrl-C,
+  `docker stop`, systemd, `kill`) now wind the process down instead of killing it: every listener stops
+  accepting, in-flight requests get `IMBH_SHUTDOWN_TIMEOUT` (new; default `5s`, `0` to not wait) to
+  finish, the Docker plugin's container readers stop and its ingest queue is drained into the DB, and
+  `Db::close()` seals the buffer — so `imbhd` exits 0 and the next start replays nothing instead of
+  recovering everything since the last seal from the WAL. A **second** signal exits immediately with
+  `128 + signum`.
+
+  New public API on the crate, all additive: `imbh_server::Shutdown` (the token — `trigger`, `wait`,
+  `is_triggered`, `on_trigger`, `install_signal_handlers`, `drain_timeout`), `serve_until`,
+  `docker::serve_plugin_until` / `serve_plugin_with_until`, `grpc::serve_grpc_until` /
+  `serve_grpc_blocking_until`, `shutdown_timeout`, and `docker::ingest::Ingestor::shutdown`. The
+  existing `serve` / `serve_plugin` / `serve_grpc*` entry points keep their signatures and their
+  "serve until the process exits" contract, so a host that drives its own lifecycle can adopt the token
+  at its own pace.
+
+  Notes on the implementation: `accept` is **woken** (one throwaway connection to the listener's own
+  address) rather than polled, because each response carries `Connection: close` — a poll tick would
+  land on every request's latency. The signal handler does only async-signal-safe work (an atomic store
+  plus one byte down a self-pipe); a watcher thread does the rest. Signal handling is Unix-only and
+  adds **no crate** to the footprint graph: `libc` (std cannot catch `SIGTERM`) is already there via
+  DataFusion, so the gate stays at 275 crates.
+
 ## [0.2.0] - 2026-07-30
 
 ### Added

@@ -134,3 +134,55 @@ async fn grpc_wire_ingest_all_signals_and_errors() {
         .await
         .expect("empty export is accepted");
 }
+
+/// The gRPC listener stops on a triggered token and gives the port back — `imbhd`'s SIGTERM path for
+/// this endpoint. An export accepted just before the trigger is still in the DB afterwards, since
+/// tonic's graceful shutdown lets in-flight calls finish.
+#[tokio::test(flavor = "multi_thread")]
+async fn shutdown_stops_the_grpc_listener_and_frees_the_port() {
+    use imbh_server::Shutdown;
+    use imbh_server::grpc::serve_grpc_until;
+
+    let addr = free_addr();
+    let db: Arc<Db> = Db::in_memory().open().expect("open in-memory db");
+    let shutdown = Shutdown::with_drain_timeout(Duration::from_secs(5));
+
+    let server = {
+        let (db, serve_addr, shutdown) = (db.clone(), addr.clone(), shutdown.clone());
+        tokio::spawn(async move {
+            serve_grpc_until(db, serve_addr.parse().expect("addr"), shutdown)
+                .await
+                .expect("serve gRPC")
+        })
+    };
+
+    let endpoint = format!("http://{addr}");
+    let mut logs = None;
+    for _ in 0..200 {
+        if let Ok(c) = LogsServiceClient::connect(endpoint.clone()).await {
+            logs = Some(c);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let mut logs = logs.expect("gRPC server did not become ready");
+    let req = ExportLogsServiceRequest::decode(otlp_log("cart", "before shutdown", 1).as_slice())
+        .expect("decode");
+    logs.export(req).await.expect("export before shutdown");
+
+    shutdown.trigger();
+    // tonic's shutdown future is the one place the token is polled, so this is bounded by that tick
+    // plus the runtime's scheduling — a whole second of slack, and it hangs if the wiring regresses.
+    tokio::time::timeout(Duration::from_secs(1), server)
+        .await
+        .expect("the gRPC server stops promptly")
+        .expect("the server task did not panic");
+
+    // The port is free for a restart.
+    assert!(
+        TcpListener::bind(&addr).is_ok(),
+        "the gRPC port is still held after shutdown"
+    );
+    // And the row exported a moment before the trigger is in the DB.
+    assert_eq!(count_rows(&db, "SELECT body FROM logs").await, 1);
+}
