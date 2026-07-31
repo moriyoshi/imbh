@@ -2178,6 +2178,7 @@ version = "0.2.0"
 dependencies = [
  "imbh",
  "imbh-test-support",
+ "libc",
  "opentelemetry-proto",
  "prost",
  "tempfile",

@@ -38,6 +38,24 @@
       "settable": ["value"]
     },
     {
+      "name": "IMBH_HEADER_TIMEOUT",
+      "description": "Total time an HTTP client gets to deliver a request line and headers before it is answered 408 and disconnected. Bounds what one idle client can hold, since the server is thread-per-connection. `0` disables it.",
+      "value": "10s",
+      "settable": ["value"]
+    },
+    {
+      "name": "IMBH_BODY_TIMEOUT",
+      "description": "How long a single read of an HTTP request body -- or a single write of a response -- may stall. Per read, not per request, so a large slow upload is fine as long as it keeps making progress. `0` disables it.",
+      "value": "30s",
+      "settable": ["value"]
+    },
+    {
+      "name": "IMBH_SHUTDOWN_TIMEOUT",
+      "description": "On SIGTERM (a `docker plugin disable`), how long in-flight requests and container lines get to finish before the buffer is sealed and the process exits. `0` does not wait. Keep it under the daemon's own stop grace.",
+      "value": "5s",
+      "settable": ["value"]
+    },
+    {
       "name": "RUST_LOG",
       "description": "Log filter for imbhd's own diagnostics. Output goes to the Docker daemon log.",
       "value": "info",

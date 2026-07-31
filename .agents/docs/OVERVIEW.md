@@ -221,7 +221,9 @@ three signals, with the reference server and SDK exporter built. See
 Post-v0.1 additions (outside the original milestone plan): the **Docker logging-driver plugin** in
 `imbh-server` (optional `docker` feature) — `--log-driver imbh` writes container stdout/stderr into
 an embedded `Db` and serves `docker logs` back out of it, with no new crate in the graph
-(ARCHITECTURE.md §10.16, [docs/DOCKER_LOG_DRIVER.md](../../docs/DOCKER_LOG_DRIVER.md)).
+(ARCHITECTURE.md §10.16, [docs/DOCKER_LOG_DRIVER.md](../../docs/DOCKER_LOG_DRIVER.md)); and
+**signal-driven graceful shutdown** for `imbhd` (`SIGINT`/`SIGTERM` → stop accepting, drain in-flight
+requests, seal the buffer, exit 0), also with no new crate (ARCHITECTURE.md §10.16).
 
 Post-v1 candidate tracks: broader query-language profiles; Parquet VARIANT for attributes;
 read-only cross-process opens; object-store tiering; downsampling; single-file segment bundles

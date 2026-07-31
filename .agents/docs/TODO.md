@@ -70,6 +70,20 @@ git history); this file tracks only what is still open.
       accepting it, or tracking an ingest-time column alongside event time so the tail can watermark
       on arrival order. — *source: JOURNAL (E2E against a real dockerd, 2026-07-30)*
 
+## Closed, awaiting the next sweep
+
+- [x] **`imbhd` connections have no read/write timeout.** *Closed 2026-08-01.* A client that opened a
+      socket and sent nothing parked a connection thread in `read_line` forever, costing a thread per
+      idle connection and making the shutdown drain (`IMBH_SHUTDOWN_TIMEOUT`) wait out its whole
+      deadline instead of finishing early. Resolved as the item called for — a header/body deadline
+      rather than a blanket `set_read_timeout`: `IMBH_HEADER_TIMEOUT` (default `10s`) bounds the request
+      head *in total*, `IMBH_BODY_TIMEOUT` (default `30s`) is a *per-read* allowance for the body plus
+      the response write, `0` disables either, and a blown deadline answers `408`. The per-read rule on
+      the body is what preserves the slow-large-upload case the item flagged. Enforcement sits in an
+      `Armed` reader *under* the `BufReader`, since arming per `read_line` would silently make the head
+      deadline per-read too. — *source: JOURNAL (graceful shutdown, 2026-07-31; connection deadlines,
+      2026-08-01)*
+
 ## Recently Swept (2026-07-24 good-sleep)
 
 Six items completed on 2026-07-24 were removed from the open list; their durable knowledge is in

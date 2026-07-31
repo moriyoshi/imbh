@@ -21,17 +21,25 @@
 //! default build carries no gRPC transport. A Docker logging-driver plugin endpoint is available
 //! behind the optional `docker` feature (see [`docker`]). Not handled here (follow-ups): gzip request
 //! bodies, TLS, and the OTLP partial-success response shape.
+//!
+//! Every endpoint stops on a shared [`Shutdown`] token: `SIGINT`/`SIGTERM` stop the accept loops,
+//! in-flight requests get a bounded drain, and `imbhd` seals the buffer with `Db::close()` before it
+//! exits. See the [`shutdown`] module for the mechanism and [`serve_until`] for the HTTP side.
 
 #[cfg(all(feature = "docker", unix))]
 pub mod docker;
 #[cfg(feature = "grpc")]
 pub mod grpc;
+pub mod shutdown;
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::time::Duration;
 
 use std::sync::Arc;
+
+pub use shutdown::{DEFAULT_DRAIN_TIMEOUT, Shutdown};
+use shutdown::{InFlight, wake_tcp_listener};
 
 use imbh::arrow::array::Array;
 use imbh::arrow::record_batch::RecordBatch;
@@ -137,33 +145,208 @@ pub fn maintenance_interval(env: Option<String>) -> imbh::Result<Duration> {
     Ok(imbh::parse_duration(value)?.max(FlushPolicy::DEFAULT_TICK))
 }
 
+/// `imbhd`'s default drain: how long a listener waits for in-flight requests at shutdown.
+pub const DEFAULT_SHUTDOWN_TIMEOUT: Duration = DEFAULT_DRAIN_TIMEOUT;
+
+/// Resolve the shutdown drain from `IMBH_SHUTDOWN_TIMEOUT` (a duration such as `5s`, `500ms`),
+/// falling back to [`DEFAULT_SHUTDOWN_TIMEOUT`]. Empty means unset; a malformed value is an error.
+///
+/// `0` is meaningful and kept: stop accepting and return without waiting for anything in flight. It
+/// is an environment variable for the same reason the listen addresses are — a managed Docker plugin
+/// can retune `env` entries but not its frozen entrypoint arguments — and it is what an operator
+/// tunes against the supervisor's own patience (Docker sends `SIGKILL` 10s after `SIGTERM`).
+pub fn shutdown_timeout(env: Option<String>) -> imbh::Result<Duration> {
+    let value = env.unwrap_or_default();
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(DEFAULT_SHUTDOWN_TIMEOUT);
+    }
+    imbh::parse_duration(value)
+}
+
+/// `imbhd`'s default header-phase deadline: how long a client gets to deliver the request line and
+/// headers, in total. Generous for a localhost/bridge collector; the point is that "connected and went
+/// quiet" is bounded at all.
+pub const DEFAULT_HEADER_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// `imbhd`'s default body deadline: how long a single read of a request body — or a single write of a
+/// response — may stall. Per read, not per request, so a large upload that keeps making progress is
+/// never cut off for being large.
+pub const DEFAULT_BODY_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Per-connection I/O deadlines, so a client cannot park a server thread indefinitely.
+///
+/// Thread-per-connection means an idle connection costs a thread, and the parser blocks in
+/// `read_line`/`read_exact` with no deadline of its own. The two phases want different rules, which is
+/// why this is two values rather than one socket timeout:
+///
+/// - [`IoTimeouts::header`] bounds the request line + headers **in total**. A per-read allowance is not
+///   enough here: a client trickling one byte per allowance is never idle, yet holds a thread forever.
+/// - [`IoTimeouts::body`] is a **per-read** allowance for the body, and the write allowance for the
+///   response. A 50 MiB OTLP body over a slow link must not be punished for its size — only for
+///   stalling — and a total deadline cannot tell those apart.
+///
+/// `Duration::ZERO` in either field means *no deadline* for that phase ([`IoTimeouts::DISABLED`] is
+/// both), which is the pre-timeout behaviour and the right choice for a host fronting `imbhd` with a
+/// proxy that already sheds slow clients.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IoTimeouts {
+    /// Total time allowed for the request line and headers.
+    pub header: Duration,
+    /// Longest a single body read, or a single response write, may stall.
+    pub body: Duration,
+}
+
+impl Default for IoTimeouts {
+    fn default() -> Self {
+        IoTimeouts {
+            header: DEFAULT_HEADER_TIMEOUT,
+            body: DEFAULT_BODY_TIMEOUT,
+        }
+    }
+}
+
+impl IoTimeouts {
+    /// No deadline on any phase: connections may stall for as long as the client keeps them open.
+    pub const DISABLED: IoTimeouts = IoTimeouts {
+        header: Duration::ZERO,
+        body: Duration::ZERO,
+    };
+
+    /// The socket timeout for the body/response phase — `None` when disabled, which is also how
+    /// `set_read_timeout`/`set_write_timeout` spell "block forever".
+    fn socket_timeout(self) -> Option<Duration> {
+        (!self.body.is_zero()).then_some(self.body)
+    }
+}
+
+/// Resolve the connection deadlines from `IMBH_HEADER_TIMEOUT` / `IMBH_BODY_TIMEOUT` (durations such
+/// as `10s`, `500ms`), each falling back to its default. Empty means unset; `0` disables that phase; a
+/// malformed value is an error, never a silent fallback.
+pub fn io_timeouts(header: Option<String>, body: Option<String>) -> imbh::Result<IoTimeouts> {
+    let resolve = |env: Option<String>, default: Duration| -> imbh::Result<Duration> {
+        let value = env.unwrap_or_default();
+        let value = value.trim();
+        if value.is_empty() {
+            return Ok(default);
+        }
+        imbh::parse_duration(value)
+    };
+    Ok(IoTimeouts {
+        header: resolve(header, DEFAULT_HEADER_TIMEOUT)?,
+        body: resolve(body, DEFAULT_BODY_TIMEOUT)?,
+    })
+}
+
 /// Serve `db` on `addr` (e.g. `127.0.0.1:4318`) until the process exits. Thread-per-connection;
 /// each connection drives the async `Db` API on its own current-thread runtime.
+///
+/// Never returns on its own; a host that wants to stop serving wants [`serve_until`].
 pub fn serve(db: Arc<Db>, addr: &str) -> std::io::Result<()> {
+    serve_until(db, addr, Shutdown::new())
+}
+
+/// Serve `db` on `addr` until `shutdown` trips, then stop accepting, give the in-flight requests up
+/// to [`Shutdown::drain_timeout`] to finish, and return.
+///
+/// Binding happens before anything else, so a bind error still surfaces to the caller. Once bound,
+/// the listener registers its own wake-up with the token ([`Shutdown::on_trigger`]): `accept` stays a
+/// *blocking* call — no poll tick added to the latency of a protocol that opens one connection per
+/// request — and the throwaway connection at trigger time is what gets the thread out of it.
+///
+/// A request that is still being read when the drain expires is abandoned, not waited for: the reply
+/// is lost but the ingest it asked for is already durable or not at all (`Db::ingest_otlp_*` is what
+/// decides that, not this loop), so an OTLP client's retry is the correct resolution either way.
+///
+/// Connections get the default [`IoTimeouts`]; [`serve_with_until`] takes them as an argument.
+pub fn serve_until(db: Arc<Db>, addr: &str, shutdown: Arc<Shutdown>) -> std::io::Result<()> {
+    serve_with_until(db, addr, IoTimeouts::default(), shutdown)
+}
+
+/// [`serve_until`] with the per-connection deadlines set explicitly — what `imbhd` calls, so
+/// `IMBH_HEADER_TIMEOUT` / `IMBH_BODY_TIMEOUT` reach the connections.
+pub fn serve_with_until(
+    db: Arc<Db>,
+    addr: &str,
+    timeouts: IoTimeouts,
+    shutdown: Arc<Shutdown>,
+) -> std::io::Result<()> {
     let listener = TcpListener::bind(addr)?;
-    for stream in listener.incoming() {
-        let stream = match stream {
-            Ok(s) => s,
+    let local = listener.local_addr()?;
+    shutdown.on_trigger(move || wake_tcp_listener(local));
+
+    let in_flight = Arc::new(InFlight::default());
+    while !shutdown.is_triggered() {
+        let stream = match listener.accept() {
+            Ok((stream, _peer)) => stream,
+            // Per-connection errors (`ECONNABORTED`, `EMFILE`); the listener itself is still good.
             Err(_) => continue,
         };
+        // Either the wake-up connection or a client that raced the shutdown. Dropping it unserved is
+        // the honest answer — the reply would arrive on a socket we are about to stop reading.
+        if shutdown.is_triggered() {
+            break;
+        }
         let db = db.clone();
+        let busy = in_flight.enter();
         std::thread::spawn(move || {
+            let _busy = busy;
             let rt = tokio::runtime::Builder::new_current_thread()
                 .build()
                 .expect("build connection runtime");
-            let _ = rt.block_on(handle_conn(db, stream));
+            let _ = rt.block_on(handle_conn(db, stream, timeouts));
         });
+    }
+    let left = in_flight.drain(shutdown.drain_timeout());
+    if left > 0 {
+        warn(&format!(
+            "{left} in-flight HTTP connection(s) abandoned after the {:?} shutdown drain",
+            shutdown.drain_timeout()
+        ));
     }
     Ok(())
 }
 
-async fn handle_conn(db: Arc<Db>, mut stream: TcpStream) -> std::io::Result<()> {
-    let mut reader = BufReader::new(stream.try_clone()?);
-    let Some((method, path, body)) = read_request(&mut reader)? else {
-        return Ok(());
+/// Report a server-level problem. Routed through `tracing` when `imbhd` is built with that feature,
+/// so it joins the rest of the server's instrumentation; plain stderr otherwise.
+pub(crate) fn warn(message: &str) {
+    #[cfg(feature = "tracing")]
+    tracing::warn!(target: "imbh_server", "{message}");
+    #[cfg(not(feature = "tracing"))]
+    eprintln!("imbhd: {message}");
+}
+
+async fn handle_conn(
+    db: Arc<Db>,
+    mut stream: TcpStream,
+    timeouts: IoTimeouts,
+) -> std::io::Result<()> {
+    let mut reader = BufReader::new(Armed::new(stream.try_clone()?, timeouts));
+    // Set before the read, so it also bounds the 408 below: a client that stalls sending is a fair bet
+    // to stall reading too, and a blocked write parks this thread exactly as a blocked read would.
+    stream.set_write_timeout(timeouts.socket_timeout())?;
+    let request = match read_request(&mut reader) {
+        Ok(Some(request)) => request,
+        Ok(None) => return Ok(()),
+        // A client that stalled mid-request gets the status that says so — best-effort, since it may
+        // well be gone. Every other error is a broken connection with nobody left to answer.
+        Err(e) if is_timeout(&e) => {
+            return write_response(&mut stream, &Response::text(408, "request timed out"));
+        }
+        Err(e) => return Err(e),
     };
+    let (method, path, body) = request;
     let resp = route(&db, &method, &path, &body).await;
     write_response(&mut stream, &resp)
+}
+
+/// Whether an I/O error is a deadline expiring. A socket read/write timeout surfaces as `WouldBlock`
+/// on Linux and `TimedOut` on Windows/macOS, so both spellings count.
+pub(crate) fn is_timeout(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+    )
 }
 
 /// Dispatch a request to the imbh library. Exposed for testing without sockets.
@@ -376,10 +559,99 @@ pub(crate) fn json_string(s: &str) -> String {
 
 type ParsedRequest = (String, String, Vec<u8>);
 
-/// Parse one HTTP/1.1 request (method, path, body) off `reader`; `None` on a clean EOF before the
-/// request line. Generic over the reader so the same parser serves the TCP server and the Unix-socket
-/// Docker plugin endpoint (`docker`), which speaks the same HTTP/1.1 dialect.
-pub(crate) fn read_request<R: BufRead>(reader: &mut R) -> std::io::Result<Option<ParsedRequest>> {
+/// A socket whose read deadline can be re-armed: `TcpStream` and (under `docker`) `UnixStream`, the two
+/// transports this parser serves.
+pub(crate) trait ReadDeadline {
+    fn arm_read_deadline(&self, timeout: Option<Duration>) -> std::io::Result<()>;
+}
+
+impl ReadDeadline for TcpStream {
+    fn arm_read_deadline(&self, timeout: Option<Duration>) -> std::io::Result<()> {
+        self.set_read_timeout(timeout)
+    }
+}
+
+#[cfg(all(feature = "docker", unix))]
+impl ReadDeadline for std::os::unix::net::UnixStream {
+    fn arm_read_deadline(&self, timeout: Option<Duration>) -> std::io::Result<()> {
+        self.set_read_timeout(timeout)
+    }
+}
+
+/// A socket that arms its own read deadline before every read, wrapped *under* the `BufReader` so it
+/// sees the real reads rather than the buffered line/exact calls above it.
+///
+/// That placement is the whole point. Arming once per `read_line` would give each underlying read a
+/// fresh allowance, and a client dribbling one byte per allowance is never idle long enough to trip it
+/// — it would hold a thread forever while technically making progress. Arming per read against an
+/// *absolute* deadline bounds the header phase in total instead.
+///
+/// The body phase is a constant per-read allowance, so it is armed once at the switch
+/// ([`Armed::begin_body`]) and left alone: the steady-state cost of all this is one extra `setsockopt`
+/// per request, since a `BufReader` normally swallows a whole request head in a single read.
+pub(crate) struct Armed<S: ReadDeadline + Read> {
+    socket: S,
+    timeouts: IoTimeouts,
+    /// When the header budget runs out; `None` when that phase is unbounded.
+    header_deadline: Option<std::time::Instant>,
+    /// Whether the body's (constant, already-armed) allowance is in effect.
+    body: bool,
+}
+
+impl<S: ReadDeadline + Read> Armed<S> {
+    pub(crate) fn new(socket: S, timeouts: IoTimeouts) -> Self {
+        Armed {
+            socket,
+            header_deadline: (!timeouts.header.is_zero())
+                .then(|| std::time::Instant::now() + timeouts.header),
+            timeouts,
+            body: false,
+        }
+    }
+
+    /// Switch to the body phase: one allowance per read, armed once because it never changes.
+    fn begin_body(&mut self) -> std::io::Result<()> {
+        self.body = true;
+        self.socket
+            .arm_read_deadline(self.timeouts.socket_timeout())
+    }
+}
+
+impl<S: ReadDeadline + Read> Read for Armed<S> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if !self.body
+            && let Some(deadline) = self.header_deadline
+        {
+            match deadline.checked_duration_since(std::time::Instant::now()) {
+                // Spent. (`set_read_timeout` rejects a zero duration — `None` there means *no*
+                // deadline — so the exhausted case has to be an error we raise ourselves.)
+                None => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "the request head did not arrive within the header timeout",
+                    ));
+                }
+                // A sub-millisecond remainder is spent for practical purposes; ask for 1ms so the
+                // syscall stays valid.
+                Some(left) => self
+                    .socket
+                    .arm_read_deadline(Some(left.max(Duration::from_millis(1))))?,
+            }
+        }
+        self.socket.read(buf)
+    }
+}
+
+/// Parse one HTTP/1.1 request (method, path, body); `None` on a clean EOF before the request line.
+/// Generic over the socket so the same parser serves the TCP server and the Unix-socket Docker plugin
+/// endpoint (`docker`), which speaks the same HTTP/1.1 dialect.
+///
+/// The [`Armed`] reader is what enforces the [`IoTimeouts`]: the head in total, the body per read.
+/// Without them a client that connects and says nothing parks this thread (and its `Db` handle) for as
+/// long as it cares to.
+pub(crate) fn read_request<S: ReadDeadline + Read>(
+    reader: &mut BufReader<Armed<S>>,
+) -> std::io::Result<Option<ParsedRequest>> {
     let mut request_line = String::new();
     if reader.read_line(&mut request_line)? == 0 {
         return Ok(None);
@@ -406,6 +678,9 @@ pub(crate) fn read_request<R: BufRead>(reader: &mut R) -> std::io::Result<Option
         }
     }
 
+    // The body switches to a per-read allowance: a slow upload that keeps delivering bytes is fine,
+    // one that stops mid-body is not.
+    reader.get_mut().begin_body()?;
     let mut body = vec![0u8; content_length];
     reader.read_exact(&mut body)?;
     Ok(Some((method, path, body)))
@@ -416,6 +691,7 @@ pub(crate) fn write_response<W: Write>(stream: &mut W, resp: &Response) -> std::
         200 => "OK",
         400 => "Bad Request",
         404 => "Not Found",
+        408 => "Request Timeout",
         500 => "Internal Server Error",
         _ => "OK",
     };
@@ -518,6 +794,53 @@ mod tests {
             imbh::FlushPolicy::DEFAULT_TICK
         );
         assert!(maintenance_interval(Some("soon".to_owned())).is_err());
+    }
+
+    #[test]
+    fn shutdown_timeout_defaults_and_accepts_zero() {
+        assert_eq!(shutdown_timeout(None).unwrap(), DEFAULT_SHUTDOWN_TIMEOUT);
+        assert_eq!(
+            shutdown_timeout(Some(String::new())).unwrap(),
+            DEFAULT_SHUTDOWN_TIMEOUT
+        );
+        assert_eq!(
+            shutdown_timeout(Some(" 500ms ".to_owned())).unwrap(),
+            Duration::from_millis(500)
+        );
+        // Unlike the maintenance interval, `0` is not floored: "do not wait for in-flight requests"
+        // is a real answer for an operator whose supervisor is impatient.
+        assert_eq!(
+            shutdown_timeout(Some("0".to_owned())).unwrap(),
+            Duration::ZERO
+        );
+        assert!(shutdown_timeout(Some("eventually".to_owned())).is_err());
+    }
+
+    #[test]
+    fn io_timeouts_default_and_disable() {
+        // Unset and empty both mean "use the default".
+        assert_eq!(io_timeouts(None, None).unwrap(), IoTimeouts::default());
+        assert_eq!(
+            io_timeouts(Some(String::new()), Some("  ".to_owned())).unwrap(),
+            IoTimeouts::default()
+        );
+        assert_eq!(IoTimeouts::default().header, DEFAULT_HEADER_TIMEOUT);
+        assert_eq!(IoTimeouts::default().body, DEFAULT_BODY_TIMEOUT);
+
+        // Each phase is set independently.
+        let t = io_timeouts(Some("2s".to_owned()), Some(" 500ms ".to_owned())).unwrap();
+        assert_eq!(t.header, Duration::from_secs(2));
+        assert_eq!(t.body, Duration::from_millis(500));
+        assert_eq!(t.socket_timeout(), Some(Duration::from_millis(500)));
+
+        // `0` disables a phase, which is how the socket layer spells "block forever" (`None`).
+        let off = io_timeouts(Some("0".to_owned()), Some("0".to_owned())).unwrap();
+        assert_eq!(off, IoTimeouts::DISABLED);
+        assert_eq!(off.socket_timeout(), None);
+
+        // A typo is fatal, per phase — never a silent fallback to a deadline nobody asked for.
+        assert!(io_timeouts(Some("soon".to_owned()), None).is_err());
+        assert!(io_timeouts(None, Some("soon".to_owned())).is_err());
     }
 
     #[test]

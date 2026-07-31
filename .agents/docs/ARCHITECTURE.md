@@ -963,12 +963,57 @@ POSTed `/admin/flush`, so nothing reached Parquet and neither RSS nor WAL size w
 takes the §10.2 spec (`interval=`, `buffer=`, `rows=`, `wal=`, `idle=`, `tick=`, or `manual`); a
 malformed value is a startup error, never a silent fallback to a different cadence.
 
+**Connections carry phase deadlines** (`IoTimeouts`), because thread-per-connection means an idle client
+costs a thread and the hand-rolled parser blocks with no deadline of its own. The two phases get
+different rules on purpose: `IMBH_HEADER_TIMEOUT` (default `10s`) bounds the request head **in total**,
+`IMBH_BODY_TIMEOUT` (default `30s`) is a **per-read** allowance for the body plus the write allowance for
+the response, and `0` disables either. A blown deadline is answered `408 Request Timeout`, best-effort,
+and ingests nothing. The reasoning behind the split is that neither rule alone is right: a per-read
+allowance on the head lets a client dribble one byte per allowance and hold a thread forever (never idle,
+never finished), while a total deadline on the body would punish a large slow upload for its size rather
+than for stalling. The enforcement lives in an `Armed` reader wrapped **under** the `BufReader`, so it
+re-arms the socket against an absolute deadline on every real read; arming once per `read_line` would
+silently give each underlying read a fresh allowance, which is the per-read behaviour the head phase must
+not have. Steady-state cost is one extra `setsockopt` per request, since a `BufReader` normally takes a
+whole request head in a single read. Note the interaction with the shutdown drain below: an idle
+connection is cut off before the drain gives up only when `IMBH_HEADER_TIMEOUT` is shorter than
+`IMBH_SHUTDOWN_TIMEOUT`, which the stock defaults (`10s` head, `5s` drain) are not — the deadlines bound
+what a client can hold, and lining the two knobs up is what makes shutdown itself prompt.
+
+`imbhd` shuts down **gracefully** on `SIGINT`/`SIGTERM`: every accept loop stops accepting, in-flight
+requests get `IMBH_SHUTDOWN_TIMEOUT` (default `5s`) to finish, the Docker plugin's container readers
+stop and its ingest queue is drained into the DB, and `Db::close()` seals the buffer before the process
+exits 0. Without it the default disposition killed the process with everything since the last seal
+living only in the WAL: correct (the WAL *is* the durability contract) but it meant every `docker stop`
+bought a replay on the next start, and a process that owns a flush scheduler (above) should seal on the
+way out. A **second** signal `_exit`s with `128 + signum` — the operator has stopped waiting.
+
+The mechanism is a `Shutdown` token every endpoint watches (`imbh_server::shutdown`), and its two
+non-obvious properties are worth keeping:
+
+- **`accept` is woken, not polled.** A listener registers a waker on the token; at trigger time that
+  makes one throwaway connection to its own address, which unblocks the thread immediately. Polling the
+  flag instead would put a tick of latency on *every* request, since each response carries
+  `Connection: close` — one connection per request. The gRPC side is the exception and does poll a
+  50 ms tick inside tonic's `serve_with_shutdown` future, which costs nothing per request because
+  HTTP/2 connections are long-lived.
+- **The signal handler only does async-signal-safe work**: an atomic store plus one byte down a
+  self-pipe. A watcher thread parked on the read end takes the locks and notifies the condvar. Tripping
+  the token from the handler would take a mutex in a signal context.
+
+`main` waits for each endpoint to report that it has stopped *and* drained (a channel, not a `join`), so
+one wedged listener cannot hold up the final seal. Signal handling needs `libc` (std cannot catch
+`SIGTERM`), which is **already in the graph** via DataFusion, so the footprint is unchanged; it is
+Unix-only, and elsewhere `install_signal_handlers` reports `Unsupported` and `imbhd` warns and serves on.
+A host embedding the library drives the same token directly (`serve_until`, `serve_plugin_until`,
+`serve_grpc_until`) with no signal handling involved.
+
 Both `imbhd` listen addresses (`IMBH_LISTEN_ADDR`, `IMBH_GRPC_LISTEN_ADDR`) read from the environment
 as well as from positional args, because a managed plugin's `entrypoint` is frozen in its
 `config.json` while `env` entries declared `settable` can be changed with `docker plugin set`; an
 **empty** value disables that listener, and with both off the process serves only the plugin socket
-and opens no network port. `main` runs every configured endpoint on its own thread and parks on all
-of them, which is what makes them independently optional. The plugin defaults to binding the docker0
+and opens no network port. `main` runs every configured endpoint on its own thread and parks on the
+shutdown token, which is what makes them independently optional. The plugin defaults to binding the docker0
 bridge gateway -- reachable from containers on every bridge network, unroutable from the LAN -- and
 `build.sh` replaces the default with the address the daemon actually reports. *Measured, not assumed:*
 `network.type: bridge` is accepted by the daemon but unimplemented for managed plugins (the process

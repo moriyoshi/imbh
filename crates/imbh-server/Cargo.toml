@@ -41,6 +41,15 @@ prost = { workspace = true, optional = true }
 # the subscriber out of the graph).
 tracing = { workspace = true, optional = true }
 
+# Graceful shutdown: `SIGINT`/`SIGTERM` handling for `imbhd` (`src/shutdown.rs`). std cannot catch a
+# signal, so `sigaction` + the self-pipe come from libc. Not optional — signal-driven shutdown is part
+# of what the reference *binary* is, not a feature to opt into. Unix-only: on other targets the crate
+# builds without it and `Shutdown::install_signal_handlers` reports `Unsupported`. Footprint-neutral:
+# libc is already in the default graph via DataFusion, so this edge adds **no crate**
+# (ARCHITECTURE.md §11).
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
 [features]
 # Install imbh's stderr console subscriber (RUST_LOG-aware) and turn on imbh's instrumentation.
 # Off by default so `cargo build -p imbh-server` (the footprint gate) stays at the measured crate count;

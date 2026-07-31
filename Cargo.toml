@@ -129,6 +129,10 @@ tonic = { version = "0.14", default-features = false }
 prost-build = "0.14"
 protox = "0.9"
 tokio = { version = "1", default-features = false, features = ["rt", "macros"] }
+# POSIX signals for the reference server's graceful shutdown (`imbh-server`, ARCHITECTURE.md §10.16):
+# `std` has no way to catch `SIGTERM`, so `sigaction` + a self-pipe come from here. Footprint-neutral:
+# libc is already compiled in the default `imbhd` graph (via DataFusion), so this adds no new crate.
+libc = "0.2"
 tempfile = "3"
 # Pure-Rust XXH3-64 for WAL/manifest frame checksums (ARCHITECTURE.md §7/§11 — no C).
 xxhash-rust = { version = "0.8", default-features = false, features = ["xxh3"] }

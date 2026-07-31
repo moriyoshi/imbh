@@ -101,13 +101,41 @@ impl MetricsService for OtlpGrpc {
 /// All three collector services share one `Arc<Db>` via `from_arc`, so ingest fans into the same
 /// buffer/WAL the HTTP routes write to.
 pub async fn serve_grpc(db: Arc<Db>, addr: SocketAddr) -> Result<(), tonic::transport::Error> {
+    server(db).serve(addr).await
+}
+
+/// [`serve_grpc`], stopping when `shutdown` trips.
+///
+/// tonic's own graceful path (`serve_with_shutdown`): the listener closes as soon as the signal
+/// future resolves, and in-flight `export` calls run to completion — so a batch that was already
+/// decoding still lands in the WAL before this returns. That future is where the token is observed,
+/// and it is the one place `imbhd` polls: HTTP/2 keeps connections alive across requests, so a tick
+/// of shutdown latency here costs no per-request latency, unlike the HTTP/1.1 accept loop.
+pub async fn serve_grpc_until(
+    db: Arc<Db>,
+    addr: SocketAddr,
+    shutdown: Arc<crate::Shutdown>,
+) -> Result<(), tonic::transport::Error> {
+    server(db)
+        .serve_with_shutdown(addr, async move {
+            while !shutdown.is_triggered() {
+                tokio::time::sleep(SHUTDOWN_POLL).await;
+            }
+        })
+        .await
+}
+
+/// How often the gRPC shutdown future rechecks the token. Bounds how long `imbhd`'s exit waits on
+/// this listener; small enough to be invisible next to a supervisor's stop grace.
+const SHUTDOWN_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// The three collector services over one shared handler.
+fn server(db: Arc<Db>) -> tonic::transport::server::Router {
     let handler = Arc::new(OtlpGrpc { db });
     tonic::transport::Server::builder()
         .add_service(LogsServiceServer::from_arc(handler.clone()))
         .add_service(TraceServiceServer::from_arc(handler.clone()))
         .add_service(MetricsServiceServer::from_arc(handler))
-        .serve(addr)
-        .await
 }
 
 /// Blocking entry point for the `imbhd` binary: build a multi-threaded tokio runtime and run
@@ -119,5 +147,21 @@ pub fn serve_grpc_blocking(db: Arc<Db>, addr: &str) -> Result<(), Box<dyn std::e
         .enable_all()
         .build()?;
     rt.block_on(serve_grpc(db, addr))?;
+    Ok(())
+}
+
+/// [`serve_grpc_blocking`], stopping when `shutdown` trips — what `imbhd` runs on its gRPC thread.
+///
+/// Returning drops the runtime, which is also what stops the worker threads tonic spawned.
+pub fn serve_grpc_blocking_until(
+    db: Arc<Db>,
+    addr: &str,
+    shutdown: Arc<crate::Shutdown>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let addr: SocketAddr = addr.parse()?;
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    rt.block_on(serve_grpc_until(db, addr, shutdown))?;
     Ok(())
 }

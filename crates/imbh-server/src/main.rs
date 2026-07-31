@@ -29,9 +29,22 @@
 //! installs a `tracing-subscriber` fmt layer that renders imbh's internal spans/events to stderr.
 //! Filter with `RUST_LOG` (e.g. `RUST_LOG=imbh=debug`); it defaults to `info` when unset. The
 //! default build carries no `tracing` dependency at all (ARCHITECTURE.md §11 footprint gate).
+//!
+//! `imbhd` shuts down **gracefully** on `SIGINT`/`SIGTERM` (`Ctrl-C`, `docker stop`, systemd, `kill`):
+//! every listener stops accepting, in-flight requests get `IMBH_SHUTDOWN_TIMEOUT` (default `5s`) to
+//! finish, the Docker plugin's queued container lines are drained into the DB, and `Db::close()` seals
+//! the buffer — so the next start replays nothing and the exit code is 0. A **second** signal exits
+//! immediately with `128 + signum`. See `imbh_server::shutdown`.
 
 use std::error::Error;
-use std::thread::JoinHandle;
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
+use std::time::{Duration, Instant};
+
+use imbh_server::Shutdown;
+
+/// Extra patience beyond the drain each listener performs itself, covering the wake-up connection and
+/// the plugin's ingest drain. A listener past this is not coming back before the process exits.
+const STOP_GRACE: Duration = Duration::from_secs(2);
 
 fn main() -> Result<(), Box<dyn Error>> {
     // Render imbh's internal instrumentation to stderr via the facade's `console` collector: it is
@@ -63,18 +76,48 @@ fn main() -> Result<(), Box<dyn Error>> {
     let flush = imbh_server::flush_policy(std::env::var("IMBH_FLUSH").ok())?;
     let maintenance_interval =
         imbh_server::maintenance_interval(std::env::var("IMBH_MAINTENANCE_INTERVAL").ok())?;
+    let drain = imbh_server::shutdown_timeout(std::env::var("IMBH_SHUTDOWN_TIMEOUT").ok())?;
+    // Per-connection deadlines. Thread-per-connection means an idle client costs a thread, so these
+    // bound how long one can hold it; `0` on either phase disables that deadline.
+    let timeouts = imbh_server::io_timeouts(
+        std::env::var("IMBH_HEADER_TIMEOUT").ok(),
+        std::env::var("IMBH_BODY_TIMEOUT").ok(),
+    )?;
+
+    // The token every endpoint watches. Installed before anything is served, so a signal arriving
+    // during startup is honoured by the listeners that come up after it rather than lost.
+    let shutdown = Shutdown::with_drain_timeout(drain);
+    if let Err(e) = shutdown.install_signal_handlers() {
+        // Serving without it is still useful (a supervisor's SIGKILL plus WAL replay is a correct, if
+        // slower, path), so this is a warning rather than a startup failure.
+        warn(&format!(
+            "no signal-driven shutdown: {e} — the buffer will be sealed by WAL replay instead"
+        ));
+    }
 
     let db = imbh::Db::builder(&dir)
         .maintenance(imbh::Maintenance::Background(maintenance_interval))
         .flush(flush)
         .open()?;
 
-    banner(&dir, addr.as_deref(), &flush, maintenance_interval);
+    banner(
+        &dir,
+        addr.as_deref(),
+        &flush,
+        maintenance_interval,
+        drain,
+        timeouts,
+    );
 
-    // Every configured endpoint runs on its own thread and `main` parks on all of them. The uniform
+    // Every configured endpoint runs on its own thread and `main` parks until shutdown. The uniform
     // shape is what makes the listeners independently optional: the process stays alive as long as
     // anything is serving, whether that is HTTP, gRPC, the Docker plugin socket, or a subset.
-    let mut servers: Vec<JoinHandle<()>> = Vec::new();
+    //
+    // Each thread reports its name when its accept loop has stopped *and* drained. `main` waits for
+    // those reports instead of joining, so one wedged listener (a client that opened a socket and went
+    // quiet) cannot hold up the final seal — it dies with the process a moment later.
+    let (stopped_tx, stopped_rx) = std::sync::mpsc::channel::<&'static str>();
+    let mut endpoints = 0usize;
 
     // The Docker logging-driver plugin endpoint, when asked for. A bind failure is fatal — Docker
     // would otherwise mark the plugin healthy and every `docker run --log-driver imbh` would hang on
@@ -89,20 +132,26 @@ fn main() -> Result<(), Box<dyn Error>> {
         tracing::info!(socket = %sock.display(), "docker log-driver plugin listening");
         #[cfg(not(feature = "tracing"))]
         println!("  docker:    {} (log-driver plugin)", sock.display());
-        servers.push(std::thread::spawn(move || {
-            if let Err(e) = imbh_server::docker::serve_plugin(plugin_db, &sock) {
-                fatal(&format!("docker plugin error on {}: {e}", sock.display()));
+        endpoints += 1;
+        serve_on_thread("docker plugin", &stopped_tx, {
+            let shutdown = shutdown.clone();
+            move || {
+                imbh_server::docker::serve_plugin_until(plugin_db, &sock, shutdown)
+                    .map_err(|e| format!("docker plugin error on {}: {e}", sock.display()))
             }
-        }));
+        });
     }
 
     if let Some(addr) = addr {
         let http_db = db.clone();
-        servers.push(std::thread::spawn(move || {
-            if let Err(e) = imbh_server::serve(http_db, &addr) {
-                fatal(&format!("HTTP server error on {addr}: {e}"));
+        endpoints += 1;
+        serve_on_thread("HTTP", &stopped_tx, {
+            let shutdown = shutdown.clone();
+            move || {
+                imbh_server::serve_with_until(http_db, &addr, timeouts, shutdown)
+                    .map_err(|e| format!("HTTP server error on {addr}: {e}"))
             }
-        }));
+        });
     }
 
     #[cfg(feature = "grpc")]
@@ -112,29 +161,123 @@ fn main() -> Result<(), Box<dyn Error>> {
         tracing::info!(%grpc_addr, "OTLP/gRPC: Logs/Trace/Metrics Service Export");
         #[cfg(not(feature = "tracing"))]
         println!("  OTLP/gRPC: {grpc_addr}  (Logs/Trace/Metrics Service Export)");
-        servers.push(std::thread::spawn(move || {
-            if let Err(e) = imbh_server::grpc::serve_grpc_blocking(grpc_db, &grpc_addr) {
-                fatal(&format!("gRPC server error on {grpc_addr}: {e}"));
+        endpoints += 1;
+        serve_on_thread("OTLP/gRPC", &stopped_tx, {
+            let shutdown = shutdown.clone();
+            move || {
+                imbh_server::grpc::serve_grpc_blocking_until(grpc_db, &grpc_addr, shutdown)
+                    .map_err(|e| format!("gRPC server error on {grpc_addr}: {e}"))
             }
-        }));
+        });
     }
 
-    if servers.is_empty() {
+    if endpoints == 0 {
         return Err(
             "nothing to serve: every listener is disabled and no plugin socket is set".into(),
         );
     }
-    for server in servers {
-        let _ = server.join();
-    }
+    // Only the server threads keep a sender past this point, so the channel disconnects once they are
+    // all gone — which is how `wait_for_endpoints` notices an early exit.
+    drop(stopped_tx);
+
+    // The life of the process: parked on the token until a signal (or a listener's fatal error, which
+    // exits directly) ends it.
+    let cause = shutdown.wait();
+    report_stopping(cause, drain);
+    wait_for_endpoints(&stopped_rx, endpoints, drain + STOP_GRACE);
+
+    // The point of all of it: seal the buffer, drain the async-ingest queue, and join the maintenance
+    // worker, so the rows accepted a moment ago are in Parquet rather than waiting for the next start
+    // to replay the WAL. A failure here is worth an exit code — it means the data is only as durable
+    // as the WAL made it.
+    db.blocking().close()?;
+    report_stopped();
     Ok(())
 }
 
-/// A listener died. Accept loops only return on a bind/serve error, and a half-serving `imbhd` is
-/// worse than a dead one — a supervisor (or Docker, for the plugin) should restart it.
+/// Run one endpoint's blocking serve loop on its own thread, reporting to `stopped` when it returns.
+/// A serve error is fatal (see [`fatal`]); a clean return means shutdown.
+fn serve_on_thread(
+    name: &'static str,
+    stopped: &Sender<&'static str>,
+    serve: impl FnOnce() -> Result<(), String> + Send + 'static,
+) {
+    let stopped = stopped.clone();
+    std::thread::spawn(move || match serve() {
+        Ok(()) => {
+            let _ = stopped.send(name);
+        }
+        Err(message) => fatal(&message),
+    });
+}
+
+/// Wait for `endpoints` listeners to report that they have stopped and drained, or for `timeout`.
+/// Reports whoever is still going, because "the seal happened while an endpoint was still draining"
+/// is the kind of thing an operator wants in the log rather than inferred from a truncated tail.
+fn wait_for_endpoints(stopped: &Receiver<&'static str>, endpoints: usize, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    let mut left = endpoints;
+    while left > 0 {
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            break;
+        };
+        match stopped.recv_timeout(remaining) {
+            Ok(_name) => left -= 1,
+            // Disconnected: every server thread is gone (each dropped its sender), so there is
+            // nothing left to wait for.
+            Err(RecvTimeoutError::Disconnected) => return,
+            Err(RecvTimeoutError::Timeout) => break,
+        }
+    }
+    if left > 0 {
+        warn(&format!(
+            "{left} endpoint(s) still draining after {timeout:?}; sealing anyway"
+        ));
+    }
+}
+
+/// A listener died. Accept loops only return an error on a bind/serve failure, and a half-serving
+/// `imbhd` is worse than a dead one — a supervisor (or Docker, for the plugin) should restart it.
+///
+/// Deliberately skips the graceful path: the buffer is not sealed, because whatever broke the listener
+/// is a poor moment to start writing Parquet, and the WAL already covers every accepted row — the next
+/// start replays it.
 fn fatal(message: &str) -> ! {
     eprintln!("imbhd: {message}");
     std::process::exit(1);
+}
+
+/// Report a startup or shutdown problem that is not fatal.
+fn warn(message: &str) {
+    #[cfg(feature = "tracing")]
+    tracing::warn!("{message}");
+    #[cfg(not(feature = "tracing"))]
+    eprintln!("imbhd: {message}");
+}
+
+/// Announce that shutdown has begun, naming the signal that asked for it. A second signal skips
+/// straight to exit, which is worth telling the operator who is waiting.
+fn report_stopping(cause: Option<i32>, drain: Duration) {
+    let by = cause.map_or("request", imbh_server::shutdown::signal_name);
+    #[cfg(feature = "tracing")]
+    tracing::info!(
+        by,
+        drain_secs = drain.as_secs_f64(),
+        "shutting down: draining, then sealing (a second signal exits immediately)"
+    );
+    #[cfg(not(feature = "tracing"))]
+    println!(
+        "imbhd stopping ({by}): draining up to {drain:?}, then sealing  \
+         (a second signal exits immediately)"
+    );
+}
+
+/// Announce a completed graceful shutdown — the buffer is sealed and the DB is closed.
+fn report_stopped() {
+    #[cfg(feature = "tracing")]
+    tracing::info!("shutdown complete: buffer sealed, database closed");
+    #[cfg(not(feature = "tracing"))]
+    println!("imbhd stopped: buffer sealed, database closed");
 }
 
 /// The startup banner. With `tracing` on it flows through the subscriber as structured events;
@@ -143,7 +286,9 @@ fn banner(
     dir: &str,
     addr: Option<&str>,
     flush: &imbh::FlushPolicy,
-    maintenance_interval: std::time::Duration,
+    maintenance_interval: Duration,
+    drain: Duration,
+    timeouts: imbh_server::IoTimeouts,
 ) {
     #[cfg(feature = "tracing")]
     {
@@ -158,6 +303,9 @@ fn banner(
         tracing::info!(
             policy = %flush,
             retention_interval_secs = maintenance_interval.as_secs(),
+            shutdown_drain_secs = drain.as_secs_f64(),
+            header_timeout_secs = timeouts.header.as_secs_f64(),
+            body_timeout_secs = timeouts.body.as_secs_f64(),
             "flush scheduler"
         );
     }
@@ -176,6 +324,17 @@ fn banner(
         println!(
             "  flush:     {flush}  (retention every {}s)",
             maintenance_interval.as_secs()
+        );
+        println!("  shutdown:  SIGINT/SIGTERM → drain up to {drain:?}, then seal");
+        // Zero means "no deadline", so say that rather than printing `0ns`.
+        let show = |d: Duration| match d.is_zero() {
+            true => "off".to_owned(),
+            false => format!("{d:?}"),
+        };
+        println!(
+            "  timeouts:  headers {} (total) · body/write {} (per read)",
+            show(timeouts.header),
+            show(timeouts.body)
         );
     }
 }

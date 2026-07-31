@@ -264,6 +264,15 @@ strategy — triggers that OR together, e.g. `interval=5s,buffer=16MiB,rows=5000
 `IMBH_MAINTENANCE_INTERVAL` (default `60s`) sets how often retention runs. Until a seal happens, rows
 live in the buffer + WAL, so this is what bounds `imbhd`'s memory and WAL growth.
 
+Connections are bounded: `IMBH_HEADER_TIMEOUT` (default `10s`) caps the request head *in total*, and
+`IMBH_BODY_TIMEOUT` (default `30s`) caps how long a single body read or response write may stall — so a
+slow-but-progressing upload is fine while an idle or stalled client gets a `408` instead of holding a
+thread. `0` disables either.
+
+`SIGINT`/`SIGTERM` (Ctrl-C, `docker stop`, systemd) shut `imbhd` down **gracefully**: listeners stop
+accepting, in-flight requests get `IMBH_SHUTDOWN_TIMEOUT` (default `5s`) to finish, the buffer is
+sealed, and the exit status is 0 — so a restart replays nothing. A second signal exits immediately.
+
 OTLP/gRPC (the OTel SDK default) is available behind the optional `grpc` feature, served on a second
 port via tonic. It is off by default so the base build stays at its measured footprint; enabling it
 pulls the tonic/hyper subtree.

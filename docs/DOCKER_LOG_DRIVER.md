@@ -158,6 +158,16 @@ together, so a plugin capturing bursty containers can add a size or idle trigger
 docker plugin set imbh/log-driver:latest IMBH_FLUSH=interval=10s,buffer=32MiB,idle=2s
 ```
 
+`IMBH_HEADER_TIMEOUT` (default `10s`) and `IMBH_BODY_TIMEOUT` (default `30s`) bound how long one client
+of the plugin's *HTTP* listener can hold a thread — the head in total, a body read or response write per
+read. The plugin's own Unix socket uses those defaults and is not tunable: its peer is the local
+`dockerd`, which is prompt or gone.
+
+Disabling the plugin sends it `SIGTERM`, which it treats as a **graceful stop**: it stops accepting,
+stops reading container FIFOs, ingests the lines it has already read, seals the buffer, and exits 0.
+`IMBH_SHUTDOWN_TIMEOUT` (default `5s`) bounds how long in-flight requests hold that up; keep it under
+the daemon's own patience, and set it to `0` to stop without waiting for anything in flight.
+
 ### Sending traces and metrics from an app container
 
 Point a stock OTel SDK at the same address. `--add-host=host.docker.internal:host-gateway` resolves
