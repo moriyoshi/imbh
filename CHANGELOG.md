@@ -15,6 +15,14 @@ release aborts if it is missing or duplicated.
 
 ## [0.3.0] - 2026-08-01
 
+> **No GitHub Release or `v0.3.0` tag.** The CD run published the Release before uploading its
+> assets, which under GitHub's immutable releases froze it empty and reserved the tag name for good;
+> the tag was then deleted in an attempt to retry. Everything else shipped normally — all 12 crates
+> are on crates.io at 0.3.0 and `ghcr.io/moriyoshi/imbh:0.3.0` is published — but there are no
+> downloadable archives for this version, and the heading below links to the release commit rather
+> than to a tag. The release workflow now uploads into a draft and publishes last, so this cannot
+> recur.
+
 ### Added
 
 - **MCP over stdio, from the `imbh-tui` binary.** `imbh-tui --mcp-stdio <db-dir>` serves the same
@@ -306,7 +314,7 @@ release aborts if it is missing or duplicated.
   All 12 crates published to crates.io (`imbh-test-support` is dev-only and stays unpublished).
 
 <!-- next-url -->
-[0.3.0]: https://github.com/moriyoshi/imbh/releases/tag/v0.3.0
+[0.3.0]: https://github.com/moriyoshi/imbh/commit/07b72dd7e05f2320afcf573e0ff4e4766b9f0ec0
 [0.2.0]: https://github.com/moriyoshi/imbh/releases/tag/v0.2.0
 [0.1.1]: https://github.com/moriyoshi/imbh/releases/tag/v0.1.1
 [0.1.0]: https://github.com/moriyoshi/imbh/releases/tag/v0.1.0

@@ -9,6 +9,17 @@ git history); this file tracks only what is still open.
 
 ## Open Items
 
+- [ ] **Decide whether to restore the `v0.3.0` git tag on the remote.** It was deleted while trying to
+      retry the failed CD run, and only the local signed tag at `07b72dd` survives, so nothing on the
+      remote marks the commit that produced crates.io 0.3.0 (`CHANGELOG.md` links the commit instead).
+      Re-pushing the tag is allowed by the `Version tags` ruleset (signed, no deletion involved), but
+      it re-triggers `release.yml`: the `meta` preflight passes (no Release exists for the tag), the
+      five build legs run for ~40 minutes, and `publish` then fails at `gh release create --draft`
+      because the tag name is permanently reserved by the immutable Release that was deleted. So the
+      choice is "one deliberately red run for the sake of a traceable tag" vs. "leave 0.3.0 tagged only
+      by the CHANGELOG commit link". Nothing else depends on it — crates.io and GHCR are both
+      published. — *source: JOURNAL (v0.3.0 lost its GitHub Release, 2026-08-01)*
+
 - [x] **`service.name` is not groupable, only filterable.** *(closed 2026-08-01)* `SqlParams::attr_field`
       (`crates/imbh/src/sql.rs`) resolved a group/filter key to a real column only when it was in
       the DB's configured `Promote` list, and otherwise emitted `json_get_str(attributes, key)`.

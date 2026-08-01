@@ -226,10 +226,20 @@ The gate is wired into `.github/workflows/`, mapping the sections above:
   license gate (`cargo-deny`) and notice generation (`cargo-about`), installing both tools so the
   scripts run for real, and uploads `THIRD-PARTY-NOTICES.txt` as an artifact; job `build` (5-leg
   matrix) builds and smoke-tests `imbhd` + `imbh-tui` per target and packages that notices file into
-  each archive; job `publish` attaches the archives + `SHA256SUMS` to the tag's GitHub Release; job
-  `image` pushes the multi-arch image to GHCR. `build` depends on `licenses` deliberately — no binary
-  ships from a run whose license gate failed. A `workflow_dispatch` run with `dry_run` (the default)
-  builds everything and publishes nothing.
+  each archive; job `publish` uploads the archives + `SHA256SUMS` into a **draft** Release for the tag
+  and publishes it only once they have all landed; job `image` pushes the multi-arch image to GHCR.
+  `build` depends on `licenses` deliberately — no binary ships from a run whose license gate failed. A
+  `workflow_dispatch` run with `dry_run` (the default) builds everything and publishes nothing.
+
+  The draft-first order in `publish` is load-bearing, not stylistic. GitHub's [immutable
+  releases](https://docs.github.com/en/code-security/concepts/supply-chain-security/immutable-releases)
+  freeze a Release at *publish* time: a published Release rejects every subsequent asset upload, and
+  its tag name is reserved permanently — deleting the Release does not free the name, and neither does
+  disabling immutability. So **never delete a `v*` tag or Release to retry a failed run**; that spends
+  the version number for good (it is how v0.3.0 lost its Release). Recover by re-running the failed
+  jobs instead: the draft is reused and `--clobber` replaces a partial asset set. The `meta` job
+  refuses to start the 5-leg build when the tag's Release is already published, so the unrecoverable
+  case is reported in seconds rather than after an hour of fat-LTO builds.
 
 Locally, still run the level matching what you touched:
 

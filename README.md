@@ -183,7 +183,8 @@ start](#quick-start-embed-the-library) above. This section is for the two **comp
 the reference server `imbhd` and the terminal explorer `imbh-tui`.
 
 Every `vX.Y.Z` [GitHub release](https://github.com/moriyoshi/imbh/releases) carries a prebuilt
-archive per platform, containing both binaries plus `LICENSE` and `THIRD-PARTY-NOTICES.txt`:
+archive per platform, containing both binaries plus `LICENSE` and `THIRD-PARTY-NOTICES.txt` (with
+one exception — see the note under the download recipe below about 0.3.0):
 
 | Platform | Archive | `docker` log driver |
 |---|---|---|
@@ -199,7 +200,7 @@ are off to keep the [footprint](#footprint) gate honest. Each release also publi
 file:
 
 ```
-VERSION=0.3.0; TARGET=x86_64-unknown-linux-gnu
+VERSION=0.2.0; TARGET=x86_64-unknown-linux-gnu
 BASE=https://github.com/moriyoshi/imbh/releases/download/v${VERSION}
 curl -fLO ${BASE}/imbh-${VERSION}-${TARGET}.tar.gz
 curl -fLO ${BASE}/SHA256SUMS
@@ -207,6 +208,13 @@ sha256sum --ignore-missing -c SHA256SUMS
 tar xzf imbh-${VERSION}-${TARGET}.tar.gz
 ./imbh-${VERSION}-${TARGET}/imbhd ./imbh-data      # then point an OTLP exporter at :4318
 ```
+
+**0.3.0 has no archives.** Its release run created the GitHub Release before uploading the assets;
+under [immutable releases](https://docs.github.com/en/code-security/concepts/supply-chain-security/immutable-releases)
+that publish froze it empty and reserved the `v0.3.0` tag name permanently, so the archives can
+never be attached. The release itself is otherwise complete — take 0.3.0 from the [container
+image](#container-image) or `cargo install imbh-server imbh-tui`, or use the 0.2.0 archives above.
+Archives resume with the next version.
 
 `docker` and `macOS`: the log-driver feature is deliberately omitted from the macOS builds. A
 logging-driver plugin talks to a *local* Docker daemon over a Unix socket, and on macOS that daemon
@@ -478,8 +486,8 @@ installed and then does the CD:
 
 1. builds `imbhd` + `imbh-tui` in the release profile for all five [published
    targets](#install-the-binaries), smoke-testing each artifact on the runner that produced it;
-2. attaches the per-platform archives and a `SHA256SUMS` to the GitHub Release for the tag, creating
-   that Release (with generated notes) if it does not exist yet;
+2. creates a **draft** Release for the tag (with generated notes), uploads the per-platform archives
+   and a `SHA256SUMS` into it, and only then flips it to published;
 3. pushes the multi-arch `ghcr.io/moriyoshi/imbh` image.
 
 Nothing needs configuring for this — GHCR authenticates with the workflow's own `GITHUB_TOKEN`. To
@@ -487,6 +495,16 @@ rehearse the whole path without publishing, run the workflow manually (`workflow
 `dry_run` input left at the default it builds and smoke-tests every archive and both image arches,
 uploads the archives as workflow artifacts, and pushes nothing. See
 [`.agents/docs/QUALITY_GATE.md`](./.agents/docs/QUALITY_GATE.md) §3–4 for the full release gate.
+
+⚠️ **Never delete a `v*` tag or its Release to retry a failed run.** GitHub's [immutable
+releases](https://docs.github.com/en/code-security/concepts/supply-chain-security/immutable-releases)
+freeze a Release the moment it is *published* — it accepts no further assets, and its tag name is
+reserved permanently. Deleting the Release does not free the name, and neither does turning
+immutability off: that version number is spent, and the only way forward is to bump and tag again.
+This is why step 2 above publishes last rather than first, and why the workflow refuses to start a
+build when the tag's Release is already published. To recover from a failed CD run, re-run the failed
+jobs instead — the draft is reused and `--clobber` replaces a partial asset set. v0.3.0 lost its
+Release to exactly this mistake, before the draft-first order was in place.
 
 ## FAQ
 
