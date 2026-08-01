@@ -359,7 +359,7 @@ pub(crate) fn draw_metric_detail(
         Line::from(Span::styled(stats, Style::default().fg(Color::DarkGray))),
         Line::from(Span::styled(
             format!(
-                "esc/{l} back {s} {r} fwd {s} h/l or shift+{l}{r} move cursor {s} home/end ends {s} pgup/pgdn page",
+                "esc/{l} back {s} bksp series list {s} {r} fwd {s} h/l or shift+{l}{r} move cursor {s} home/end ends {s} pgup/pgdn page",
                 l = g.left,
                 r = g.right,
                 s = g.sep

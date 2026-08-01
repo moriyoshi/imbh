@@ -73,10 +73,13 @@ pub(crate) fn draw_log_detail(
     let (sep, left, right, scroll_hint) = (g.sep, g.left, g.right, g.scroll());
     let hint = if record.trace_id.is_some() {
         format!(
-            "esc/{left} back {sep} enter open trace {sep} {right} fwd {sep} {scroll_hint} scroll"
+            "esc/{left} back {sep} bksp logs list {sep} enter open trace {sep} {right} fwd {sep} \
+             {scroll_hint} scroll"
         )
     } else {
-        format!("esc/{left} back {sep} (no trace id) {sep} {scroll_hint} scroll")
+        format!(
+            "esc/{left} back {sep} bksp logs list {sep} (no trace id) {sep} {scroll_hint} scroll"
+        )
     };
     frame.render_widget(Paragraph::new(hint).wrap(Wrap { trim: true }), rows[2]);
 }

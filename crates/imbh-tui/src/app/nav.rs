@@ -1,7 +1,9 @@
-//! Navigation state: the menu bar, the keyboard focus ring, and the back/forward history.
+//! Navigation state: the menu bar, the keyboard focus ring, the back/forward history, and the
+//! walk up a screen's own view series.
 
 use crate::app::App;
-use crate::model::{Focus, MENU_LEN, Mode, NavEntry, Screen};
+use crate::model::{Focus, MENU_LEN, Mode, NavEntry, Route, Screen};
+use crate::waterfall::TraceDetail;
 
 impl App {
     /// Activate the menu bar (`F9`), starting the highlight on the current screen.
@@ -171,13 +173,77 @@ impl App {
             false
         }
     }
+
+    /// The materialized trace for `trace_id`: the one retained behind the Traces preview pane, else a
+    /// trace detail still sitting on the back stack. Purely a *data* lookup for rebuilding the parent
+    /// view — where an up-navigation goes is fixed by the series, never by what was visited.
+    fn series_trace(&self, trace_id: &str) -> Option<TraceDetail> {
+        if let Some(detail) = self
+            .trace_detail
+            .as_ref()
+            .filter(|detail| detail.trace_id == trace_id)
+        {
+            return Some(detail.clone());
+        }
+        self.back.iter().rev().find_map(|entry| match &entry.route {
+            Route::TraceDetail { detail } if detail.trace_id == trace_id => Some(detail.clone()),
+            _ => None,
+        })
+    }
+
+    /// The view one step earlier in this screen's *series* — the chain a screen drills through
+    /// (`Metrics → MetricDetail`, `Traces → TraceDetail → SpanDetail`, `Logs → LogDetail`) — regardless
+    /// of how the current view was reached. `None` on a screen's list route, which is its series' first
+    /// view and has nothing above it.
+    ///
+    /// A span detail whose trace can no longer be materialized (see [`Self::series_trace`]) steps to the
+    /// Traces list instead: still up its own series, just skipping the rung there is no longer data for.
+    pub(crate) fn series_parent(&self) -> Option<Route> {
+        match &self.route {
+            Route::MetricDetail { .. } => Some(Route::Metrics),
+            Route::LogDetail { .. } => Some(Route::Logs),
+            Route::TraceDetail { .. } => Some(Route::Traces),
+            Route::SpanDetail { trace_id, .. } => Some(
+                self.series_trace(trace_id)
+                    .map_or(Route::Traces, |detail| Route::TraceDetail { detail }),
+            ),
+            Route::Overview | Route::Metrics | Route::Traces | Route::Logs => None,
+        }
+    }
+
+    /// Walk one step up the screen series (`Backspace`), recording the departed view so `←` undoes the
+    /// move. Unlike [`Self::go_back`] this ignores the visit history entirely: a trace detail opened by
+    /// a log→trace jump steps up to the Traces list, where Back would return to the log it came from.
+    /// Returns whether a move happened, so the caller reloads the destination's data.
+    pub(crate) fn go_up(&mut self) -> bool {
+        let Some(parent) = self.series_parent() else {
+            return false;
+        };
+        self.push_history();
+        self.route = parent;
+        self.scroll = 0;
+        self.focus = Focus::Primary;
+        self.mode = Mode::Normal;
+        self.completion = None;
+        // Drill-down intents and exemplar markers belong to the view being left; a late waterfall must
+        // not yank the user back down into the detail they just stepped out of.
+        self.pending_trace_open = false;
+        self.clear_trace_focus();
+        self.metric_exemplars.clear();
+        // Stepping out of the trace views entirely retires the waterfall cursor; stepping from a span
+        // detail up to its trace keeps it, so the cursor lands back on the span that was open.
+        if !self.route.is_detail() {
+            self.span_cursor = 0;
+        }
+        true
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::model::{LogCorrelation, MetricDetail, Route};
-    use crate::testutil::sample_log_record;
+    use crate::testutil::{sample_log_record, traces_app_with_trace};
 
     #[test]
     fn menu_cursor_wraps_over_screens_and_the_range_item() {
@@ -336,6 +402,86 @@ mod tests {
             !app.go_forward(),
             "a new navigation clears the redo history"
         );
+    }
+
+    #[test]
+    fn up_walks_the_screen_series_regardless_of_how_the_view_was_reached() {
+        // The state a log→trace jump leaves: parked on a trace detail with the *log* detail behind it.
+        let mut app = traces_app_with_trace();
+        app.route = Route::LogDetail {
+            record: sample_log_record(Some("aa")),
+        };
+        app.push_history();
+        let detail = app.trace_detail.clone().expect("materialized trace");
+        app.route = Route::TraceDetail { detail };
+
+        // Up follows the Traces series (→ the trace list), where Back would return to the log detail.
+        assert!(app.go_up());
+        assert!(matches!(app.route, Route::Traces));
+        // The departed view is recorded, so `←` undoes the step up.
+        assert!(app.go_back());
+        assert!(app.route_trace_detail().is_some());
+
+        // Back on the log detail, Up follows the *Logs* series instead.
+        assert!(app.go_back());
+        assert!(app.route_log_record().is_some());
+        assert!(app.go_up());
+        assert!(matches!(app.route, Route::Logs));
+    }
+
+    #[test]
+    fn up_from_a_span_detail_lands_on_its_trace_with_the_cursor_on_that_span() {
+        let mut app = traces_app_with_trace();
+        assert!(app.open_trace_detail());
+        app.move_span_cursor(2);
+        assert!(app.open_span_detail());
+
+        assert!(app.go_up());
+        let detail = app.route_trace_detail().expect("stepped up to the trace");
+        assert_eq!(detail.spans.len(), 3);
+        assert_eq!(app.span_cursor, 2, "the cursor is back on the open span");
+
+        // One more step up leaves the trace views for the list, retiring the waterfall cursor.
+        assert!(app.go_up());
+        assert!(matches!(app.route, Route::Traces));
+        assert_eq!(app.span_cursor, 0);
+    }
+
+    #[test]
+    fn up_from_a_span_detail_falls_back_to_the_list_when_its_trace_is_gone() {
+        // A span detail whose trace is neither retained nor on the back stack: the trace-detail rung
+        // has no data to rebuild from, so the step lands on the Traces list instead.
+        let mut app = traces_app_with_trace();
+        let span = app.trace_detail.as_ref().unwrap().spans[1].clone();
+        app.trace_detail = None;
+        app.route = Route::SpanDetail {
+            trace_id: "0123456789abcdef0123456789abcdef".to_owned(),
+            span,
+        };
+        assert!(app.go_up());
+        assert!(matches!(app.route, Route::Traces));
+    }
+
+    #[test]
+    fn up_is_a_noop_on_a_screens_list_route() {
+        let mut app = App::new();
+        for route in [Route::Overview, Route::Metrics, Route::Traces, Route::Logs] {
+            app.route = route;
+            assert!(app.series_parent().is_none());
+            assert!(!app.go_up(), "a list route is the first view of its series");
+            assert!(app.back.is_empty(), "a no-op records no history");
+        }
+
+        // A metric detail, by contrast, steps up to the series list.
+        app.route = Route::MetricDetail {
+            detail: MetricDetail {
+                labels: "svc=a".into(),
+                query: "up".into(),
+                points: vec![(1, 1.0)],
+            },
+        };
+        assert!(app.go_up());
+        assert!(matches!(app.route, Route::Metrics));
     }
 
     #[test]

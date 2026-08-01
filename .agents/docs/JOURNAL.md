@@ -2284,3 +2284,34 @@ ambiguous as one cell is the assumption every bordered pane already makes (see t
 above). `--ascii` mode uses `...` and stays exact. If a CJK-configured terminal ever shows a truncated
 row's bar one cell right of its neighbours', this is the cause and the fix is an ASCII marker in both
 modes.
+
+## Backspace walks the screen series, not the visit history (2026-08-01)
+
+**Ask.** Bind Backspace to "go to the previous screen in the screen series it belongs to" —
+explicitly *not* the existing `←`/Esc, which pop the browser-style visit history.
+
+**Model.** Each `Screen` owns a fixed chain of views: `Metrics → MetricDetail`,
+`Traces → TraceDetail → SpanDetail`, `Logs → LogDetail`, `Overview` alone. `App::series_parent`
+maps the current `Route` to the previous rung of that chain (`None` on a list route, which is a
+series' first view), and `App::go_up` performs the move. The two axes now read cleanly: `←`/`→`
+are *how you got here*, Backspace is *where this view sits*. They diverge whenever a view was
+reached by a jump — a trace detail opened by the log→trace drill-down steps up to the Traces list,
+where Back returns to the log.
+
+**Rebuilding the parent.** `Route` variants carry their own data, so most rungs are trivial to
+mint. `SpanDetail` is the exception: it holds `trace_id` + one span, not the whole trace. The trace
+is recovered from `App::trace_detail` (the materialized trace retained behind the Traces preview
+pane) and, failing that, from a `TraceDetail` still on the back stack — a *data* lookup only, never
+a choice of destination. With neither available the step lands on the Traces list: still up its own
+series, just skipping the rung there is no longer data for.
+
+**State hygiene.** `go_up` pushes the departed view (so `←` undoes the step), resets focus/scroll,
+and drops the intents scoped to the view being left (`pending_trace_open`, the trace focus, the
+metric exemplars) — otherwise a late waterfall could yank the user back down into the detail they
+just stepped out of. `span_cursor` is deliberately *kept* when stepping from a span detail up to its
+trace (the cursor lands back on the span that was open) and cleared only when leaving the trace
+views for a list.
+
+**Lesson.** A keymap change is a hint-string change: the four detail hint bars (`ui/logs.rs`,
+`ui/traces.rs` ×2, `ui/metrics.rs`) each grew a `bksp …` item. The global footer did not — Backspace
+is a no-op on list routes, and advertising an inert key is worse than not advertising it.

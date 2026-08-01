@@ -392,6 +392,16 @@ pub(crate) fn handle_key(
                 request_metric_exemplars(app, db, sender);
             }
         }
+        // Backspace walks one step *up the screen series* — the chain a screen drills through (Metrics
+        // → MetricDetail, Traces → TraceDetail → SpanDetail, Logs → LogDetail) — rather than through
+        // the visit history: a trace detail opened by a log→trace jump steps up to the Traces list,
+        // where Esc/← would return to the log it came from. A no-op on a screen's list route.
+        KeyCode::Backspace => {
+            if app.go_up() {
+                request_refresh(app, db.clone(), options.clone(), sender.clone());
+                request_metric_exemplars(app, db, sender);
+            }
+        }
         // Logs list → log detail (Enter): open the detail for the selected entry.
         KeyCode::Enter if matches!(app.route, Route::Logs) => {
             if let Some(record) = app.selected_log_record().cloned() {

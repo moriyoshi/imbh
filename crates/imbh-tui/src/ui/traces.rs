@@ -221,8 +221,8 @@ pub(crate) fn draw_trace_detail(
     let sticky = if app.sticky_waterfall { "on" } else { "off" };
     frame.render_widget(
         Paragraph::new(format!(
-            "esc/{left} back {sep} {scroll_hint} span {sep} enter span fields {sep} L logs for span \
-             {sep} s sticky:{sticky} {sep} {right} fwd"
+            "esc/{left} back {sep} bksp trace list {sep} {scroll_hint} span {sep} enter span fields \
+             {sep} L logs for span {sep} s sticky:{sticky} {sep} {right} fwd"
         ))
         .wrap(Wrap { trim: true }),
         hint_area,
@@ -290,7 +290,8 @@ pub(crate) fn draw_span_detail(
     let (sep, left, right, scroll_hint) = (g.sep, g.left, g.right, g.scroll());
     frame.render_widget(
         Paragraph::new(format!(
-            "esc/{left} back {sep} L logs for this span {sep} {scroll_hint} scroll {sep} {right} fwd"
+            "esc/{left} back {sep} bksp trace {sep} L logs for this span {sep} {scroll_hint} scroll \
+             {sep} {right} fwd"
         ))
         .wrap(Wrap { trim: true }),
         rows[2],
