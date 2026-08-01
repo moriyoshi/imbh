@@ -15,6 +15,35 @@ release aborts if it is missing or duplicated.
 
 ### Added
 
+- **MCP over stdio, from the `imbh-tui` binary.** `imbh-tui --mcp-stdio <db-dir>` serves the same
+  Model Context Protocol on stdin/stdout — the transport MCP clients "SHOULD support whenever
+  possible", and the one an agent that spawns its own server speaks. No port is bound, nothing needs
+  to be running, and the pipe is the authorization:
+
+  ```sh
+  claude mcp add imbh -- imbh-tui --mcp-stdio /var/lib/imbh
+  ```
+
+  The directory is opened with `Db::open_read_only`, which takes no writer lock, so a session reads
+  alongside a live `imbhd` on the same files. What a read-only opener cannot see is that writer's
+  unsealed buffer — for which `imbh-tui --mcp-stdio --url 127.0.0.1:4318` forwards each message to
+  the daemon's `POST /mcp` instead, synthesizing the header mirror the stateless revision requires
+  from the message it is forwarding. The forwarding client is hand-written HTTP/1.1 over
+  `std::net::TcpStream`, so it pulls **no HTTP client dependency** into the TUI binary.
+
+  New crate **`imbh-mcp`**, holding the protocol dispatch, the 15 read-only tools, and the stdio
+  transport. The module moved there out of `imbh-server` because both transports need it and
+  `imbh-tui` may not depend on `imbh-server` (`imbh ← imbh-mcp ← {imbh-server, imbh-tui}`). The
+  dispatch is now explicitly transport-aware: `handle(db, bytes, &Transport)`, where the stateless
+  revision's `MCP-Protocol-Version` / `Mcp-Method` / `Mcp-Name` header agreement is enforced for
+  `Transport::Http` and skipped for `Transport::Stdio`, which has no header channel to agree with.
+  No footprint change — `imbh-mcp` is `imbh` plus `serde_json` and `base64`, both already compiled
+  under DataFusion (the facade stays at 275 crates).
+
+  `imbh_server::mcp` still resolves (it re-exports the crate), as do
+  `imbh_server::{batches_to_json, stats_json, offload}`. `imbh-tui`'s command line also gained
+  `--db` (an explicit spelling of the positional directory) and `--help`.
+
 - **`imbhd` serves the Model Context Protocol at `POST /mcp`**, so an agent can search logs, pull
   traces, and query metrics through the same process that ingests them — no Grafana, no datasource
   proxy, no export step. Point a client at `http://127.0.0.1:4318/mcp` (e.g.

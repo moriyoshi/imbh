@@ -963,20 +963,48 @@ subtree used to be confined to that feature; now that the HTTP listener brings h
 anyway, what `grpc` adds on top is just tonic and h2. The **default build still carries no gRPC
 transport**.
 
-#### 10.16.1 MCP endpoint
+#### 10.16.1 MCP server (both transports)
 
-`POST /mcp` serves the **Model Context Protocol** over its Streamable HTTP transport, so an agent can
-search logs, pull traces, and query metrics through the same process that ingests them — no Grafana,
-no datasource proxy, no export step. It is on in the default build and adds **no crate** to the
-graph: it speaks JSON-RPC through `serde_json`, and Base64 (the transport's `=?base64?…?=` header
-sentinel, and `AnyValue::Bytes` attributes) through `base64` — both already compiled in the default
-tree, `serde_json` via `arrow-json` and `base64` via `arrow-cast`, both under DataFusion, so the
-direct edges measured 275 → 275 on the facade and 293 → 293 on `imbh-server`. Note that `serde_json`
-here is the *default* build without `preserve_order`, so object keys serialize alphabetically;
-turning that feature on would flip it for every `serde_json` user in the graph, DataFusion included,
-to buy nothing but field order. The
-module (`imbh-server/src/mcp/`) is transport-agnostic — `handle(db, bytes, headers) -> Reply` — so a
-stdio transport can be added later without moving any protocol logic.
+imbh serves the **Model Context Protocol** over **both** transports MCP defines, so an agent can
+search logs, pull traces, and query metrics through the same process that holds them — no Grafana,
+no datasource proxy, no export step:
+
+- **Streamable HTTP** — `imbhd` at `POST /mcp` (`imbh-server`), on in the default build.
+- **stdio** — `imbh-tui --mcp-stdio`, newline-delimited JSON-RPC on stdin/stdout. stdio is the
+  transport clients "SHOULD support whenever possible" and the one an agent that *spawns* its server
+  speaks; it binds no port, and the pipe is the authorization.
+
+The protocol lives in its own crate, **`imbh-mcp`** (§12), because both transports need it and the
+dependency direction forbids `imbh-tui` reaching into `imbh-server`. Its dispatch is
+transport-agnostic — `handle(db, bytes, &Transport) -> Reply`, bytes plus which transport in, a
+`Value` body out — and `Transport` exists for exactly one reason: the stateless revision's
+header mirror (`MCP-Protocol-Version` / `Mcp-Method` / `Mcp-Name`) is a rule of the *HTTP* transport,
+so `Transport::Stdio` validates none of it and serves a modern request on its `_meta` alone. The
+crate also owns the two JSON serializers `POST /api/query` and `GET /stats` share with the
+`query_sql` and `db_stats` tools, so the tool surface and the HTTP surface cannot describe the same
+rows — or the same database — two different ways.
+
+Neither transport adds **any crate** to any graph. The protocol speaks JSON-RPC through `serde_json`
+and Base64 (the HTTP transport's `=?base64?…?=` header sentinel, and `AnyValue::Bytes` attributes)
+through `base64` — both already compiled in the default tree, `serde_json` via `arrow-json` and
+`base64` via `arrow-cast`, both under DataFusion. Measured 275 → 275 on the facade, and lifting the
+module out of `imbh-server` moved both consumers by exactly one *workspace* crate (`imbh-server`
+300 → 301, `imbh-tui` 312 → 313 third-party-plus-workspace edges). The stdio transport's `--url`
+forwarding mode (below) is likewise dependency-free: one buffered `POST` per message over
+`std::net::TcpStream`, hand-written, rather than an HTTP client subtree in the TUI binary. Note that
+`serde_json` here is the *default* build without `preserve_order`, so object keys serialize
+alphabetically; turning that feature on would flip it for every `serde_json` user in the graph,
+DataFusion included, to buy nothing but field order.
+
+A stdio session gets its answers from one of two backends. `--mcp-stdio <dir>` opens the directory
+with `Db::open_read_only`, which takes no writer lock and therefore reads *alongside* a running
+`imbhd` — the common case, and it needs nothing running at all. What a read-only opener cannot see
+is the writer's unsealed buffer, so `--mcp-stdio --url <addr>` instead forwards each message to that
+daemon's `POST /mcp`, synthesizing the header mirror from the body it is forwarding (the daemon
+enforces the agreement the pipe could not carry). The loop is strictly one message at a time: a `Db`
+query is blocking parquet/tantivy I/O from start to finish, so concurrent requests would contend for
+the same disk rather than overlap, and the blocking `std::io` handles are sound precisely because
+nothing else shares that runtime.
 
 The 15 tools are **read-only** wrappers over §10.5–§10.9: `db_stats`, `list_attribute_keys` /
 `list_attribute_values`, `search_logs` / `count_logs` / `log_volume`, `search_traces` / `get_trace` /
@@ -989,23 +1017,26 @@ see a transport failure. Time windows default to a 1h look-back with `since` / e
 `start_unix_nano`/`end_unix_nano` overrides — which is why the tool descriptions and `instructions`
 point a model at `db_stats` first, since a replayed or historical DB holds nothing in the last hour.
 
-The endpoint is **dual-era**, because MCP revision `2026-07-28` made the protocol stateless (no
+The tool surface is **dual-era**, because MCP revision `2026-07-28` made the protocol stateless (no
 `initialize`; each request declares its version in `params._meta`; `server/discover` reports
 capabilities; results carry `resultType: "complete"`) while `2025-11-25` and earlier open with the
 `initialize` handshake. Serving only one would be unusable by half the clients in the field, so era
 is chosen **per request**: a `params._meta` protocol version — or a `server/discover` call — selects
-the stateless path, anything else the handshake path. On the stateless path the `MCP-Protocol-Version`
-/ `Mcp-Method` / `Mcp-Name` headers are validated against the body (`-32020` on mismatch, including
-the `=?base64?…?=` sentinel decode) and an unimplemented version is refused with `-32022` listing what
-is supported. Nothing streams, so every response is a single `application/json` body and no session id
-is minted; `GET`/`DELETE /mcp` answer `405`, which is what the spec prescribes for a server offering
-neither stream nor session.
+the stateless path, anything else the handshake path. On the stateless path *over HTTP* the
+`MCP-Protocol-Version` / `Mcp-Method` / `Mcp-Name` headers are validated against the body (`-32020` on
+mismatch, including the `=?base64?…?=` sentinel decode) and an unimplemented version is refused with
+`-32022` listing what is supported. Nothing streams, so every response is a single JSON document and
+no session id is minted; `GET`/`DELETE /mcp` answer `405`, which is what the spec prescribes for a
+server offering neither stream nor session. Over stdio the same rules hold minus the headers, and
+framing takes their place: one line in, at most one line out, a notification answered with nothing, a
+blank line skipped, and a malformed line answered with a parse error that does not end the session.
 
-Exposure follows the rest of `imbhd`: unauthenticated, gated by whatever fronts it. The one defence
-implemented here is the transport's DNS-rebinding rule — a request carrying a browser `Origin`
+Exposure over HTTP follows the rest of `imbhd`: unauthenticated, gated by whatever fronts it. The one
+defence implemented here is the transport's DNS-rebinding rule — a request carrying a browser `Origin`
 outside the loopback set is refused `403`, so a page the user merely visits cannot drive the tools on
-their loopback `imbhd`. `IMBH_MCP_ALLOWED_ORIGINS` (comma-separated, `*` to disable) widens it. See
-`docs/MCP.md` for client configuration.
+their loopback `imbhd`. `IMBH_MCP_ALLOWED_ORIGINS` (comma-separated, `*` to disable) widens it. Over stdio there is no
+equivalent question: no port is bound, and only the process that spawned the session can write to its
+pipe. See `docs/MCP.md` for client configuration on both transports.
 
 A **Docker logging-driver plugin** is available behind the optional, off-by-default `docker` feature
 (`cargo build -p imbh-server --features docker`), turning `imbhd` into a `docker.logdriver/1.0`
@@ -1270,7 +1301,10 @@ imbh/
     imbh-lgtm/             # LGTM-stack (Loki/Tempo/Mimir) query languages: expression models +
                            # reference evaluators (`model`), P1/L1/T1 parsers/lowering (`syntax`),
                            # and the optional native-IMBH `source` adapter (feature-gated)
-    imbh-tui/              # optional read-only local companion TUI
+    imbh-mcp/              # the MCP server: protocol dispatch, the read-only tool surface, and the
+                           # stdio transport (shared by imbh-server's HTTP endpoint and imbh-tui)
+    imbh-tui/              # optional read-only local companion TUI; its binary also hosts the
+                           # MCP stdio transport (`imbh-tui --mcp-stdio`)
     imbh/                  # facade crate embedders use: Db, blocking + async API; optional stderr
                            # console renderer (`imbh::console`, `tracing-console` feature)
     imbh-proto/            # protobuf wire types for the query inputs (protox build.rs); the
@@ -1289,6 +1323,9 @@ LGTM query languages live in `imbh-lgtm`, whose `syntax` (parsers) depends on it
 (expression types + evaluators); the optional `imbh-lgtm/source` adapter depends on `imbh`, and
 `tui` depends on `imbh` and `imbh-lgtm` with that feature. `imbh` never depends on `imbh-lgtm` or
 terminal crates.
+`imbh-mcp` sits in that same top tier — `imbh ← imbh-mcp ← {imbh-server, imbh-tui}` — and is where
+the MCP protocol lives *because* of this direction: the HTTP endpoint is in `imbh-server` and the
+stdio one in the `imbh-tui` binary, and neither of those crates may depend on the other (§10.16.1).
 `imbh-proto` is a prost-only leaf that `imbh` depends on **optionally**, under its `proto` feature
 (§10.17); it depends on nothing else in the workspace.
 `imbh-tracing` sits at the top tier alongside `{exporter, server}` and depends on `imbh`. It provides

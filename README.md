@@ -279,22 +279,28 @@ OTLP/gRPC (the OTel SDK default) is available behind the optional `grpc` feature
 port via tonic. It is off by default so the base build stays at its measured footprint; enabling it
 pulls the tonic/hyper subtree.
 
-### MCP endpoint (agents)
+### MCP server (agents)
 
-`POST /mcp` serves the **Model Context Protocol**, so an agent can search logs, pull traces, and
-query metrics through the same process that ingests them — no Grafana, no datasource proxy, no
-export step:
+imbh serves the **Model Context Protocol** over both of MCP's transports, so an agent can search
+logs, pull traces, and query metrics through the same process that holds them — no Grafana, no
+datasource proxy, no export step:
 
 ```
-claude mcp add --transport http imbh http://127.0.0.1:4318/mcp
+claude mcp add imbh -- imbh-tui --mcp-stdio /var/lib/imbh     # stdio: no port, nothing running
+claude mcp add --transport http imbh http://127.0.0.1:4318/mcp  # HTTP: imbhd's POST /mcp
 ```
+
+The stdio server opens the database directory **read-only**, so it works alongside a live writer
+without contending with it; `imbh-tui --mcp-stdio --url 127.0.0.1:4318` forwards to a running
+`imbhd` instead when the answers must include what that writer has not sealed yet.
 
 The 15 tools are read-only — `search_logs`, `search_traces`, `get_trace`, `span_metrics`,
 `query_metric_range`, `histogram_quantile`, attribute discovery, `db_stats`, and `query_sql` for
 everything else. Both protocol eras are served (the stateless `2026-07-28` revision and the
-`initialize` handshake of `2025-11-25` and earlier), it is on in the default build, and it adds
-**no crate** to the dependency graph. A browser `Origin` outside loopback is refused unless
-`IMBH_MCP_ALLOWED_ORIGINS` says otherwise. See the [MCP guide](./docs/MCP.md).
+`initialize` handshake of `2025-11-25` and earlier), both transports are on in the default build,
+and they add **no crate** to the dependency graph. On the HTTP side a browser `Origin` outside
+loopback is refused unless `IMBH_MCP_ALLOWED_ORIGINS` says otherwise; the stdio side binds no port
+at all. See the [MCP guide](./docs/MCP.md).
 
 ### Docker logging driver (`docker` feature)
 
@@ -329,7 +335,11 @@ span:
 cargo run -p imbh-tui -- ./imbh-data
                         # imbh-tui <DB_DIR> [--ascii] [--refresh-seconds N]
                         #                    [--from 'YYYY-MM-DD HH:MM:SS' --to '…']
+                        # imbh-tui --mcp-stdio (<DB_DIR> | --url http://host:port)
 ```
+
+The same binary is imbh's [MCP server over stdio](#mcp-server-agents) — the same read-only view of
+someone else's database, addressed to an agent rather than to a person.
 
 The Ratatui/Crossterm dependencies stay confined to this crate and never enter the `imbh` or
 `imbhd` graphs. Its library entry point is `run(Arc<Db>, Options)` if you want to embed it. It ships
@@ -348,7 +358,7 @@ in every [release archive and in the container image](#install-the-binaries) alo
 ## Workspace layout
 
 Dependency direction:
-`core ← {otlp, storage, index, query} ← imbh ← {lgtm, exporter, server, tracing} ← tui`.
+`core ← {otlp, storage, index, query} ← imbh ← {lgtm, mcp, exporter, server, tracing} ← tui`.
 
 | Crate | Responsibility |
 |-------|----------------|
@@ -359,7 +369,8 @@ Dependency direction:
 | `imbh-query` | DataFusion providers, UDFs, session config, typed plans (**only crate that knows DataFusion**) |
 | `imbh` | the facade embedders use: `Db`, blocking + async API; optional stderr console renderer (`imbh::console`, `tracing-console` feature) |
 | `imbh-lgtm` | bounded PromQL/LogQL/TraceQL profiles: parser-independent models + reference evaluators (`model`) and source-positioned translators (`syntax`); native execution adapters under the optional `source` feature |
-| `imbh-tui` | optional read-only terminal explorer for metrics, traces, logs, and log-derived charts (Ratatui/Crossterm confined here) |
+| `imbh-tui` | optional read-only terminal explorer for metrics, traces, logs, and log-derived charts (Ratatui/Crossterm confined here); also hosts the MCP stdio transport |
+| `imbh-mcp` | the MCP server: protocol, the 15 read-only agent tools, and the stdio transport, shared by `imbhd`'s `POST /mcp` and `imbh-tui --mcp-stdio` |
 | `imbh-proto` | protobuf wire types for the typed query-API inputs (Go/FFI binding surface); pulled only by the facade's `proto` feature, prost-only, optional |
 | `imbh-otel-exporter` | opentelemetry-rust SDK exporter adapters (span/log/metric), optional |
 | `imbh-tracing` | `tracing` plumbing: `DbLayer` sinking `tracing` into a `Db`, optional |

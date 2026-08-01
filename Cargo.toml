@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/imbh-core",
     "crates/imbh-lgtm",
+    "crates/imbh-mcp",
     "crates/imbh-tui",
     "crates/imbh-otlp",
     "crates/imbh-storage",
@@ -50,6 +51,9 @@ dependent-version = "upgrade"
 imbh = { path = "crates/imbh", version = "0.2.0" }
 imbh-core = { path = "crates/imbh-core", version = "0.2.0" }
 imbh-lgtm = { path = "crates/imbh-lgtm", version = "0.2.0" }
+# The MCP server (protocol dispatch + tools + the stdio transport), shared by the HTTP endpoint in
+# `imbh-server` and the stdio one in the `imbh-tui` binary.
+imbh-mcp = { path = "crates/imbh-mcp", version = "0.2.0" }
 imbh-tui = { path = "crates/imbh-tui", version = "0.2.0" }
 imbh-otlp = { path = "crates/imbh-otlp", version = "0.2.0" }
 # default-features = false so the `imbh` facade's own `search` feature governs the tantivy subtree

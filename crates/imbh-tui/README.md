@@ -16,11 +16,27 @@ native IMBH query APIs.
 It is a viewer, not a writer: it never ingests, and opening a database read-only means it composes
 with a live single writer plus many cross-process readers.
 
+## The same view, for an agent
+
+The binary is also imbh's **MCP server over stdio** — the same read-only database, addressed to an
+agent instead of a person:
+
+```sh
+imbh-tui --mcp-stdio ./imbh-data              # read the directory directly (nothing need be running)
+imbh-tui --mcp-stdio --url 127.0.0.1:4318     # ...or forward to a running imbhd, buffer included
+```
+
+It speaks newline-delimited JSON-RPC on stdin/stdout, which is the transport an MCP client that
+spawns its own server uses — no port, no configuration beyond a path. The 15 tools are read-only and
+come from [`imbh-mcp`](https://crates.io/crates/imbh-mcp), shared with `imbhd`'s `POST /mcp`
+endpoint. See [`docs/MCP.md`](https://github.com/moriyoshi/imbh/blob/main/docs/MCP.md).
+
 ## Role in the workspace
 
-Depends on the [`imbh`](https://crates.io/crates/imbh) facade and
-[`imbh-lgtm`](https://crates.io/crates/imbh-lgtm) (with its `source` feature). A leaf binary crate:
-`{imbh, imbh-lgtm} ← imbh-tui`.
+Depends on the [`imbh`](https://crates.io/crates/imbh) facade,
+[`imbh-lgtm`](https://crates.io/crates/imbh-lgtm) (with its `source` feature), and
+[`imbh-mcp`](https://crates.io/crates/imbh-mcp). A leaf binary crate:
+`{imbh, imbh-lgtm, imbh-mcp} ← imbh-tui`.
 
 See the design reference [`OVERVIEW.md`](https://github.com/moriyoshi/imbh/blob/main/.agents/docs/OVERVIEW.md)
 §13. License: Apache-2.0.

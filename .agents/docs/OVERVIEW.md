@@ -174,7 +174,8 @@ Cargo workspace (ARCHITECTURE.md §12); dependency direction
 | `imbh-index` | Tantivy schema/build/search and the row-ordinal bridge (**only crate that knows Tantivy**) |
 | `imbh-query` | DataFusion providers, UDFs, session config, typed plans (**only crate that knows DataFusion**) |
 | `imbh-lgtm` | LGTM-stack (Loki/Tempo/Mimir) query-language compatibility: PromQL/LogQL/TraceQL parser-independent models + reference evaluators (`model`) and source-positioned translators for the pinned P1/L1/T1 profiles (`syntax`); optional native-IMBH adapters/builders under the `source` feature |
-| `imbh-tui` | optional read-only local companion for metrics, traces, logs, and log-derived charts |
+| `imbh-tui` | optional read-only local companion for metrics, traces, logs, and log-derived charts; its binary also hosts the MCP **stdio** transport (`imbh-tui --mcp-stdio`) |
+| `imbh-mcp` | the MCP server: protocol dispatch, the 15 read-only tools, and the stdio transport — shared by `imbh-server`'s `POST /mcp` and `imbh-tui`'s stdio mode; adds no crate to the graph |
 | `imbh` | the facade embedders use: `Db`, blocking + async API; optional stderr console renderer (`imbh::console`, `tracing-console` feature) |
 | `imbh-proto` | protobuf wire types for the query-API inputs (Go/FFI binding surface, `proto` feature); generated from `.proto` via protox, prost-only, optional |
 | `imbh-otel-exporter` | opentelemetry-rust SDK exporter adapters (span/log/metric), optional |
@@ -221,9 +222,12 @@ three signals, with the reference server and SDK exporter built. See
 Post-v0.1 additions (outside the original milestone plan): the **Docker logging-driver plugin** in
 `imbh-server` (optional `docker` feature) — `--log-driver imbh` writes container stdout/stderr into
 an embedded `Db` and serves `docker logs` back out of it, with no new crate in the graph
-(ARCHITECTURE.md §10.16, [docs/DOCKER_LOG_DRIVER.md](../../docs/DOCKER_LOG_DRIVER.md)); and
+(ARCHITECTURE.md §10.16, [docs/DOCKER_LOG_DRIVER.md](../../docs/DOCKER_LOG_DRIVER.md));
 **signal-driven graceful shutdown** for `imbhd` (`SIGINT`/`SIGTERM` → stop accepting, drain in-flight
-requests, seal the buffer, exit 0), also with no new crate (ARCHITECTURE.md §10.16).
+requests, seal the buffer, exit 0), also with no new crate (ARCHITECTURE.md §10.16); and the **MCP
+server** (`imbh-mcp`), which exposes the telemetry as 15 read-only agent tools over both of MCP's
+transports — `imbhd`'s `POST /mcp` and `imbh-tui --mcp-stdio` — again with no new crate
+(ARCHITECTURE.md §10.16.1, [docs/MCP.md](../../docs/MCP.md)).
 
 Post-v1 candidate tracks: broader query-language profiles; Parquet VARIANT for attributes;
 read-only cross-process opens; object-store tiering; downsampling; single-file segment bundles
