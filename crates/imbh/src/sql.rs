@@ -9,6 +9,27 @@
 
 use datafusion::scalar::ScalarValue;
 
+/// The built-in column an attribute key resolves to, if any.
+///
+/// `service` is a first-class column on every signal table, lifted out of the OTel *resource* at
+/// ingest — it is never a record `attributes` entry. So a group/filter key naming it must resolve to
+/// the column: routing it through `json_get_str(attributes, …)` yields NULL for every row, which is
+/// silent rather than loud (a missing attribute is a legitimate NULL), and collapses a group-by into
+/// a single empty-labelled series with all counts merged. Both spellings resolve: `service` (the
+/// column name, as PromQL-style selectors and `Db::attrs` label sets use it) and `service.name` (the
+/// OTel semantic-convention attribute key, as OTLP and the MCP tools use it).
+///
+/// This wins over the configured `Promote` list. A promoted key can never shadow `service` —
+/// `imbh_storage::promoted_columns` drops reserved names — and a promoted `service.name` column
+/// would be built by [`lookup_promoted`](imbh_storage) over record `attributes`, i.e. all-NULL for
+/// the same reason, so the built-in column is strictly the better answer for either spelling.
+fn builtin_column(key: &str) -> Option<&'static str> {
+    match key {
+        "service" | "service.name" => Some("service"),
+        _ => None,
+    }
+}
+
 /// A positional bind-parameter collector. Each `bind` returns the placeholder text (`$1`, `$2`, …)
 /// and appends the value; [`SqlParams::into_values`] yields the values in `$1..$N` order.
 ///
@@ -37,15 +58,18 @@ impl SqlParams {
         }
     }
 
-    /// A `Utf8` SQL expression reading record-`attributes` key `key`: the promoted dictionary column
-    /// cast to `VARCHAR` (exactly how `service` is read) when `key` is promoted, else
-    /// `json_get_str(attributes, $key)`. Both forms are identical in result — a promoted key also
-    /// stays in the JSON blob and the column mirrors the record `attributes` scope only (§6.1) — so
-    /// mixing them across one query (some keys promoted, some not) is safe. The `CAST` normalizes the
-    /// dict to plain text so `= v` / `IS NOT NULL` / `matches(...)` / `coalesce(...)` compose the same
-    /// regardless of branch.
+    /// A `Utf8` SQL expression reading record-`attributes` key `key`: the built-in column when `key`
+    /// names one ([`builtin_column`]), else the promoted dictionary column cast to `VARCHAR`
+    /// (exactly how `service` is read) when `key` is promoted, else `json_get_str(attributes, $key)`.
+    /// The promoted and JSON forms are identical in result — a promoted key also stays in the JSON
+    /// blob and the column mirrors the record `attributes` scope only (§6.1) — so mixing them across
+    /// one query (some keys promoted, some not) is safe. The `CAST` normalizes the dict to plain text
+    /// so `= v` / `IS NOT NULL` / `matches(...)` / `coalesce(...)` compose the same regardless of
+    /// branch.
     pub(crate) fn attr_field(&mut self, key: &str) -> String {
-        if self.promoted.iter().any(|c| c == key) {
+        if let Some(col) = builtin_column(key) {
+            format!("CAST({col} AS VARCHAR)")
+        } else if self.promoted.iter().any(|c| c == key) {
             format!("CAST(\"{}\" AS VARCHAR)", key.replace('"', "\"\""))
         } else {
             format!("json_get_str(attributes, {})", self.str(key))
@@ -61,7 +85,9 @@ impl SqlParams {
     /// comparison is false) for an absent key or a non-numeric value, matching the evaluator: the
     /// resulting predicate is a sound superset of the typed comparison.
     pub(crate) fn attr_num_field(&mut self, key: &str) -> String {
-        if self.promoted.iter().any(|c| c == key) {
+        if let Some(col) = builtin_column(key) {
+            format!("TRY_CAST(CAST({col} AS VARCHAR) AS DOUBLE)")
+        } else if self.promoted.iter().any(|c| c == key) {
             format!(
                 "TRY_CAST(CAST(\"{}\" AS VARCHAR) AS DOUBLE)",
                 key.replace('"', "\"\"")

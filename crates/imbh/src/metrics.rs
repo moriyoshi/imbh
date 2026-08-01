@@ -312,16 +312,12 @@ enum LabelOp {
     NotRegex,
 }
 
-/// Compile one metric-label selector with Prometheus missing-label semantics. A promoted attribute
-/// key resolves to its dictionary column (pushdown) via [`SqlParams::attr_field`], `service` to the
-/// promoted `service` column, everything else to a `json_get_str` scan — all identical in result
-/// (ARCHITECTURE.md §6.1).
+/// Compile one metric-label selector with Prometheus missing-label semantics. [`SqlParams::attr_field`]
+/// resolves `service` / `service.name` to the built-in `service` column, a promoted attribute key to
+/// its dictionary column (pushdown), and everything else to a `json_get_str` scan — all identical in
+/// result (ARCHITECTURE.md §6.1).
 fn label_cond(key: &str, op: LabelOp, value: &str, p: &mut SqlParams) -> String {
-    let field = if key == "service" {
-        "CAST(service AS VARCHAR)".to_owned()
-    } else {
-        p.attr_field(key)
-    };
+    let field = p.attr_field(key);
     let actual = format!("coalesce({field}, '')");
     let v = p.str(value);
     match op {

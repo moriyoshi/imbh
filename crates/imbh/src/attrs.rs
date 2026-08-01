@@ -75,22 +75,18 @@ impl AttrsApi {
         Ok(keys.into_iter().collect())
     }
 
-    /// Distinct string values for `key` across every signal (sorted). `service.name` resolves to the
-    /// promoted column; any other key resolves through `json_get_str` over the attributes column.
+    /// Distinct string values for `key` across every signal (sorted). `service.name` (or `service`)
+    /// resolves to the built-in `service` column, a promoted key to its dictionary column, any other
+    /// key through `json_get_str` over the attributes column.
     pub async fn values(&self, key: &str) -> Result<Vec<String>> {
         let mut params = SqlParams::with_promote(self.db.storage.promote().keys());
-        let sql = if key == "service.name" {
-            across_all_tables(|t| {
-                format!("SELECT DISTINCT service AS v FROM {t} WHERE service IS NOT NULL")
-            })
-        } else {
-            // The field expression (promoted dict column when `key` is promoted, else a
-            // `json_get_str` scan) is reused at both spots in every per-table fragment.
-            let f = params.attr_field(key);
-            across_all_tables(|t| {
-                format!("SELECT DISTINCT {f} AS v FROM {t} WHERE {f} IS NOT NULL")
-            })
-        };
+        // The field expression (built-in column for `service`/`service.name`, promoted dict column
+        // when `key` is promoted, else a `json_get_str` scan) is reused at both spots in every
+        // per-table fragment.
+        let f = params.attr_field(key);
+        let sql = across_all_tables(|t| {
+            format!("SELECT DISTINCT {f} AS v FROM {t} WHERE {f} IS NOT NULL")
+        });
         let batches = self
             .db
             .sql_with_params(sql, params.into_values())

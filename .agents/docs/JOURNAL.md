@@ -1808,3 +1808,51 @@ build, clippy `-D warnings`, `cargo test --workspace`, plus the footprint gate (
 driving real sessions over in-memory pipes, including a hand-rolled fake `imbhd` on loopback that
 asserts the synthesized header mirror *from the receiving side*, which is the only place that
 particular bug could have been caught.
+
+## `service.name` is groupable now, not only filterable (2026-08-01)
+
+`SqlParams::attr_field` is the single funnel every typed builder uses to turn a group/filter key
+into SQL. It had two branches — configured `Promote` key → `CAST("key" AS VARCHAR)`, everything else
+→ `json_get_str(attributes, $key)` — and `service.name` fell into the second one. But `service.name`
+is a *resource* attribute, lifted at ingest into the built-in `service` column; it is never a record
+`attributes` entry. So the expression was NULL on every row.
+
+The failure mode is the interesting part: **filtering** by it matched nothing, which is at least
+plausible to notice, but **grouping** by it produced one `{"service.name": ""}` series with every
+count merged — a well-formed, confident-looking answer. Nothing is wrong at the SQL level (a missing
+attribute is a legitimate NULL, and NULLs group together), so there is no error to surface. The MCP
+tool descriptions had been written *around* the bug ("These are attributes, not `service.name` — to
+split by service, call once per service with the `service` filter"), which is how a data bug becomes
+a documented API constraint.
+
+The fix is a third branch, `builtin_column`, ahead of the other two: `service` (the column name) and
+`service.name` (the OTel semantic convention) both emit `CAST(service AS VARCHAR)`, in `attr_field`
+and its numeric twin `attr_num_field`. Ordering matters and is deliberate — the built-in branch wins
+over `Promote`. A promoted key can never shadow `service` (`promoted_columns` drops reserved names),
+and a promoted `service.name` column would be built by `lookup_promoted` over record `attributes`
+and hence be all-NULL for exactly the same reason, so the built-in column is strictly the better
+answer for either spelling. That ordering also means the fix needs no storage change: adding
+`service.name` to `RESERVED_COLUMNS` would have been the "tidier" fix and would have altered the
+on-disk schema of any DB that promotes it, for no gain.
+
+Because `attr_field` is the funnel, one branch fixed every caller at once: `LogsApi::volume_by`,
+`TracesApi::span_metrics`, the four metric group-by paths, and every `attr_eq`/`attr_exists`/
+`attr_in`/`attr_regex`/`attr_num` matcher on logs and traces. It also *deleted* two workarounds that
+had grown around the gap — the `key == "service"` special case in `metrics::label_cond` and the
+`service.name` special case in `AttrsApi::values`, both now just `attr_field` calls. Duplicated
+special cases at the call sites are a good signal the funnel is missing a branch.
+
+`imbh-lgtm`'s PromQL path is unaffected: it groups over materialized label sets
+(`metric_labels_from_batch`, which already folds `service` in), not over `MetricQuery::group_by`.
+
+Testing: the existing pin in `crates/imbh-server/tests/mcp_e2e.rs` was inverted to assert resolution
+for both spellings, and a new `grouping_by_service_name_splits_the_series_per_service` seeds *two*
+services — the shared `seeded_db` only ever ingests `cart`, and a single-service fixture cannot tell
+a working group-by from the collapsed one, which is why the bug survived the original smoke test.
+`logs_group_and_filter_by_service_name` (`crates/imbh/src/lib.rs`) covers the same ground library-side
+across group-by, `attr_eq`, and `attr_exists`. The MCP `group_by` descriptions now say `service.name`
+is groupable.
+
+Footprint: unchanged (no dependency touched). Gate green: `cargo fmt --all --check`,
+`cargo build --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`,
+`cargo test --workspace`.

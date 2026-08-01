@@ -138,6 +138,16 @@ column explosion is an RSS/schema-churn trap. The design:
    promoted and `json_get_str(attributes, $key)` otherwise — provably identical results, since the
    column mirrors the record `attributes` scope only and the key also stays in the JSON. Column
    values are string-only.
+   Ahead of both branches, `attr_field` resolves the **built-in** `service` column: a key spelled
+   `service` (the column name) or `service.name` (the OTel semantic convention) emits
+   `CAST(service AS VARCHAR)`. Without that branch such a key falls through to
+   `json_get_str(attributes, …)` and is NULL on every row — `service.name` lives in the resource,
+   never in record `attributes` — so a *filter* on it matched nothing and a *group-by* collapsed
+   into one empty-labelled series with every count merged, silently (a missing attribute is a
+   legitimate NULL). The built-in branch wins over `promote`: a promoted key can never shadow
+   `service` (reserved names are dropped by `promoted_columns`), and a promoted `service.name`
+   column would be materialized from record `attributes` and hence be all-NULL for the same reason,
+   so the built-in column is strictly the better answer for either spelling.
 
    *Not pursued — LGTM label-read zero-copy.* Sourcing PromQL/LogQL result-label buffers from the
    promoted columns (the original ARROW_LGTM_API_PROPOSAL Phase 3 idea) is architecturally bounded
@@ -651,8 +661,10 @@ server maps errors to HTTP status via error-classification helpers.
 - **Attribute matching.** *Deviation:* rather than a single `AttrMatcher`/`MatchOp` vocabulary
   type, each query builder exposes matcher **methods** directly:
   `attr_eq`, `attr_exists`, `attr_matches` (term search), `attr_in`, `attr_not_in`,
-  `attr_gt`/`attr_ge`/`attr_lt`/`attr_le`, `attr_regex`. `service.name` hits the promoted column;
-  everything else resolves via `json_get_str` (there is no attrs Tantivy index, §8).
+  `attr_gt`/`attr_ge`/`attr_lt`/`attr_le`, `attr_regex`. `service.name` (and `service`) hits the
+  built-in `service` column and a configured `promote` key its dictionary column (§6.1); everything
+  else resolves via `json_get_str` (there is no attrs Tantivy index, §8). The same resolution backs
+  group-by, so `service.name` is groupable as well as filterable.
 - **Ids & enums.** `TraceId([u8;16])` / `SpanId([u8;8])` (lowercase hex), `Lsn` (a
   `NonZero<u64>` type alias — 0 is never a valid LSN, so "nothing durable / not yet written" is
   `Option<Lsn>` = `None` rather than an in-band `Lsn(0)` sentinel),

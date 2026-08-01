@@ -440,15 +440,43 @@ async fn the_trace_tools_answer_over_real_data() {
     assert!(text.contains(r#""p95_ns":"#), "{text}");
     // The grouped label must actually *resolve*, not merely be present. Asserting only the response
     // shape is what let a `group_by: ["service.name"]` example survive in the tool descriptions while
-    // silently producing `{"service.name": ""}` for every series: a group key is looked up in the
-    // record's `attributes`, and `service.name` is never there (it is the promoted `service` column).
+    // silently producing `{"service.name": ""}` for every series.
     assert!(text.contains(r#""http.method":"GET""#), "{text}");
     // The spans that *lack* the key group under "" — correct SQL semantics for a missing attribute,
     // and the reason a model must be told which keys are groupable rather than guessing.
     assert!(text.contains(r#""http.method":"""#), "{text}");
-    // And the trap itself: grouping by `service.name` yields one empty-labelled series, never a
-    // per-service breakdown. Pinned so a library-side fix shows up here as a failing test.
-    let text = tool_text(
+    // `service.name` is not a record attribute — it is the built-in `service` column — so it used to
+    // group into one empty-labelled series with every count merged. `SqlParams::attr_field` now
+    // resolves both its spellings to that column, so it groups like any other key.
+    for key in ["service.name", "service"] {
+        let text = tool_text(
+            &call_tool(
+                &db,
+                "span_metrics",
+                &format!(r#"{{{WINDOW},"step":"1h","group_by":["{key}"]}}"#),
+            )
+            .await,
+        );
+        assert!(text.contains(&format!(r#""{key}":"cart""#)), "{text}");
+        assert!(!text.contains(&format!(r#""{key}":"""#)), "{text}");
+    }
+}
+
+/// Grouping by `service.name` must produce one series *per service*, not one merged series. The
+/// shared `seeded_db` only ever ingests `cart`, so a single-service fixture cannot tell a working
+/// group-by from the collapsed one — this seeds two services and checks both the split and the
+/// counts.
+#[tokio::test]
+async fn grouping_by_service_name_splits_the_series_per_service() {
+    let db: Arc<Db> = Db::in_memory().open().expect("open in-memory db");
+    db.ingest_otlp_traces(&otlp_trace_wide("cart", [0x31; 16], 3, &[]))
+        .await
+        .expect("ingest cart spans");
+    db.ingest_otlp_traces(&otlp_trace_wide("checkout", [0x32; 16], 2, &[]))
+        .await
+        .expect("ingest checkout spans");
+
+    let value = tool_value(
         &call_tool(
             &db,
             "span_metrics",
@@ -456,8 +484,49 @@ async fn the_trace_tools_answer_over_real_data() {
         )
         .await,
     );
-    assert!(text.contains(r#""service.name":"""#), "{text}");
-    assert!(!text.contains(r#""service.name":"cart""#), "{text}");
+    let series = value["series"].as_array().expect("a series array");
+    let mut calls: Vec<(String, i64)> = series
+        .iter()
+        .map(|s| {
+            let service = s["labels"]["service.name"]
+                .as_str()
+                .unwrap_or_else(|| panic!("no service.name label in {s}"))
+                .to_owned();
+            let calls = s["points"]
+                .as_array()
+                .expect("a points array")
+                .iter()
+                .map(|p| p["calls"].as_i64().expect("a calls count"))
+                .sum();
+            (service, calls)
+        })
+        .collect();
+    calls.sort();
+    // `otlp_trace_wide(_, _, n, _)` emits `n` spans (a root plus `n - 1` children).
+    assert_eq!(
+        calls,
+        vec![("cart".to_owned(), 3), ("checkout".to_owned(), 2)],
+        "{value}"
+    );
+
+    // The same key used as an attribute *filter* agrees with the breakdown — one spelling, both
+    // directions. (Previously this matched nothing: `json_get_str(attributes, 'service.name')` is
+    // NULL on every span.)
+    let value = tool_value(
+        &call_tool(
+            &db,
+            "span_metrics",
+            &format!(r#"{{{WINDOW},"step":"1h","attributes":{{"service.name":"checkout"}}}}"#),
+        )
+        .await,
+    );
+    let filtered: i64 = value["series"][0]["points"]
+        .as_array()
+        .expect("a points array")
+        .iter()
+        .map(|p| p["calls"].as_i64().expect("a calls count"))
+        .sum();
+    assert_eq!(filtered, 2, "{value}");
 }
 
 #[tokio::test]
