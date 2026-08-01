@@ -5,6 +5,24 @@ use crate::app::App;
 use crate::model::{Focus, MENU_LEN, Mode, NavEntry, Route, Screen};
 use crate::waterfall::TraceDetail;
 
+/// One step up a screen's view series (see [`App::series_parent`]). Most rungs are a different
+/// [`Route`], but the Metrics series' first one is not: the catalog and the series list are the same
+/// route told apart by whether the query is empty, so stepping onto it is a query change.
+#[derive(Debug, Clone)]
+pub(crate) enum SeriesUp {
+    /// An earlier route in the chain. Boxed because a `Route` carries its view's whole data (a trace
+    /// detail is ~340 bytes) and the other variant carries none — one allocation per `Backspace`.
+    Route(Box<Route>),
+    /// The Metrics catalog — `Route::Metrics` with the query cleared.
+    Catalog,
+}
+
+impl SeriesUp {
+    fn route(route: Route) -> Self {
+        Self::Route(Box::new(route))
+    }
+}
+
 impl App {
     /// Activate the menu bar (`F9`), starting the highlight on the current screen.
     pub(crate) fn open_menu(&mut self) {
@@ -192,21 +210,25 @@ impl App {
     }
 
     /// The view one step earlier in this screen's *series* — the chain a screen drills through
-    /// (`Metrics → MetricDetail`, `Traces → TraceDetail → SpanDetail`, `Logs → LogDetail`) — regardless
-    /// of how the current view was reached. `None` on a screen's list route, which is its series' first
-    /// view and has nothing above it.
+    /// (`catalog → Metrics → MetricDetail`, `Traces → TraceDetail → SpanDetail`, `Logs → LogDetail`) —
+    /// regardless of how the current view was reached. `None` on a series' first view, which has
+    /// nothing above it.
     ///
     /// A span detail whose trace can no longer be materialized (see [`Self::series_trace`]) steps to the
     /// Traces list instead: still up its own series, just skipping the rung there is no longer data for.
-    pub(crate) fn series_parent(&self) -> Option<Route> {
+    pub(crate) fn series_parent(&self) -> Option<SeriesUp> {
         match &self.route {
-            Route::MetricDetail { .. } => Some(Route::Metrics),
-            Route::LogDetail { .. } => Some(Route::Logs),
-            Route::TraceDetail { .. } => Some(Route::Traces),
-            Route::SpanDetail { trace_id, .. } => Some(
+            Route::MetricDetail { .. } => Some(SeriesUp::route(Route::Metrics)),
+            Route::LogDetail { .. } => Some(SeriesUp::route(Route::Logs)),
+            Route::TraceDetail { .. } => Some(SeriesUp::route(Route::Traces)),
+            Route::SpanDetail { trace_id, .. } => Some(SeriesUp::route(
                 self.series_trace(trace_id)
                     .map_or(Route::Traces, |detail| Route::TraceDetail { detail }),
-            ),
+            )),
+            // The Metrics series has a rung below its list route: the catalog the series list was built
+            // from. `on_catalog` (an empty query) tells the two apart, so a series list steps up to the
+            // catalog and only the catalog itself is the series' first view.
+            Route::Metrics if !self.on_catalog() => Some(SeriesUp::Catalog),
             Route::Overview | Route::Metrics | Route::Traces | Route::Logs => None,
         }
     }
@@ -216,11 +238,20 @@ impl App {
     /// a log→trace jump steps up to the Traces list, where Back would return to the log it came from.
     /// Returns whether a move happened, so the caller reloads the destination's data.
     pub(crate) fn go_up(&mut self) -> bool {
-        let Some(parent) = self.series_parent() else {
+        let Some(step) = self.series_parent() else {
             return false;
         };
         self.push_history();
-        self.route = parent;
+        match step {
+            SeriesUp::Route(route) => self.route = *route,
+            // The catalog is reached by dropping the query, not by changing route; the refresh the
+            // caller issues then renders the tree instead of a series table. The row cursor indexed the
+            // series rows, which mean nothing in the catalog, so it restarts at the top.
+            SeriesUp::Catalog => {
+                self.active_query_mut().clear();
+                self.selected = 0;
+            }
+        }
         self.scroll = 0;
         self.focus = Focus::Primary;
         self.mode = Mode::Normal;
@@ -243,7 +274,7 @@ impl App {
 mod tests {
     use super::*;
     use crate::model::{LogCorrelation, MetricDetail, Route};
-    use crate::testutil::{sample_log_record, traces_app_with_trace};
+    use crate::testutil::{metrics_app_with_series, sample_log_record, traces_app_with_trace};
 
     #[test]
     fn menu_cursor_wraps_over_screens_and_the_range_item() {
@@ -463,12 +494,13 @@ mod tests {
     }
 
     #[test]
-    fn up_is_a_noop_on_a_screens_list_route() {
+    fn up_is_a_noop_on_a_series_first_view() {
         let mut app = App::new();
+        // The Metrics list route is the *catalog* only while its query is empty, which `App::new` is.
         for route in [Route::Overview, Route::Metrics, Route::Traces, Route::Logs] {
             app.route = route;
             assert!(app.series_parent().is_none());
-            assert!(!app.go_up(), "a list route is the first view of its series");
+            assert!(!app.go_up(), "the first view of a series has nothing above");
             assert!(app.back.is_empty(), "a no-op records no history");
         }
 
@@ -482,6 +514,41 @@ mod tests {
         };
         assert!(app.go_up());
         assert!(matches!(app.route, Route::Metrics));
+    }
+
+    #[test]
+    fn up_walks_the_metrics_series_through_the_series_list_to_the_catalog() {
+        // The Metrics series has a rung that is not a route: the catalog the series list was built
+        // from, told apart by an empty query. Drill catalog -> series list -> series detail...
+        let mut app = metrics_app_with_series();
+        app.selected = 0;
+        assert!(app.open_metric_detail());
+        assert_eq!(app.metric_exemplars.len(), 0);
+
+        // ...then walk back up it. The detail steps to the series list, query intact.
+        assert!(app.go_up());
+        assert!(matches!(app.route, Route::Metrics));
+        assert_eq!(app.active_query(), "up");
+        assert!(!app.on_catalog(), "still the series list");
+
+        // The series list steps to the catalog: same route, query dropped.
+        assert!(app.go_up());
+        assert!(matches!(app.route, Route::Metrics));
+        assert_eq!(app.active_query(), "");
+        assert!(app.on_catalog());
+        assert_eq!(
+            app.selected, 0,
+            "the series row cursor does not index the tree"
+        );
+
+        // The catalog is the series' first view.
+        assert!(!app.go_up());
+
+        // Each step is recorded, so `←` walks back down: catalog -> series list -> detail.
+        assert!(app.go_back());
+        assert_eq!(app.active_query(), "up");
+        assert!(app.go_back());
+        assert!(app.route_metric_detail().is_some());
     }
 
     #[test]

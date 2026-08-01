@@ -568,7 +568,10 @@ pub(crate) fn draw(frame: &mut ratatui::Frame<'_>, app: &App, options: &Options)
             Screen::Metrics if app.active_query().trim().is_empty() => {
                 format!(" {sep} space expand/select series {sep} enter visualize")
             }
-            Screen::Metrics => format!(" {sep} enter series detail {sep} {}/esc back", g.left),
+            Screen::Metrics => format!(
+                " {sep} enter series detail {sep} bksp catalog {sep} {}/esc back",
+                g.left
+            ),
             _ => String::new(),
         };
         // The mascot toggle is only advertised on terminals that can render it.
