@@ -35,7 +35,9 @@ pub(crate) struct Waterfall {
 pub(crate) struct WaterfallRow {
     /// The status marker before the name column: `' '`, or `'!'` when the parent chain is broken.
     pub(crate) marker: char,
-    /// Nesting depth in *levels* (two cells each), already capped at [`WATERFALL_MAX_INDENT`].
+    /// True nesting depth in *levels* (two cells each). Stored uncapped: how much of it is *drawn* is
+    /// a draw-time question, answered by [`visible_indent_base`] subtracting the shallowest depth on
+    /// screen and [`WATERFALL_MIN_NAME_W`] flooring what is left.
     ///
     /// Kept apart from `name` because the indent must **never** scroll: it is the only thing showing
     /// the trace's shape, so scrolling it away to read a long name would trade the whole tree for one
@@ -119,11 +121,15 @@ pub(crate) struct TraceDetail {
 /// Fixed width (terminal cells) of the waterfall name column; the status marker prepends one more.
 pub(crate) const WATERFALL_NAME_W: usize = 20;
 
-/// Deepest nesting level the row indent renders. Past it every row indents the same, because the
-/// indent shares [`WATERFALL_NAME_W`] with the name: at two cells per level an uncapped indent leaves
-/// only four readable name cells at depth 8, exactly where a deep trace needs them most. The
-/// hierarchy signal the cap gives up is what the pinned ancestor rows ([`sticky_layout`]) restore.
-pub(crate) const WATERFALL_MAX_INDENT: usize = 5;
+/// Cells of [`WATERFALL_NAME_W`] the name is always left, however deep the row.
+///
+/// The indent shares the name column, so at two cells per level something has to give at depth. This
+/// used to be an absolute cap on the *stored* depth, which flattened every trace past level 5 whether
+/// or not the flattening bought anything. It is now a floor applied to the *rendered* indent, after
+/// [`visible_indent_base`] has already subtracted the shallowest depth on screen — so it binds only in
+/// the genuinely awkward case where the rows visible together span more than
+/// `(WATERFALL_NAME_W - WATERFALL_MIN_NAME_W) / 2` levels, rather than on every deep trace.
+pub(crate) const WATERFALL_MIN_NAME_W: usize = 10;
 
 /// Cells kept to the right of the bar for the ` 12.345ms STATUS` column, so the bar never crowds it.
 pub(crate) const WATERFALL_SUFFIX_W: usize = 20;
@@ -181,7 +187,7 @@ pub(crate) fn build_trace_detail(trace: &imbh::Trace, ascii: bool) -> TraceDetai
             // cells it leaves at draw time, where the column width and its scroll offset are known.
             let row = WaterfallRow {
                 marker: if malformed { '!' } else { ' ' },
-                indent: depth.min(WATERFALL_MAX_INDENT),
+                indent: depth,
                 name: span.name.clone(),
                 parent_row: span
                     .parent_span_id
@@ -290,9 +296,12 @@ pub(crate) fn render_waterfall_row(
     )
 }
 
-/// Cells of leading indent a row renders, once the on-screen base is subtracted.
+/// Cells of leading indent a row renders, once the on-screen base is subtracted and the name's
+/// guaranteed minimum width is reserved. The floor is what stops a window that happens to span the
+/// root and a deep leaf together from indenting the deep rows clean out of the column, leaving them
+/// with no name at all.
 fn row_indent_cells(row: &WaterfallRow, indent_base: usize) -> usize {
-    (row.indent.saturating_sub(indent_base) * 2).min(WATERFALL_NAME_W)
+    (row.indent.saturating_sub(indent_base) * 2).min(WATERFALL_NAME_W - WATERFALL_MIN_NAME_W)
 }
 
 /// How far this row's name may usefully scroll: enough to bring its tail to the last cell of the
@@ -538,7 +547,7 @@ mod tests {
         (0..n)
             .map(|index| WaterfallRow {
                 marker: ' ',
-                indent: index.min(WATERFALL_MAX_INDENT),
+                indent: index,
                 name: format!("span-{index}"),
                 parent_row: index.checked_sub(1),
                 start: 0.0,
@@ -686,9 +695,10 @@ mod tests {
     }
 
     #[test]
-    fn the_indent_cap_keeps_a_deep_span_name_readable() {
-        // Two cells of indent per level would leave four name cells at depth 8; the cap holds the
-        // indent at WATERFALL_MAX_INDENT levels so the name always has room.
+    fn depth_is_stored_uncapped_and_floored_only_at_draw_time() {
+        // Depth is a fact about the trace, so the row model keeps it whole; the name column's minimum
+        // width is enforced where it belongs, on the *rendered* indent after the on-screen base has
+        // been subtracted.
         let mut spans = vec![waterfall_span(1, None, "root", 0, 1_000_000)];
         for id in 2..=12u8 {
             spans.push(waterfall_span(
@@ -708,16 +718,37 @@ mod tests {
             spans,
         };
         let rows = build_trace_detail(&trace, true).waterfall.rows;
-        // Depth 0..=WATERFALL_MAX_INDENT indents exactly as it always has.
-        for (depth, row) in rows.iter().enumerate().take(WATERFALL_MAX_INDENT + 1) {
+        // Every row's stored depth is its real one, all the way down — nothing is flattened.
+        let last = rows.len() - 1;
+        for (depth, row) in rows.iter().enumerate() {
             assert_eq!(row.indent, depth);
         }
-        // Past the cap every row shares the deepest indent, leaving >= 10 cells for the name.
-        let last = rows.len() - 1;
-        assert_eq!(rows[last].indent, WATERFALL_MAX_INDENT);
-        assert!(WATERFALL_NAME_W - rows[last].indent * 2 >= 10);
-        // ...and the parent chain is still fully walkable however deep the trace goes, so the pinned
-        // ancestors carry the hierarchy the capped indent stops showing.
+        assert_eq!(rows[last].indent, last);
+
+        // Rendered from the root (base 0), the deepest rows would out-indent the whole 20-cell column,
+        // so the floor caps the drawn indent and the name always keeps WATERFALL_MIN_NAME_W cells.
+        let waterfall = Waterfall {
+            rows: rows.clone(),
+            marker: '#',
+            light_marker: '-',
+        };
+        for line in render_waterfall(
+            &waterfall,
+            &WaterfallView {
+                bar_cells: 10,
+                ..WaterfallView::default()
+            },
+        ) {
+            let field = &line[1..line.find('|').unwrap()];
+            let name = field.trim_start();
+            assert!(
+                name.len() >= WATERFALL_MIN_NAME_W,
+                "a row lost its name: {line:?}"
+            );
+        }
+
+        // The parent chain stays fully walkable however deep the trace goes, so the pinned ancestors
+        // carry the hierarchy the floor stops drawing.
         assert_eq!(ancestor_rows(&rows, last), (0..last).collect::<Vec<_>>());
     }
 

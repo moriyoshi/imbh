@@ -2061,3 +2061,36 @@ The draw-time parameters (`bar_cells`, `name_offset`, `indent_base`) now travel 
 `SpanSpec` shape already used in `gen-demo-db` for exactly this reason.
 
 119 unit tests in `imbh-tui` (3 new). Verified against a `gen-demo-db` database in a pty.
+
+## Removing the indent cap: clamp the view, not the fact (2026-08-01)
+
+`WATERFALL_MAX_INDENT` is gone. `WaterfallRow::indent` now stores the span's true depth, and the only
+remaining bound is `WATERFALL_MIN_NAME_W` (10) — a floor on the *rendered* indent, applied after
+`visible_indent_base` has subtracted the shallowest depth on screen.
+
+The cap was the wrong instinct, and the previous entry said so before this change made it actionable:
+it treated *depth* as the problem when the problem was only ever depth **shared** by the rows you can
+see. Flattening at level 5 in the row model paid a permanent cost — every trace past that depth lost
+its shape — to solve a case the relative base already handles.
+
+But removing it outright would have been wrong too, and checking that was the whole job. Without the
+cap, a window that happens to span the root and a deep leaf together renders `depth * 2` cells of
+indent into a 20-cell column: at depth 16 that is 32 cells, the name gets `clip_field(name, 0, ..)`,
+and the row draws as pure indent with **no name at all**. Not a crash — the `.min(WATERFALL_NAME_W)`
+clamp was already there — just a silently nameless row. That case is reachable in ordinary data: a
+start-time-ordered waterfall puts a shallow sibling directly under a deep subtree, which is exactly
+what drops the base back to zero. So the bound moved rather than vanished, from the stored fact to
+the drawn quantity.
+
+The general shape is worth keeping: **prefer clamping a derived, view-dependent quantity at draw time
+over truncating the underlying fact at build time.** The model should not lose information the view
+merely cannot show today — the view's constraints change (a wider pane, a relative base, a different
+column layout) and a truncated model cannot recover what it threw away. Same discipline as storing
+the bars as duration *fractions* and resolving cells at draw time, which this crate already had.
+
+Verified against `gen-demo-db --deep-hops 8` (38 spans, depth 17) in a pty: at the top of the pane
+true depth now renders where it used to flatten at level 5; scrolled to the bottom, where a shallow
+sibling pulls the base to zero and the visible rows span more than five levels, the floor engages and
+every row still keeps its ten name cells. 119 unit tests in `imbh-tui`; the cap's test became
+`depth_is_stored_uncapped_and_floored_only_at_draw_time`, which asserts the model keeps every level
+and that no rendered row can lose its name.
