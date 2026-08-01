@@ -13,8 +13,6 @@ release aborts if it is missing or duplicated.
 
 ## [Unreleased]
 
-## [0.3.0] - 2026-08-01
-
 ### Added
 
 - **MCP over stdio, from the `imbh-tui` binary.** `imbh-tui --mcp-stdio <db-dir>` serves the same
@@ -306,7 +304,6 @@ release aborts if it is missing or duplicated.
   All 12 crates published to crates.io (`imbh-test-support` is dev-only and stays unpublished).
 
 <!-- next-url -->
-[0.3.0]: https://github.com/moriyoshi/imbh/releases/tag/v0.3.0
 [0.2.0]: https://github.com/moriyoshi/imbh/releases/tag/v0.2.0
 [0.1.1]: https://github.com/moriyoshi/imbh/releases/tag/v0.1.1
 [0.1.0]: https://github.com/moriyoshi/imbh/releases/tag/v0.1.0

@@ -411,7 +411,7 @@ checksum = "3a8241f3ebb85c056b509d4327ad0358fbbba6ffb340bf388f26350aeda225b1"
 
 [[package]]
 name = "bench"
-version = "0.3.0"
+version = "0.2.0"
 dependencies = [
  "imbh",
  "opentelemetry-proto",
@@ -1489,7 +1489,7 @@ checksum = "9e5e8f6c15a24b9a3ee5efec809ccd006d3b30e8b3bb63c39af737c7f87daa1d"
 
 [[package]]
 name = "embed-in-app"
-version = "0.3.0"
+version = "0.2.0"
 dependencies = [
  "imbh",
  "opentelemetry-proto",
@@ -1701,7 +1701,7 @@ dependencies = [
 
 [[package]]
 name = "gen-demo-db"
-version = "0.3.0"
+version = "0.2.0"
 dependencies = [
  "imbh",
  "opentelemetry-proto",
@@ -2075,7 +2075,7 @@ dependencies = [
 
 [[package]]
 name = "imbh"
-version = "0.3.0"
+version = "0.2.0"
 dependencies = [
  "arrow",
  "datafusion",
@@ -2099,7 +2099,7 @@ dependencies = [
 
 [[package]]
 name = "imbh-core"
-version = "0.3.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -2108,7 +2108,7 @@ dependencies = [
 
 [[package]]
 name = "imbh-index"
-version = "0.3.0"
+version = "0.2.0"
 dependencies = [
  "imbh-core",
  "tantivy",
@@ -2118,7 +2118,7 @@ dependencies = [
 
 [[package]]
 name = "imbh-lgtm"
-version = "0.3.0"
+version = "0.2.0"
 dependencies = [
  "imbh",
  "imbh-core",
@@ -2130,7 +2130,7 @@ dependencies = [
 
 [[package]]
 name = "imbh-mcp"
-version = "0.3.0"
+version = "0.2.0"
 dependencies = [
  "base64",
  "imbh",
@@ -2142,7 +2142,7 @@ dependencies = [
 
 [[package]]
 name = "imbh-otel-exporter"
-version = "0.3.0"
+version = "0.2.0"
 dependencies = [
  "imbh",
  "imbh-test-support",
@@ -2156,7 +2156,7 @@ dependencies = [
 
 [[package]]
 name = "imbh-otlp"
-version = "0.3.0"
+version = "0.2.0"
 dependencies = [
  "imbh-core",
  "opentelemetry-proto",
@@ -2166,7 +2166,7 @@ dependencies = [
 
 [[package]]
 name = "imbh-proto"
-version = "0.3.0"
+version = "0.2.0"
 dependencies = [
  "prost",
  "prost-build",
@@ -2175,7 +2175,7 @@ dependencies = [
 
 [[package]]
 name = "imbh-query"
-version = "0.3.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "datafusion",
@@ -2189,7 +2189,7 @@ dependencies = [
 
 [[package]]
 name = "imbh-server"
-version = "0.3.0"
+version = "0.2.0"
 dependencies = [
  "axum",
  "flate2",
@@ -2213,7 +2213,7 @@ dependencies = [
 
 [[package]]
 name = "imbh-storage"
-version = "0.3.0"
+version = "0.2.0"
 dependencies = [
  "arrow",
  "fs4",
@@ -2227,7 +2227,7 @@ dependencies = [
 
 [[package]]
 name = "imbh-test-support"
-version = "0.3.0"
+version = "0.2.0"
 dependencies = [
  "imbh",
  "opentelemetry-proto",
@@ -2238,7 +2238,7 @@ dependencies = [
 
 [[package]]
 name = "imbh-tracing"
-version = "0.3.0"
+version = "0.2.0"
 dependencies = [
  "imbh",
  "opentelemetry-proto",
@@ -2250,7 +2250,7 @@ dependencies = [
 
 [[package]]
 name = "imbh-tui"
-version = "0.3.0"
+version = "0.2.0"
 dependencies = [
  "crossterm",
  "imbh",
@@ -3360,7 +3360,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "replay-otlp-file"
-version = "0.3.0"
+version = "0.2.0"
 dependencies = [
  "imbh",
  "imbh-core",
@@ -3372,7 +3372,7 @@ dependencies = [
 
 [[package]]
 name = "rss-probe"
-version = "0.3.0"
+version = "0.2.0"
 dependencies = [
  "imbh",
  "opentelemetry-proto",
