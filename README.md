@@ -240,9 +240,10 @@ floating `X.Y`, and `latest`. Build it yourself for the host architecture with
 
 ## Reference server (`imbhd`)
 
-`imbhd` is an example wiring of the library API over a minimal `std::net` HTTP stack (zero heavy
-deps), not a mandatory component. To just *run* it, take a [prebuilt binary or the container
-image](#install-the-binaries); to hack on it, build from source:
+`imbhd` is an example wiring of the library API over axum/hyper, not a mandatory component — and
+because it sits *downstream* of the library (`imbh ← imbh-server`), nothing it links counts against
+the footprint budget, which is measured on the `imbh` facade's own graph. To just *run* it, take a
+[prebuilt binary or the container image](#install-the-binaries); to hack on it, build from source:
 
 ```
 cargo run -p imbh-server            # imbhd [DB_DIR] [ADDR]

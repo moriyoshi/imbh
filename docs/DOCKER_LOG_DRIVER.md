@@ -159,9 +159,11 @@ docker plugin set imbh/log-driver:latest IMBH_FLUSH=interval=10s,buffer=32MiB,id
 ```
 
 `IMBH_HEADER_TIMEOUT` (default `10s`) and `IMBH_BODY_TIMEOUT` (default `30s`) bound how long one client
-of the plugin's *HTTP* listener can hold a thread — the head in total, a body read or response write per
-read. The plugin's own Unix socket uses those defaults and is not tunable: its peer is the local
-`dockerd`, which is prompt or gone.
+of the plugin's *HTTP* listener can hold a connection without making progress — the head in total, a
+body read per read — and `IMBH_MAX_BODY` (default `64MiB`) bounds how large a request may be. The
+plugin's own Unix socket applies the same defaults and is not tunable: its peer is the local
+`dockerd`, which is prompt or gone. A `docker logs -f` whose client stops reading is abandoned after
+30s of backpressure rather than held open indefinitely.
 
 Disabling the plugin sends it `SIGTERM`, which it treats as a **graceful stop**: it stops accepting,
 stops reading container FIFOs, ingests the lines it has already read, seals the buffer, and exits 0.
@@ -187,10 +189,9 @@ traces, and metrics all land under one `service`, joinable in a single SQL query
 of running the driver rather than shipping logs somewhere separate.
 
 The plugin build carries both OTLP transports, so the SDK default (gRPC on 4317) works as-is; for
-OTLP/HTTP set `OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf`. One caveat either way: `imbhd` does not
-decompress request bodies. SDKs send uncompressed by default, but the **OpenTelemetry Collector's
-OTLP exporters default to `compression: gzip`** -- if you front the plugin with a collector, set
-`compression: none` explicitly or every export fails.
+OTLP/HTTP set `OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf`. `Content-Encoding: gzip` on the HTTP
+endpoint is handled, so a collector fronting the plugin with the **OTLP exporter's default
+`compression: gzip`** works without being reconfigured.
 
 ### Opening no network port at all
 

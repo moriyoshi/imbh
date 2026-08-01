@@ -1309,3 +1309,219 @@ bounded" as "shutdown is always prompt".
   test against absent signal handling. Two assertions written the other way (`count(*)` compared with
   `num_rows()`, vacuously 1) proved nothing until rewritten. The habit that caught both: state what
   wrong implementation the assertion is supposed to reject, before writing it.
+
+## `imbh-server`: hand-rolled HTTP/1.1 → axum/hyper (2026-08-01)
+
+Replaced the reference server's `std::net`, thread-per-connection HTTP/1.1 server with axum over
+hyper. The prompt was a design question ("does migrating to axum make sense?"), and the first answer
+was *no* — on a footprint argument that turned out to be measuring the wrong thing.
+
+- **The footprint objection was mis-scoped, and that was the whole argument.** `imbh-server` linking
+  axum was assumed to spend the §11 crate budget. It does not: `scripts/footprint-gate.sh:25` counts
+  `cargo tree -p imbh` — the *facade* — and the dependency direction is `imbh ← imbh-server`. The
+  gated number is 275 before and after. Measured cost is ~17 crates in `imbh-server`'s own graph
+  (287 → 304 by name) and ~1.4 MiB of `imbhd` binary (31.2 → 32.6 MiB, against a 42 MB target). The
+  general lesson: before pricing a dependency against a budget, check which graph the gate actually
+  walks. "It is in the workspace" is not "it is in the budget".
+- **tonic 0.14 routes through axum**, so `--features grpc` was *already* pulling axum/hyper/tower/h2.
+  After the migration `grpc`'s marginal cost is tonic + h2 (6 crates over default) and the
+  full-feature graph is unchanged at 310. A feature that used to justify itself as "off by default so
+  the subtree stays out" was, on inspection, the reason the subtree was reachable at all.
+- **The real cost was the runtime model, not the dependencies.** `Db`'s futures do blocking
+  parquet/tantivy I/O *inside themselves* — `grep -rn 'spawn_blocking\|block_in_place'` over
+  `imbh`/`imbh-storage`/`imbh-query` returns nothing — which the old design made safe by giving each
+  connection its own current-thread runtime on its own thread. On a shared multi-threaded runtime that
+  same await parks a worker and starves every other connection. Hence `offload`: `block_in_place` +
+  `Handle::block_on`, with a plain `.await` fallback when `Handle::runtime_flavor()` is not
+  `MultiThread` (`block_in_place` panics on a current-thread runtime, which is what `#[tokio::test]`
+  builds and what the existing socket-free `route()` tests run on). Keeping the fallback is what let
+  every one of those tests stay unchanged.
+- **hyper reports the header deadline but does not answer it.** `header_read_timeout` yields
+  `Kind::HeaderTimeout`, and `proto/h1/role.rs::on_error` maps parse errors to a status but returns
+  `None` for that one — so hyper closes silently where the old server sent `408 Request Timeout`, and
+  a passing test asserted the 408. Preserved it by `try_clone`ing the accepted socket before handing
+  it to hyper and writing the 408 on the duplicate when the connection ends in `e.is_timeout()` with
+  no request head ever parsed. The dup shares `O_NONBLOCK` with hyper's fd (file *description* flags),
+  so the spare has to become a second `tokio::net::TcpStream` rather than a blocking std one.
+- **Four defects fell out of the transport, not out of care.** Chunked bodies read as empty and
+  answered `200 {"accepted":0}` (the old parser keyed entirely off `Content-Length`); `vec![0u8;
+  content_length]` allocated from an attacker-controlled header before reading a byte; no gzip, which
+  the OTel Collector's `otlphttp` exporter sends *by default*; every response carried
+  `Connection: close`. Each is now a test in `tests/protocol_e2e.rs`. Worth noting how they hid: the
+  chunked one returned a **success** status, so nothing short of asserting on `accepted` could catch
+  it, and the gzip one was documented as a known limitation with a workaround (`compression: none`)
+  rather than tracked as a bug.
+- **gzip cost zero crates.** `flate2` was already in the default graph via parquet — but pinned to the
+  `zlib-rs` backend (`parquet/flate2-zlib-rs`), so declaring it with flate2's *default* features would
+  have pulled miniz_oxide as a genuinely new crate. When adding a dependency that is already present,
+  match its feature selection, not just its name.
+- **What did not move.** The Docker plugin endpoint keeps the crate's own HTTP/1.1 parser: it is a
+  different protocol (`docker.logdriver/1.0`) on a Unix socket with a streaming `ReadLogs` endpoint
+  that writes its own frames. `Armed`/`read_request`/`write_response` are now `#[cfg(all(feature =
+  "docker", unix))]`, so the default build carries none of it. Porting it is its own change with its
+  own risk — recorded in TODO.md rather than bundled in.
+
+## 2026-08-01 — axum migration, part 2: what self-review caught that the tests could not
+
+Completes the entry above (the design findings and the four transport defects are there; this is the
+work summary, the problems found *after* it was passing, and the verification record).
+
+**Shipped.** `crates/imbh-server/src/lib.rs` rewritten around `axum::Router` + `hyper::server::conn::
+http1` (the accept loop, `handle`/`read_body`, `offload`, `Limits`); `shutdown.rs` lost
+`wake_tcp_listener` and gated `InFlight`/`Busy` to `docker`; `main.rs` threads a `Limits` and prints
+it; new `tests/protocol_e2e.rs` (7 tests) plus two `route()` unit tests for the 404→405 change.
+Additive public API: `app`, `Limits`, `serve_with_limits_until`, `offload`, `max_body`,
+`max_connections`, `DEFAULT_MAX_BODY`, `DEFAULT_MAX_CONNECTIONS`. Docs corrected in six places
+(below). `Cargo.lock` grew **9 lines** — the axum/hyper/tower entries were already there for `grpc`.
+
+- **`axum::serve` has no hook for the hyper builder, and that decided the shape of the code.**
+  `serve/mod.rs:391` constructs `Builder::new(TokioExecutor::new())` internally with no config
+  parameter, so `header_read_timeout` — the thing `IMBH_HEADER_TIMEOUT` maps onto — is unreachable
+  through it. Preserving a documented, tested knob therefore meant a manual accept loop over
+  `hyper::server::conn::http1::Builder` with `hyper_util`'s `GracefulShutdown` for the drain, rather
+  than the three-line `axum::serve(listener, app).with_graceful_shutdown(..)` idiom. Anyone reading
+  this loop and wondering why it is not the idiom: that is why. Note `header_read_timeout` is also a
+  no-op unless `builder.timer(TokioTimer::new())` is set — it fails silently, not loudly.
+- **The 408-preserving trick paid for itself in a resource nothing was measuring.** Writing the
+  header-timeout 408 needs a second descriptor on the socket (hyper consumes the first and answers
+  nothing), and the first cut took that dup for *every* accepted connection. With the cap at 1024 that
+  is 2048 descriptors against a typical 1024 soft `RLIMIT_NOFILE` — the connection cap would have been
+  a cap on half as many descriptors as it advertised, and `EMFILE` would have arrived long before the
+  limit it was there to enforce. No test would have caught it: none opens hundreds of sockets, and the
+  6 timeout tests plus 7 protocol tests all passed. Fixed by taking the dup only when a header
+  deadline is configured and releasing it the instant a request head arrives (the service already sets
+  `served` for the 408 guard, so the drop point was free), and lowering the default cap to 512 to
+  leave headroom for parquet and tantivy descriptors. **The general shape is worth remembering: a
+  safety feature that bounds one resource can quietly spend a different one, and the tests written for
+  the first resource will stay green.** Budget the fix in the same units as the thing it protects.
+- **`let`-chains extend temporaries across the whole `if` body, which turns a `std::sync` guard into a
+  `Send` error naming the wrong line.** `if let Err(e) = conn.await && ... && let Some(x) =
+  m.lock().unwrap().take() { ... x.write_all(..).await }` keeps the `MutexGuard` alive to the end of
+  the block, so the guard straddles the inner `.await` and the compiler reports *"future cannot be
+  sent between threads safely"* pointing at the enclosing `tokio::spawn`, not at the lock. The fix is
+  a plain `let` statement for the `take()` before the `if`. Cheap once recognised; the diagnostic does
+  not point at the cause.
+- **One behaviour genuinely regressed, and it is not visible in any test.** `IMBH_BODY_TIMEOUT` used
+  to bound the *response write* too (`set_write_timeout` on the socket); hyper exposes no write
+  deadline, so a client that stops reading its response now holds a connection until it goes away —
+  bounded by `IMBH_MAX_CONNECTIONS`, i.e. by count rather than by time. Recorded in TODO.md rather
+  than papered over. Worth stating plainly because the migration is otherwise a strict improvement,
+  and "strictly better" is exactly the claim under which a small regression rides along unmentioned.
+- **A transport change falsifies prose in places grep-for-the-feature will not find.** Six documents
+  carried claims that went false: `ARCHITECTURE.md` §10.16 (three paragraphs, including a whole
+  passage on the `Armed` reader that no longer exists), `crates/imbh-server/README.md`,
+  `LTM/reference-server-exporter-and-ops.md` (which stated "**No axum/hyper/tower**" as a design
+  axiom), `docs/DOCKER_LOG_DRIVER.md` (told operators to set `compression: none`, now wrong *and*
+  wrong in the unhelpful direction), `CHANGELOG.md`'s own unreleased entry, and the crate
+  description in `Cargo.toml`. What found them was grepping for the *claims* — `thread-per-connection`,
+  `std::net`, `hand-rolled`, `no axum` — not for the subsystem. A feature-shaped grep misses every
+  sentence that describes the old design without naming it.
+- **Verification.** `fmt`/`build`/`clippy -D warnings`/`test` clean on the workspace and on
+  `--features docker,grpc,tracing`; **408 tests** pass, including all six pre-existing `timeouts_e2e`
+  tests unchanged. Footprint gate OK: facade **275 crates** (unchanged, at target), `imbhd` **32.6
+  MiB** (was 31.2, budget 42 MB), search-off lever still 71 crates. Binary smoke-tested end to end —
+  banner, keep-alive, `405` on a known path with the wrong method, `404` unknown, `413` on a forged
+  `Content-Length: 10GiB`, SQL round-trip, and `SIGTERM` → sealed buffer, exit 0. One gate run
+  reported `datafusion: NO` under concurrent cargo processes and was a flake (`cargo tree` output
+  raced; the script swallows its stderr with `2>/dev/null`) — re-running shows both engines present.
+
+## 2026-08-01 — the Docker plugin socket onto axum too, and how to migrate a blocking generator
+
+The TCP listener moved to axum/hyper earlier today; this finishes the job by moving the Docker
+logging-driver plugin's Unix socket onto the same stack. Both listeners now share one `handle`, so
+body limits, phase deadlines, and `Content-Encoding` decoding are identical on both, and the crate's
+hand-rolled HTTP/1.1 parser (`Armed`/`ReadDeadline`/`read_request`/`write_response`, ~6.6 KB of
+source) is **deleted** rather than merely `#[cfg]`-gated. `shutdown.rs` lost `InFlight`/`Busy` too —
+hyper's `GracefulShutdown` is the drain for both now.
+
+- **A blocking generator does not have to become a `Stream` to be served by one.** `ReadLogs` is the
+  hard part of this endpoint: `readlogs::stream` is synchronous, generic over `io::Write`, does its
+  own paging and follow-mode polling, and under `Follow` runs until the container stops. Rewriting it
+  as a `Stream` would have put the paging state machine, the follow watermark, and the idle-exit rule
+  all at risk for no behavioural gain. Instead it runs **unchanged** on a `spawn_blocking` task whose
+  sink is a bounded `mpsc` channel, with a hand-written `http_body::Body` draining that channel as the
+  response. The generator kept every line; only the sink changed. Worth reaching for whenever the
+  blocking code is the part that encodes hard-won behaviour.
+- **The channel is also the backpressure and disconnect signal, which is what made it safe.** Sending
+  is `try_send` in a loop against a 30s stall deadline, so a `docker logs -f` client that stops
+  reading surfaces to the generator as `ErrorKind::TimedOut` and one that hangs up as
+  `ErrorKind::BrokenPipe` — both already handled, because the generator was written against a socket
+  that could do exactly that. This is the same write-deadline property the socket used to provide via
+  `set_write_timeout`, recovered rather than lost: notable because the buffered HTTP responses *did*
+  lose it (still in TODO.md). A channel sink can see backpressure; a buffered response cannot.
+- **`spawn_blocking` threads may create and drive a runtime.** `readlogs::stream` builds its own
+  current-thread runtime and `block_on`s the typed query API. Whether that survives inside
+  `spawn_blocking` decided the whole design, so it was measured rather than assumed (a 20-line probe):
+  both an owned current-thread runtime **and** the outer `Handle::block_on` work there — tokio marks
+  those threads as a blocking region, so the "cannot start a runtime from within a runtime" panic does
+  not apply. Zero changes to `readlogs.rs` followed from that one check.
+- **The wire format changed, and the test client was the only thing that cared.** `ReadLogs` bodies
+  are now `Transfer-Encoding: chunked` — hyper frames a body of unknowable length properly, where the
+  old server wrote frames raw and closed the socket. Three tests failed with *"log entry frame of
+  858918154 bytes exceeds the limit"*: the chunk-size hex line being read as a frame length. The right
+  fix was to teach the test to un-chunk, not to fight hyper, because the real client is Docker's Go
+  `net/http`, which un-chunks transparently — the hand-rolled test client had been the only consumer
+  of a non-standard framing. **Check who the real client is before treating a wire change as a
+  regression.**
+- **A 15× test speedup fell out, and it was a latent smell.** `docker_plugin_e2e` went from 30.06s to
+  1.72s. The plugin now keeps connections alive, so the test client's `read_to_end` was waiting out
+  the 10s header deadline for the *next* request before seeing EOF. Adding `Connection: close` to the
+  test client fixed it. The old server closed every connection, so that read-to-EOF idiom had always
+  worked by accident; keep-alive turned an implicit assumption into 28 seconds of sleeping. A suite
+  that got dramatically slower or faster after a transport change is reporting something real.
+- **Wind-down order differs between the two listeners, and it is not arbitrary.** The plugin calls
+  `plugin.shutdown()` — stopping FIFO readers and draining the ingest queue — *before* the connection
+  drain, because clearing the stream registry is also what ends the `docker logs -f` responses still
+  open (follow mode exits once its container has no live stream). Draining first would wait out the
+  full `IMBH_SHUTDOWN_TIMEOUT` on connections that only stop because of that call.
+- **Footprint unchanged, again.** `docker` still adds **zero** crates (304 with and without it), the
+  facade stays at 275, `imbhd` at 32.6 MiB. `http-body` became a direct dependency for the hand-written
+  `Body` impl and was already in the graph via hyper.
+- **Verification.** `fmt`/`build`/`clippy -D warnings` clean on the workspace and on
+  `--features docker,grpc,tracing`; 408 workspace tests plus all 7 plugin e2e tests pass. Smoke-tested
+  against the real binary over a Unix socket: `Plugin.Activate` and `Capabilities` answer in
+  `application/vnd.docker.plugins.v1.1+json`, two calls share one connection, an unknown endpoint is
+  404, `ReadLogs` returns `content-type: application/x-json-stream` with `transfer-encoding: chunked`,
+  and `SIGTERM` seals the buffer, unlinks the socket, and exits 0.
+
+## 2026-08-01 — Session summary: the axum arc, and a doc sweep that had to be run twice
+
+Closes the three entries above (TCP migration, its self-review, the Docker plugin). Recorded here is
+what happened *after* the plugin entry, plus the arc's final state.
+
+- **A hand-listed doc sweep missed a file, and only a second sweep caught it.** The TCP migration's
+  entry claims the doc sweep worked by grepping for the *claims* rather than the feature — true, but
+  the grep ran over a **hand-written list of paths**, and the repository's root `README.md` was not on
+  it. So `README.md` went on describing `imbhd` as "a minimal `std::net` HTTP stack (zero heavy deps)"
+  through an entire migration and its verification, and survived a sweep whose whole purpose was to
+  catch exactly that. It was found only because the same grep was re-run with a wider file list after
+  the plugin change. Two lessons, and the second is the real one: sweep by **repository**, not by a
+  remembered list of the files you touched — the stale claims are precisely in the files you did *not*
+  touch. And a "documentation updated" claim is worth as much as the file list behind it, which is why
+  the sweep is now a grep over the tree rather than an act of memory. (Also caught: a comment in
+  `readlogs.rs` still calling the plugin "a blocking thread-per-connection design".)
+- **The `datafusion: NO` gate flake reproduced**, confirming the earlier diagnosis rather than leaving
+  it as a one-off guess: `scripts/footprint-gate.sh:52` swallows `cargo tree`'s stderr with
+  `2>/dev/null`, so under concurrent cargo processes a failed/partial tree reads as "the engine is
+  absent" and the gate still prints OK. Worth fixing when the gate is next touched — a check that
+  reports a missing engine dependency should fail, not decorate.
+
+**Final state of the arc.** Both listeners on axum/hyper; the hand-rolled HTTP/1.1 parser and
+`shutdown.rs`'s `InFlight`/`Busy` deleted outright. Four transport defects fixed (chunked read as
+empty, unbounded `Content-Length` allocation, no gzip, no keep-alive) plus two the migration itself
+introduced and self-review caught (doubled descriptors per connection, a `MutexGuard` across an
+await). New: `tests/protocol_e2e.rs` (7 tests). Public API additive only — `app`, `Limits`,
+`serve_with_limits_until`, `offload`, `max_body`/`max_connections` and their defaults; `serve`,
+`serve_until`, `serve_with_until`, `route`, `IoTimeouts`, and `Shutdown` unchanged. Client-visible
+changes, all in CHANGELOG: keep-alive, `405` for a known path with the wrong method, and
+`Transfer-Encoding: chunked` on `LogDriver.ReadLogs`.
+
+Verified: `fmt`/`build`/`clippy -D warnings` clean on the workspace and on
+`--features docker,grpc,tracing`; **408** workspace tests and **77** with all features; footprint gate
+OK with the facade unchanged at **275 crates** and `imbhd` at **32.6 MiB** (from 31.2, budget 42 MB);
+`docker` still adds **zero** crates. Both sockets smoke-tested against the real binary. Nothing is
+committed — 17 modified files plus the new test.
+
+Still open from this arc (TODO.md): no write-side deadline on *buffered* responses — the streaming
+`ReadLogs` case is covered by its channel sink, which can see backpressure where a buffered response
+cannot.

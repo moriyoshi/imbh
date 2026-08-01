@@ -9,6 +9,15 @@ git history); this file tracks only what is still open.
 
 ## Open Items
 
+- [ ] **No write-side deadline on buffered HTTP responses.** `IMBH_BODY_TIMEOUT` used to bound the
+      response write as well as body reads, via `set_write_timeout` on the socket; hyper exposes no
+      equivalent, so a client that stops reading a *buffered* response holds a connection until it goes
+      away. Bounded in practice by `IMBH_MAX_CONNECTIONS` (default `512`) rather than by time. The
+      streaming case is already covered — the Docker plugin's `ReadLogs` abandons a stalled client
+      after `STREAM_STALL` (30s), because its channel sink can see the backpressure. If the buffered
+      case matters, the fix is a `tower` timeout layer around the response future or a connection-level
+      deadline. — *source: JOURNAL (axum migration, 2026-08-01)*
+
 - [ ] **Optional upstream differential runner.** Automate the versioned in-process fixture corpus
       against pinned Prometheus/Loki/Tempo daemons behind an opt-in test or script. Default
       workspace tests must remain daemon-free and offline. Deferred by explicit user request. —

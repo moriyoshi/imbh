@@ -13,21 +13,75 @@ release aborts if it is missing or duplicated.
 
 ## [Unreleased]
 
+### Changed
+
+- **`imbh-server` now serves HTTP on axum/hyper** instead of its own `std::net`, thread-per-connection
+  server. This covers **both** listeners — the TCP server and the Docker logging-driver plugin's Unix
+  socket — which share one request path, so body limits, phase deadlines, and `Content-Encoding`
+  decoding are identical on both. The crate's hand-rolled HTTP/1.1 parser is gone.
+
+  `imbh-server` is optional and sits *downstream* of the library, so the footprint budget is
+  untouched: it is measured on `cargo tree -p imbh`, which stays at **275 crates**. The cost is ~17
+  crates in `imbh-server`'s own graph and ~1.4 MiB of `imbhd` binary (31.2 → 32.6 MiB, budget 42 MB).
+  `--features grpc` got *cheaper* — tonic 0.14 routes through axum, so hyper/tower/axum used to arrive
+  with it; the full-feature graph is unchanged at 310 crates.
+
+  Behaviour that changed, all of it visible to clients:
+
+  - **Keep-alive.** Responses no longer carry `Connection: close`, so an exporter pushing a batch a
+    second stops paying a TCP handshake per batch.
+  - **A known path with the wrong method is `405`,** not `404`. Unknown paths are still `404`.
+  - A header-phase timeout is still answered `408 Request Timeout`; hyper reports that deadline without
+    answering it, so the accept loop writes the 408 itself.
+  - **`LogDriver.ReadLogs` responses are now `Transfer-Encoding: chunked`** (`docker` feature). The
+    plugin used to write frames raw and close the socket. Docker reads this body through Go's
+    `net/http`, which un-chunks transparently, so `docker logs` and `docker logs -f` are unaffected; a
+    hand-written client that read the old raw stream needs to decode chunked framing. A `docker logs -f`
+    whose client stops reading is now abandoned after a bounded stall instead of held open.
+  - `IMBH_MAX_CONNECTIONS` defaults to `512`, under the usual 1024 soft `RLIMIT_NOFILE`, so parquet
+    and tantivy keep their share of descriptors.
+
+  New public API, additive: `app(db) -> axum::Router` (mount imbh's endpoints in an existing axum
+  application), `Limits`, `serve_with_limits_until`, `offload`, `max_body` / `max_connections`, and
+  `DEFAULT_MAX_BODY` / `DEFAULT_MAX_CONNECTIONS`. `serve`, `serve_until`, `serve_with_until`, `route`,
+  `IoTimeouts`, and the `Shutdown` token keep their signatures.
+
+### Fixed
+
+- **A chunked request body was silently read as empty (`imbh-server`).** The old parser keyed entirely
+  off `Content-Length`, so a `Transfer-Encoding: chunked` upload — what Go's `http.Client` sends
+  whenever the body is not a sized reader — was read as zero bytes and answered
+  `200 {"accepted":0}`: a success status for dropped telemetry. hyper undoes the framing, so the body
+  now arrives intact.
+- **An unbounded allocation from a forged `Content-Length` (`imbh-server`).** The old parser did
+  `vec![0u8; content_length]` straight from the header, before reading a byte, so
+  `Content-Length: 10737418240` with no body behind it was a 10 GiB allocation. Bodies are now capped by
+  `IMBH_MAX_BODY` (new; default `64MiB`) and an oversized declared length is refused with
+  `413 Payload Too Large` without reading the body.
+- **Connections were unbounded (`imbh-server`).** The accept loop spawned an OS thread per connection
+  with no cap, on both the TCP listener and the plugin socket. Connections are tasks now, bounded by
+  `IMBH_MAX_CONNECTIONS` (new; default `512`).
+
 ### Added
 
-- **Per-connection deadlines for `imbhd` (`imbh-server`).** The server is thread-per-connection and its
-  parser blocked with no deadline, so a client that connected and said nothing held a thread (and a `Db`
-  handle) indefinitely. Two phase deadlines now bound it, with deliberately different rules:
-  `IMBH_HEADER_TIMEOUT` (new; default `10s`) caps the request line + headers **in total**, and
-  `IMBH_BODY_TIMEOUT` (new; default `30s`) is a **per-read** allowance for the body plus the write
-  allowance for the response. So a large OTLP body over a slow link still succeeds — the rule is "do not
-  stall", not "do not take a while" — while an idle, trickling, or stalled client is answered
-  `408 Request Timeout` and disconnected, having ingested nothing. `0` disables either phase.
+- **gzip request bodies (`imbh-server`).** `Content-Encoding: gzip` is accepted on every route. The
+  OpenTelemetry Collector's `otlphttp` exporter sets `compression: gzip` by default, so a stock
+  collector pointed at `imbhd` used to fail every export and had to be reconfigured with
+  `compression: none`. The cap in `IMBH_MAX_BODY` is applied to the *inflated* size, so a compression
+  bomb is refused on what it expands to rather than on its size on the wire. No new crate: `flate2` was
+  already in the graph via parquet.
+- **Per-connection deadlines for `imbhd` (`imbh-server`).** A client that connected and said nothing
+  held a connection (and a `Db` handle) indefinitely. Two phase deadlines now bound it, with
+  deliberately different rules: `IMBH_HEADER_TIMEOUT` (new; default `10s`) caps the request line +
+  headers **in total**, and `IMBH_BODY_TIMEOUT` (new; default `30s`) is a **per-read** allowance for the
+  body. So a large OTLP body over a slow link still succeeds — the rule is "do not stall", not "do not
+  take a while" — while an idle, trickling, or stalled client is answered `408 Request Timeout` and
+  disconnected, having ingested nothing. `0` disables either phase.
 
   New public API, additive: `IoTimeouts` (with `DISABLED`), `io_timeouts`, `DEFAULT_HEADER_TIMEOUT` /
   `DEFAULT_BODY_TIMEOUT`, and `serve_with_until` (`serve` / `serve_until` use `IoTimeouts::default()`).
   The Docker plugin endpoint applies the defaults to its own socket, which also means a `docker logs -f`
-  client that vanishes without closing no longer holds its thread and stream open.
+  client that vanishes without closing no longer holds its stream open.
 
 - **Signal handling and graceful shutdown for `imbhd` (`imbh-server`).** `SIGINT`/`SIGTERM` (Ctrl-C,
   `docker stop`, systemd, `kill`) now wind the process down instead of killing it: every listener stops
@@ -45,12 +99,12 @@ release aborts if it is missing or duplicated.
   "serve until the process exits" contract, so a host that drives its own lifecycle can adopt the token
   at its own pace.
 
-  Notes on the implementation: `accept` is **woken** (one throwaway connection to the listener's own
-  address) rather than polled, because each response carries `Connection: close` — a poll tick would
-  land on every request's latency. The signal handler does only async-signal-safe work (an atomic store
-  plus one byte down a self-pipe); a watcher thread does the rest. Signal handling is Unix-only and
-  adds **no crate** to the footprint graph: `libc` (std cannot catch `SIGTERM`) is already there via
-  DataFusion, so the gate stays at 275 crates.
+  Notes on the implementation: `accept` is **woken**, not polled — each listener registers a waker on
+  the token and turns it into a `oneshot` its accept loop selects on, so an idle server costs nothing
+  and shutdown is observed immediately. The signal handler does only async-signal-safe work (an atomic
+  store plus one byte down a self-pipe); a watcher thread does the rest. Signal handling is Unix-only
+  and adds **no crate** to the footprint graph: `libc` (std cannot catch `SIGTERM`) is already there
+  via DataFusion, so the gate stays at 275 crates.
 
 ## [0.2.0] - 2026-07-30
 

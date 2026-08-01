@@ -363,6 +363,8 @@ dependencies = [
  "http",
  "http-body",
  "http-body-util",
+ "hyper",
+ "hyper-util",
  "itoa",
  "matchit",
  "memchr",
@@ -371,6 +373,7 @@ dependencies = [
  "pin-project-lite",
  "serde_core",
  "sync_wrapper",
+ "tokio",
  "tower",
  "tower-layer",
  "tower-service",
@@ -2176,6 +2179,12 @@ dependencies = [
 name = "imbh-server"
 version = "0.2.0"
 dependencies = [
+ "axum",
+ "flate2",
+ "http-body",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "imbh",
  "imbh-test-support",
  "libc",
@@ -2184,6 +2193,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tonic",
+ "tower",
  "tracing",
 ]
 

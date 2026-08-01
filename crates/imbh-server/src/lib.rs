@@ -1,11 +1,27 @@
 //! imbhd — the reference HTTP server (ARCHITECTURE.md §10.16).
 //!
-//! A deliberately tiny HTTP/1.1 server over `std::net` (thread-per-connection), showing one way a
-//! host can expose the imbh library over HTTP. It is **reference wiring, not the product** (§10.1):
-//! no axum/hyper, so it adds no heavy dependencies and keeps the footprint story intact.
+//! An HTTP/1.1 server on **axum over hyper**, showing one way a host can expose the imbh library over
+//! HTTP. It is **reference wiring, not the product** (§10.1) — the library imposes no server
+//! framework, and this crate's choices bind nobody. Footprint-wise it is free where it counts: the
+//! crate-count gate measures `cargo tree -p imbh` (`scripts/footprint-gate.sh`) and the dependency
+//! direction is `imbh ← imbh-server`, so nothing here reaches the number the budget is written
+//! against. Under `--features grpc` the whole subtree is already present anyway, since tonic routes
+//! through axum.
+//!
+//! ## The runtime model
+//!
+//! One shared multi-threaded runtime drives the accept loop and every connection. That matters
+//! because `Db`'s futures do **blocking** parquet/tantivy I/O inside themselves — the library has no
+//! `spawn_blocking` anywhere — so awaiting one on a runtime worker would park that worker and starve
+//! every other connection, `/health` included. Every `Db` call therefore goes through [`offload`],
+//! which runs it under `tokio::task::block_in_place` so tokio replaces the worker for the duration.
+//! Request concurrency is then bounded by the blocking pool (i.e. by *work*) rather than by socket
+//! count, which is the right axis: connections are cheap now, and the old design's thread per
+//! connection was not.
 //!
 //! Routes:
-//! - `POST /v1/logs` · `/v1/traces` · `/v1/metrics` — OTLP/HTTP protobuf ingest (uncompressed).
+//! - `POST /v1/logs` · `/v1/traces` · `/v1/metrics` — OTLP/HTTP protobuf ingest, `Content-Encoding:
+//!   gzip` accepted (the OTel Collector's `otlphttp` exporter compresses by default).
 //! - `POST /api/query` — a SQL string body → JSON rows.
 //! - `GET /stats` — DB operational stats (per-table counts + buffer/WAL bytes + durable LSN) as JSON.
 //! - `POST /admin/flush` · `/admin/compact` — maintenance actions (seal the buffer; force-merge
@@ -17,10 +33,15 @@
 //! collector that never seals keeps every row in the buffer + WAL, so `/admin/flush` should be a
 //! manual override, not the only path to Parquet.
 //!
+//! Requests are bounded on three axes, all tunable and all defaulted (see [`Limits`]): the head by
+//! [`IoTimeouts::header`], each body read by [`IoTimeouts::body`], the body's size by
+//! [`Limits::max_body`], and simultaneous connections by [`Limits::max_connections`].
+//!
 //! OTLP/gRPC is available on a second port behind the optional `grpc` feature (see [`grpc`]); the
 //! default build carries no gRPC transport. A Docker logging-driver plugin endpoint is available
-//! behind the optional `docker` feature (see [`docker`]). Not handled here (follow-ups): gzip request
-//! bodies, TLS, and the OTLP partial-success response shape.
+//! behind the optional `docker` feature (see [`docker`]); it speaks a different protocol on a Unix
+//! socket but runs on this same stack, sharing [`handle`] and so the same body limits, deadlines,
+//! and decoding. Not handled here (follow-ups): TLS and the OTLP partial-success response shape.
 //!
 //! Every endpoint stops on a shared [`Shutdown`] token: `SIGINT`/`SIGTERM` stop the accept loops,
 //! in-flight requests get a bounded drain, and `imbhd` seals the buffer with `Db::close()` before it
@@ -32,25 +53,50 @@ pub mod docker;
 pub mod grpc;
 pub mod shutdown;
 
-use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::future::Future;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, PoisonError};
 use std::time::Duration;
 
-use std::sync::Arc;
+use axum::Router;
+use axum::body::{Body, Bytes};
+use axum::extract::State;
+use axum::http::{Request, StatusCode, header};
+use axum::response::IntoResponse;
+use axum::routing::{get, post};
+use http_body_util::BodyExt;
+use hyper_util::rt::{TokioIo, TokioTimer};
+use hyper_util::server::graceful::GracefulShutdown;
+use tower::ServiceExt;
 
 pub use shutdown::{DEFAULT_DRAIN_TIMEOUT, Shutdown};
-use shutdown::{InFlight, wake_tcp_listener};
 
 use imbh::arrow::array::Array;
 use imbh::arrow::record_batch::RecordBatch;
 use imbh::arrow::util::display::{ArrayFormatter, FormatOptions};
 use imbh::{Db, FlushPolicy};
 
-/// A minimal HTTP response.
+/// A minimal HTTP response — the shape every handler in this crate returns, converted into an axum
+/// response on the way out (and written directly by the Docker plugin endpoint, which does not go
+/// through hyper).
 pub struct Response {
     pub status: u16,
     pub content_type: String,
     pub body: Vec<u8>,
+}
+
+impl IntoResponse for Response {
+    fn into_response(self) -> axum::response::Response {
+        // An unmappable code would be a bug here (every construction site uses a real status), but a
+        // 500 is a better answer than a panic on a connection thread.
+        let status = StatusCode::from_u16(self.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        (
+            status,
+            [(header::CONTENT_TYPE, self.content_type)],
+            self.body,
+        )
+            .into_response()
+    }
 }
 
 impl Response {
@@ -174,21 +220,22 @@ pub const DEFAULT_HEADER_TIMEOUT: Duration = Duration::from_secs(10);
 /// never cut off for being large.
 pub const DEFAULT_BODY_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Per-connection I/O deadlines, so a client cannot park a server thread indefinitely.
+/// Per-connection I/O deadlines, so a client cannot hold a connection open without making progress.
 ///
-/// Thread-per-connection means an idle connection costs a thread, and the parser blocks in
-/// `read_line`/`read_exact` with no deadline of its own. The two phases want different rules, which is
-/// why this is two values rather than one socket timeout:
+/// The two phases want different rules, which is why this is two values rather than one socket
+/// timeout:
 ///
-/// - [`IoTimeouts::header`] bounds the request line + headers **in total**. A per-read allowance is not
-///   enough here: a client trickling one byte per allowance is never idle, yet holds a thread forever.
-/// - [`IoTimeouts::body`] is a **per-read** allowance for the body, and the write allowance for the
-///   response. A 50 MiB OTLP body over a slow link must not be punished for its size — only for
-///   stalling — and a total deadline cannot tell those apart.
+/// - [`IoTimeouts::header`] bounds the request line + headers **in total** — hyper's
+///   `header_read_timeout`. A per-read allowance is not enough here: a client trickling one byte per
+///   allowance is never idle, yet never finishes either. It is armed for every head on a connection,
+///   so it also bounds an idle keep-alive connection between requests.
+/// - [`IoTimeouts::body`] is a **per-read** allowance for the body. A 50 MiB OTLP body over a slow
+///   link must not be punished for its size — only for stalling — and a total deadline cannot tell
+///   those apart.
 ///
 /// `Duration::ZERO` in either field means *no deadline* for that phase ([`IoTimeouts::DISABLED`] is
-/// both), which is the pre-timeout behaviour and the right choice for a host fronting `imbhd` with a
-/// proxy that already sheds slow clients.
+/// both), which is the right choice for a host fronting `imbhd` with a proxy that already sheds slow
+/// clients.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IoTimeouts {
     /// Total time allowed for the request line and headers.
@@ -213,8 +260,12 @@ impl IoTimeouts {
         body: Duration::ZERO,
     };
 
-    /// The socket timeout for the body/response phase — `None` when disabled, which is also how
-    /// `set_read_timeout`/`set_write_timeout` spell "block forever".
+    /// The head deadline as hyper wants it: `None` disables `header_read_timeout` entirely.
+    fn header_deadline(self) -> Option<Duration> {
+        (!self.header.is_zero()).then_some(self.header)
+    }
+
+    /// The per-read body allowance — `None` when the phase is unbounded.
     fn socket_timeout(self) -> Option<Duration> {
         (!self.body.is_zero()).then_some(self.body)
     }
@@ -238,8 +289,75 @@ pub fn io_timeouts(header: Option<String>, body: Option<String>) -> imbh::Result
     })
 }
 
-/// Serve `db` on `addr` (e.g. `127.0.0.1:4318`) until the process exits. Thread-per-connection;
-/// each connection drives the async `Db` API on its own current-thread runtime.
+/// `imbhd`'s default cap on one request body: large enough for a fat OTLP batch, small enough that a
+/// forged `Content-Length` asks for a refusal rather than for the machine's memory.
+pub const DEFAULT_MAX_BODY: u64 = 64 * 1024 * 1024;
+
+/// `imbhd`'s default cap on simultaneous connections. Connections are cheap now (a task, not a
+/// thread), so this is a guard against file-descriptor exhaustion rather than a throughput knob —
+/// what bounds actual work is the blocking pool every `Db` call goes through (see [`offload`]).
+///
+/// Deliberately under the usual 1024 soft `RLIMIT_NOFILE`, because connections are not the only
+/// descriptors this process wants: parquet segments and tantivy's mmaps need their share too, and a
+/// connection that has not sent a request head yet is briefly holding two (see [`serve_async`]).
+pub const DEFAULT_MAX_CONNECTIONS: usize = 512;
+
+/// Resolve the request-body cap from `IMBH_MAX_BODY` (a byte size such as `64MiB`), falling back to
+/// [`DEFAULT_MAX_BODY`]. Empty means unset; `0` means no cap; a malformed value is an error.
+pub fn max_body(env: Option<String>) -> imbh::Result<u64> {
+    let value = env.unwrap_or_default();
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(DEFAULT_MAX_BODY);
+    }
+    imbh::parse_bytes(value)
+}
+
+/// Resolve the connection cap from `IMBH_MAX_CONNECTIONS`, falling back to
+/// [`DEFAULT_MAX_CONNECTIONS`]. Empty means unset; `0` means no cap; a malformed value is an error.
+pub fn max_connections(env: Option<String>) -> imbh::Result<usize> {
+    let value = env.unwrap_or_default();
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(DEFAULT_MAX_CONNECTIONS);
+    }
+    value
+        .parse()
+        .map_err(|_| imbh::Error::config_msg(format!("not a connection count: {value}")))
+}
+
+/// Everything that bounds one connection: the phase deadlines, the body cap, and how many
+/// connections may be open at once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Limits {
+    /// Per-phase I/O deadlines.
+    pub timeouts: IoTimeouts,
+    /// Largest request body accepted, in bytes, measured *after* any `Content-Encoding` is undone.
+    /// `0` means no cap.
+    pub max_body: u64,
+    /// Most connections open at once; further ones wait for a slot rather than being accepted.
+    /// `0` means no cap.
+    pub max_connections: usize,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Limits {
+            timeouts: IoTimeouts::default(),
+            max_body: DEFAULT_MAX_BODY,
+            max_connections: DEFAULT_MAX_CONNECTIONS,
+        }
+    }
+}
+
+impl Limits {
+    /// Whether `len` bytes is over the body cap (never, when the cap is off).
+    fn exceeds_body(self, len: u64) -> bool {
+        self.max_body != 0 && len > self.max_body
+    }
+}
+
+/// Serve `db` on `addr` (e.g. `127.0.0.1:4318`) until the process exits.
 ///
 /// Never returns on its own; a host that wants to stop serving wants [`serve_until`].
 pub fn serve(db: Arc<Db>, addr: &str) -> std::io::Result<()> {
@@ -249,63 +367,189 @@ pub fn serve(db: Arc<Db>, addr: &str) -> std::io::Result<()> {
 /// Serve `db` on `addr` until `shutdown` trips, then stop accepting, give the in-flight requests up
 /// to [`Shutdown::drain_timeout`] to finish, and return.
 ///
-/// Binding happens before anything else, so a bind error still surfaces to the caller. Once bound,
-/// the listener registers its own wake-up with the token ([`Shutdown::on_trigger`]): `accept` stays a
-/// *blocking* call — no poll tick added to the latency of a protocol that opens one connection per
-/// request — and the throwaway connection at trigger time is what gets the thread out of it.
+/// A request still in flight when the drain expires is abandoned, not waited for: the reply is lost
+/// but the ingest it asked for is already durable or not at all (`Db::ingest_otlp_*` decides that,
+/// not this loop), so an OTLP client's retry is the correct resolution either way.
 ///
-/// A request that is still being read when the drain expires is abandoned, not waited for: the reply
-/// is lost but the ingest it asked for is already durable or not at all (`Db::ingest_otlp_*` is what
-/// decides that, not this loop), so an OTLP client's retry is the correct resolution either way.
-///
-/// Connections get the default [`IoTimeouts`]; [`serve_with_until`] takes them as an argument.
+/// Connections get the default [`Limits`]; [`serve_with_until`] and [`serve_with_limits_until`] take
+/// them as an argument.
 pub fn serve_until(db: Arc<Db>, addr: &str, shutdown: Arc<Shutdown>) -> std::io::Result<()> {
-    serve_with_until(db, addr, IoTimeouts::default(), shutdown)
+    serve_with_limits_until(db, addr, Limits::default(), shutdown)
 }
 
-/// [`serve_until`] with the per-connection deadlines set explicitly — what `imbhd` calls, so
-/// `IMBH_HEADER_TIMEOUT` / `IMBH_BODY_TIMEOUT` reach the connections.
+/// [`serve_until`] with the per-connection deadlines set explicitly, leaving the size and count caps
+/// at their defaults.
 pub fn serve_with_until(
     db: Arc<Db>,
     addr: &str,
     timeouts: IoTimeouts,
     shutdown: Arc<Shutdown>,
 ) -> std::io::Result<()> {
-    let listener = TcpListener::bind(addr)?;
-    let local = listener.local_addr()?;
-    shutdown.on_trigger(move || wake_tcp_listener(local));
+    serve_with_limits_until(
+        db,
+        addr,
+        Limits {
+            timeouts,
+            ..Limits::default()
+        },
+        shutdown,
+    )
+}
 
-    let in_flight = Arc::new(InFlight::default());
-    while !shutdown.is_triggered() {
-        let stream = match listener.accept() {
-            Ok((stream, _peer)) => stream,
-            // Per-connection errors (`ECONNABORTED`, `EMFILE`); the listener itself is still good.
+/// [`serve_until`] with every bound set explicitly — what `imbhd` calls, so `IMBH_HEADER_TIMEOUT`,
+/// `IMBH_BODY_TIMEOUT`, `IMBH_MAX_BODY`, and `IMBH_MAX_CONNECTIONS` all reach the connections.
+///
+/// Blocking: it owns the runtime for its whole life, which is what lets `imbhd`'s `main` run each
+/// listener on a plain thread. A host that already has a runtime should mount [`app`] in its own
+/// server instead of calling this.
+pub fn serve_with_limits_until(
+    db: Arc<Db>,
+    addr: &str,
+    limits: Limits,
+    shutdown: Arc<Shutdown>,
+) -> std::io::Result<()> {
+    // Multi-threaded on purpose: `offload` needs `block_in_place`, which a current-thread runtime does
+    // not have, and one blocking `Db` call would otherwise stop the listener answering anything.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(serve_async(db, addr, limits, shutdown))
+}
+
+/// The accept loop. Binds first, so a bind failure still reaches the caller.
+async fn serve_async(
+    db: Arc<Db>,
+    addr: &str,
+    limits: Limits,
+    shutdown: Arc<Shutdown>,
+) -> std::io::Result<()> {
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let app = app(db);
+
+    // The token is a sync primitive (a condvar, tripped from the signal watcher thread), so bridge it
+    // into a future once rather than polling it. `on_trigger` runs the closure immediately if the
+    // token is already tripped, which covers binding after the signal arrived.
+    let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
+    shutdown.on_trigger(move || {
+        let _ = stop_tx.send(());
+    });
+
+    let graceful = GracefulShutdown::new();
+    let connections = Arc::new(tokio::sync::Semaphore::new(match limits.max_connections {
+        0 => tokio::sync::Semaphore::MAX_PERMITS,
+        n => n,
+    }));
+
+    let mut builder = hyper::server::conn::http1::Builder::new();
+    // `header_read_timeout` is a no-op without a timer, so this line is what makes `IoTimeouts::header`
+    // real. It is armed for every head on a connection, so it bounds idle keep-alive periods too.
+    builder.timer(TokioTimer::new());
+    builder.header_read_timeout(limits.timeouts.header_deadline());
+
+    loop {
+        // The permit is taken *before* the accept, so the cap bounds connections the kernel has handed
+        // us rather than letting them pile up inside the process.
+        let permit = tokio::select! {
+            permit = connections.clone().acquire_owned() => match permit {
+                Ok(permit) => permit,
+                // The semaphore is never closed; bail rather than spin if that ever changes.
+                Err(_) => break,
+            },
+            _ = &mut stop_rx => break,
+        };
+        let stream = tokio::select! {
+            accepted = listener.accept() => match accepted {
+                Ok((stream, _peer)) => stream,
+                // Per-connection errors (`ECONNABORTED`, `EMFILE`); the listener itself is still good.
+                Err(_) => continue,
+            },
+            _ = &mut stop_rx => break,
+        };
+
+        // A second descriptor on the same socket, held aside so a header-phase timeout can still say
+        // 408. hyper reports that deadline but answers nothing (`role::on_error` maps parse errors to a
+        // status and header timeouts to `None`), and by then it has dropped its own handle — this
+        // duplicate is what keeps the socket alive long enough to explain itself.
+        //
+        // Only worth taking while a 408 is still possible: none if the header phase is unbounded, and
+        // released the moment a request head arrives (below), so the doubled descriptor lasts only as
+        // long as a connection that has not asked for anything yet. Otherwise the connection cap would
+        // quietly be a cap on *half* as many descriptors as it says.
+        let (stream, late) = match stream.into_std() {
+            Ok(raw) => {
+                let late = limits.timeouts.header_deadline().and_then(|_| {
+                    raw.try_clone()
+                        .and_then(tokio::net::TcpStream::from_std)
+                        .ok()
+                });
+                match tokio::net::TcpStream::from_std(raw) {
+                    Ok(stream) => (stream, late),
+                    Err(_) => continue,
+                }
+            }
             Err(_) => continue,
         };
-        // Either the wake-up connection or a client that raced the shutdown. Dropping it unserved is
-        // the honest answer — the reply would arrive on a socket we are about to stop reading.
-        if shutdown.is_triggered() {
-            break;
-        }
-        let db = db.clone();
-        let busy = in_flight.enter();
-        std::thread::spawn(move || {
-            let _busy = busy;
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .build()
-                .expect("build connection runtime");
-            let _ = rt.block_on(handle_conn(db, stream, timeouts));
+        let late = Arc::new(std::sync::Mutex::new(late));
+
+        // Set once a request head has been parsed, so the 408 above is only ever sent to a client that
+        // never asked for anything — not appended after a keep-alive connection's last response.
+        let served = Arc::new(AtomicBool::new(false));
+        let service = hyper::service::service_fn({
+            let app = app.clone();
+            let served = Arc::clone(&served);
+            let late = Arc::clone(&late);
+            move |request: Request<hyper::body::Incoming>| {
+                served.store(true, Ordering::SeqCst);
+                // This connection has asked for something, so the spare descriptor has no 408 left to
+                // send: give it back now rather than at the end of the connection.
+                drop(late.lock().unwrap_or_else(PoisonError::into_inner).take());
+                let app = app.clone();
+                async move { Ok::<_, std::convert::Infallible>(handle(app, request, limits).await) }
+            }
+        });
+        let connection = graceful.watch(builder.serve_connection(TokioIo::new(stream), service));
+        tokio::spawn(async move {
+            let _permit = permit;
+            let outcome = connection.await;
+            // The head deadline ran out before a request arrived. hyper reports that but does not
+            // answer it, so the spare descriptor does.
+            let unanswered =
+                matches!(&outcome, Err(e) if e.is_timeout()) && !served.load(Ordering::SeqCst);
+            // Taken out of the lock in its own statement: a `std::sync` guard must not live across
+            // the await below, and a let-chain would keep it alive for the whole `if` body.
+            let late = match unanswered {
+                true => late.lock().unwrap_or_else(PoisonError::into_inner).take(),
+                false => None,
+            };
+            if let Some(mut late) = late {
+                use tokio::io::AsyncWriteExt as _;
+                let _ = tokio::time::timeout(LATE_REPLY, late.write_all(HTTP_408)).await;
+            }
         });
     }
-    let left = in_flight.drain(shutdown.drain_timeout());
-    if left > 0 {
+
+    // Signals every live connection to finish what it is doing and close. An idle keep-alive
+    // connection goes at once; one mid-request gets to finish it.
+    if tokio::time::timeout(shutdown.drain_timeout(), graceful.shutdown())
+        .await
+        .is_err()
+    {
         warn(&format!(
-            "{left} in-flight HTTP connection(s) abandoned after the {:?} shutdown drain",
+            "in-flight HTTP connection(s) abandoned after the {:?} shutdown drain",
             shutdown.drain_timeout()
         ));
     }
     Ok(())
 }
+
+/// The 408 written to a client that opened a connection and never sent a request head. Pre-rendered
+/// because it goes out on a raw socket, after hyper has given up on the connection.
+const HTTP_408: &[u8] = b"HTTP/1.1 408 Request Timeout\r\nContent-Type: text/plain\r\n\
+    Content-Length: 17\r\nConnection: close\r\n\r\nrequest timed out";
+
+/// How long that last-gasp 408 may take to go out. It is 17 bytes into an empty socket buffer, so
+/// this only ever expires when the peer is already gone.
+const LATE_REPLY: Duration = Duration::from_secs(1);
 
 /// Report a server-level problem. Routed through `tracing` when `imbhd` is built with that feature,
 /// so it joins the rest of the server's instrumentation; plain stderr otherwise.
@@ -316,83 +560,290 @@ pub(crate) fn warn(message: &str) {
     eprintln!("imbhd: {message}");
 }
 
-async fn handle_conn(
-    db: Arc<Db>,
-    mut stream: TcpStream,
-    timeouts: IoTimeouts,
-) -> std::io::Result<()> {
-    let mut reader = BufReader::new(Armed::new(stream.try_clone()?, timeouts));
-    // Set before the read, so it also bounds the 408 below: a client that stalls sending is a fair bet
-    // to stall reading too, and a blocked write parks this thread exactly as a blocked read would.
-    stream.set_write_timeout(timeouts.socket_timeout())?;
-    let request = match read_request(&mut reader) {
-        Ok(Some(request)) => request,
-        Ok(None) => return Ok(()),
-        // A client that stalled mid-request gets the status that says so — best-effort, since it may
-        // well be gone. Every other error is a broken connection with nobody left to answer.
-        Err(e) if is_timeout(&e) => {
-            return write_response(&mut stream, &Response::text(408, "request timed out"));
-        }
-        Err(e) => return Err(e),
-    };
-    let (method, path, body) = request;
-    let resp = route(&db, &method, &path, &body).await;
-    write_response(&mut stream, &resp)
-}
-
-/// Whether an I/O error is a deadline expiring. A socket read/write timeout surfaces as `WouldBlock`
-/// on Linux and `TimedOut` on Windows/macOS, so both spellings count.
-pub(crate) fn is_timeout(e: &std::io::Error) -> bool {
-    matches!(
-        e.kind(),
-        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-    )
-}
-
-/// Dispatch a request to the imbh library. Exposed for testing without sockets.
+/// One request: read and decode the body under [`Limits`], then let the router dispatch it.
+///
+/// The body is buffered here rather than in an extractor so that "too big", "stalled", and "not
+/// actually gzip" each get the status they deserve (413 / 408 / 400) instead of the one blanket
+/// rejection an extractor would produce. By the time the router runs, the body is a plain `Bytes`.
 #[cfg_attr(
     feature = "tracing",
     tracing::instrument(
         level = "info",
         name = "request",
         skip_all,
-        fields(method, path, status = tracing::field::Empty)
+        fields(
+            method = %request.method(),
+            path = %request.uri().path(),
+            status = tracing::field::Empty,
+        )
     )
 )]
-pub async fn route(db: &Arc<Db>, method: &str, path: &str, body: &[u8]) -> Response {
-    let resp = match (method, path) {
-        ("GET", "/health") | ("GET", "/") => Response::text(200, "ok"),
-        ("POST", "/v1/logs") => ingest_response(db.ingest_otlp_logs(body).await),
-        ("POST", "/v1/traces") => ingest_response(db.ingest_otlp_traces(body).await),
-        ("POST", "/v1/metrics") => ingest_response(db.ingest_otlp_metrics(body).await),
-        ("POST", "/api/query") => query_response(db, body).await,
-        ("GET", "/stats") => stats_response(db).await,
-        ("POST", "/admin/flush") => match db.flush().await {
-            Ok(()) => Response::json(200, b"{\"flushed\":true}".to_vec()),
-            Err(e) => error_response(&e),
-        },
-        ("POST", "/admin/compact") => match db.compact().await {
-            Ok(r) => Response::json(
-                200,
-                format!(
-                    "{{\"segments_merged\":{},\"segments_created\":{}}}",
-                    r.segments_merged, r.segments_created
-                )
-                .into_bytes(),
-            ),
-            Err(e) => error_response(&e),
-        },
-        _ => Response::text(404, "not found"),
+pub(crate) async fn handle(
+    app: Router,
+    request: Request<hyper::body::Incoming>,
+    limits: Limits,
+) -> axum::response::Response {
+    let (parts, body) = request.into_parts();
+    let response = match read_body(&parts, body, limits).await {
+        Ok(body) => app
+            .oneshot(Request::from_parts(parts, Body::from(body)))
+            // The router's error type is `Infallible`, so this arm is uninhabited.
+            .await
+            .unwrap_or_else(|e: std::convert::Infallible| match e {}),
+        Err(response) => response.into_response(),
     };
     #[cfg(feature = "tracing")]
-    tracing::Span::current().record("status", resp.status);
-    resp
+    tracing::Span::current().record("status", response.status().as_u16());
+    response
+}
+
+/// Buffer a request body, enforcing the size cap, the per-read deadline, and `Content-Encoding`.
+///
+/// Chunked bodies need no special handling — hyper has already undone the framing, which is the bug
+/// the hand-rolled parser had: it keyed entirely off `Content-Length` and read a chunked upload as
+/// zero bytes, then answered `200 {"accepted":0}`.
+async fn read_body(
+    parts: &axum::http::request::Parts,
+    body: hyper::body::Incoming,
+    limits: Limits,
+) -> Result<Vec<u8>, Response> {
+    // A declared length over the cap is refused before a byte is read: allocating for it up front is
+    // precisely what a forged `Content-Length` is asking for.
+    if let Some(declared) = parts
+        .headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        && limits.exceeds_body(declared)
+    {
+        return Err(too_large(limits.max_body));
+    }
+
+    let allowance = limits.timeouts.socket_timeout();
+    let mut body = body;
+    let mut buffered: Vec<u8> = Vec::new();
+    loop {
+        // Per frame, not per request: an upload that keeps delivering is never cut off for being
+        // large, only for going quiet.
+        let frame = match allowance {
+            Some(allowance) => match tokio::time::timeout(allowance, body.frame()).await {
+                Ok(frame) => frame,
+                Err(_) => return Err(Response::text(408, "request timed out")),
+            },
+            None => body.frame().await,
+        };
+        let Some(frame) = frame else { break };
+        let frame = frame.map_err(|_| Response::text(400, "malformed request body"))?;
+        // Trailers carry no body bytes; skip them rather than treating them as data.
+        if let Ok(data) = frame.into_data() {
+            if limits.exceeds_body((buffered.len() + data.len()) as u64) {
+                return Err(too_large(limits.max_body));
+            }
+            buffered.extend_from_slice(&data);
+        }
+    }
+
+    if !is_gzip(parts) {
+        return Ok(buffered);
+    }
+    let max_body = limits.max_body;
+    offload_blocking(move || gunzip(&buffered, max_body)).await
+}
+
+/// Whether the request declares a gzip body. The OTel Collector's `otlphttp` exporter sets this by
+/// default, so a stock collector in front of `imbhd` depends on it.
+fn is_gzip(parts: &axum::http::request::Parts) -> bool {
+    parts
+        .headers
+        .get(header::CONTENT_ENCODING)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("gzip"))
+}
+
+/// Inflate a gzip body, refusing one that expands past the cap.
+///
+/// The cap is enforced by reading one byte *past* it and treating that byte's existence as the
+/// overflow — a compression bomb is a small upload, so the declared length cannot catch it and only
+/// bounding the output can.
+fn gunzip(body: &[u8], max_body: u64) -> Result<Vec<u8>, Response> {
+    use std::io::Read as _;
+
+    let ceiling = match max_body {
+        0 => u64::MAX,
+        max => max.saturating_add(1),
+    };
+    let mut inflated = Vec::new();
+    flate2::read::GzDecoder::new(body)
+        .take(ceiling)
+        .read_to_end(&mut inflated)
+        .map_err(|_| Response::text(400, "malformed gzip request body"))?;
+    if max_body != 0 && inflated.len() as u64 > max_body {
+        return Err(too_large(max_body));
+    }
+    Ok(inflated)
+}
+
+/// The 413 for a body over [`Limits::max_body`], in the same `{"error": ...}` shape as every other
+/// failure so a client has one thing to parse.
+fn too_large(max_body: u64) -> Response {
+    Response::json(
+        413,
+        format!(
+            "{{\"error\":{}}}",
+            json_string(&format!("request body exceeds the {max_body}-byte limit"))
+        )
+        .into_bytes(),
+    )
+}
+
+/// The route table, over a shared `Db`.
+///
+/// Public because it is the useful half of this crate for a host that already runs axum: mount it
+/// (or a `Router::nest` of it) in an existing application and imbh's endpoints come along, without
+/// [`serve`]'s opinions about runtimes, ports, or shutdown.
+pub fn app(db: Arc<Db>) -> Router {
+    Router::new()
+        .route("/", get(health))
+        .route("/health", get(health))
+        .route("/v1/logs", post(ingest_logs))
+        .route("/v1/traces", post(ingest_traces))
+        .route("/v1/metrics", post(ingest_metrics))
+        .route("/api/query", post(query))
+        .route("/stats", get(stats))
+        .route("/admin/flush", post(admin_flush))
+        .route("/admin/compact", post(admin_compact))
+        .fallback(not_found)
+        .with_state(db)
+}
+
+async fn health() -> Response {
+    Response::text(200, "ok")
+}
+
+async fn not_found() -> Response {
+    Response::text(404, "not found")
+}
+
+async fn ingest_logs(State(db): State<Arc<Db>>, body: Bytes) -> Response {
+    ingest_response(offload(db.ingest_otlp_logs(&body)).await)
+}
+
+async fn ingest_traces(State(db): State<Arc<Db>>, body: Bytes) -> Response {
+    ingest_response(offload(db.ingest_otlp_traces(&body)).await)
+}
+
+async fn ingest_metrics(State(db): State<Arc<Db>>, body: Bytes) -> Response {
+    ingest_response(offload(db.ingest_otlp_metrics(&body)).await)
+}
+
+async fn query(State(db): State<Arc<Db>>, body: Bytes) -> Response {
+    query_response(&db, &body).await
+}
+
+async fn stats(State(db): State<Arc<Db>>) -> Response {
+    stats_response(&db).await
+}
+
+async fn admin_flush(State(db): State<Arc<Db>>) -> Response {
+    match offload(db.flush()).await {
+        Ok(()) => Response::json(200, b"{\"flushed\":true}".to_vec()),
+        Err(e) => error_response(&e),
+    }
+}
+
+async fn admin_compact(State(db): State<Arc<Db>>) -> Response {
+    match offload(db.compact()).await {
+        Ok(r) => Response::json(
+            200,
+            format!(
+                "{{\"segments_merged\":{},\"segments_created\":{}}}",
+                r.segments_merged, r.segments_created
+            )
+            .into_bytes(),
+        ),
+        Err(e) => error_response(&e),
+    }
+}
+
+/// Dispatch one request through the same route table [`app`] builds, without a socket. Exposed for
+/// testing, and for a host that owns its own transport and just wants the handlers.
+pub async fn route(db: &Arc<Db>, method: &str, path: &str, body: &[u8]) -> Response {
+    let request = match Request::builder()
+        .method(method)
+        .uri(path)
+        .body(Body::from(body.to_vec()))
+    {
+        Ok(request) => request,
+        // A method or URI that is not well-formed at all; hyper would have rejected it before the
+        // router ever saw it, so this only reaches a caller building requests by hand.
+        Err(_) => return Response::text(400, "malformed request"),
+    };
+    let response = app(db.clone())
+        .oneshot(request)
+        .await
+        .unwrap_or_else(|e: std::convert::Infallible| match e {});
+
+    let status = response.status().as_u16();
+    let content_type = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("text/plain")
+        .to_owned();
+    // Handler bodies are all in memory already, so there is nothing to bound here.
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap_or_default()
+        .to_vec();
+    Response {
+        status,
+        content_type,
+        body,
+    }
+}
+
+/// Whether `block_in_place` is available — it is not on a current-thread runtime, where it panics.
+/// That is what `#[tokio::test]` gives by default, and what the `Db` facade's own blocking mirror
+/// builds.
+fn can_block_in_place() -> bool {
+    matches!(
+        tokio::runtime::Handle::try_current().map(|handle| handle.runtime_flavor()),
+        Ok(tokio::runtime::RuntimeFlavor::MultiThread)
+    )
+}
+
+/// Run a `Db` future to completion without leaving a runtime worker parked on its blocking I/O.
+///
+/// `Db`'s futures block *inside themselves* — parquet and tantivy reads are synchronous and the
+/// library has no `spawn_blocking` anywhere — so awaiting one directly on a worker stops that worker
+/// serving anything else, `/health` included. `block_in_place` hands this worker's queue to a
+/// replacement for the duration, which is the contract we want and costs no `Send + 'static` bound:
+/// the future goes on borrowing the `Db` and the request body.
+///
+/// On a current-thread runtime it simply awaits. Nothing else shares that thread to starve, which is
+/// the situation in `#[tokio::test]` and in an embedder driving [`route`] by hand.
+pub async fn offload<F: Future>(fut: F) -> F::Output {
+    if can_block_in_place() {
+        tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(fut))
+    } else {
+        fut.await
+    }
+}
+
+/// [`offload`] for synchronous CPU work — gzip inflation, and the Docker plugin's endpoints, which
+/// do blocking filesystem work (`StartLogging` waits up to `OPEN_TIMEOUT` on a FIFO open).
+pub(crate) async fn offload_blocking<T>(work: impl FnOnce() -> T) -> T {
+    if can_block_in_place() {
+        tokio::task::block_in_place(work)
+    } else {
+        work()
+    }
 }
 
 /// `GET /stats` — the DB's operational stats as JSON (VM `/status/tsdb` analogue): per-table
 /// segment/row/buffer counts and time span, plus buffer bytes, WAL bytes, and the durable LSN.
 async fn stats_response(db: &Arc<Db>) -> Response {
-    let stats = match db.stats().await {
+    let stats = match offload(db.stats()).await {
         Ok(s) => s,
         Err(e) => return error_response(&e),
     };
@@ -448,7 +899,9 @@ async fn query_response(db: &Arc<Db>, body: &[u8]) -> Response {
         Ok(s) => s,
         Err(_) => return Response::text(400, "query body is not UTF-8"),
     };
-    match db.sql(sql).collect().await {
+    // The heaviest offload in the crate: a scan is blocking parquet and tantivy I/O from start to
+    // finish, so this is the call that would park a worker for whole seconds.
+    match offload(db.sql(sql).collect()).await {
         Ok(batches) => Response::json(200, batches_to_json(&batches)),
         Err(e) => error_response(&e),
     }
@@ -553,158 +1006,6 @@ pub(crate) fn json_string(s: &str) -> String {
     }
     out.push('"');
     out
-}
-
-// ── minimal HTTP/1.1 ────────────────────────────────────────────────────────────────────
-
-type ParsedRequest = (String, String, Vec<u8>);
-
-/// A socket whose read deadline can be re-armed: `TcpStream` and (under `docker`) `UnixStream`, the two
-/// transports this parser serves.
-pub(crate) trait ReadDeadline {
-    fn arm_read_deadline(&self, timeout: Option<Duration>) -> std::io::Result<()>;
-}
-
-impl ReadDeadline for TcpStream {
-    fn arm_read_deadline(&self, timeout: Option<Duration>) -> std::io::Result<()> {
-        self.set_read_timeout(timeout)
-    }
-}
-
-#[cfg(all(feature = "docker", unix))]
-impl ReadDeadline for std::os::unix::net::UnixStream {
-    fn arm_read_deadline(&self, timeout: Option<Duration>) -> std::io::Result<()> {
-        self.set_read_timeout(timeout)
-    }
-}
-
-/// A socket that arms its own read deadline before every read, wrapped *under* the `BufReader` so it
-/// sees the real reads rather than the buffered line/exact calls above it.
-///
-/// That placement is the whole point. Arming once per `read_line` would give each underlying read a
-/// fresh allowance, and a client dribbling one byte per allowance is never idle long enough to trip it
-/// — it would hold a thread forever while technically making progress. Arming per read against an
-/// *absolute* deadline bounds the header phase in total instead.
-///
-/// The body phase is a constant per-read allowance, so it is armed once at the switch
-/// ([`Armed::begin_body`]) and left alone: the steady-state cost of all this is one extra `setsockopt`
-/// per request, since a `BufReader` normally swallows a whole request head in a single read.
-pub(crate) struct Armed<S: ReadDeadline + Read> {
-    socket: S,
-    timeouts: IoTimeouts,
-    /// When the header budget runs out; `None` when that phase is unbounded.
-    header_deadline: Option<std::time::Instant>,
-    /// Whether the body's (constant, already-armed) allowance is in effect.
-    body: bool,
-}
-
-impl<S: ReadDeadline + Read> Armed<S> {
-    pub(crate) fn new(socket: S, timeouts: IoTimeouts) -> Self {
-        Armed {
-            socket,
-            header_deadline: (!timeouts.header.is_zero())
-                .then(|| std::time::Instant::now() + timeouts.header),
-            timeouts,
-            body: false,
-        }
-    }
-
-    /// Switch to the body phase: one allowance per read, armed once because it never changes.
-    fn begin_body(&mut self) -> std::io::Result<()> {
-        self.body = true;
-        self.socket
-            .arm_read_deadline(self.timeouts.socket_timeout())
-    }
-}
-
-impl<S: ReadDeadline + Read> Read for Armed<S> {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        if !self.body
-            && let Some(deadline) = self.header_deadline
-        {
-            match deadline.checked_duration_since(std::time::Instant::now()) {
-                // Spent. (`set_read_timeout` rejects a zero duration — `None` there means *no*
-                // deadline — so the exhausted case has to be an error we raise ourselves.)
-                None => {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        "the request head did not arrive within the header timeout",
-                    ));
-                }
-                // A sub-millisecond remainder is spent for practical purposes; ask for 1ms so the
-                // syscall stays valid.
-                Some(left) => self
-                    .socket
-                    .arm_read_deadline(Some(left.max(Duration::from_millis(1))))?,
-            }
-        }
-        self.socket.read(buf)
-    }
-}
-
-/// Parse one HTTP/1.1 request (method, path, body); `None` on a clean EOF before the request line.
-/// Generic over the socket so the same parser serves the TCP server and the Unix-socket Docker plugin
-/// endpoint (`docker`), which speaks the same HTTP/1.1 dialect.
-///
-/// The [`Armed`] reader is what enforces the [`IoTimeouts`]: the head in total, the body per read.
-/// Without them a client that connects and says nothing parks this thread (and its `Db` handle) for as
-/// long as it cares to.
-pub(crate) fn read_request<S: ReadDeadline + Read>(
-    reader: &mut BufReader<Armed<S>>,
-) -> std::io::Result<Option<ParsedRequest>> {
-    let mut request_line = String::new();
-    if reader.read_line(&mut request_line)? == 0 {
-        return Ok(None);
-    }
-    let mut parts = request_line.split_whitespace();
-    let method = parts.next().unwrap_or_default().to_owned();
-    let raw_path = parts.next().unwrap_or_default();
-    let path = raw_path.split('?').next().unwrap_or_default().to_owned();
-
-    let mut content_length = 0usize;
-    loop {
-        let mut header = String::new();
-        if reader.read_line(&mut header)? == 0 {
-            break;
-        }
-        let trimmed = header.trim_end();
-        if trimmed.is_empty() {
-            break;
-        }
-        if let Some((name, value)) = trimmed.split_once(':')
-            && name.eq_ignore_ascii_case("content-length")
-        {
-            content_length = value.trim().parse().unwrap_or(0);
-        }
-    }
-
-    // The body switches to a per-read allowance: a slow upload that keeps delivering bytes is fine,
-    // one that stops mid-body is not.
-    reader.get_mut().begin_body()?;
-    let mut body = vec![0u8; content_length];
-    reader.read_exact(&mut body)?;
-    Ok(Some((method, path, body)))
-}
-
-pub(crate) fn write_response<W: Write>(stream: &mut W, resp: &Response) -> std::io::Result<()> {
-    let reason = match resp.status {
-        200 => "OK",
-        400 => "Bad Request",
-        404 => "Not Found",
-        408 => "Request Timeout",
-        500 => "Internal Server Error",
-        _ => "OK",
-    };
-    let header = format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        resp.status,
-        reason,
-        resp.content_type,
-        resp.body.len()
-    );
-    stream.write_all(header.as_bytes())?;
-    stream.write_all(&resp.body)?;
-    stream.flush()
 }
 
 #[cfg(test)]
@@ -851,6 +1152,26 @@ mod tests {
             listen_addr(None, Some(" 172.17.0.1:4318\n".to_owned()), "x"),
             Some("172.17.0.1:4318".to_owned())
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_known_path_with_the_wrong_method_is_405() {
+        // A behaviour change from the hand-rolled dispatcher, which matched on the `(method, path)`
+        // pair and so answered 404 for everything it did not recognise. The router knows a path it
+        // serves from one it does not, and says which of the two is wrong.
+        let db = Db::in_memory().open().unwrap();
+        assert_eq!(route(&db, "GET", "/v1/logs", b"").await.status, 405);
+        assert_eq!(route(&db, "POST", "/health", b"").await.status, 405);
+        // An unknown path is still a 404, wrong method or not.
+        assert_eq!(route(&db, "DELETE", "/nope", b"").await.status, 404);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_query_string_is_not_part_of_the_route() {
+        let db = Db::in_memory().open().unwrap();
+        let stats = route(&db, "GET", "/stats?pretty=1", b"").await;
+        assert_eq!(stats.status, 200);
+        assert_eq!(stats.content_type, "application/json");
     }
 
     fn otlp_log(service: &str, body_text: &str, time: u64) -> Vec<u8> {

@@ -24,9 +24,19 @@
 //!
 //! ## Threads
 //!
-//! Thread-per-connection for the plugin API (as in the HTTP server), plus one reader thread per
-//! live container FIFO, all funneling into a single batching [`ingest::Ingestor`] worker so ingest
-//! cost is per batch, not per line. Nothing here is on the query path.
+//! The plugin API runs on the same axum/hyper stack as the TCP server, over a `UnixListener`, and
+//! shares its request handling ([`crate::handle`]) — so the body limits, phase deadlines, and
+//! decoding are the same on both sockets. Alongside it sits one reader thread per live container
+//! FIFO, all funneling into a single batching [`ingest::Ingestor`] worker so ingest cost is per
+//! batch, not per line. Nothing here is on the query path.
+//!
+//! `ReadLogs` is the awkward one: it streams length-prefixed frames for as long as the client wants
+//! them, and the logic that produces them ([`readlogs::stream`]) is blocking and generic over
+//! `io::Write`. Rather than rewrite it as a `Stream`, it runs unchanged on a `spawn_blocking` task
+//! whose sink is a bounded channel, and the response body drains that channel — so backpressure and
+//! client disconnects reach the generator as ordinary `io::Error`s. On the wire this is now
+//! `Transfer-Encoding: chunked` (hyper frames it, since the length is unknowable); Docker's plugin
+//! client reads the body through Go's `net/http`, which un-chunks transparently.
 //!
 //! ## Footprint
 //!
@@ -41,20 +51,30 @@ pub mod readlogs;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufReader, Write};
-use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::task::{Context, Poll};
+use std::time::{Duration, Instant};
+
+use axum::Router;
+use axum::body::{Body, Bytes};
+use axum::extract::State;
+use axum::http::header;
+use axum::response::IntoResponse;
+use axum::routing::any;
+use hyper_util::rt::{TokioIo, TokioTimer};
+use hyper_util::server::graceful::GracefulShutdown;
 
 use imbh::Db;
 
 use entry::{EntryReader, PartialAssembler};
 use ingest::{Container, IngestConfig, Ingestor};
 
-use crate::Response;
-use crate::shutdown::{InFlight, Shutdown};
+use crate::shutdown::Shutdown;
+use crate::{Limits, Response};
 
 /// The content type Docker's plugin client expects on every non-streaming reply.
 const PLUGIN_CONTENT_TYPE: &str = "application/vnd.docker.plugins.v1.1+json";
@@ -125,7 +145,23 @@ pub fn serve_plugin_with_until(
     ingest: IngestConfig,
     shutdown: Arc<Shutdown>,
 ) -> std::io::Result<()> {
-    let socket = socket.as_ref();
+    // Multi-threaded for the same reason the HTTP listener is: `crate::offload*` needs
+    // `block_in_place`, and `ReadLogs` parks a blocking task per follow stream.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(serve_plugin_async(db, socket.as_ref(), ingest, shutdown))
+}
+
+/// The plugin's accept loop. Binds first, so a bind failure still reaches the caller — which for
+/// `imbhd` is fatal, since Docker would otherwise mark the plugin healthy and every
+/// `docker run --log-driver imbh` would hang on a socket nobody is listening to.
+async fn serve_plugin_async(
+    db: Arc<Db>,
+    socket: &Path,
+    ingest: IngestConfig,
+    shutdown: Arc<Shutdown>,
+) -> std::io::Result<()> {
     if let Some(parent) = socket.parent()
         && !parent.as_os_str().is_empty()
     {
@@ -133,40 +169,62 @@ pub fn serve_plugin_with_until(
     }
     remove_stale_socket(socket)?;
 
-    let listener = UnixListener::bind(socket)?;
-    let wake = socket.to_path_buf();
+    let listener = tokio::net::UnixListener::bind(socket)?;
+    let plugin = Arc::new(Plugin::new(db, ingest));
+    let app = plugin_app(Arc::clone(&plugin));
+
+    let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
     shutdown.on_trigger(move || {
-        // Unblocks the `accept` below; the loop then sees the flag and drops the connection.
-        let _ = UnixStream::connect(&wake);
+        let _ = stop_tx.send(());
     });
 
-    let plugin = Arc::new(Plugin::new(db, ingest));
-    let in_flight = Arc::new(InFlight::default());
-    while !shutdown.is_triggered() {
-        let Ok((stream, _peer)) = listener.accept() else {
-            continue;
+    // The peer is `dockerd` over a local socket — prompt or gone — so the deadlines are not
+    // operator-tunable here; they exist so a wedged peer cannot pin a connection forever.
+    let limits = Limits::default();
+    let graceful = GracefulShutdown::new();
+    let mut builder = hyper::server::conn::http1::Builder::new();
+    builder.timer(TokioTimer::new());
+    builder.header_read_timeout(limits.timeouts.header_deadline());
+
+    loop {
+        let stream = tokio::select! {
+            accepted = listener.accept() => match accepted {
+                Ok((stream, _peer)) => stream,
+                Err(_) => continue,
+            },
+            _ = &mut stop_rx => break,
         };
-        if shutdown.is_triggered() {
-            break;
-        }
-        let plugin = plugin.clone();
-        let busy = in_flight.enter();
-        std::thread::spawn(move || {
-            let _busy = busy;
-            if let Err(e) = handle_conn(&plugin, stream) {
-                warn(&format!("connection error: {e}"));
+        let service = hyper::service::service_fn({
+            let app = app.clone();
+            move |request| {
+                let app = app.clone();
+                async move {
+                    Ok::<_, std::convert::Infallible>(crate::handle(app, request, limits).await)
+                }
             }
+        });
+        let connection = graceful.watch(builder.serve_connection(TokioIo::new(stream), service));
+        tokio::spawn(async move {
+            let _ = connection.await;
         });
     }
 
+    // Order matters, and it is not the HTTP listener's order. The container readers stop and the
+    // ingest queue drains *before* the connection drain, because clearing the stream registry is
+    // also what ends the `docker logs -f` responses still open — follow mode exits once its
+    // container has no live stream. Draining first would mean waiting out the full timeout on
+    // connections that only stop because of this call.
     plugin.shutdown();
-    let left = in_flight.drain(shutdown.drain_timeout());
-    if left > 0 {
+    if tokio::time::timeout(shutdown.drain_timeout(), graceful.shutdown())
+        .await
+        .is_err()
+    {
         warn(&format!(
-            "{left} in-flight plugin request(s) abandoned after the {:?} shutdown drain",
+            "in-flight plugin request(s) abandoned after the {:?} shutdown drain",
             shutdown.drain_timeout()
         ));
     }
+    // Unlink last, so a restart binds a clean path rather than clearing someone else's leftover.
     let _ = std::fs::remove_file(socket);
     Ok(())
 }
@@ -182,31 +240,169 @@ fn remove_stale_socket(socket: &Path) -> std::io::Result<()> {
     }
 }
 
-fn handle_conn(plugin: &Arc<Plugin>, mut stream: UnixStream) -> std::io::Result<()> {
-    // The same phase deadlines the HTTP server applies, so a plugin connection cannot park a thread
-    // either. Not operator-tunable here: the peer is `dockerd` over a local socket, which is prompt or
-    // gone. The write deadline matters most for `ReadLogs` — a `docker logs -f` client that vanishes
-    // without closing would otherwise hold its thread and stream open indefinitely.
-    let timeouts = crate::IoTimeouts::default();
-    stream.set_write_timeout(timeouts.socket_timeout())?;
-    let mut reader = BufReader::new(crate::Armed::new(stream.try_clone()?, timeouts));
-    let Some((_method, path, body)) = crate::read_request(&mut reader)? else {
-        return Ok(());
-    };
+/// The plugin's route table.
+///
+/// Deliberately method-agnostic (`any`): Docker posts, but the parser this replaced ignored the
+/// method entirely, and a `405` to a daemon that changed its mind would be a worse failure than
+/// simply answering.
+fn plugin_app(plugin: Arc<Plugin>) -> Router {
+    Router::new()
+        .route("/Plugin.Activate", any(activate))
+        .route("/LogDriver.Capabilities", any(capabilities))
+        .route("/LogDriver.StartLogging", any(start_logging))
+        .route("/LogDriver.StopLogging", any(stop_logging))
+        .route("/LogDriver.ReadLogs", any(read_logs))
+        .fallback(not_found)
+        .with_state(plugin)
+}
 
-    // ReadLogs streams frames for as long as the client wants them, so it writes its own header and
-    // owns the socket; every other endpoint is a single small JSON reply.
-    if path == "/LogDriver.ReadLogs" {
-        stream.write_all(
-            b"HTTP/1.1 200 OK\r\nContent-Type: application/x-json-stream\r\nConnection: close\r\n\r\n",
-        )?;
-        stream.flush()?;
-        let watcher = plugin.clone();
-        return readlogs::stream(&plugin.db, &body, &mut stream, |id| watcher.is_active(id));
+/// Run one of the four small JSON endpoints through [`Plugin::route`], off the runtime workers:
+/// `StartLogging` blocks for up to [`OPEN_TIMEOUT`] waiting on a FIFO open.
+async fn dispatch(plugin: Arc<Plugin>, path: &'static str, body: Bytes) -> Response {
+    crate::offload_blocking(move || plugin.route(path, &body)).await
+}
+
+async fn activate(State(plugin): State<Arc<Plugin>>, body: Bytes) -> Response {
+    dispatch(plugin, "/Plugin.Activate", body).await
+}
+
+async fn capabilities(State(plugin): State<Arc<Plugin>>, body: Bytes) -> Response {
+    dispatch(plugin, "/LogDriver.Capabilities", body).await
+}
+
+async fn start_logging(State(plugin): State<Arc<Plugin>>, body: Bytes) -> Response {
+    dispatch(plugin, "/LogDriver.StartLogging", body).await
+}
+
+async fn stop_logging(State(plugin): State<Arc<Plugin>>, body: Bytes) -> Response {
+    dispatch(plugin, "/LogDriver.StopLogging", body).await
+}
+
+async fn not_found() -> Response {
+    Response::text(404, "not found")
+}
+
+/// `/LogDriver.ReadLogs` — stream a container's stored logs back as length-prefixed frames.
+///
+/// [`readlogs::stream`] is blocking and generic over `io::Write`, and under `Follow` it runs until
+/// the container stops or the client leaves. It goes on a blocking task writing into a bounded
+/// channel; the response body is that channel. Nothing about the generator changes.
+async fn read_logs(State(plugin): State<Arc<Plugin>>, body: Bytes) -> axum::response::Response {
+    let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(FRAME_QUEUE);
+    let db = Arc::clone(&plugin.db);
+    tokio::task::spawn_blocking(move || {
+        let mut sink = FrameSink::new(tx);
+        let watcher = Arc::clone(&plugin);
+        let outcome = readlogs::stream(&db, &body, &mut sink, |id| watcher.is_active(id))
+            .and_then(|()| sink.flush());
+        if let Err(e) = outcome
+            // The client hanging up mid-stream is how a `docker logs` normally ends, not a fault.
+            && !matches!(
+                e.kind(),
+                std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::TimedOut
+            )
+        {
+            warn(&format!("ReadLogs stream ended: {e}"));
+        }
+    });
+
+    axum::response::Response::builder()
+        .status(200)
+        .header(header::CONTENT_TYPE, READLOGS_CONTENT_TYPE)
+        .body(Body::new(FrameBody { rx }))
+        .unwrap_or_else(|_| Response::text(500, "cannot start the log stream").into_response())
+}
+
+/// The content type of the framed `ReadLogs` body.
+const READLOGS_CONTENT_TYPE: &str = "application/x-json-stream";
+
+/// Frame batches buffered ahead of a slow `docker logs` client before the generator has to wait.
+/// Small on purpose: the point of streaming is that a busy container's history is not held in memory.
+const FRAME_QUEUE: usize = 16;
+
+/// How long one write may wait for a client that has stopped reading before the stream is abandoned.
+/// This is the backpressure bound that the socket write timeout used to provide — without it a
+/// `docker logs -f` whose client vanished without closing would hold a blocking task indefinitely.
+const STREAM_STALL: Duration = Duration::from_secs(30);
+
+/// How long to wait between attempts when the frame queue is full.
+const STREAM_RETRY: Duration = Duration::from_millis(10);
+
+/// The blocking `io::Write` sink [`readlogs::stream`] writes frames into, backed by the response
+/// body's channel.
+struct FrameSink {
+    tx: tokio::sync::mpsc::Sender<Bytes>,
+    buffered: Vec<u8>,
+}
+
+impl FrameSink {
+    fn new(tx: tokio::sync::mpsc::Sender<Bytes>) -> FrameSink {
+        FrameSink {
+            tx,
+            buffered: Vec::new(),
+        }
+    }
+}
+
+impl Write for FrameSink {
+    /// Accumulate: `write_entry` emits a frame in several small writes, and `readlogs` flushes once
+    /// per batch, which is the granularity worth sending.
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        self.buffered.extend_from_slice(data);
+        Ok(data.len())
     }
 
-    let resp = plugin.route(&path, &body);
-    crate::write_response(&mut stream, &resp)
+    fn flush(&mut self) -> std::io::Result<()> {
+        if self.buffered.is_empty() {
+            return Ok(());
+        }
+        let mut chunk = Bytes::from(std::mem::take(&mut self.buffered));
+        let deadline = Instant::now() + STREAM_STALL;
+        loop {
+            match self.tx.try_send(chunk) {
+                Ok(()) => return Ok(()),
+                // The body was dropped: the client is gone.
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "the docker logs client closed the stream",
+                    ));
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Full(returned)) => {
+                    if Instant::now() >= deadline {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "the docker logs client stopped reading",
+                        ));
+                    }
+                    chunk = returned;
+                    std::thread::sleep(STREAM_RETRY);
+                }
+            }
+        }
+    }
+}
+
+/// The `ReadLogs` response body: whatever the generator task has put on the channel, until it ends.
+struct FrameBody {
+    rx: tokio::sync::mpsc::Receiver<Bytes>,
+}
+
+impl http_body::Body for FrameBody {
+    type Data = Bytes;
+    /// The generator reports its own failures; a stream that ends early is an ended body, not a
+    /// body error — there is no way to signal one mid-response anyway.
+    type Error = std::convert::Infallible;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<http_body::Frame<Bytes>, Self::Error>>> {
+        self.get_mut()
+            .rx
+            .poll_recv(cx)
+            .map(|frame| frame.map(|bytes| Ok(http_body::Frame::data(bytes))))
+    }
 }
 
 /// A container's live FIFO reader.
