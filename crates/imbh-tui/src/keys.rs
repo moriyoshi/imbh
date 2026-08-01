@@ -51,6 +51,9 @@ pub(crate) fn handle_detail_key(
                 app.open_span_detail();
             }
             KeyCode::Char('L') => span_logs_drilldown(app, db, options, sender),
+            // Pin/unpin the selected span's scrolled-off ancestors at the top of the waterfall. Bound
+            // here rather than globally: it only means anything on this route.
+            KeyCode::Char('s') => app.sticky_waterfall = !app.sticky_waterfall,
             _ => return None,
         }
         return Some(Control::Continue);

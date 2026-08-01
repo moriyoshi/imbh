@@ -521,7 +521,8 @@ pub(crate) fn draw(frame: &mut ratatui::Frame<'_>, app: &App, options: &Options)
             let bar_cells = (detail_area.width as usize)
                 .saturating_sub(1 + WATERFALL_NAME_W + 2 + WATERFALL_SUFFIX_W)
                 .max(1);
-            let rows = render_waterfall(waterfall, bar_cells);
+            // No span cursor on this pane, so the name column never scrolls horizontally here.
+            let rows = render_waterfall(waterfall, bar_cells, 0);
             // This preview pane is a fixed slice of the results area and does not scroll: say so when a
             // deep trace overflows it, so the hidden spans are never silently dropped. The full,
             // scrolling waterfall is one Enter away (`Route::TraceDetail`).
@@ -635,7 +636,7 @@ mod tests {
     use crate::completion::{Candidate, CandidateKind, Completion};
     use crate::mascot::MascotCtx;
     use crate::model::{DetailPane, LogRecord, MetricDetail, Snapshot};
-    use crate::testutil::ascii_trace;
+    use crate::testutil::{ascii_trace, nested_trace};
     use crate::waterfall::build_trace_detail;
 
     #[test]
@@ -728,6 +729,16 @@ mod tests {
                     detail: build_trace_detail(&ascii_trace(), true),
                 };
                 app.span_cursor = 1;
+                app
+            }),
+            ("trace detail with a scrolled name column", {
+                // Deeply nested, with names longer than the name column: exercises the indent cap and
+                // the horizontally clipped/scrolled name field, whose `<`/`>` markers must stay ASCII.
+                let mut app = App::new();
+                app.route = Route::TraceDetail {
+                    detail: build_trace_detail(&nested_trace(), true),
+                };
+                app.span_cursor = 17;
                 app
             }),
             ("span detail", {

@@ -1902,3 +1902,82 @@ familiar "delete it and retry" is the one move that cannot be undone, and it is 
 half-finished publish invites. Any step that publishes something frozen must therefore be the *last*
 step, and the failure message at that step has to tell the operator what not to do — by the time
 they are reading it, the destructive option looks like the obvious one.
+
+## Sticky waterfall: the obvious fixpoint cycles, and depth broke two things nobody had rendered (2026-08-01)
+
+The trace detail's waterfall now pins the selected span's scrolled-off ancestors at the top of the
+pane, dimmed, so scrolling into a deep trace no longer strands you on a `db.query` at indent 3 with
+no way to see what it hangs off. `s` toggles it, bound in the trace-detail arm of `handle_detail_key`
+rather than globally; it is on by default and the hint line reads `s sticky:on|off`. The state is an
+`App` field alongside `show_mascot` and deliberately *not* in `NavEntry` — a display preference should
+survive Back/Forward, not be captured by it.
+
+The shape of it: a pure `sticky_layout(rows, cursor, viewport, enabled) -> StickyLayout { pinned,
+offset, height }`, so the whole geometry is unit-testable without a terminal, and the renderer just
+splits the block's inner rect into a pinned `Paragraph` and an offset-pinned `List`. The pinned block
+is capped at a third of the viewport, keeping the *innermost* ancestors — the nearest context is worth
+more than the root when the chain will not fit. `WaterfallRow` gained `parent_row` (a *row* index, not
+a span id, and only ever walked upward: spans come back `ORDER BY start_time`, not as a tree, so clock
+skew across services can put a parent below its child — walking strictly upward is what makes the walk
+both correct and cycle-safe without a visited set) and lost its pre-baked `prefix` in favour of
+`marker`/`indent`/`name`, because horizontal scrolling needs the raw text at draw time. Three findings
+worth keeping.
+
+**The obvious formulation of "sticky" does not converge.** The natural reading — pin the ancestors of
+the *topmost visible row* — is a fixpoint problem, because pinning rows shrinks the window, which
+moves the offset, which changes whose ancestors you are pinning. That function is **not monotone**.
+With rows `A`, `B` (child of `A`), `C` (child of `B`), `D` (a fresh root), the pinned count runs
+`1 → 2 → 0 → 1 → 2 → 0 …` with period 3, so any iteration budget returns a budget-dependent answer and
+the block visibly flickers as the user holds `↓`. Anchoring on the **cursor's** ancestor chain instead
+makes it monotone: more pinned rows ⇒ shorter window ⇒ larger offset ⇒ weakly more ancestors above it,
+so iterating from zero reaches the least fixpoint on `{0..=cap}` in at most `cap + 1` steps. The two
+anchors describe the same pane *only* because the offset is stateless here (a fresh `ListState` each
+frame ⇒ either `offset == 0` or the cursor sits on the last visible row — one degree of freedom). If
+that offset ever becomes stateful, the anchor has to be revisited; the doc comment says so.
+
+The general lesson: when a layout quantity feeds back into the geometry that produces it, the choice
+of anchor is not cosmetic — it decides whether the recursion is a fixpoint or an oscillator. Picking
+the anchor that makes the function monotone is worth more than any iteration cap. A counterexample
+test (`sticky_layout_is_stable_across_a_subtree_boundary`, asserting the invariants at *every* cursor
+value over exactly that shape) is the regression guard, and a 20 000-case fuzz over random forests
+confirmed cursor-visibility, pinned-above-window, and the cap.
+
+**Depth broke two things that had simply never been rendered.** The waterfall had only ever been
+exercised at depth ≤ 4. The indent shares the 20-cell name column at two cells per level, so at depth
+8 a name had four readable cells — and `clamp_field` truncated with a hard-coded `…`, meaning
+`--ascii` mode leaked a Unicode glyph the moment a trace nested deep enough. The `--ascii` sweep never
+caught it because no fixture nested that far, and it runs at 48×10 where the pane is too short for
+sticky to engage at all. So: the indent is capped at 5 levels (≥ 10 name cells always, with the
+hierarchy the cap gives up now supplied by the pinned ancestors), and `clamp_field` became
+`clip_field(text, width, offset)`, which marks clipping with ASCII `<`/`>` written *into* an edge cell
+rather than stealing width — the field stays exactly `width` cells, which is what the bar-axis
+alignment invariant rests on, and the ASCII leak disappears by construction rather than by a flag.
+
+**The pty caught what 116 unit tests could not.** The name column also scrolls horizontally, following
+the cursor. Two failure modes only showed up driving the real binary against a `gen-demo-db` database
+in a sized pty (a small Python `pty.fork` + `TIOCSWINSZ` harness; `script` gives a 0×0 window and the
+TUI renders nothing). First, pinned ancestors are the *shallowest* rows and so usually the *shortest*
+names — sharing the cursor's offset outright scrolled them clean out of their own field and the
+context band rendered blank, i.e. the feature silently deleted itself exactly when it mattered. Fixed
+by clamping every row to its own maximum useful offset, so the column still moves as one but no row
+scrolls into emptiness. Second, and worse: scrolling the column shifted the *indent* off the left
+edge, so the whole trace's shape vanished the instant the cursor landed on a long name. `WaterfallRow`
+now keeps `indent` and `name` apart and only the name scrolls — the tree is never negotiable. Both
+bugs were invisible to substring assertions over a `TestBackend`, because both produced perfectly
+well-formed rows; they were only wrong *as a picture*. Render tests prove structure, not legibility.
+
+`examples/gen-demo-db` gained a deep trace per step so any of this is reachable in the demo data: a
+checkout entry chaining `--deep-hops` (default 5) service hops, 23 spans nested 11 deep, names longer
+than the name column, and ~1 in 4 failing at the innermost `db.query` so the ERROR propagates up the
+whole pinned chain. It reuses every existing `Role`, so `logs_body`/`log_line` needed no changes.
+
+Verification: 116 unit tests in `imbh-tui` (16 new — the cycling counterexample, the cap keeping the
+innermost ancestors, cycle-safe `ancestor_rows`, degenerate viewports, `clip_field` exactness at every
+offset including wide-glyph boundaries, the indent cap, the indent-never-scrolls guard, and two
+`TestBackend` renders asserting the pinned rows carry `Modifier::DIM` while the cursor row does not
+and that the whole sticky render stays ASCII). The pre-existing
+`trace_detail_waterfall_scrolls_to_keep_the_span_cursor_visible` passes unchanged — its 40 spans are
+all roots, so sticky is provably inert on a flat trace. Full workspace `fmt`/`build`/`clippy`/`test`
+green; no dependency changes, so the footprint gate is a no-op.
+
+
