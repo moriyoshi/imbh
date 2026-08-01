@@ -18,7 +18,7 @@ use imbh::{
 };
 use serde_json::{Value, json};
 
-use super::json::{Args, attributes, labels, number};
+use crate::json::{Args, attributes, labels, number};
 use crate::{batches_to_json, offload, stats_json};
 
 /// One tool as `tools/list` describes it.

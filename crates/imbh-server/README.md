@@ -51,6 +51,10 @@ nothing there can ingest, flush, compact, or apply retention. The endpoint is on
 build and adds **no crate** to the graph: it speaks JSON-RPC through `serde_json` and Base64 through
 `base64`, both already compiled under DataFusion (via `arrow-json` and `arrow-cast`).
 
+The protocol and the tools themselves live in [`imbh-mcp`](https://crates.io/crates/imbh-mcp); this
+crate is the Streamable HTTP transport around them. The other transport, **stdio**, is hosted by the
+`imbh-tui` binary (`imbh-tui --mcp-stdio`), which needs no port and no daemon.
+
 Both protocol eras are served: the stateless `2026-07-28` revision (per-request `_meta`,
 `server/discover`, validated header mirror) and the `initialize` handshake of `2025-11-25` and
 earlier. Nothing streams, so responses are single JSON bodies and no session is kept.

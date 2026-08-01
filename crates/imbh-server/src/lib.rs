@@ -53,10 +53,8 @@
 pub mod docker;
 #[cfg(feature = "grpc")]
 pub mod grpc;
-pub mod mcp;
 pub mod shutdown;
 
-use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, PoisonError};
 use std::time::Duration;
@@ -74,10 +72,17 @@ use tower::ServiceExt;
 
 pub use shutdown::{DEFAULT_DRAIN_TIMEOUT, Shutdown};
 
-use imbh::arrow::array::Array;
-use imbh::arrow::record_batch::RecordBatch;
-use imbh::arrow::util::display::{ArrayFormatter, FormatOptions};
 use imbh::{Db, FlushPolicy};
+
+/// The MCP server (protocol, tools, and the stdio transport) lives in its own crate, since the
+/// `imbh-tui` binary hosts the stdio half of it. Re-exported under the name this module has always
+/// had, so `imbh_server::mcp::…` keeps working.
+pub use imbh_mcp as mcp;
+pub(crate) use imbh_mcp::json_string;
+/// The JSON serializers `POST /api/query` / `GET /stats` share with the `query_sql` / `db_stats`
+/// tools, and the `block_in_place` wrapper every `Db` call goes through. All three moved to
+/// [`imbh_mcp`] with the tools that use them; re-exported here because they are this crate's API too.
+pub use imbh_mcp::{batches_to_json, offload, stats_json};
 
 /// A minimal HTTP response — the shape every handler in this crate returns, converted into an axum
 /// response on the way out (and written directly by the Docker plugin endpoint, which does not go
@@ -792,12 +797,15 @@ async fn mcp_post(
         );
     }
 
-    let headers = mcp::Headers {
+    // `Transport::Http` is what turns on the header/body agreement rules below; the stdio transport
+    // in `imbh-tui` passes `Transport::Stdio` to the same dispatch and skips them, since a pipe has
+    // no header channel to agree with.
+    let transport = mcp::Transport::Http(mcp::Headers {
         protocol_version: header("mcp-protocol-version"),
         method: header("mcp-method"),
         name: header("mcp-name"),
-    };
-    let reply = mcp::handle(&db, &body, &headers).await;
+    });
+    let reply = mcp::handle(&db, &body, &transport).await;
     match reply.body {
         // Serializing a `Value` fails only on a non-finite float or a non-string map key, neither of
         // which the MCP module can construct — but a 500 beats a panic on a request path.
@@ -894,24 +902,6 @@ fn can_block_in_place() -> bool {
     )
 }
 
-/// Run a `Db` future to completion without leaving a runtime worker parked on its blocking I/O.
-///
-/// `Db`'s futures block *inside themselves* — parquet and tantivy reads are synchronous and the
-/// library has no `spawn_blocking` anywhere — so awaiting one directly on a worker stops that worker
-/// serving anything else, `/health` included. `block_in_place` hands this worker's queue to a
-/// replacement for the duration, which is the contract we want and costs no `Send + 'static` bound:
-/// the future goes on borrowing the `Db` and the request body.
-///
-/// On a current-thread runtime it simply awaits. Nothing else shares that thread to starve, which is
-/// the situation in `#[tokio::test]` and in an embedder driving [`route`] by hand.
-pub async fn offload<F: Future>(fut: F) -> F::Output {
-    if can_block_in_place() {
-        tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(fut))
-    } else {
-        fut.await
-    }
-}
-
 /// [`offload`] for synchronous CPU work — gzip inflation, and the Docker plugin's endpoints, which
 /// do blocking filesystem work (`StartLogging` waits up to `OPEN_TIMEOUT` on a FIFO open).
 pub(crate) async fn offload_blocking<T>(work: impl FnOnce() -> T) -> T {
@@ -929,38 +919,6 @@ async fn stats_response(db: &Arc<Db>) -> Response {
         Ok(stats) => Response::json(200, stats_json(&stats).into_bytes()),
         Err(e) => error_response(&e),
     }
-}
-
-/// Serialize [`imbh::DbStats`] — shared by `GET /stats` and the MCP `db_stats` tool, so the two can
-/// never describe the same database differently.
-pub(crate) fn stats_json(stats: &imbh::DbStats) -> String {
-    let opt = |v: Option<i64>| v.map_or("null".to_owned(), |n| n.to_string());
-    let mut tables = String::from("[");
-    for (i, t) in stats.tables.iter().enumerate() {
-        if i > 0 {
-            tables.push(',');
-        }
-        use std::fmt::Write as _;
-        let _ = write!(
-            tables,
-            "{{\"table\":{},\"segment_count\":{},\"segment_rows\":{},\"buffer_rows\":{},\
-             \"min_time_unix_nano\":{},\"max_time_unix_nano\":{}}}",
-            json_string(t.table.as_str()),
-            t.segment_count,
-            t.segment_rows,
-            t.buffer_rows,
-            opt(t.min_time_unix_nano),
-            opt(t.max_time_unix_nano),
-        );
-    }
-    tables.push(']');
-    format!(
-        "{{\"buffer_bytes\":{},\"wal_bytes\":{},\"durable_lsn\":{},\"tables\":{}}}",
-        stats.buffer_bytes,
-        stats.wal_bytes,
-        stats.durable_lsn.map_or(0, |l| l.get()),
-        tables,
-    )
 }
 
 fn ingest_response(result: imbh::Result<imbh::IngestReceipt>) -> Response {
@@ -1007,91 +965,6 @@ fn error_response(e: &imbh::Error) -> Response {
         status,
         format!("{{\"error\":{}}}", json_string(&e.to_string())).into_bytes(),
     )
-}
-
-// ── JSON serialization of query results ─────────────────────────────────────────────────
-
-/// Serialize result batches into a JSON array of row objects. Numeric columns render as JSON
-/// numbers; everything else as JSON strings (via arrow's value formatter); nulls as `null`.
-pub(crate) fn batches_to_json(batches: &[RecordBatch]) -> Vec<u8> {
-    let mut out = String::from("[");
-    let opts = FormatOptions::default();
-    let mut first_row = true;
-    for batch in batches {
-        let names: Vec<String> = batch
-            .schema()
-            .fields()
-            .iter()
-            .map(|f| f.name().clone())
-            .collect();
-        // A column whose type arrow can't build a formatter for renders as `null` rather than
-        // panicking the connection (`.ok()` instead of `.expect(...)`). Every type imbh emits is
-        // supported, so this is defensive.
-        let formatters: Vec<Option<ArrayFormatter>> = batch
-            .columns()
-            .iter()
-            .map(|c| ArrayFormatter::try_new(c, &opts).ok())
-            .collect();
-        for row in 0..batch.num_rows() {
-            if !first_row {
-                out.push(',');
-            }
-            first_row = false;
-            out.push('{');
-            for (col, name) in names.iter().enumerate() {
-                if col > 0 {
-                    out.push(',');
-                }
-                out.push_str(&json_string(name));
-                out.push(':');
-                let array = batch.column(col);
-                match formatters[col].as_ref() {
-                    Some(f) if !array.is_null(row) => {
-                        let value = f.value(row).to_string();
-                        if is_numeric(array.data_type()) {
-                            out.push_str(&value);
-                        } else {
-                            out.push_str(&json_string(&value));
-                        }
-                    }
-                    _ => out.push_str("null"),
-                }
-            }
-            out.push('}');
-        }
-    }
-    out.push(']');
-    out.into_bytes()
-}
-
-fn is_numeric(dt: &imbh::arrow::datatypes::DataType) -> bool {
-    use imbh::arrow::datatypes::DataType::*;
-    matches!(
-        dt,
-        Int8 | Int16 | Int32 | Int64 | UInt8 | UInt16 | UInt32 | UInt64 | Float32 | Float64
-    )
-}
-
-/// JSON-quote and escape a string.
-pub(crate) fn json_string(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => {
-                use std::fmt::Write as _;
-                let _ = write!(out, "\\u{:04x}", c as u32);
-            }
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-    out
 }
 
 #[cfg(test)]

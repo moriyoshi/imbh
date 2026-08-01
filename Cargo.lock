@@ -2129,6 +2129,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "imbh-mcp"
+version = "0.2.0"
+dependencies = [
+ "base64",
+ "imbh",
+ "imbh-test-support",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "imbh-otel-exporter"
 version = "0.2.0"
 dependencies = [
@@ -2180,13 +2192,13 @@ name = "imbh-server"
 version = "0.2.0"
 dependencies = [
  "axum",
- "base64",
  "flate2",
  "http-body",
  "http-body-util",
  "hyper",
  "hyper-util",
  "imbh",
+ "imbh-mcp",
  "imbh-test-support",
  "libc",
  "opentelemetry-proto",
@@ -2243,6 +2255,7 @@ dependencies = [
  "crossterm",
  "imbh",
  "imbh-lgtm",
+ "imbh-mcp",
  "rand",
  "ratatui",
  "tokio",

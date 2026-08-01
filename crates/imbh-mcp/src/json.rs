@@ -219,6 +219,25 @@ pub(crate) fn decode_header_value(value: &str) -> Option<String> {
     String::from_utf8(BASE64.decode(inner).ok()?).ok()
 }
 
+/// Encode a value for a Streamable HTTP header, applying the `=?base64?…?=` sentinel only when the
+/// value cannot travel as a plain header value.
+///
+/// The conservative set is what MCP allows in a tool name (`[A-Za-z0-9_.-]`), which every tool this
+/// server exposes already satisfies — so in practice this returns the name unchanged, and the
+/// sentinel exists for a client calling something outside that set (whose `Unknown tool` answer
+/// should still come from the dispatch rather than from a header refusal).
+pub(crate) fn encode_header_value(value: &str) -> String {
+    let plain = !value.is_empty()
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'.' || b == b'-');
+    if plain {
+        value.to_owned()
+    } else {
+        format!("=?base64?{}?=", BASE64.encode(value))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -325,5 +344,19 @@ mod tests {
         // Malformed sentinels are refused rather than silently passed through as literals.
         assert_eq!(decode_header_value("=?base64?not!base64?="), None);
         assert_eq!(decode_header_value("=?base64?Zm8?="), None); // unpadded
+    }
+
+    #[test]
+    fn header_encoding_round_trips_through_the_decoder() {
+        for value in ["search_logs", "a.b-c_1", "Hello, 世界", "has space", ""] {
+            assert_eq!(
+                decode_header_value(&encode_header_value(value)).as_deref(),
+                Some(value),
+                "{value:?} did not survive the header round trip"
+            );
+        }
+        // Wire-safe values travel as themselves — the sentinel is only for what cannot.
+        assert_eq!(encode_header_value("search_logs"), "search_logs");
+        assert_eq!(encode_header_value("世界"), "=?base64?5LiW55WM?=");
     }
 }

@@ -9,16 +9,6 @@ git history); this file tracks only what is still open.
 
 ## Open Items
 
-- [ ] **MCP over stdio, hosted by `imbh-tui`.** `imbhd` serves MCP over HTTP (§10.16.1); the other
-      half of the plan is a stdio transport in the TUI binary, since stdio is what MCP clients
-      "SHOULD support whenever possible" and it needs no listening port. `mcp::handle` is already
-      transport-agnostic (`bytes + headers → Reply`), so this is a newline-delimited read/write loop
-      plus a data-access flag: `--db <path>` opening the directory read-only (`Db::open_read_only`,
-      which reads alongside a live `imbhd` writer) or `--url <addr>` proxying to a running `imbhd`.
-      Note the dependency direction — the protocol module currently lives in `imbh-server`, so
-      sharing it with `imbh-tui` means lifting `mcp/` into a crate both can depend on. —
-      *source: JOURNAL (MCP endpoint, 2026-08-01)*
-
 - [ ] **`service.name` is not groupable, only filterable.** `SqlParams::attr_field`
       (`crates/imbh/src/sql.rs:47`) resolves a group/filter key to a real column only when it is in
       the DB's configured `Promote` list, and otherwise emits `json_get_str(attributes, key)`.
@@ -110,6 +100,25 @@ git history); this file tracks only what is still open.
       on arrival order. — *source: JOURNAL (E2E against a real dockerd, 2026-07-30)*
 
 ## Closed, awaiting the next sweep
+
+- [x] **MCP over stdio, hosted by `imbh-tui`.** *Closed 2026-08-01.* `imbhd` served MCP over HTTP
+      only (§10.16.1); the other half of the plan was a stdio transport in the TUI binary, since stdio
+      is what MCP clients "SHOULD support whenever possible" and it needs no listening port. Done as
+      the item called for, with one correction to its premise: `mcp::handle` was *not* quite
+      transport-agnostic — its header/body agreement check (`MCP-Protocol-Version` / `Mcp-Method` /
+      `Mcp-Name`) is a **Streamable HTTP** rule, and over a pipe there is no header channel to agree
+      with, so a modern request would have been refused for a missing header it could never carry.
+      The dispatch now takes a `Transport` (`Http(Headers)` / `Stdio`) and validates the mirror only
+      for HTTP. The protocol module was lifted out of `imbh-server` into the new **`imbh-mcp`** crate,
+      per the item's note on dependency direction (`imbh ← imbh-mcp ← {imbh-server, imbh-tui}`); it
+      also took `batches_to_json` / `stats_json` / `offload` along, since the tools and the HTTP
+      endpoints share them. Both data-access flags shipped: `imbh-tui --mcp-stdio <dir>`
+      (`Db::open_read_only`, reads alongside a live writer) and `--mcp-stdio --url <addr>` (forwards
+      to a running `imbhd`, synthesizing the header mirror from the message it forwards, over
+      hand-written HTTP/1.1 so no HTTP client dependency enters the TUI). Covered by
+      `crates/imbh-mcp/tests/stdio_e2e.rs`; footprint unchanged (facade 275 crates; +1 *workspace*
+      crate each on `imbh-server` and `imbh-tui`). — *source: JOURNAL (MCP endpoint, 2026-08-01;
+      MCP over stdio, 2026-08-01)*
 
 - [x] **`imbhd` connections have no read/write timeout.** *Closed 2026-08-01.* A client that opened a
       socket and sent nothing parked a connection thread in `read_line` forever, costing a thread per

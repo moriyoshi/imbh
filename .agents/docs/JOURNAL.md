@@ -1742,3 +1742,69 @@ The takeaway for the next mechanical refactor: static checks got ~85% of the way
 thing keeping the work honest while no compiler existed, but the last 15% — anything where a *name*
 means two things (variant vs type, alias vs original, trait vs method) — is compiler territory. Do
 not ship a split of this size on inference alone.
+
+## 2026-08-01 — MCP over stdio: the transport that had to admit it was a transport
+
+The TODO item read like a small one: `mcp::handle` is already transport-agnostic
+(`bytes + headers → Reply`), so stdio is "a newline-delimited read/write loop plus a data-access
+flag". Two of those three premises held. The third did not, and it is the finding worth keeping.
+
+**`handle` was HTTP-shaped in one place, and it was the load-bearing place.** The stateless
+`2026-07-28` revision requires a modern request's method, protocol version, and tool name to appear
+as `MCP-Protocol-Version` / `Mcp-Method` / `Mcp-Name` headers *and* to agree with the body — a rule
+that exists so a proxy can route without parsing JSON. `validate_modern` enforced it for every modern
+request. Over a pipe there are no headers, so the very first `_meta`-carrying message from a modern
+stdio client would have been refused `-32020` for a missing header it could never have sent. The
+header mirror is a **Streamable HTTP** rule, not a protocol rule, and the dispatch had no way to say
+so. Fix: `handle(db, bytes, &Transport)` where `Transport` is `Http(Headers)` or `Stdio`, and the
+whole mirror block is skipped when there is no header channel. The version check still runs on both,
+reading the version from `_meta` alone over stdio. This is the kind of thing "transport-agnostic"
+hides: the *signature* was agnostic, the *behaviour* was not, and only a second transport could tell.
+
+**Lifting the module was forced by dependency direction, and paid for itself.** `imbh-tui` may not
+depend on `imbh-server` (§12), so the protocol moved to a new `imbh-mcp` crate that both sit above:
+`imbh ← imbh-mcp ← {imbh-server, imbh-tui}`. `tools.rs` reached into its host crate for
+`batches_to_json`, `stats_json`, and `offload`, so those came along and `imbh-server` now re-exports
+them — which is the right direction anyway: `query_sql` and `POST /api/query` share a row serializer
+*because* they must never render the same rows two ways, and that invariant now lives below both
+callers rather than beside one of them. `imbh_server::mcp` survives as `pub use imbh_mcp as mcp`, so
+the published API surface did not break.
+
+**The `--url` mode is where the header rule came back.** Forwarding a stdio session to a running
+`imbhd` means the message arrives with no headers and must leave with the exact mirror the daemon
+enforces — so the proxy *derives* the headers from the body it is about to send (`method`,
+`params._meta` version, `params.name`, Base64-sentinel-encoded when the tool name is not wire-safe).
+That is a satisfying closure: the transport that has no headers is also the one that has to
+manufacture them. Encoding needed a new `encode_header_value` mirroring the existing decoder, and its
+test is a round trip through both.
+
+**The HTTP client is 150 lines of `std::net`, deliberately.** A client crate would have pulled hyper's
+client stack into the TUI binary to send a fixed method to a fixed path with a known-length body and
+no redirects, compression, TLS, or pooling. One buffered `POST` per message with `Connection: close`
+(so reading to EOF is correct framing-independently) costs a TCP handshake per tool call against a
+loopback daemon — not a cost worth a subtree. `Content-Length` and `chunked` are both handled; the
+latter only because something might sit in between.
+
+Smaller decisions worth remembering:
+
+- **Blocking `std::io` inside an `async fn` is correct here**, and the comment says why: the loop is
+  the only thing on its runtime, and a `Db` query is blocking parquet/tantivy I/O from end to end, so
+  concurrent requests would contend for the same disk rather than overlap. Sequential is not a
+  simplification, it is the right shape.
+- **A malformed line must not end a session.** One bad message from a client is a parse error and a
+  continue; EOF and `BrokenPipe` are both `Ok(())`, because "the client went away" is how a stdio
+  session ends normally. A notification writes *nothing* — not an empty line.
+- **stdout is the transport.** The one-line "serving MCP over stdio from …" banner goes to stderr,
+  where clients collect it as the server's log.
+- The TUI's argument parsing moved into `cli.rs` (a `Mode` enum) so the combinations that must be
+  refused — `--url` without `--mcp-stdio`, two sources at once, `--ascii` in server mode — are tests
+  rather than prose. `--db` and `--help` came along.
+
+Footprint: unchanged. `imbh-mcp` is `imbh` plus `serde_json` and `base64`, both already compiled
+under DataFusion; the facade stays at 275 crates, and `imbh-server` (300 → 301) and `imbh-tui`
+(312 → 313) each gained exactly one *workspace* crate and zero third-party ones. Gate green: fmt,
+build, clippy `-D warnings`, `cargo test --workspace`, plus the footprint gate (275 crates, 32.9 MiB
+`imbhd`, RSS soak within budget). New coverage: `crates/imbh-mcp/tests/stdio_e2e.rs` — six tests
+driving real sessions over in-memory pipes, including a hand-rolled fake `imbhd` on loopback that
+asserts the synthesized header mirror *from the receiving side*, which is the only place that
+particular bug could have been caught.

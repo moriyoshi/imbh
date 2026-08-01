@@ -14,6 +14,12 @@
 //! * [`syntax`] / [`completion`] / [`promql`] — the query-language support behind the editor.
 //! * [`format`] / [`time`] / [`waterfall`] / [`detail_text`] / [`chart`] — display helpers.
 //! * [`mascot`] — the animated easter egg that rides on top of it all.
+//!
+//! The binary this crate backs is also imbh's **MCP server over stdio** (`imbh-tui --mcp-stdio`):
+//! the same read-only view of someone else's database, addressed to an agent rather than to a
+//! person. The protocol and tools live in `imbh-mcp`; [`cli`] is where the two modes are told apart.
+
+pub mod cli;
 
 mod app;
 mod chart;

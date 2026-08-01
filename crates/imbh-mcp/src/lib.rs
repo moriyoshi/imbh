@@ -1,9 +1,20 @@
-//! The MCP (Model Context Protocol) endpoint: imbh's telemetry as agent tools.
+//! The MCP (Model Context Protocol) server: imbh's telemetry as agent tools.
 //!
-//! `imbhd` serves MCP over the Streamable HTTP transport at `POST /mcp`, so an agent can search
-//! logs, pull traces, and query metrics through the same process that ingests them — no Grafana, no
-//! datasource proxy, and no second copy of the data. The tool surface is [`tools`]: read-only
-//! wrappers over the imbh library's typed query APIs plus raw SQL.
+//! An agent connected here can search logs, pull traces, and query metrics through the same process
+//! that holds them — no Grafana, no datasource proxy, and no second copy of the data. The tool
+//! surface is read-only wrappers over the imbh library's typed query APIs plus raw SQL.
+//!
+//! # Transports
+//!
+//! [`handle`] is the whole protocol, and it is transport-agnostic: bytes plus a [`Transport`] in, a
+//! [`Reply`] out. Two transports wire into it, and they are the two MCP defines:
+//!
+//! - **Streamable HTTP** — `imbhd` serves it at `POST /mcp` (`imbh-server`), which is where
+//!   [`Transport::Http`]'s header/body agreement rules apply.
+//! - **stdio** — [`stdio::serve`], newline-delimited JSON-RPC over a pipe, hosted by the `imbh-tui`
+//!   binary (`imbh-tui --mcp-stdio`). stdio is what clients "SHOULD support whenever possible", it
+//!   needs no listening port, and it is the transport an agent launching a subprocess speaks. Its
+//!   framing carries no headers, so [`Transport::Stdio`] validates none.
 //!
 //! # Two protocol eras
 //!
@@ -30,21 +41,29 @@
 //!
 //! # Exposure
 //!
-//! The endpoint is unauthenticated, like the rest of `imbhd` (ARCHITECTURE.md §10.16) — a real
-//! deployment gates it. What it *does* enforce is the transport's DNS-rebinding defence: a browser
-//! `Origin` outside the loopback set is refused with `403` unless `IMBH_MCP_ALLOWED_ORIGINS` says
-//! otherwise. Keep `imbhd` bound to `127.0.0.1` when an agent on the same machine is the only
-//! client.
+//! Over HTTP the endpoint is unauthenticated, like the rest of `imbhd` (ARCHITECTURE.md §10.16) — a
+//! real deployment gates it. What it *does* enforce is the transport's DNS-rebinding defence: a
+//! browser `Origin` outside the loopback set is refused with `403` unless `IMBH_MCP_ALLOWED_ORIGINS`
+//! says otherwise ([`origin_allowed`]). Keep `imbhd` bound to `127.0.0.1` when an agent on the same
+//! machine is the only client. Over stdio the question does not arise: the pipe *is* the
+//! authorization — whoever spawned the process is the only one who can talk to it.
 
 pub(crate) mod json;
 pub(crate) mod tools;
 
+pub mod proxy;
+mod render;
+pub mod stdio;
+
+use std::future::Future;
 use std::sync::Arc;
 
 use imbh::Db;
 use serde_json::{Value, json};
 
 use json::{Args, decode_header_value};
+
+pub use render::{batches_to_json, json_string, stats_json};
 
 /// The stateless revision this server implements. Modern requests must name exactly this.
 pub const LATEST_VERSION: &str = "2026-07-28";
@@ -81,22 +100,47 @@ const META_VERSION: &str = "io.modelcontextprotocol/protocolVersion";
 
 /// The Streamable HTTP request headers this endpoint validates against the body.
 #[derive(Default)]
-pub(crate) struct Headers<'a> {
+pub struct Headers<'a> {
     /// `MCP-Protocol-Version`.
-    pub(crate) protocol_version: Option<&'a str>,
+    pub protocol_version: Option<&'a str>,
     /// `Mcp-Method`.
-    pub(crate) method: Option<&'a str>,
+    pub method: Option<&'a str>,
     /// `Mcp-Name` — the tool name on a `tools/call`.
-    pub(crate) name: Option<&'a str>,
+    pub name: Option<&'a str>,
+}
+
+/// Which MCP transport a message arrived over.
+///
+/// The difference is entirely about *headers*. The stateless revision's Streamable HTTP transport
+/// mirrors the request's method, protocol version, and tool name into HTTP headers and requires the
+/// two to agree, so a proxy can route without parsing the body. stdio frames messages as bare lines
+/// with nowhere to put a header — those rules are the HTTP transport's, not the protocol's, so over
+/// stdio there is nothing to check and a modern request is served on its `_meta` alone.
+pub enum Transport<'a> {
+    /// Streamable HTTP: header/body agreement is enforced.
+    Http(Headers<'a>),
+    /// stdio: newline-delimited JSON with no header channel.
+    Stdio,
+}
+
+impl<'a> Transport<'a> {
+    /// The headers to validate against, or `None` where the transport has no header channel.
+    fn headers(&self) -> Option<&Headers<'a>> {
+        match self {
+            Transport::Http(headers) => Some(headers),
+            Transport::Stdio => None,
+        }
+    }
 }
 
 /// One MCP message's answer: a JSON-RPC body, or nothing at all for an accepted notification.
 ///
 /// The body stays a [`Value`] rather than bytes so the transport owns serialization — which is what
-/// lets a future stdio loop reuse this dispatch unchanged.
-pub(crate) struct Reply {
-    pub(crate) status: u16,
-    pub(crate) body: Option<Value>,
+/// lets the stdio loop reuse this dispatch unchanged. `status` is the HTTP status the Streamable
+/// HTTP transport should answer with; stdio ignores it, since a pipe has no status line.
+pub struct Reply {
+    pub status: u16,
+    pub body: Option<Value>,
 }
 
 impl Reply {
@@ -118,10 +162,10 @@ impl Reply {
 
 /// Handle one JSON-RPC message from the MCP endpoint.
 ///
-/// Transport-agnostic on purpose: it takes bytes and the (already extracted) header values and
-/// returns bytes, so the same dispatch can sit behind a stdio loop later without moving any of the
-/// protocol logic.
-pub(crate) async fn handle(db: &Arc<Db>, body: &[u8], headers: &Headers<'_>) -> Reply {
+/// Transport-agnostic on purpose: it takes the message bytes plus which [`Transport`] they arrived
+/// over (with the already-extracted header values, for HTTP) and returns a [`Reply`] the caller
+/// serializes, so the HTTP endpoint and the stdio loop share every line of protocol logic.
+pub async fn handle(db: &Arc<Db>, body: &[u8], transport: &Transport<'_>) -> Reply {
     // `from_slice` covers invalid UTF-8 too, so there is one parse-failure path rather than two.
     let message: Value = match serde_json::from_slice(body) {
         Ok(message) => message,
@@ -175,7 +219,8 @@ pub(crate) async fn handle(db: &Arc<Db>, body: &[u8], headers: &Headers<'_>) -> 
         return Reply::accepted();
     };
 
-    if modern && let Some(reply) = validate_modern(&id, method, declared, param("name"), headers) {
+    if modern && let Some(reply) = validate_modern(&id, method, declared, param("name"), transport)
+    {
         return reply;
     }
 
@@ -259,7 +304,7 @@ fn validate_modern(
     method: &str,
     declared: Option<&str>,
     name: Option<&Value>,
-    headers: &Headers<'_>,
+    transport: &Transport<'_>,
 ) -> Option<Reply> {
     let mismatch = |message: String| {
         Some(Reply::json(
@@ -268,9 +313,12 @@ fn validate_modern(
         ))
     };
 
-    // `server/discover` is how a client probes an unknown server, so it is exempt from the
-    // header-agreement rules it cannot yet know it needs; everything else must comply.
-    if method != "server/discover" {
+    // The header mirror is the Streamable HTTP transport's rule, so stdio skips this block whole.
+    // `server/discover` is how a client probes an unknown server, so it is exempt too — it cannot
+    // yet know the rules it would have to comply with; everything else must.
+    if let Some(headers) = transport.headers()
+        && method != "server/discover"
+    {
         let Some(header_version) = headers.protocol_version else {
             return mismatch("missing required `MCP-Protocol-Version` header".to_owned());
         };
@@ -308,7 +356,7 @@ fn validate_modern(
 
     // Version support is checked after the headers agree, so the version reported back is the one
     // the client actually meant.
-    let requested = declared.or(headers.protocol_version);
+    let requested = declared.or_else(|| transport.headers().and_then(|h| h.protocol_version));
     match requested {
         Some(v) if v == LATEST_VERSION => None,
         // A `server/discover` with no declared version is the legitimate "what do you speak?" probe.
@@ -392,6 +440,31 @@ fn error_with_data(id: Option<Value>, code: i64, message: &str, data: Value) -> 
         "id": id.unwrap_or(Value::Null),
         "error": {"code": code, "message": message, "data": data},
     })
+}
+
+// ── running blocking `Db` work ──────────────────────────────────────────────────────────────────
+
+/// Run a `Db` future to completion without leaving a runtime worker parked on its blocking I/O.
+///
+/// `Db`'s futures block *inside themselves* — parquet and tantivy reads are synchronous and the
+/// library has no `spawn_blocking` anywhere — so awaiting one on a multi-threaded runtime's worker
+/// stops that worker serving anything else. `block_in_place` hands this worker's queue to a
+/// replacement for the duration, which is the contract we want and costs no `Send + 'static` bound:
+/// the future goes on borrowing the `Db` and the request arguments.
+///
+/// On a current-thread runtime it simply awaits. Nothing else shares that thread to starve, which is
+/// the situation in `#[tokio::test]`, in an embedder driving the dispatch by hand, and in the stdio
+/// transport — where the loop is strictly one message at a time anyway.
+pub async fn offload<F: Future>(fut: F) -> F::Output {
+    let multi_thread = matches!(
+        tokio::runtime::Handle::try_current().map(|handle| handle.runtime_flavor()),
+        Ok(tokio::runtime::RuntimeFlavor::MultiThread)
+    );
+    if multi_thread {
+        tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(fut))
+    } else {
+        fut.await
+    }
 }
 
 // ── DNS-rebinding defence ───────────────────────────────────────────────────────────────────────

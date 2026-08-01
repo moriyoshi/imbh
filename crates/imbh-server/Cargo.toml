@@ -14,6 +14,12 @@ path = "src/main.rs"
 
 [dependencies]
 imbh.workspace = true
+# The MCP server itself: protocol dispatch, the read-only tool surface, and the JSON serializers
+# `POST /api/query` and `GET /stats` share with the `query_sql`/`db_stats` tools. This crate owns only
+# the Streamable HTTP transport around it (`POST /mcp`); the stdio transport is hosted by `imbh-tui`
+# (ARCHITECTURE.md §10.16.1). Adds no crate to the graph — it is imbh plus serde_json and base64,
+# both already compiled under DataFusion.
+imbh-mcp.workspace = true
 # One shared multi-threaded runtime drives the accept loop and every connection. `Db`'s futures do
 # blocking parquet/tantivy I/O inside themselves (there is no `spawn_blocking` anywhere in the
 # library), so a handler that called them on a runtime worker would park it — every `Db` call in
@@ -36,12 +42,12 @@ hyper-util.workspace = true
 http-body-util.workspace = true
 http-body.workspace = true
 tower.workspace = true
-# The MCP endpoint's wire format (ARCHITECTURE.md §10.16.1): JSON-RPC in, JSON-RPC out. Both crates
-# are already compiled in the default graph — serde_json via arrow-json, base64 via arrow-cast, both
-# under datafusion — so these edges add **no crate** to `imbh-server`'s tree (measured 293 → 293) and
-# none to the `imbh` facade the footprint gate counts, which they never reach.
+# The MCP endpoint's wire format (ARCHITECTURE.md §10.16.1): JSON-RPC in, JSON-RPC out. Already
+# compiled in the default graph — serde_json via arrow-json, under datafusion — so this edge adds
+# **no crate** to `imbh-server`'s tree (measured 293 → 293) and none to the `imbh` facade the
+# footprint gate counts, which it never reaches. (Base64 is `imbh-mcp`'s business now: the
+# `=?base64?…?=` header sentinel is decoded inside the dispatch.)
 serde_json.workspace = true
-base64.workspace = true
 # gzip request bodies (`Content-Encoding: gzip`), which the OTel Collector's otlphttp exporter sends by
 # default. Already in the default graph via parquet — no new crate.
 flate2.workspace = true

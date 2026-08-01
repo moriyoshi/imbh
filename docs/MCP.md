@@ -1,20 +1,67 @@
 # imbh as an MCP server
 
-`imbhd` — the reference server ([ARCHITECTURE.md §10.16](../.agents/docs/ARCHITECTURE.md)) — serves
-the **Model Context Protocol** at `POST /mcp`. An agent connected to it can search logs, pull
-traces, and query metrics through the same process that ingests them: no Grafana, no datasource
-proxy, no export step, and no second copy of the data.
+imbh serves the **Model Context Protocol** over both of MCP's transports. An agent connected to
+either one can search logs, pull traces, and query metrics through the same process that holds
+them: no Grafana, no datasource proxy, no export step, and no second copy of the data.
 
 ```
-OTLP in ──▶  imbhd  ──▶  imbh Db  ──▶  /mcp (tools)  ──▶  agent
+OTLP in ──▶  imbhd  ──▶  imbh Db  ──▶  tools  ──▶  agent
 ```
 
-This is one worked example of host wiring, like the rest of `imbh-server`. It is on in the default
-build and adds **no crate** to the graph: it speaks JSON-RPC through `serde_json` and Base64 through
-`base64`, both of which are already compiled under DataFusion (via `arrow-json` and `arrow-cast`), so
-the direct dependencies cost nothing.
+| Transport | Served by | When |
+|---|---|---|
+| **stdio** | `imbh-tui --mcp-stdio` | The agent runs on the same machine and can spawn a process. No port, no configuration beyond a path. |
+| **Streamable HTTP** | `imbhd` at `POST /mcp` | The agent is elsewhere, or the answers must include what the writer has not sealed yet. |
 
-## Quick start
+The protocol and the tools are one crate (`imbh-mcp`) behind both, so the two transports cannot
+answer differently. Neither adds **any crate** to the dependency graph: JSON-RPC goes through
+`serde_json` and Base64 through `base64`, both already compiled under DataFusion (via `arrow-json`
+and `arrow-cast`), and the stdio transport's HTTP forwarding mode is hand-written over
+`std::net::TcpStream`.
+
+## Quick start: stdio
+
+Point the client at the database directory. Nothing needs to be running — `imbh-tui` opens it
+**read-only**, which works whether or not an `imbhd` is writing the same directory:
+
+```sh
+imbh-tui --mcp-stdio ./imbh-data
+```
+
+For Claude Code:
+
+```sh
+claude mcp add imbh -- imbh-tui --mcp-stdio /var/lib/imbh
+```
+
+For a client configured by file:
+
+```json
+{
+  "mcpServers": {
+    "imbh": {
+      "command": "imbh-tui",
+      "args": ["--mcp-stdio", "/var/lib/imbh"]
+    }
+  }
+}
+```
+
+A read-only opener sees every segment the writer has sealed plus its live WAL tail, but not what is
+still only in the writer's in-memory buffer. When the last few seconds have to be visible, forward
+to the running daemon instead of opening the files — same stdio session, same tools:
+
+```sh
+imbh-tui --mcp-stdio --url 127.0.0.1:4318
+```
+
+The session speaks newline-delimited JSON-RPC on stdin/stdout, so it is scriptable without a client:
+
+```sh
+echo '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | imbh-tui --mcp-stdio ./imbh-data
+```
+
+## Quick start: HTTP
 
 ```sh
 imbhd ./imbh-data 127.0.0.1:4318
@@ -84,23 +131,31 @@ two:
 
 - **`2026-07-28`** — the stateless revision: no `initialize`, each request carries its version in
   `params._meta`, `server/discover` reports capabilities, and results carry
-  `resultType: "complete"`. The `MCP-Protocol-Version`, `Mcp-Method`, and `Mcp-Name` headers are
-  validated against the body, and a mismatch is refused with `-32020`.
+  `resultType: "complete"`. Over HTTP the `MCP-Protocol-Version`, `Mcp-Method`, and `Mcp-Name`
+  headers are validated against the body, and a mismatch is refused with `-32020`. Those headers
+  are the *HTTP transport's* rule, so a stdio session — where there is no header channel — is
+  served on its `_meta` alone. (`--url` mode synthesizes them from the message it forwards.)
 - **`2025-11-25`, `2025-06-18`, `2025-03-26`** — the handshake era: `initialize` →
   `notifications/initialized` → `tools/list` / `tools/call`.
 
-`imbhd` picks per request: a `params._meta` protocol version (or a `server/discover` call) selects
-the stateless path, anything else the handshake path. A client asking `initialize` for an unknown
-revision is answered with the newest handshake-era one.
+The era is chosen per request: a `params._meta` protocol version (or a `server/discover` call)
+selects the stateless path, anything else the handshake path. A client asking `initialize` for an
+unknown revision is answered with the newest handshake-era one.
 
-Responses are always a single `application/json` body — nothing here streams, so no SSE stream is
-opened and no session id is minted. `GET /mcp` and `DELETE /mcp` (the older revisions' stream and
-session-teardown verbs) answer `405`.
+Responses are always a single JSON document — nothing here streams, so no SSE stream is opened and
+no session id is minted. Over HTTP, `GET /mcp` and `DELETE /mcp` (the older revisions' stream and
+session-teardown verbs) answer `405`. Over stdio, one line in is at most one line out: a
+notification is answered with nothing, a blank line is skipped, and a malformed line gets a parse
+error without ending the session.
 
 ## Exposure
 
-Like the rest of `imbhd`, the endpoint is **unauthenticated** — a real deployment gates it, and the
-default `127.0.0.1` bind is the intended posture for a local agent.
+Over stdio the question barely arises: the pipe is the authorization, since only the process that
+spawned the server can write to it, and the server binds no port. The reach of a session is exactly
+the database directory (or the `--url` daemon) it was started with, and every tool is read-only.
+
+Over HTTP, like the rest of `imbhd`, the endpoint is **unauthenticated** — a real deployment gates
+it, and the default `127.0.0.1` bind is the intended posture for a local agent.
 
 What it does enforce is the transport's DNS-rebinding defence: a request carrying a browser `Origin`
 outside the loopback set is refused with `403`, so a web page the user merely visits cannot drive
@@ -122,3 +177,15 @@ Remember what the same port also serves: OTLP ingest on `/v1/*` and `POST /admin
 An MCP client and a writer can share one database directory: `imbhd` holds the write lock, and any
 number of read-only opens (`Db::open_read_only`) can query alongside it, seeing the writer's sealed
 segments plus its live WAL tail (OVERVIEW.md §3). Only one process may write.
+
+That is what `imbh-tui --mcp-stdio <dir>` does, and it is why a stdio session needs nothing running.
+What it cannot see is the writer's unsealed in-memory buffer — so if an agent must be able to ask
+about the last few seconds, either shorten `IMBH_FLUSH` on the daemon or point the session at it
+with `--mcp-stdio --url 127.0.0.1:4318`, which forwards every message to the writer itself.
+
+## Serving MCP from your own host
+
+Neither binary is the product. `imbh-mcp` is a library: `handle(&db, message, &transport)` takes one
+JSON-RPC message and returns the reply, so a host that already owns a transport (a Unix socket, a
+WebSocket, an existing HTTP server) can serve the same tools without adopting `imbhd` or `imbh-tui`.
+`imbh_mcp::stdio::serve` is itself only a `read_until`/`write_all` loop over that call.

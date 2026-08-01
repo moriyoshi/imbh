@@ -10,6 +10,12 @@ description = "Read-only terminal explorer for IMBH metrics, traces, and logs."
 
 [dependencies]
 imbh.workspace = true
+# `imbh-tui --mcp-stdio` serves the Model Context Protocol on stdin/stdout — the transport MCP
+# clients "SHOULD support whenever possible", and the one an agent that spawns its own server
+# speaks. The protocol, the tools, and the loop all live in imbh-mcp, shared with the HTTP endpoint
+# `imbhd` serves (ARCHITECTURE.md §10.16.1); this binary only chooses the backend. Adds no crate to
+# the graph: it is `imbh` plus serde_json and base64, both already compiled under DataFusion.
+imbh-mcp.workspace = true
 imbh-lgtm = { workspace = true, features = ["source"] }
 ratatui.workspace = true
 crossterm.workspace = true

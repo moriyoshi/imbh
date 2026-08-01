@@ -1,0 +1,27 @@
+[package]
+name = "imbh-mcp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Model Context Protocol server for imbh: read-only telemetry tools over a transport-agnostic JSON-RPC dispatch, plus a stdio transport."
+
+[dependencies]
+imbh.workspace = true
+# The wire format (ARCHITECTURE.md §10.16.1): JSON-RPC in, JSON-RPC out, plus the transport's
+# `=?base64?…?=` header sentinel. Both crates are already compiled in the default graph — serde_json
+# via arrow-json, base64 via arrow-cast, both under DataFusion — so these edges add **no crate** to
+# any tree, and none to the `imbh` facade the footprint gate counts, which they never reach.
+serde_json.workspace = true
+base64.workspace = true
+# `offload` runs a blocking `Db` future under `block_in_place` when the caller's runtime is
+# multi-threaded (`imbhd`), and awaits it directly otherwise (the stdio transport's current-thread
+# runtime). `rt-multi-thread` is what `block_in_place` lives behind; it pulls no additional crate.
+tokio = { workspace = true, features = ["rt", "rt-multi-thread"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros", "net", "io-util"] }
+tempfile.workspace = true
+imbh-test-support.workspace = true
