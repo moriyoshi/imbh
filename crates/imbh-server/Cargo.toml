@@ -36,6 +36,12 @@ hyper-util.workspace = true
 http-body-util.workspace = true
 http-body.workspace = true
 tower.workspace = true
+# The MCP endpoint's wire format (ARCHITECTURE.md §10.16.1): JSON-RPC in, JSON-RPC out. Both crates
+# are already compiled in the default graph — serde_json via arrow-json, base64 via arrow-cast, both
+# under datafusion — so these edges add **no crate** to `imbh-server`'s tree (measured 293 → 293) and
+# none to the `imbh` facade the footprint gate counts, which they never reach.
+serde_json.workspace = true
+base64.workspace = true
 # gzip request bodies (`Content-Encoding: gzip`), which the OTel Collector's otlphttp exporter sends by
 # default. Already in the default graph via parquet — no new crate.
 flate2.workspace = true

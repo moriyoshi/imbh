@@ -257,6 +257,7 @@ Point a stock OTel SDK's OTLP/HTTP exporter at `http://ADDR` and query it:
 
 - **Ingest:** `POST /v1/logs` · `/v1/traces` · `/v1/metrics`
 - **Query:** `POST /api/query` (SQL body → JSON)
+- **Agents:** `POST /mcp` (Model Context Protocol — read-only telemetry tools)
 - **Ops:** `GET /stats` · `POST /admin/flush` · `/admin/compact` · `GET /health`
 
 `imbhd` runs a **flush scheduler** (the library leaves that choice to the host). `IMBH_FLUSH` picks the
@@ -277,6 +278,23 @@ sealed, and the exit status is 0 — so a restart replays nothing. A second sign
 OTLP/gRPC (the OTel SDK default) is available behind the optional `grpc` feature, served on a second
 port via tonic. It is off by default so the base build stays at its measured footprint; enabling it
 pulls the tonic/hyper subtree.
+
+### MCP endpoint (agents)
+
+`POST /mcp` serves the **Model Context Protocol**, so an agent can search logs, pull traces, and
+query metrics through the same process that ingests them — no Grafana, no datasource proxy, no
+export step:
+
+```
+claude mcp add --transport http imbh http://127.0.0.1:4318/mcp
+```
+
+The 15 tools are read-only — `search_logs`, `search_traces`, `get_trace`, `span_metrics`,
+`query_metric_range`, `histogram_quantile`, attribute discovery, `db_stats`, and `query_sql` for
+everything else. Both protocol eras are served (the stateless `2026-07-28` revision and the
+`initialize` handshake of `2025-11-25` and earlier), it is on in the default build, and it adds
+**no crate** to the dependency graph. A browser `Origin` outside loopback is refused unless
+`IMBH_MCP_ALLOWED_ORIGINS` says otherwise. See the [MCP guide](./docs/MCP.md).
 
 ### Docker logging driver (`docker` feature)
 

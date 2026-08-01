@@ -23,6 +23,8 @@
 //! - `POST /v1/logs` · `/v1/traces` · `/v1/metrics` — OTLP/HTTP protobuf ingest, `Content-Encoding:
 //!   gzip` accepted (the OTel Collector's `otlphttp` exporter compresses by default).
 //! - `POST /api/query` — a SQL string body → JSON rows.
+//! - `POST /mcp` — the Model Context Protocol endpoint (see [`mcp`]): read-only telemetry tools for
+//!   an agent, over MCP's Streamable HTTP transport. `GET`/`DELETE` there answer `405`.
 //! - `GET /stats` — DB operational stats (per-table counts + buffer/WAL bytes + durable LSN) as JSON.
 //! - `POST /admin/flush` · `/admin/compact` — maintenance actions (seal the buffer; force-merge
 //!   segments). These are unauthenticated by design — a real deployment gates `/admin/*` itself.
@@ -51,6 +53,7 @@
 pub mod docker;
 #[cfg(feature = "grpc")]
 pub mod grpc;
+pub mod mcp;
 pub mod shutdown;
 
 use std::future::Future;
@@ -324,6 +327,22 @@ pub fn max_connections(env: Option<String>) -> imbh::Result<usize> {
     value
         .parse()
         .map_err(|_| imbh::Error::config_msg(format!("not a connection count: {value}")))
+}
+
+/// Resolve the MCP endpoint's `Origin` allowlist from `IMBH_MCP_ALLOWED_ORIGINS` — a comma-separated
+/// list of origins (`https://app.example.com`), or the single entry `*` to accept any.
+///
+/// Empty (or unset) means the default posture: only loopback origins, which is the DNS-rebinding
+/// defence MCP's Streamable HTTP transport requires. Nothing here is an error — an unparseable entry
+/// is simply an origin that will never match, and refusing to start over a typo in an allowlist is
+/// worse than refusing the request.
+pub fn mcp_allowed_origins(env: Option<String>) -> Vec<String> {
+    env.unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(str::to_owned)
+        .collect()
 }
 
 /// Everything that bounds one connection: the phase deadlines, the body cap, and how many
@@ -712,6 +731,13 @@ pub fn app(db: Arc<Db>) -> Router {
         .route("/stats", get(stats))
         .route("/admin/flush", post(admin_flush))
         .route("/admin/compact", post(admin_compact))
+        // MCP's Streamable HTTP endpoint. `GET`/`DELETE` are the SSE-stream and session-teardown
+        // verbs of the older revisions, which this server does not implement — `405` is the answer
+        // the spec prescribes, and it is what tells a client not to wait for a stream.
+        .route(
+            "/mcp",
+            post(mcp_post).get(mcp_unsupported).delete(mcp_unsupported),
+        )
         .fallback(not_found)
         .with_state(db)
 }
@@ -742,6 +768,62 @@ async fn query(State(db): State<Arc<Db>>, body: Bytes) -> Response {
 
 async fn stats(State(db): State<Arc<Db>>) -> Response {
     stats_response(&db).await
+}
+
+/// `POST /mcp` — one MCP message in, one JSON-RPC message out (see [`mcp`]).
+async fn mcp_post(
+    State(db): State<Arc<Db>>,
+    headers: axum::http::HeaderMap,
+    body: Bytes,
+) -> Response {
+    let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+
+    // The DNS-rebinding check comes before anything reads the body: a page that should not be
+    // talking to this port must not be able to run a tool, even one that only reads.
+    if let Some(origin) = header("origin")
+        && !mcp::origin_allowed(
+            origin,
+            &mcp_allowed_origins(std::env::var("IMBH_MCP_ALLOWED_ORIGINS").ok()),
+        )
+    {
+        return Response::json(
+            403,
+            format!("{{\"error\":{}}}", json_string("origin not allowed")).into_bytes(),
+        );
+    }
+
+    let headers = mcp::Headers {
+        protocol_version: header("mcp-protocol-version"),
+        method: header("mcp-method"),
+        name: header("mcp-name"),
+    };
+    let reply = mcp::handle(&db, &body, &headers).await;
+    match reply.body {
+        // Serializing a `Value` fails only on a non-finite float or a non-string map key, neither of
+        // which the MCP module can construct — but a 500 beats a panic on a request path.
+        Some(body) => match serde_json::to_vec(&body) {
+            Ok(bytes) => Response::json(reply.status, bytes),
+            Err(e) => Response::json(
+                500,
+                format!("{{\"error\":{}}}", json_string(&e.to_string())).into_bytes(),
+            ),
+        },
+        // A notification is accepted with no body at all, which is not the same as an empty JSON
+        // document — `Response::text` keeps `Content-Length: 0` without claiming a JSON payload.
+        None => Response::text(reply.status, ""),
+    }
+}
+
+/// `GET`/`DELETE /mcp`: the SSE-stream and session verbs this server does not implement.
+async fn mcp_unsupported() -> Response {
+    Response::json(
+        405,
+        format!(
+            "{{\"error\":{}}}",
+            json_string("the imbh MCP endpoint accepts POST only: it opens no SSE stream and keeps no session")
+        )
+        .into_bytes(),
+    )
 }
 
 async fn admin_flush(State(db): State<Arc<Db>>) -> Response {
@@ -843,10 +925,15 @@ pub(crate) async fn offload_blocking<T>(work: impl FnOnce() -> T) -> T {
 /// `GET /stats` — the DB's operational stats as JSON (VM `/status/tsdb` analogue): per-table
 /// segment/row/buffer counts and time span, plus buffer bytes, WAL bytes, and the durable LSN.
 async fn stats_response(db: &Arc<Db>) -> Response {
-    let stats = match offload(db.stats()).await {
-        Ok(s) => s,
-        Err(e) => return error_response(&e),
-    };
+    match offload(db.stats()).await {
+        Ok(stats) => Response::json(200, stats_json(&stats).into_bytes()),
+        Err(e) => error_response(&e),
+    }
+}
+
+/// Serialize [`imbh::DbStats`] — shared by `GET /stats` and the MCP `db_stats` tool, so the two can
+/// never describe the same database differently.
+pub(crate) fn stats_json(stats: &imbh::DbStats) -> String {
     let opt = |v: Option<i64>| v.map_or("null".to_owned(), |n| n.to_string());
     let mut tables = String::from("[");
     for (i, t) in stats.tables.iter().enumerate() {
@@ -867,14 +954,13 @@ async fn stats_response(db: &Arc<Db>) -> Response {
         );
     }
     tables.push(']');
-    let body = format!(
+    format!(
         "{{\"buffer_bytes\":{},\"wal_bytes\":{},\"durable_lsn\":{},\"tables\":{}}}",
         stats.buffer_bytes,
         stats.wal_bytes,
         stats.durable_lsn.map_or(0, |l| l.get()),
         tables,
-    );
-    Response::json(200, body.into_bytes())
+    )
 }
 
 fn ingest_response(result: imbh::Result<imbh::IngestReceipt>) -> Response {
@@ -927,7 +1013,7 @@ fn error_response(e: &imbh::Error) -> Response {
 
 /// Serialize result batches into a JSON array of row objects. Numeric columns render as JSON
 /// numbers; everything else as JSON strings (via arrow's value formatter); nulls as `null`.
-fn batches_to_json(batches: &[RecordBatch]) -> Vec<u8> {
+pub(crate) fn batches_to_json(batches: &[RecordBatch]) -> Vec<u8> {
     let mut out = String::from("[");
     let opts = FormatOptions::default();
     let mut first_row = true;

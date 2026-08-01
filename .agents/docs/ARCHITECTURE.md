@@ -930,8 +930,8 @@ result — see §10.16 and `docs/EMBEDDING.md`.
 
 `imbh-server` / `imbhd` is a worked example, not the product: an HTTP/1.1 server on **axum over
 hyper** exposing OTLP/HTTP ingest on `/v1/{logs,traces,metrics}` (protobuf, `Content-Encoding: gzip`
-accepted), a SQL query endpoint `POST /api/query` (JSON rows or Arrow IPC out), `GET /stats`, admin
-`POST /admin/{flush,compact}`, and `GET /health`.
+accepted), a SQL query endpoint `POST /api/query` (JSON rows or Arrow IPC out), an MCP endpoint
+`POST /mcp` (§10.16.1), `GET /stats`, admin `POST /admin/{flush,compact}`, and `GET /health`.
 
 **Why a framework here does not cost the footprint claim.** The §11 crate budget is written against
 the *library* graph, and `scripts/footprint-gate.sh` measures exactly that (`cargo tree -p imbh`).
@@ -962,6 +962,50 @@ error → `InvalidArgument`, else `Internal`), mirroring the HTTP status mapping
 subtree used to be confined to that feature; now that the HTTP listener brings hyper/tower/axum
 anyway, what `grpc` adds on top is just tonic and h2. The **default build still carries no gRPC
 transport**.
+
+#### 10.16.1 MCP endpoint
+
+`POST /mcp` serves the **Model Context Protocol** over its Streamable HTTP transport, so an agent can
+search logs, pull traces, and query metrics through the same process that ingests them — no Grafana,
+no datasource proxy, no export step. It is on in the default build and adds **no crate** to the
+graph: it speaks JSON-RPC through `serde_json`, and Base64 (the transport's `=?base64?…?=` header
+sentinel, and `AnyValue::Bytes` attributes) through `base64` — both already compiled in the default
+tree, `serde_json` via `arrow-json` and `base64` via `arrow-cast`, both under DataFusion, so the
+direct edges measured 275 → 275 on the facade and 293 → 293 on `imbh-server`. Note that `serde_json`
+here is the *default* build without `preserve_order`, so object keys serialize alphabetically;
+turning that feature on would flip it for every `serde_json` user in the graph, DataFusion included,
+to buy nothing but field order. The
+module (`imbh-server/src/mcp/`) is transport-agnostic — `handle(db, bytes, headers) -> Reply` — so a
+stdio transport can be added later without moving any protocol logic.
+
+The 15 tools are **read-only** wrappers over §10.5–§10.9: `db_stats`, `list_attribute_keys` /
+`list_attribute_values`, `search_logs` / `count_logs` / `log_volume`, `search_traces` / `get_trace` /
+`span_metrics`, `list_metrics` / `metric_series` / `query_metric_range` / `query_metric_instant` /
+`histogram_quantile`, and `query_sql`. Nothing ingests, flushes, compacts, or applies retention, so
+the endpoint is safe to hand an agent that is only meant to *look*. Every tool answers with one JSON
+document in a `text` content block; argument and query failures come back as tool-execution errors
+(`isError: true`) rather than JSON-RPC errors, which is what lets a model self-correct rather than
+see a transport failure. Time windows default to a 1h look-back with `since` / explicit
+`start_unix_nano`/`end_unix_nano` overrides — which is why the tool descriptions and `instructions`
+point a model at `db_stats` first, since a replayed or historical DB holds nothing in the last hour.
+
+The endpoint is **dual-era**, because MCP revision `2026-07-28` made the protocol stateless (no
+`initialize`; each request declares its version in `params._meta`; `server/discover` reports
+capabilities; results carry `resultType: "complete"`) while `2025-11-25` and earlier open with the
+`initialize` handshake. Serving only one would be unusable by half the clients in the field, so era
+is chosen **per request**: a `params._meta` protocol version — or a `server/discover` call — selects
+the stateless path, anything else the handshake path. On the stateless path the `MCP-Protocol-Version`
+/ `Mcp-Method` / `Mcp-Name` headers are validated against the body (`-32020` on mismatch, including
+the `=?base64?…?=` sentinel decode) and an unimplemented version is refused with `-32022` listing what
+is supported. Nothing streams, so every response is a single `application/json` body and no session id
+is minted; `GET`/`DELETE /mcp` answer `405`, which is what the spec prescribes for a server offering
+neither stream nor session.
+
+Exposure follows the rest of `imbhd`: unauthenticated, gated by whatever fronts it. The one defence
+implemented here is the transport's DNS-rebinding rule — a request carrying a browser `Origin`
+outside the loopback set is refused `403`, so a page the user merely visits cannot drive the tools on
+their loopback `imbhd`. `IMBH_MCP_ALLOWED_ORIGINS` (comma-separated, `*` to disable) widens it. See
+`docs/MCP.md` for client configuration.
 
 A **Docker logging-driver plugin** is available behind the optional, off-by-default `docker` feature
 (`cargo build -p imbh-server --features docker`), turning `imbhd` into a `docker.logdriver/1.0`
