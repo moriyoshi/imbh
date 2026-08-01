@@ -2094,3 +2094,36 @@ sibling pulls the base to zero and the visible rows span more than five levels, 
 every row still keeps its ten name cells. 119 unit tests in `imbh-tui`; the cap's test became
 `depth_is_stored_uncapped_and_floored_only_at_draw_time`, which asserts the model keeps every level
 and that no rendered row can lose its name.
+
+## Correction: the ambiguous bar glyph is not a bug (2026-08-01)
+
+The 2026-08-01 sticky-waterfall follow-up entry above records, as a "pre-existing latent bug", that
+`━` U+2501 is East-Asian-width ambiguous and therefore violates this crate's own EAW rule. That
+finding is **wrong** and is retracted here; no code changed.
+
+The user's one-line objection was decisive: *"Don't we already use the symbols for pane frames?"* We
+do. Probed, every glyph in ratatui's default `border::PLAIN` set — `│ ─ ┌ ┐ └ ┘` — is ambiguous in
+exactly the same way as the bar, `width` 1 against `width_cjk` 2. So the bar is not an outlier
+violating a rule the rest of the UI obeys; it is consistent with every bordered pane on the screen.
+
+Which means the framing was incoherent from the start. If a terminal really renders ambiguous as two
+cells, the frames break identically and the entire UI is already unusable — fixing the bar alone
+would buy nothing. And if it does not, nothing was broken. ratatui's cell grid assumes
+ambiguous-as-narrow, as does essentially every terminal UI framework; that is why CJK users generally
+configure ambiguous-width to 1, and it is what `--ascii` exists for.
+
+The mistake was over-applying a documented rule past its actual scope. The LTM pitfall said
+"decorative glyphs must be EAW-unambiguous", with examples (`● • · ▼ ▶`) that are all accent glyphs
+inside strings *our own* alignment arithmetic measures — the menu-bar brand, hint separators, tree
+markers. Box-drawing chrome that ratatui lays out on its grid was never the target. The tell I walked
+straight past: when a "violation" turns out to be everywhere in a codebase that documents the rule it
+supposedly violates, the rule almost certainly means something narrower than the reading that
+produced the finding. Checking the *neighbours* of a suspected violation is cheap and would have
+caught this before it was written down as a defect.
+
+The rule in `LTM/imbh-tui-and-gen-demo-db.md` has been split in two so the next reader cannot repeat
+it: an explicit "box-drawing is the deliberate exception, do not fix it" entry, and the original rule
+restated with its real scope. The probe result is recorded there too, since it is the useful part of
+the exercise: the whole box-drawing *and* block-element repertoire is ambiguous (`━ ─ ═ ┄ █ ▄ ▀ ▂ ▁
+■ — ― ‾`), and the only safe bar-ish glyphs are `▬ ╌ − ⎯ ⸺ ¯ ‗` plus ASCII — so there is no drop-in
+replacement that preserves the look, which is the second reason not to have gone down this road.
