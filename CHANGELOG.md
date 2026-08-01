@@ -13,7 +13,116 @@ release aborts if it is missing or duplicated.
 
 ## [Unreleased]
 
+### Added
+
+- **The terminal explorer can drive a running `imbhd`: `imbh-tui --url http://host:4318`.** Until now
+  the TUI only opened a directory, through `Db::open_read_only` — a view that cannot see the writer's
+  *unsealed* buffer, i.e. the most recent telemetry of all. Pointed at a daemon it asks the process
+  that owns those rows, so the newest data is on screen; as a side effect the database may now live on
+  another machine. `imbh-tui <directory>` is unchanged and still opens in-process.
+
+  The surface is a new published crate, **`imbh-head`** (ARCHITECTURE.md §10.19), sitting below both
+  consumers because §12 forbids `imbh-tui` reaching into `imbh-server`. It is three layers:
+  `imbh_head::dto` (the wire types — where the facade already has a `serde`-gated type for something,
+  `LogQuery` / `LogPage` / `Trace` / `MetricMeta`, the wire *is* that type), `imbh_head::exec` (the
+  eleven operations, executed against an open `Db`), and `imbh_head::client` (the HTTP client a remote
+  head uses). The load-bearing property is that `exec` is the **single** implementation: `imbhd` calls
+  it behind `/api/head/…`, the TUI's local backend calls it in-process, so the query-language
+  translation, the evaluation caps, and the trace-window narrowing cannot diverge between the two
+  modes. Deliberately *not* folded into `imbh-mcp`: that surface is shaped for a model and lossy by
+  design (no paging cursors, no per-sample matrices, no waterfall), and reshaping it for a UI would
+  change what every agent sees.
+
+  Row-shaped results (the PromQL/LogQL matrices, the TraceQL matches, a log page, a trace) answer as
+  **Arrow IPC**; scalar ones stay JSON. That is soundness, not taste — JSON has no `NaN`/`±Inf` and
+  `serde_json` writes all three as `null`, which then fails to read back as an `f64`, and a PromQL
+  evaluation produces all three routinely. Anything not row-shaped (paging cursor, scan counters, the
+  assembled trace header, the narrowed window start) rides in the IPC schema metadata.
+
+  New public API: the `imbh-head` crate, and `imbh_server::head` with `head::routes() -> Router<Arc<Db>>`
+  so a host can mount the head surface alone — a UI's backing daemon with no ingest and no admin
+  actions — or leave it out entirely. The endpoints are **read-only** (nothing below `/api/head`
+  ingests, flushes, compacts, or applies retention) and, like the rest of `imbhd`, unauthenticated, so
+  a real deployment gates the prefix. Footprint is untouched where it is measured: `arrow-ipc` is
+  already compiled wherever DataFusion is, and everything `reqwest` pulls (hyper, tower, bytes,
+  http-body-util) is already compiled for `imbh-server` — it is new only to the `imbh-tui` binary, and
+  neither reaches the `imbh` facade the gate measures. The client is trimmed to plain HTTP/1.1 + JSON:
+  no TLS (`imbhd` serves none, so an `https://` URL is refused rather than silently downgraded), no
+  http2, no cookies.
+
+- **TUI: Backspace walks up the current screen's drill-down chain**, a separate axis from the `←`/Esc
+  visit history. Each screen owns a fixed series — `Metrics catalog → series list → series detail`,
+  `Traces → TraceDetail → SpanDetail`, `Logs → LogDetail`, `Overview` alone — and Backspace moves one
+  rung outward. The two axes diverge exactly where they should: a trace detail opened by the log→trace
+  jump steps *up* to the Traces list, while `←` still returns to the log it came from. The step pushes
+  the departed view, so one `←` undoes it.
+
+  `SpanDetail` is the one rung whose parent is not self-contained — it holds a trace id plus a single
+  span, not the trace — so the trace is recovered from the retained detail or from a `TraceDetail`
+  still on the back stack, and with neither available the step lands on the Traces list rather than an
+  empty rung. The waterfall cursor survives `SpanDetail → TraceDetail` so it lands back on the span
+  that was open. Intents scoped to the view being left (a pending trace open, the trace focus, the
+  metric exemplars) are dropped, so a late waterfall cannot yank you back into the detail you just
+  stepped out of. On the Metrics screen the first rung is the **catalog**, which shares
+  `Route::Metrics` with the series list and is told apart by an empty query, so the up-step is a
+  query-clearing move rather than a route change; the series list used to look like a first view and
+  Backspace did nothing there. All four detail hint bars gained a `bksp …` item (and the Metrics
+  series list a `bksp catalog`); the global footer did not, since Backspace is inert on list routes
+  and advertising a dead key is worse than not advertising it.
+
+- **TUI: a sticky waterfall on the trace detail.** The selected span's scrolled-off ancestors are
+  pinned at the top of the pane, so scrolling into a deep trace no longer strands you on a `db.query`
+  with no way to see what it hangs off. `s` toggles it (on by default), and the pinned block is capped
+  at a third of the viewport, keeping the innermost ancestors. The geometry is a pure function, so it
+  is tested without a terminal; it anchors on the *cursor's* ancestor chain rather than the topmost
+  visible row, because the latter is not monotone in the pinned count and provably cycles — which
+  would flicker as the user holds Down.
+
+  The pinned rows are de-emphasised over three channels rather than one: an explicit `DarkGray`
+  foreground (error rows keep `Red`, since a failing ancestor is still worth seeing), a lighter bar
+  glyph, and `DIM`. An attribute-only distinction is a bet on terminal support that does not pay off —
+  many terminals draw box-drawing characters from a built-in geometry renderer that honours the cell's
+  colour but not the faint attribute, so the text dimmed and the bar did not. The last pinned row
+  carries an `UNDERLINED` divider, padded to the full pane width (a rule *row* would have cost a
+  viewport line out of a pane whose whole problem is being too short).
+
+- **`gen-demo-db --deep-hops N`** (default 5) emits one deep trace per step: a checkout entry chaining
+  that many service hops, nested well past what the shallow fixtures reached, with names longer than
+  the name column and roughly one in four failing at the innermost `db.query` so an ERROR propagates
+  up the pinned ancestor chain.
+
+### Changed
+
+- **Breaking: `imbh_tui::cli::Mode::Tui` carries `source: Source` instead of `path: PathBuf`,** since
+  the explorer now takes `--url` as well as a directory. `imbh_tui::run` takes `impl Into<Backend>`
+  and still accepts an `Arc<Db>` (via `From<Arc<Db>>`). `imbh-tui`'s command line also accepts `--url`
+  wherever it accepted a directory, including under `--mcp-stdio`.
+
+- **TUI: the waterfall's 20-cell name column is flat.** Two removals. Span names are no longer
+  indented by depth — nesting is already carried by the pinned ancestor block (walked from the parent
+  link, never from a depth counter) and by the bars themselves, so the indent spent name cells saying
+  what the pane already said twice over; at depth 8 a name had four readable cells left. And the
+  column no longer scrolls horizontally to chase the cursor row: a name that fits is shown whole, one
+  that does not is cut with a trailing ellipsis (`...` under `--ascii`, which stays pure ASCII). The
+  pane is therefore stateless left-to-right — it renders the same wherever the cursor is, so pinned
+  and scrolling rows lay out identically and nothing shifts under the eye on cursor movement. A
+  truncated name's tail is one row away in the span summary. The alignment invariant is untouched:
+  everything left of the first `|` still sums to a fixed cell count, so the bars line up across rows.
+
 ### Fixed
+
+- **The release workflow published an empty, frozen GitHub Release (CD).** `release.yml` did
+  `gh release create` and then `gh release upload`, which assumes a mutable Release; GitHub's
+  immutable releases freeze one the moment it is *published*, so every upload failed with
+  `HTTP 422: Cannot upload assets to an immutable release` — and the obvious recovery, deleting the
+  Release and re-tagging, reserves the tag name permanently (see the `[0.3.0]` note below). The job
+  now creates a **draft** (mutable, re-runnable, deletable), uploads every archive into it, and only
+  then flips `--draft=false`, with an explicit `--latest` so a prerelease cannot displace the stable
+  Release. It branches on an existing Release's state — reuse a draft, refuse a published one — and
+  annotates a failed create with what a burned tag name means, each message saying plainly not to
+  delete anything, because by the time an operator reads it that is the tempting move. The `meta` job
+  gained a matching preflight, so an already-published Release aborts the run in seconds rather than
+  after five fat-LTO build legs.
 
 - **TUI: Enter on a log detail now opens the trace detail, not the trace list.** The log→trace jump
   (and the metric exemplar→trace jump, which shares the code path) focused the trace and switched to
