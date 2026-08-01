@@ -79,11 +79,13 @@ pub(crate) fn handle_detail_key(
     }
     if app.route_log_record().is_some() {
         match key.code {
-            // Enter is the explicit forward navigation to the trace viewer (when the log has a trace).
+            // Enter is the explicit forward navigation to the trace viewer (when the log has a trace):
+            // the Traces screen is loaded focused on that trace and its detail opens on arrival.
             KeyCode::Enter => {
                 if let Some(trace_id) = app.route_log_record().and_then(|r| r.trace_id.clone()) {
                     app.push_history();
                     app.focus_trace_id = Some(trace_id);
+                    app.focus_trace_open = true;
                     switch_screen(
                         app,
                         Screen::Traces,
@@ -134,6 +136,7 @@ pub(crate) fn handle_detail_key(
                 let trace_id = app.nearest_exemplar_trace()?;
                 app.push_history();
                 app.focus_trace_id = Some(trace_id);
+                app.focus_trace_open = true;
                 switch_screen(
                     app,
                     Screen::Traces,
@@ -541,7 +544,7 @@ pub(crate) fn handle_key(
         KeyCode::PageDown => move_selection(app, app.page_rows.get() as isize),
         KeyCode::PageUp => move_selection(app, -(app.page_rows.get() as isize)),
         KeyCode::Home => {
-            app.focus_trace_id = None;
+            app.clear_trace_focus();
             if let Some((first, _)) = app.selectable_bounds() {
                 app.selected = first;
             } else {
@@ -549,7 +552,7 @@ pub(crate) fn handle_key(
             }
         }
         KeyCode::End => {
-            app.focus_trace_id = None;
+            app.clear_trace_focus();
             if let Some((_, last)) = app.selectable_bounds() {
                 app.selected = last;
             } else {
@@ -567,7 +570,7 @@ pub(crate) fn handle_key(
 /// otherwise scroll the plain pane by the same amount. Moving the cursor releases any log→trace
 /// focus so the waterfall follows the selection again.
 pub(crate) fn move_selection(app: &mut App, delta: isize) {
-    app.focus_trace_id = None;
+    app.clear_trace_focus();
     if let Some((first, last)) = app.selectable_bounds() {
         let current = app.selected.clamp(first, last) as isize;
         app.selected = (current + delta).clamp(first as isize, last as isize) as usize;
@@ -635,10 +638,10 @@ pub(crate) fn switch_screen(
     app.focus = Focus::Primary;
     // A trace-open intent is scoped to the Traces list it was issued from.
     app.pending_trace_open = false;
-    // A log→trace jump sets `focus_trace_id` just before switching to Traces; drop a stale focus when
-    // switching anywhere else.
+    // A log→trace jump sets `focus_trace_id` (and the intent to open its detail) just before switching
+    // to Traces; drop a stale focus when switching anywhere else.
     if screen != Screen::Traces {
-        app.focus_trace_id = None;
+        app.clear_trace_focus();
     }
     // A trace→log drill-down sets `log_correlation` just before switching to Logs; drop it when leaving
     // Logs so an unrelated Logs visit is not silently correlated. Exemplar markers belong to a metric

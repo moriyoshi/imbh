@@ -154,6 +154,27 @@ impl App {
     /// for another trace), which the caller turns into a `pending_trace_open` intent. History is
     /// recorded here, so a no-op Enter never disturbs the Forward stack.
     pub(crate) fn open_trace_detail(&mut self) -> bool {
+        self.open_trace_detail_inner(true)
+    }
+
+    /// Consume a pending log→trace / exemplar→trace jump (`focus_trace_open`) by opening the focused
+    /// trace's detail, once its waterfall has landed. Returns `false` — leaving the intent armed for
+    /// the next attempt — while the fetch is still in flight. Unlike [`Self::open_trace_detail`] this
+    /// records no history: the Traces list is only a way station the jump passes through, so a single
+    /// Enter stays a single `←`.
+    pub(crate) fn open_focused_trace_detail(&mut self) -> bool {
+        if !self.focus_trace_open || !self.open_trace_detail_inner(false) {
+            return false;
+        }
+        // The jump has arrived: the focus has done its job, so the Traces list left underneath is free
+        // to follow its own cursor again.
+        self.clear_trace_focus();
+        true
+    }
+
+    /// Open the trace detail for the focus/selection, recording the departing view in the history only
+    /// when `record_history` is set. Shared by the Traces-list Enter and the focus jump.
+    fn open_trace_detail_inner(&mut self, record_history: bool) -> bool {
         if !matches!(self.route, Route::Traces) {
             return false;
         }
@@ -171,7 +192,9 @@ impl App {
         else {
             return false;
         };
-        self.push_history();
+        if record_history {
+            self.push_history();
+        }
         self.route = Route::TraceDetail { detail };
         self.span_cursor = 0;
         self.scroll = 0;
@@ -223,6 +246,14 @@ impl App {
         self.scroll = 0;
         self.focus = Focus::Primary;
         true
+    }
+
+    /// Abandon a log→trace / exemplar→trace focus along with its "open the detail on arrival" intent,
+    /// so the waterfall follows the row cursor again and a late fetch cannot yank the user into a
+    /// detail they have navigated away from.
+    pub(crate) fn clear_trace_focus(&mut self) {
+        self.focus_trace_id = None;
+        self.focus_trace_open = false;
     }
 
     /// After a fresh Traces result, move the cursor onto the focused trace (if it is in the result
@@ -386,6 +417,47 @@ mod tests {
         app.selected = 0;
         assert!(!app.open_metric_detail());
         assert!(app.route_metric_detail().is_none());
+    }
+
+    #[test]
+    fn a_focused_trace_jump_opens_the_detail_not_the_traces_list() {
+        // The state a log-detail Enter leaves behind: focused on the log's trace, parked on the Traces
+        // list the jump routes through, with the log detail already on the back stack.
+        let mut app = traces_app_with_trace();
+        let trace_id = app.detail_trace_id.clone().expect("materialized trace");
+        app.push_history();
+        app.focus_trace_id = Some(trace_id);
+        app.focus_trace_open = true;
+
+        assert!(app.open_focused_trace_detail());
+        assert!(
+            app.route_trace_detail().is_some(),
+            "the jump lands on the trace detail, not the list"
+        );
+        // The intent is spent (a later waterfall must not re-open it) and the focus with it.
+        assert!(!app.focus_trace_open);
+        assert_eq!(app.focus_trace_id, None);
+        // The way-station list is not recorded: one Enter stays one `←`, back to the log detail.
+        assert_eq!(app.back.len(), 1);
+        assert!(matches!(app.back[0].route, Route::Traces));
+    }
+
+    #[test]
+    fn a_focused_trace_jump_stays_armed_until_its_waterfall_lands() {
+        let mut app = traces_app_with_trace();
+        app.focus_trace_id = app.detail_trace_id.clone();
+        app.focus_trace_open = true;
+        app.trace_detail = None; // fetch still in flight
+
+        assert!(!app.open_focused_trace_detail());
+        assert!(matches!(app.route, Route::Traces));
+        assert!(app.focus_trace_open, "the intent survives for the arrival");
+
+        // Moving the cursor away abandons the jump, so a late waterfall cannot yank the view.
+        app.clear_trace_focus();
+        app.trace_detail = Some(build_trace_detail(&sample_trace(), true));
+        assert!(!app.open_focused_trace_detail());
+        assert!(matches!(app.route, Route::Traces));
     }
 
     #[test]
