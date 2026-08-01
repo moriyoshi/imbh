@@ -137,6 +137,10 @@ pub async fn run(db: Arc<Db>, options: Options) -> io::Result<()> {
                             // log) then fetch the selected/focused trace's waterfall.
                             app.focus_select_trace();
                             request_waterfall(&mut app, &db, &sender, options.ascii);
+                            // A log→trace / exemplar→trace jump wants the trace's *detail*, not the
+                            // Traces list it routes through: open it right away when the waterfall was
+                            // already retained (no fetch was issued above), else on its arrival below.
+                            app.open_focused_trace_detail();
                             // A fresh flat catalog: (re)build the metric tree over it.
                             if app.on_catalog() {
                                 app.build_metric_tree();
@@ -184,10 +188,13 @@ pub async fn run(db: Arc<Db>, options: Options) -> io::Result<()> {
                                 app.snapshot.detail = Some(detail);
                                 app.trace_detail = trace;
                                 // An Enter pressed while this fetch was in flight opens the full trace
-                                // detail now that the data is here.
+                                // detail now that the data is here — either the Traces-list Enter
+                                // (`pending_trace_open`) or a log/exemplar→trace jump.
                                 if app.pending_trace_open {
                                     app.pending_trace_open = false;
                                     app.open_trace_detail();
+                                } else {
+                                    app.open_focused_trace_detail();
                                 }
                             }
                         }

@@ -121,8 +121,10 @@ impl App {
         // Exemplar markers are view-specific; a metric detail restored by history refetches them.
         self.metric_exemplars.clear();
         // A trace-open intent belongs to the view it was issued from; history navigation abandons it so
-        // a late waterfall never yanks the user into a detail they navigated away from.
+        // a late waterfall never yanks the user into a detail they navigated away from. The restored
+        // focus is a plain waterfall focus — the jump that armed it has already been navigated away.
         self.pending_trace_open = false;
+        self.focus_trace_open = false;
         self.mode = Mode::Normal;
         self.completion = None;
         self.focus = Focus::Primary;

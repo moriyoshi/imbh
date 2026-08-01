@@ -2127,3 +2127,35 @@ restated with its real scope. The probe result is recorded there too, since it i
 the exercise: the whole box-drawing *and* block-element repertoire is ambiguous (`━ ─ ═ ┄ █ ▄ ▀ ▂ ▁
 ■ — ― ‾`), and the only safe bar-ish glyphs are `▬ ╌ − ⎯ ⸺ ¯ ‗` plus ASCII — so there is no drop-in
 replacement that preserves the look, which is the second reason not to have gone down this road.
+
+## The log→trace jump stopped at the trace list: an intent with no carrier (2026-08-01)
+
+**Symptom.** Enter on a log entry's detail screen navigated to the Traces *list* instead of the
+selected log's trace detail.
+
+**Cause.** The jump is a three-hop dance and the "open the detail" intent had no carrier that
+survived it. `handle_detail_key` set `focus_trace_id` and called `switch_screen(Traces)`, which
+issues a list refresh; the list result then runs `focus_select_trace` + `request_waterfall`; the
+waterfall result finally arrives. `App::pending_trace_open` — the flag the Traces-list Enter uses
+for "open as soon as the fetch lands" — is deliberately cleared by *both* intermediate hops
+(`switch_screen`, so an intent cannot outlive its list; `request_waterfall`, so an Enter meant for
+the trace the cursor just left is abandoned). Correct for that flag, fatal for this one: nothing
+was left set by the time the waterfall landed, so the view stayed on the list. The exemplar→trace
+jump from a metric detail (`keys.rs`, the `nearest_exemplar_trace` arm) had the identical bug.
+
+**Fix.** A second, focus-scoped intent `App::focus_trace_open`, set alongside `focus_trace_id` by
+both jumps and cleared only where the focus itself is abandoned (`clear_trace_focus`, now used by
+`move_selection` / Home / End / a non-Traces `switch_screen`, plus `restore_nav`). It is consumed by
+`App::open_focused_trace_detail` from two places in the run loop: right after the list result (the
+waterfall may still be *retained* from an earlier visit, in which case no fetch is issued and no
+`Update::Waterfall` would ever arrive) and on the waterfall arrival otherwise.
+
+**Design note.** `open_focused_trace_detail` opens *without* pushing history — the Traces list is a
+way station the user never asked for, so one Enter stays one `←` back to the log detail. That is why
+`open_trace_detail` grew an `open_trace_detail_inner(record_history)` core rather than being reused
+directly.
+
+**Lesson.** "Clear this intent on navigation" and "carry this intent across a navigation" cannot
+share one flag. When a drill-down is implemented as *switch screen, then let the data pull you the
+rest of the way*, the intent has to be scoped to the thing it is waiting for (here: the trace focus),
+not to the screen it happens to pass through.

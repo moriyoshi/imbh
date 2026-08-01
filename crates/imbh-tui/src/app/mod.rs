@@ -88,6 +88,10 @@ pub(crate) struct App {
     /// When navigating from a log's detail to its trace, the trace id to focus the Traces waterfall on
     /// (overrides the selection until the cursor is moved or a matching row is found).
     pub(crate) focus_trace_id: Option<String>,
+    /// Set alongside `focus_trace_id` by a log→trace / exemplar→trace jump: those drill-downs ask for
+    /// the trace *detail*, not the Traces list they route through, so the detail is opened as soon as
+    /// the focused trace's waterfall is in hand. Cleared by any navigation that abandons the focus.
+    pub(crate) focus_trace_open: bool,
     /// The Metrics catalog tree (expansion + lazily-loaded dimensions). Rebuilt whenever the flat
     /// catalog snapshot arrives; drives the catalog table rendering.
     pub(crate) metric_tree: Vec<MetricNode>,
@@ -190,6 +194,7 @@ impl App {
             span_cursor: 0,
             metric_cursor: 0,
             focus_trace_id: None,
+            focus_trace_open: false,
             metric_tree: Vec::new(),
             tree_rows: Vec::new(),
             log_labels: None,

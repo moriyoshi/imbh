@@ -13,6 +13,16 @@ release aborts if it is missing or duplicated.
 
 ## [Unreleased]
 
+### Fixed
+
+- **TUI: Enter on a log detail now opens the trace detail, not the trace list.** The log→trace jump
+  (and the metric exemplar→trace jump, which shares the code path) focused the trace and switched to
+  the Traces screen, but the intent to open the trace's waterfall was dropped on the way — the screen
+  switch and the waterfall fetch both cleared the existing `pending_trace_open` flag — so the jump
+  stopped at the correlated list. The intent now rides along with the trace focus and is consumed
+  when the waterfall lands. The Traces list the jump routes through is not recorded in the history,
+  so one Enter is still undone by one `←`.
+
 ## [0.3.0] - 2026-08-01
 
 > **No GitHub Release or `v0.3.0` tag.** The CD run published the Release before uploading its
