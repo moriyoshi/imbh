@@ -6,7 +6,7 @@ name: Release
 #   meta      resolve the version / tag / image name once, so no job re-derives them
 #   licenses  license compatibility (cargo-deny) + THIRD-PARTY-NOTICES.txt (cargo-about)
 #   build     imbhd + imbh-tui, release profile, one leg per published target
-#   publish   checksums + upload the archives to the GitHub Release for the tag
+#   publish   checksums + upload the archives into a DRAFT Release, then publish it
 #   image     linux/amd64 + linux/arm64 manifest -> ghcr.io/<owner>/imbh
 #
 # `build` depends on `licenses` on purpose: the notices file it packages into every archive is the
@@ -91,6 +91,27 @@ jobs:
             echo "publish=${publish}"
             echo "image=${image}"
           } | tee -a "${GITHUB_OUTPUT}"
+
+      # Fail in seconds rather than after five fat-LTO build legs. An already-published Release is
+      # immutable and can never accept this run's archives, so there is nothing worth building — and
+      # the tempting fix (delete it and re-tag) is the one move that cannot be undone. Says so here,
+      # while the reader still has the choice.
+      - name: Check the Release slot is still writable
+        if: steps.resolve.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ steps.resolve.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          draft="$(gh release view "${TAG}" --json isDraft --jq '.isDraft' 2> /dev/null || echo absent)"
+          case "${draft}" in
+            absent) echo "no Release exists for ${TAG} yet — the publish job will create a draft" ;;
+            true)   echo "::notice::a draft Release already exists for ${TAG}; the publish job will fill and publish it" ;;
+            *)      echo "::error::${TAG} already has a published (immutable) Release — it cannot accept new assets. Do NOT delete it to retry: GitHub keeps the tag name reserved permanently, even after deletion and even with immutability turned off. Release the next version instead."
+                    exit 1 ;;
+          esac
 
   licenses:
     name: License + notices
@@ -345,7 +366,14 @@ jobs:
           cat ./*.sha256 | sort -k2 > SHA256SUMS
           rm -f ./*.sha256
           cat SHA256SUMS
-      - name: Create the Release if it does not exist yet, then upload
+      # Upload into a DRAFT and publish only once every asset has landed. This order is not a
+      # nicety, it is the only order that works under GitHub's immutable releases: publishing
+      # freezes a release, so a *published* one rejects every later asset upload ("Cannot upload
+      # assets to an immutable release"), and the tag name is then burned FOREVER — deleting the
+      # release to retry does not give it back, and neither does turning immutability off. A
+      # create-then-upload sequence therefore does not merely fail, it destroys the version number.
+      # A draft is exempt from all of that: it is mutable, re-runnable, and deletable.
+      - name: Upload the archives into a draft Release, then publish it
         env:
           GH_TOKEN: ${{ github.token }}
           # This job never checks out (it only needs the artifacts), so `gh` cannot infer the
@@ -356,13 +384,37 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if ! gh release view "${TAG}" > /dev/null 2>&1; then
-            flags=(--title "${TAG}" --generate-notes --verify-tag)
-            [ "${PRERELEASE}" = "true" ] && flags+=(--prerelease)
-            gh release create "${TAG}" "${flags[@]}"
-          fi
-          # --clobber so a re-run replaces a partially uploaded asset set rather than failing.
+          # `none` also covers a `gh` that cannot see the release at all; the create below is the
+          # authority either way.
+          state="$(gh release view "${TAG}" --json isDraft \
+            --jq 'if .isDraft then "draft" else "published" end' 2> /dev/null || echo none)"
+          case "${state}" in
+            none)
+              flags=(--draft --title "${TAG}" --generate-notes --verify-tag)
+              [ "${PRERELEASE}" = "true" ] && flags+=(--prerelease)
+              if ! gh release create "${TAG}" "${flags[@]}"; then
+                echo "::error::could not create a draft Release for ${TAG}. If the API said the tag name was used by an immutable release, that name is permanently reserved — it cannot be recovered by deleting anything or by disabling immutability. Bump to the next version and tag again."
+                exit 1
+              fi
+              ;;
+            draft)
+              echo "::notice::reusing the existing draft Release for ${TAG}"
+              ;;
+            published)
+              echo "::error::${TAG} is already published, so it is immutable and cannot accept these assets. Do NOT delete it to retry — that burns the tag name permanently. Release the next version instead."
+              exit 1
+              ;;
+          esac
+          # --clobber so a re-run replaces a partially uploaded asset set rather than failing. Safe
+          # here precisely because the target is still a draft.
           gh release upload "${TAG}" dist/* --clobber
+          # Everything is in place: freeze it. `--latest` is explicit so a prerelease never displaces
+          # the current stable release on the repository front page.
+          if [ "${PRERELEASE}" = "true" ]; then
+            gh release edit "${TAG}" --draft=false --latest=false
+          else
+            gh release edit "${TAG}" --draft=false --latest=true
+          fi
           gh release view "${TAG}" --json assets --jq '.assets[].name'
 
   image:

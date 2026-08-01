@@ -1856,3 +1856,49 @@ is groupable.
 Footprint: unchanged (no dependency touched). Gate green: `cargo fmt --all --check`,
 `cargo build --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`,
 `cargo test --workspace`.
+
+## v0.3.0 lost its GitHub Release: create-then-upload is fatal under immutable releases (2026-08-01)
+
+The v0.3.0 CD run built and smoke-tested all five targets, pushed the multi-arch GHCR image, and
+then failed in `publish`. Attempt 1 of that job shows the whole mechanism in two lines:
+
+```
+https://github.com/moriyoshi/imbh/releases/tag/v0.3.0        <- gh release create succeeded
+HTTP 422: Cannot upload assets to an immutable release.      <- gh release upload then failed
+```
+
+`release.yml`'s `publish` step did `gh release create` (no assets) followed by `gh release upload`.
+That is a mutable-Release assumption. GitHub's immutable releases freeze a Release the moment it is
+**published**, so the create published an empty, frozen Release and the upload could never land.
+
+The second, irreversible half followed from a reasonable reaction to that failure: the Release and
+the tag were deleted so a clean release could be cut from a fresh tag. But an immutable release
+reserves its tag name **permanently** — the reservation survives deleting the Release, deleting the
+tag, and turning immutability off (it is anti-repository-resurrection protection). Re-running
+`publish` then produced the terminal error:
+
+```
+HTTP 422: Validation Failed - tag_name was used by an immutable release
+```
+
+`v0.3.0` can never have a GitHub Release in this repository again. Everything else about 0.3.0
+shipped: all 12 crates on crates.io, `ghcr.io/moriyoshi/imbh:0.3.0` + `:0.3` + `:latest`. Only the
+per-platform archives have nowhere to live. Recorded as-is rather than papered over with a no-op
+0.3.1: the version stays where it is, and `README.md` / `CHANGELOG.md` now say plainly that 0.3.0
+has no archives and point at the container image, `cargo install`, and the release commit.
+
+Fixes, all in `release.yml`:
+
+- `publish` creates a **draft**, uploads into it, and flips `--draft=false` only once every asset has
+  landed. A draft is mutable, re-runnable, and deletable — it carries none of the hazard. `--latest`
+  is now explicit at publish time so a prerelease cannot displace the stable release.
+- It also branches on the existing Release's state: reuse a draft, refuse a published one with an
+  error that says *do not delete it*, and annotate a failed create with what a burned tag name means.
+- `meta` checks the Release slot before the build matrix starts, so the unrecoverable case costs
+  seconds instead of an hour of fat-LTO builds across five runners.
+
+The generalisable lesson is about failure-recovery instincts, not YAML. Under immutability the
+familiar "delete it and retry" is the one move that cannot be undone, and it is exactly what a
+half-finished publish invites. Any step that publishes something frozen must therefore be the *last*
+step, and the failure message at that step has to tell the operator what not to do — by the time
+they are reading it, the destructive option looks like the obvious one.
