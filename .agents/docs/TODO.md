@@ -9,17 +9,21 @@ git history); this file tracks only what is still open.
 
 ## Open Items
 
-- [ ] **`service.name` is not groupable, only filterable.** `SqlParams::attr_field`
-      (`crates/imbh/src/sql.rs:47`) resolves a group/filter key to a real column only when it is in
-      the DB's configured `Promote` list, and otherwise emits `json_get_str(attributes, key)`.
+- [x] **`service.name` is not groupable, only filterable.** *(closed 2026-08-01)* `SqlParams::attr_field`
+      (`crates/imbh/src/sql.rs`) resolved a group/filter key to a real column only when it was in
+      the DB's configured `Promote` list, and otherwise emitted `json_get_str(attributes, key)`.
       `service.name` lives in the `resource` column and the built-in promoted `service` column, never
       in record `attributes`, so `LogsApi::volume_by`, `TracesApi::span_metrics`, and the metrics
-      group-by all collapse it to a single `{"service.name": ""}` series with the counts merged —
-      silently, since a missing attribute is a legitimate NULL. Filtering by service is unaffected.
-      The fix is to special-case the built-in promoted columns (`service`, and `service.name` as its
-      OTel spelling) in `attr_field`, the way a configured `Promote` key already is. Pinned by a test
-      in `crates/imbh-server/tests/mcp_e2e.rs` so a fix shows up as a failure there. —
-      *source: JOURNAL (MCP endpoint smoke test, 2026-08-01)*
+      group-by all collapsed it to a single `{"service.name": ""}` series with the counts merged —
+      silently, since a missing attribute is a legitimate NULL. Filtering by service was unaffected.
+      **Fixed** by a `builtin_column` branch ahead of the `Promote` lookup in `attr_field` /
+      `attr_num_field`: both `service` and its OTel spelling `service.name` emit
+      `CAST(service AS VARCHAR)`. That also removed the ad-hoc `key == "service"` special case in
+      `metrics::label_cond` and the `service.name` special case in `AttrsApi::values`. The pinning
+      test in `crates/imbh-server/tests/mcp_e2e.rs` now asserts the split (plus a new two-service
+      case), joined by `logs_group_and_filter_by_service_name` in `crates/imbh/src/lib.rs`. The MCP
+      `log_volume` / `span_metrics` `group_by` descriptions no longer tell models to call once per
+      service. — *source: JOURNAL (MCP endpoint smoke test, 2026-08-01)*
 
 - [ ] **MCP tools have no cost ceiling of their own.** Every tool bounds its own result (`limit`
       clamps, `max_rows` on `query_sql`), but nothing bounds the *work*: an agent can ask

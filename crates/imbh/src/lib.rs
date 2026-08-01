@@ -3110,6 +3110,73 @@ mod tests {
         assert_eq!(b.count, 1);
     }
 
+    /// `service.name` is a resource attribute lifted into the built-in `service` column, never a
+    /// record `attributes` entry, so grouping by it used to resolve through
+    /// `json_get_str(attributes, 'service.name')` — NULL on every row, collapsing the breakdown into
+    /// one `{"service.name": ""}` series with the counts merged. `SqlParams::attr_field` resolves
+    /// both spellings to the column now; this pins the split (and the equivalent filter).
+    #[tokio::test(flavor = "current_thread")]
+    async fn logs_group_and_filter_by_service_name() {
+        let db = Db::in_memory().open().unwrap();
+        db.ingest_otlp_logs(&otlp_rich("cart", "x", 1, 9, &[]))
+            .await
+            .unwrap();
+        db.ingest_otlp_logs(&otlp_rich("cart", "y", 2, 9, &[]))
+            .await
+            .unwrap();
+        db.ingest_otlp_logs(&otlp_rich("checkout", "z", 3, 9, &[]))
+            .await
+            .unwrap();
+
+        // Both spellings group the same way: the OTel key and the column name.
+        for key in ["service.name", "service"] {
+            let buckets = db
+                .logs()
+                .volume_by(
+                    LogQuery::new(),
+                    std::time::Duration::from_nanos(1000),
+                    &[key],
+                )
+                .await
+                .unwrap();
+            let mut counts: Vec<(String, u64)> = buckets
+                .iter()
+                .map(|b| {
+                    let (k, v) = &b.labels[0];
+                    assert_eq!(k, key);
+                    (v.clone(), b.count)
+                })
+                .collect();
+            counts.sort();
+            assert_eq!(
+                counts,
+                vec![("cart".to_owned(), 2), ("checkout".to_owned(), 1)],
+                "grouping by {key}"
+            );
+        }
+
+        // The same key as an attribute *filter* agrees with the breakdown.
+        let page = db
+            .logs()
+            .query(LogQuery::new().attr_eq("service.name", "cart"))
+            .await
+            .unwrap();
+        assert_eq!(page.entries.len(), 2);
+        assert!(
+            page.entries
+                .iter()
+                .all(|e| e.service.as_deref() == Some("cart"))
+        );
+
+        // And `attr_exists` sees it, rather than treating every row as missing the key.
+        let page = db
+            .logs()
+            .query(LogQuery::new().attr_exists("service.name"))
+            .await
+            .unwrap();
+        assert_eq!(page.entries.len(), 3);
+    }
+
     /// Build a one-span OTLP/traces body.
     fn otlp_trace(
         service: &str,

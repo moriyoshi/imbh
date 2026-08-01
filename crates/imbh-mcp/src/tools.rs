@@ -116,7 +116,7 @@ pub(crate) const TOOLS: &[Tool] = &[
             "start_unix_nano":{"type":"integer"},
             "end_unix_nano":{"type":"integer"},
             "step":{"type":"string","description":"Bucket width, e.g. \"1m\" (default), \"5m\", \"1h\"."},
-            "group_by":{"type":"array","items":{"type":"string"},"description":"Record attribute keys to break the volume down by, e.g. [\"http.route\"]. These are attributes, not `service.name` — to split by service, call once per service with the `service` filter."}
+            "group_by":{"type":"array","items":{"type":"string"},"description":"Keys to break the volume down by, e.g. [\"http.route\"]. Record attribute keys, plus `service.name` to split by service. A record missing the key groups under \"\"."}
         },"additionalProperties":false}"#,
     },
     Tool {
@@ -163,7 +163,7 @@ pub(crate) const TOOLS: &[Tool] = &[
             "kind":{"type":"string"},
             "status":{"type":"string"},
             "attributes":{"type":"object","description":"Span-attribute equality filters."},
-            "group_by":{"type":"array","items":{"type":"string"},"description":"Span attribute keys to group series by, e.g. [\"http.route\"]. These are attributes, not `service.name` — to split by service, call once per service with the `service` filter."},
+            "group_by":{"type":"array","items":{"type":"string"},"description":"Keys to group series by, e.g. [\"http.route\"]. Span attribute keys, plus `service.name` to split by service. A span missing the key groups under \"\"."},
             "since":{"type":"string","description":"Look-back window ending now (default \"1h\")."},
             "start_unix_nano":{"type":"integer"},
             "end_unix_nano":{"type":"integer"},
