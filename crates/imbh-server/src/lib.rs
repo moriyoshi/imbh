@@ -799,7 +799,15 @@ async fn mcp_post(
     };
     let reply = mcp::handle(&db, &body, &headers).await;
     match reply.body {
-        Some(body) => Response::json(reply.status, body.into_bytes()),
+        // Serializing a `Value` fails only on a non-finite float or a non-string map key, neither of
+        // which the MCP module can construct — but a 500 beats a panic on a request path.
+        Some(body) => match serde_json::to_vec(&body) {
+            Ok(bytes) => Response::json(reply.status, bytes),
+            Err(e) => Response::json(
+                500,
+                format!("{{\"error\":{}}}", json_string(&e.to_string())).into_bytes(),
+            ),
+        },
         // A notification is accepted with no body at all, which is not the same as an empty JSON
         // document — `Response::text` keeps `Content-Length: 0` without claiming a JSON payload.
         None => Response::text(reply.status, ""),

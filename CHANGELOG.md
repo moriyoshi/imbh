@@ -30,8 +30,10 @@ release aborts if it is missing or duplicated.
   `initialize` handshake of `2025-11-25` and earlier. Nothing streams, so responses are single JSON
   bodies and no session id is minted; `GET`/`DELETE /mcp` answer `405`.
 
-  On in the default build, and it adds **no crate** to any dependency graph — MCP is JSON-RPC over
-  HTTP, which this crate already has the JSON plumbing for. Like the rest of `imbhd` the endpoint is
+  On in the default build, and it adds **no crate** to any dependency graph: it speaks JSON-RPC
+  through `serde_json` and Base64 through `base64`, both of which are already compiled under
+  DataFusion (via `arrow-json` and `arrow-cast`), so the new direct edges cost nothing — measured
+  275 → 275 crates on the `imbh` facade and 293 → 293 on `imbh-server`. Like the rest of `imbhd` the endpoint is
   unauthenticated, but it enforces the transport's DNS-rebinding defence: a browser `Origin` outside
   loopback is refused `403`, widened by the new `IMBH_MCP_ALLOWED_ORIGINS` (comma-separated, or `*`).
   Public API additions: `imbh_server::mcp` and `imbh_server::mcp_allowed_origins`. See

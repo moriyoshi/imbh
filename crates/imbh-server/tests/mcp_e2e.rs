@@ -11,11 +11,12 @@ use std::sync::Arc;
 
 use axum::body::Body;
 use axum::http::Request;
-use imbh::{AnyValue, Db, parse_json};
+use imbh::Db;
 use imbh_server::app;
 use imbh_test_support::otlp::{
     otlp_hist, otlp_metrics, otlp_rich, otlp_trace_tree, otlp_trace_wide,
 };
+use serde_json::{Value, json};
 use tower::ServiceExt;
 
 /// The fixtures sit at epoch nanosecond ~1, so every tool call passes explicit bounds — a `since`
@@ -75,29 +76,29 @@ async fn call_tool(db: &Arc<Db>, tool: &str, arguments: &str) -> String {
 
 /// The `text` of the single content block a tool answers with, having asserted it is not an error.
 fn tool_text(response: &str) -> String {
-    let value = parse_json(response).expect("response is JSON");
-    let field = |v: &AnyValue, name: &str| match v {
-        AnyValue::Map(pairs) => pairs
-            .iter()
-            .find(|(k, _)| k == name)
-            .map(|(_, v)| v.clone()),
-        _ => None,
-    };
-    let result = field(&value, "result").expect("a result, not an error");
+    let value: Value = serde_json::from_str(response).expect("response is JSON");
+    let result = &value["result"];
+    assert!(
+        !result.is_null(),
+        "a result, not an error, was expected: {response}"
+    );
     assert_eq!(
-        field(&result, "isError"),
-        Some(AnyValue::Bool(false)),
+        result["isError"],
+        json!(false),
         "tool reported an error: {response}"
     );
-    let Some(AnyValue::Array(content)) = field(&result, "content") else {
-        panic!("no content array in {response}");
-    };
-    let Some(AnyValue::Str(text)) = field(&content[0], "text") else {
-        panic!("no text block in {response}");
-    };
+    let text = result["content"][0]["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no text block in {response}"))
+        .to_owned();
     // Every tool answers with a JSON document, so a client can parse the block rather than read it.
-    assert!(parse_json(&text).is_some(), "tool text is not JSON: {text}");
+    serde_json::from_str::<Value>(&text).unwrap_or_else(|e| panic!("tool text is not JSON: {e}"));
     text
+}
+
+/// The parsed tool payload, for assertions that are about structure rather than substrings.
+fn tool_value(response: &str) -> Value {
+    serde_json::from_str(&tool_text(response)).expect("tool text is JSON")
 }
 
 async fn seeded_db() -> Arc<Db> {
@@ -463,34 +464,17 @@ async fn the_trace_tools_answer_over_real_data() {
 async fn the_metric_and_discovery_tools_answer_over_real_data() {
     let db = seeded_db().await;
 
-    let text = tool_text(&call_tool(&db, "list_metrics", "{}").await);
-    assert!(text.contains(r#""metric":"#), "{text}");
-    assert!(text.contains(r#""kind":"#), "{text}");
+    let catalog = tool_value(&call_tool(&db, "list_metrics", "{}").await);
+    let metrics = catalog["metrics"].as_array().expect("a metrics array");
+    assert!(!metrics.is_empty(), "{catalog}");
 
     // Pull a real metric name out of the catalogue and query it, the way a model would.
-    let catalog = parse_json(&text).expect("catalogue is JSON");
-    let AnyValue::Map(pairs) = catalog else {
-        panic!("catalogue is not an object")
-    };
-    let Some((_, AnyValue::Array(metrics))) = pairs.into_iter().find(|(k, _)| k == "metrics")
-    else {
-        panic!("no metrics array")
-    };
     let name = metrics
         .iter()
-        .find_map(|m| match m {
-            AnyValue::Map(fields) => {
-                let get = |k: &str| {
-                    fields
-                        .iter()
-                        .find(|(key, _)| key == k)
-                        .and_then(|(_, v)| v.as_str())
-                };
-                (get("kind") == Some("gauge")).then(|| get("metric").unwrap_or_default().to_owned())
-            }
-            _ => None,
-        })
-        .expect("a gauge metric in the fixture");
+        .find(|m| m["kind"] == json!("gauge"))
+        .and_then(|m| m["metric"].as_str())
+        .expect("a gauge metric in the fixture")
+        .to_owned();
 
     let text = tool_text(
         &call_tool(

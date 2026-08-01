@@ -2180,6 +2180,7 @@ name = "imbh-server"
 version = "0.2.0"
 dependencies = [
  "axum",
+ "base64",
  "flate2",
  "http-body",
  "http-body-util",
@@ -2190,6 +2191,7 @@ dependencies = [
  "libc",
  "opentelemetry-proto",
  "prost",
+ "serde_json",
  "tempfile",
  "tokio",
  "tonic",

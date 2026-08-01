@@ -16,8 +16,9 @@ use imbh::{
     Aggregation, Db, Direction, HistogramQuery, LogEntry, LogQuery, MetricQuery, SeverityNumber,
     SpanMetricsQuery, TimeRange, Timestamp, TraceId, TraceQuery, parse_duration,
 };
+use serde_json::{Value, json};
 
-use super::json::{Args, Arr, Obj, any_value, attributes, labels, number};
+use super::json::{Args, attributes, labels, number};
 use crate::{batches_to_json, offload, stats_json};
 
 /// One tool as `tools/list` describes it.
@@ -25,9 +26,20 @@ pub(crate) struct Tool {
     pub(crate) name: &'static str,
     pub(crate) title: &'static str,
     pub(crate) description: &'static str,
-    /// The tool's JSON Schema, verbatim. Written by hand (this crate has no serde) and covered by a
-    /// test that parses every one of them.
+    /// The tool's JSON Schema as text. Kept as a literal because a schema reads far better written
+    /// out than assembled from `json!` calls; [`Tool::schema`] parses it for the wire.
     pub(crate) input_schema: &'static str,
+}
+
+impl Tool {
+    /// The parsed `inputSchema` for `tools/list`.
+    ///
+    /// The schemas are compile-time literals covered by a test that parses every one of them, so the
+    /// fallback is unreachable — but a malformed schema must degrade to an unhelpful tool rather
+    /// than panic inside a request handler.
+    pub(crate) fn schema(&self) -> Value {
+        serde_json::from_str(self.input_schema).unwrap_or_else(|_| json!({"type": "object"}))
+    }
 }
 
 /// The tool table, in a stable order — MCP asks for deterministic ordering so clients can cache the
@@ -258,7 +270,7 @@ pub(crate) const TOOLS: &[Tool] = &[
 
 /// Run one tool. `None` means the tool name is unknown, which is a *protocol* error (`-32602`), not
 /// a tool-execution error. `Some(Err(message))` is a tool-execution error the model should see.
-pub(crate) async fn call(db: &Arc<Db>, name: &str, args: &Args) -> Option<Result<String, String>> {
+pub(crate) async fn call(db: &Arc<Db>, name: &str, args: &Args) -> Option<Result<Value, String>> {
     Some(match name {
         "query_sql" => query_sql(db, args).await,
         "search_logs" => search_logs(db, args).await,
@@ -376,7 +388,7 @@ fn log_filter(args: &Args) -> Result<LogQuery, String> {
 
 // ── tools ───────────────────────────────────────────────────────────────────────────────────────
 
-async fn query_sql(db: &Arc<Db>, args: &Args) -> Result<String, String> {
+async fn query_sql(db: &Arc<Db>, args: &Args) -> Result<Value, String> {
     let sql = args.req_str("sql")?;
     let max_rows = args.limit("max_rows", 200, 5000)?;
 
@@ -401,16 +413,19 @@ async fn query_sql(db: &Arc<Db>, args: &Args) -> Result<String, String> {
             remaining = 0;
         }
     }
-    let rows = String::from_utf8(batches_to_json(&kept)).map_err(|e| e.to_string())?;
+    // `batches_to_json` is the same serializer `POST /api/query` answers with, so SQL rows look
+    // identical on both surfaces. It renders straight to bytes, hence the parse back into a value —
+    // bounded by `max_rows`, and worth it to keep one row serializer rather than two.
+    let rows: Value = serde_json::from_slice(&batches_to_json(&kept)).map_err(|e| e.to_string())?;
 
-    Ok(Obj::new()
-        .raw("rows", &rows)
-        .uint("row_count", total.min(max_rows) as u64)
-        .bool("truncated", total > max_rows)
-        .finish())
+    Ok(json!({
+        "rows": rows,
+        "row_count": total.min(max_rows),
+        "truncated": total > max_rows,
+    }))
 }
 
-async fn search_logs(db: &Arc<Db>, args: &Args) -> Result<String, String> {
+async fn search_logs(db: &Arc<Db>, args: &Args) -> Result<Value, String> {
     let mut q = log_filter(args)?.limit(args.limit("limit", 50, 1000)?);
     if let Some(direction) = args.str("direction")? {
         q = q.direction(match direction {
@@ -428,35 +443,31 @@ async fn search_logs(db: &Arc<Db>, args: &Args) -> Result<String, String> {
         .await
         .map_err(|e| e.to_string())?;
 
-    let mut entries = Arr::new();
-    for entry in &page.entries {
-        entries.raw(&log_entry_json(entry));
-    }
-    let stats = Obj::new()
-        .uint("rows_scanned", page.stats.rows_scanned)
-        .uint("segments_scanned", page.stats.segments_scanned)
-        .uint("segments_pruned", page.stats.segments_pruned)
-        .uint("elapsed_ns", page.stats.elapsed.0)
-        .bool("used_index", page.stats.used_index)
-        .finish();
-    Ok(Obj::new()
-        .raw("entries", &entries.finish())
-        .uint("entry_count", page.entries.len() as u64)
+    let entries: Vec<Value> = page.entries.iter().map(log_entry_json).collect();
+    Ok(json!({
+        "entries": entries,
+        "entry_count": page.entries.len(),
         // The cursor itself is opaque and not resumable across calls here, so report only whether
         // more rows exist — a model reading `has_more` will narrow its window or raise the limit.
-        .bool("has_more", page.next.is_some())
-        .raw("stats", &stats)
-        .finish())
+        "has_more": page.next.is_some(),
+        "stats": {
+            "rows_scanned": page.stats.rows_scanned,
+            "segments_scanned": page.stats.segments_scanned,
+            "segments_pruned": page.stats.segments_pruned,
+            "elapsed_ns": page.stats.elapsed.0,
+            "used_index": page.stats.used_index,
+        },
+    }))
 }
 
-async fn count_logs(db: &Arc<Db>, args: &Args) -> Result<String, String> {
+async fn count_logs(db: &Arc<Db>, args: &Args) -> Result<Value, String> {
     let count = offload(db.logs().count(log_filter(args)?))
         .await
         .map_err(|e| e.to_string())?;
-    Ok(Obj::new().uint("count", count).finish())
+    Ok(json!({ "count": count }))
 }
 
-async fn log_volume(db: &Arc<Db>, args: &Args) -> Result<String, String> {
+async fn log_volume(db: &Arc<Db>, args: &Args) -> Result<Value, String> {
     let filter = log_filter(args)?;
     let step = step(args, "1m")?;
     let group_by = args.string_list("group_by")?;
@@ -466,22 +477,23 @@ async fn log_volume(db: &Arc<Db>, args: &Args) -> Result<String, String> {
         .await
         .map_err(|e| e.to_string())?;
 
-    let mut out = Arr::new();
-    for bucket in &buckets {
-        let mut obj = Obj::new();
-        obj.int("time_unix_nano", bucket.time.0);
-        if !bucket.labels.is_empty() {
-            obj.raw("labels", &labels(&bucket.labels));
-        }
-        out.raw(&obj.uint("count", bucket.count).finish());
-    }
-    Ok(Obj::new()
-        .uint("step_ns", step.as_nanos().min(u64::MAX as u128) as u64)
-        .raw("buckets", &out.finish())
-        .finish())
+    let out: Vec<Value> = buckets
+        .iter()
+        .map(|bucket| {
+            let mut obj = json!({"time_unix_nano": bucket.time.0, "count": bucket.count});
+            if !bucket.labels.is_empty() {
+                obj["labels"] = labels(&bucket.labels);
+            }
+            obj
+        })
+        .collect();
+    Ok(json!({
+        "step_ns": step.as_nanos().min(u64::MAX as u128) as u64,
+        "buckets": out,
+    }))
 }
 
-async fn search_traces(db: &Arc<Db>, args: &Args) -> Result<String, String> {
+async fn search_traces(db: &Arc<Db>, args: &Args) -> Result<Value, String> {
     let mut q = TraceQuery::new()
         .range(window(args, "1h")?)
         .limit(args.limit("limit", 20, 200)?);
@@ -514,78 +526,76 @@ async fn search_traces(db: &Arc<Db>, args: &Args) -> Result<String, String> {
         .await
         .map_err(|e| e.to_string())?;
 
-    let mut out = Arr::new();
-    for t in &traces {
-        out.raw(
-            &Obj::new()
-                .str("trace_id", &t.trace_id.to_hex())
-                .opt_str("root_service", t.root_service.as_deref())
-                .opt_str("root_name", t.root_name.as_deref())
-                .int("start_time_unix_nano", t.start_time.0)
-                .uint("duration_ns", t.duration_ns.0)
-                .uint("span_count", t.span_count)
-                .bool("error", t.error)
-                .finish(),
-        );
-    }
-    Ok(Obj::new()
-        .raw("traces", &out.finish())
-        .uint("trace_count", traces.len() as u64)
-        .finish())
+    let out: Vec<Value> = traces
+        .iter()
+        .map(|t| {
+            json!({
+                "trace_id": t.trace_id.to_hex(),
+                "root_service": t.root_service,
+                "root_name": t.root_name,
+                "start_time_unix_nano": t.start_time.0,
+                "duration_ns": t.duration_ns.0,
+                "span_count": t.span_count,
+                "error": t.error,
+            })
+        })
+        .collect();
+    Ok(json!({"traces": out, "trace_count": traces.len()}))
 }
 
-async fn get_trace(db: &Arc<Db>, args: &Args) -> Result<String, String> {
+async fn get_trace(db: &Arc<Db>, args: &Args) -> Result<Value, String> {
     let id = trace_id(args.req_str("trace_id")?)?;
     let trace = offload(db.traces().get(id))
         .await
         .map_err(|e| e.to_string())?;
 
     let Some(trace) = trace else {
-        return Ok(Obj::new()
-            .bool("found", false)
-            .str("trace_id", &id.to_hex())
-            .finish());
+        return Ok(json!({"found": false, "trace_id": id.to_hex()}));
     };
 
-    let mut spans = Arr::new();
-    for s in &trace.spans {
-        let mut obj = Obj::new();
-        obj.str("span_id", &s.span_id.to_hex())
-            .opt_str(
-                "parent_span_id",
-                s.parent_span_id.map(|p| p.to_hex()).as_deref(),
-            )
-            .str("name", &s.name)
-            .str("kind", &s.kind)
-            .opt_str("service", s.service.as_deref())
-            .int("start_time_unix_nano", s.start_time.0)
-            .uint("duration_ns", s.duration_ns.0)
-            .str("status_code", &s.status_code)
-            .opt_str("status_message", s.status_message.as_deref());
-        if !s.attributes.is_empty() {
-            obj.raw("attributes", &attributes(&s.attributes));
-        }
-        if !s.resource.is_empty() {
-            obj.raw("resource", &attributes(&s.resource));
-        }
-        embed_json(&mut obj, "events", s.events.as_deref());
-        embed_json(&mut obj, "links", s.links.as_deref());
-        spans.raw(&obj.finish());
-    }
+    let spans: Vec<Value> = trace
+        .spans
+        .iter()
+        .map(|s| {
+            // Absent *scalars* serialize as null (a uniform key set is easier to read than a
+            // shifting one); absent *collections* are omitted, since an empty object is pure noise
+            // on every span of a large trace.
+            let mut obj = json!({
+                "span_id": s.span_id.to_hex(),
+                "parent_span_id": s.parent_span_id.map(|p| p.to_hex()),
+                "name": s.name,
+                "kind": s.kind,
+                "service": s.service,
+                "start_time_unix_nano": s.start_time.0,
+                "duration_ns": s.duration_ns.0,
+                "status_code": s.status_code,
+                "status_message": s.status_message,
+            });
+            if !s.attributes.is_empty() {
+                obj["attributes"] = attributes(&s.attributes);
+            }
+            if !s.resource.is_empty() {
+                obj["resource"] = attributes(&s.resource);
+            }
+            embed_json(&mut obj, "events", s.events.as_deref());
+            embed_json(&mut obj, "links", s.links.as_deref());
+            obj
+        })
+        .collect();
 
-    Ok(Obj::new()
-        .bool("found", true)
-        .str("trace_id", &trace.trace_id.to_hex())
-        .opt_str("root_service", trace.root_service.as_deref())
-        .opt_str("root_name", trace.root_name.as_deref())
-        .int("start_time_unix_nano", trace.start_time.0)
-        .uint("duration_ns", trace.duration_ns.0)
-        .raw("spans", &spans.finish())
-        .uint("span_count", trace.spans.len() as u64)
-        .finish())
+    Ok(json!({
+        "found": true,
+        "trace_id": trace.trace_id.to_hex(),
+        "root_service": trace.root_service,
+        "root_name": trace.root_name,
+        "start_time_unix_nano": trace.start_time.0,
+        "duration_ns": trace.duration_ns.0,
+        "span_count": trace.spans.len(),
+        "spans": spans,
+    }))
 }
 
-async fn span_metrics(db: &Arc<Db>, args: &Args) -> Result<String, String> {
+async fn span_metrics(db: &Arc<Db>, args: &Args) -> Result<Value, String> {
     let mut q = SpanMetricsQuery::new()
         .range(window(args, "1h")?)
         .step(step(args, "1m")?);
@@ -612,67 +622,65 @@ async fn span_metrics(db: &Arc<Db>, args: &Args) -> Result<String, String> {
         .await
         .map_err(|e| e.to_string())?;
 
-    let mut series = Arr::new();
-    for s in &metrics.0 {
-        let mut points = Arr::new();
-        for p in &s.points {
-            points.raw(
-                &Obj::new()
-                    .int("time_unix_nano", p.time.0)
-                    .uint("calls", p.calls)
-                    .uint("errors", p.errors)
-                    .float("error_rate", p.error_rate)
-                    .float("p50_ns", p.p50_ns)
-                    .float("p95_ns", p.p95_ns)
-                    .float("p99_ns", p.p99_ns)
-                    .finish(),
-            );
-        }
-        series.raw(
-            &Obj::new()
-                .raw("labels", &labels(&s.labels))
-                .raw("points", &points.finish())
-                .finish(),
-        );
-    }
-    Ok(Obj::new().raw("series", &series.finish()).finish())
+    let series: Vec<Value> = metrics
+        .0
+        .iter()
+        .map(|s| {
+            let points: Vec<Value> = s
+                .points
+                .iter()
+                .map(|p| {
+                    json!({
+                        "time_unix_nano": p.time.0,
+                        "calls": p.calls,
+                        "errors": p.errors,
+                        // Latency percentiles over an empty bucket are NaN, which JSON cannot spell;
+                        // `number` renders those as null rather than producing invalid JSON.
+                        "error_rate": number(p.error_rate),
+                        "p50_ns": number(p.p50_ns),
+                        "p95_ns": number(p.p95_ns),
+                        "p99_ns": number(p.p99_ns),
+                    })
+                })
+                .collect();
+            json!({"labels": labels(&s.labels), "points": points})
+        })
+        .collect();
+    Ok(json!({ "series": series }))
 }
 
-async fn list_metrics(db: &Arc<Db>) -> Result<String, String> {
+async fn list_metrics(db: &Arc<Db>) -> Result<Value, String> {
     let catalog = offload(db.metrics().catalog())
         .await
         .map_err(|e| e.to_string())?;
-    let mut out = Arr::new();
-    for m in &catalog {
-        out.raw(
-            &Obj::new()
-                .str("metric", &m.metric)
-                .str("kind", &m.kind)
-                .str("unit", &m.unit)
-                .opt_str("temporality", m.temporality.as_deref())
-                .finish(),
-        );
-    }
-    Ok(Obj::new().raw("metrics", &out.finish()).finish())
+    let out: Vec<Value> = catalog
+        .iter()
+        .map(|m| {
+            json!({
+                "metric": m.metric,
+                "kind": m.kind,
+                "unit": m.unit,
+                "temporality": m.temporality,
+            })
+        })
+        .collect();
+    Ok(json!({ "metrics": out }))
 }
 
-async fn metric_series(db: &Arc<Db>, args: &Args) -> Result<String, String> {
+async fn metric_series(db: &Arc<Db>, args: &Args) -> Result<Value, String> {
     let metric = args.req_str("metric")?;
     let series = offload(db.metrics().series(metric))
         .await
         .map_err(|e| e.to_string())?;
-    let mut out = Arr::new();
-    for labels in &series {
-        out.raw(&attributes(labels));
-    }
-    Ok(Obj::new()
-        .str("metric", metric)
-        .raw("series", &out.finish())
-        .uint("series_count", series.len() as u64)
-        .finish())
+    let out: Vec<Value> = series.iter().map(attributes).collect();
+    Ok(json!({
+        "metric": metric,
+        "series": out,
+        "series_count": series.len(),
+    }))
 }
 
-async fn query_metric(db: &Arc<Db>, args: &Args, instant: bool) -> Result<String, String> {
+async fn query_metric(db: &Arc<Db>, args: &Args, instant: bool) -> Result<Value, String> {
     let metric = args.req_str("metric")?;
     let kind = args.str("kind")?.unwrap_or("gauge");
     let mut q = match kind {
@@ -721,38 +729,32 @@ async fn query_metric(db: &Arc<Db>, args: &Args, instant: bool) -> Result<String
         let vector = offload(db.metrics().instant(q))
             .await
             .map_err(|e| e.to_string())?;
-        let mut out = Arr::new();
-        for s in &vector.0 {
-            out.raw(
-                &Obj::new()
-                    .raw("labels", &labels(&s.labels))
-                    .int("time_unix_nano", s.sample.time.0)
-                    .float("value", s.sample.value)
-                    .finish(),
-            );
-        }
-        return Ok(Obj::new()
-            .str("metric", metric)
-            .raw("samples", &out.finish())
-            .finish());
+        let out: Vec<Value> = vector
+            .0
+            .iter()
+            .map(|s| {
+                json!({
+                    "labels": labels(&s.labels),
+                    "time_unix_nano": s.sample.time.0,
+                    "value": number(s.sample.value),
+                })
+            })
+            .collect();
+        return Ok(json!({"metric": metric, "samples": out}));
     }
 
     let matrix = offload(db.metrics().range(q))
         .await
         .map_err(|e| e.to_string())?;
-    Ok(Obj::new()
-        .str("metric", metric)
-        .raw("series", &matrix_json(&matrix))
-        .finish())
+    Ok(json!({"metric": metric, "series": matrix_json(&matrix)}))
 }
 
-async fn histogram_quantile(db: &Arc<Db>, args: &Args) -> Result<String, String> {
+async fn histogram_quantile(db: &Arc<Db>, args: &Args) -> Result<Value, String> {
     let metric = args.req_str("metric")?;
     let phi = args.f64("quantile")?.unwrap_or(0.95);
     if !(0.0..=1.0).contains(&phi) {
         return Err(format!(
-            "argument `quantile` must be between 0 and 1, got {}",
-            number(phi)
+            "argument `quantile` must be between 0 and 1, got {phi}"
         ));
     }
     let range = window(args, "1h")?;
@@ -789,107 +791,101 @@ async fn histogram_quantile(db: &Arc<Db>, args: &Args) -> Result<String, String>
     }
     .map_err(|e| e.to_string())?;
 
-    Ok(Obj::new()
-        .str("metric", metric)
-        .float("quantile", phi)
-        .raw("series", &matrix_json(&matrix))
-        .finish())
+    Ok(json!({
+        "metric": metric,
+        "quantile": number(phi),
+        "series": matrix_json(&matrix),
+    }))
 }
 
-async fn list_attribute_keys(db: &Arc<Db>) -> Result<String, String> {
+async fn list_attribute_keys(db: &Arc<Db>) -> Result<Value, String> {
     let keys = offload(db.attrs().names())
         .await
         .map_err(|e| e.to_string())?;
-    let mut out = Arr::new();
-    for key in &keys {
-        out.str(key);
-    }
-    Ok(Obj::new().raw("keys", &out.finish()).finish())
+    Ok(json!({ "keys": keys }))
 }
 
-async fn list_attribute_values(db: &Arc<Db>, args: &Args) -> Result<String, String> {
+async fn list_attribute_values(db: &Arc<Db>, args: &Args) -> Result<Value, String> {
     let key = args.req_str("key")?;
     let values = offload(db.attrs().values(key))
         .await
         .map_err(|e| e.to_string())?;
-    let mut out = Arr::new();
-    for value in &values {
-        out.str(value);
-    }
-    Ok(Obj::new()
-        .str("key", key)
-        .raw("values", &out.finish())
-        .uint("value_count", values.len() as u64)
-        .finish())
+    Ok(json!({
+        "key": key,
+        "value_count": values.len(),
+        "values": values,
+    }))
 }
 
-async fn db_stats(db: &Arc<Db>) -> Result<String, String> {
+async fn db_stats(db: &Arc<Db>) -> Result<Value, String> {
     let stats = offload(db.stats()).await.map_err(|e| e.to_string())?;
-    Ok(stats_json(&stats))
+    // `stats_json` is the same serializer `GET /stats` answers with, so the two surfaces cannot
+    // describe one database differently; it renders to text, hence the parse back into a value.
+    serde_json::from_str(&stats_json(&stats)).map_err(|e| e.to_string())
 }
 
 // ── result rendering ────────────────────────────────────────────────────────────────────────────
 
-fn log_entry_json(e: &LogEntry) -> String {
-    let mut obj = Obj::new();
-    obj.int("time_unix_nano", e.time.0)
-        .int("severity_number", e.severity_number.0 as i64)
-        .opt_str("severity_text", e.severity_text.as_deref())
-        .opt_str("service", e.service.as_deref())
-        .str("body", &e.body);
+fn log_entry_json(e: &LogEntry) -> Value {
+    let mut obj = json!({
+        "time_unix_nano": e.time.0,
+        "severity_number": e.severity_number.0,
+        "severity_text": e.severity_text,
+        "service": e.service,
+        "body": e.body,
+        "trace_id": e.trace_id.map(|t| t.to_hex()),
+        "span_id": e.span_id.map(|s| s.to_hex()),
+    });
+    // Empty attribute maps are omitted rather than sent as `{}` — on a page of 1000 entries that is
+    // pure noise in the model's context.
     if !e.attributes.is_empty() {
-        obj.raw("attributes", &attributes(&e.attributes));
+        obj["attributes"] = attributes(&e.attributes);
     }
     if !e.resource.is_empty() {
-        obj.raw("resource", &attributes(&e.resource));
+        obj["resource"] = attributes(&e.resource);
     }
-    obj.opt_str("trace_id", e.trace_id.map(|t| t.to_hex()).as_deref())
-        .opt_str("span_id", e.span_id.map(|s| s.to_hex()).as_deref())
-        .finish()
+    obj
 }
 
-fn matrix_json(matrix: &imbh::Matrix) -> String {
-    let mut series = Arr::new();
-    for s in &matrix.0 {
-        let mut samples = Arr::new();
-        for sample in &s.samples {
-            samples.raw(
-                &Obj::new()
-                    .int("time_unix_nano", sample.time.0)
-                    .float("value", sample.value)
-                    .finish(),
-            );
-        }
-        series.raw(
-            &Obj::new()
-                .raw("labels", &labels(&s.labels))
-                .raw("samples", &samples.finish())
-                .finish(),
-        );
-    }
-    series.finish()
+fn matrix_json(matrix: &imbh::Matrix) -> Value {
+    let series: Vec<Value> = matrix
+        .0
+        .iter()
+        .map(|s| {
+            let samples: Vec<Value> = s
+                .samples
+                .iter()
+                .map(|sample| {
+                    json!({
+                        "time_unix_nano": sample.time.0,
+                        "value": number(sample.value),
+                    })
+                })
+                .collect();
+            json!({"labels": labels(&s.labels), "samples": samples})
+        })
+        .collect();
+    Value::Array(series)
 }
 
 /// Embed a stored canonical-JSON blob (a span's `events`/`links`) as real JSON.
 ///
-/// The column is engine-written, so it parses — but a corrupt segment must not be able to splice
-/// arbitrary text into the response, so anything that does not parse is carried as a string instead.
-fn embed_json(obj: &mut Obj, name: &str, raw: Option<&str>) {
+/// The column is engine-written, so it parses — but a corrupt segment must not be able to put
+/// anything but a value where a value belongs, so text that does not parse is carried as a string.
+fn embed_json(obj: &mut Value, name: &str, raw: Option<&str>) {
     let Some(raw) = raw else { return };
-    match imbh::parse_json(raw) {
-        Some(value) => {
-            obj.raw(name, &any_value(&value));
-        }
-        None => {
-            obj.str(name, raw);
-        }
-    }
+    obj[name] = serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_owned()));
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use imbh::parse_json;
+
+    /// Build an `Args` from a JSON literal, the way a `tools/call` body would.
+    fn args(json: &str) -> Args {
+        let value: Value = serde_json::from_str(json).expect("test json");
+        Args::new(Some(&value))
+    }
 
     #[test]
     fn tool_names_are_unique_and_wire_safe() {
@@ -913,33 +909,18 @@ mod tests {
 
     #[test]
     fn every_input_schema_is_valid_json() {
+        // This is what makes `Tool::schema`'s fallback unreachable: a malformed literal fails here
+        // rather than reaching a client as a tool with no arguments.
         for tool in TOOLS {
-            let parsed = parse_json(tool.input_schema)
-                .unwrap_or_else(|| panic!("tool {} has a malformed input schema", tool.name));
-            let AnyValueMap(pairs) = AnyValueMap::of(&parsed)
-                .unwrap_or_else(|| panic!("tool {} schema is not an object", tool.name));
-            let ty = pairs
-                .iter()
-                .find(|(k, _)| k == "type")
-                .and_then(|(_, v)| v.as_str());
+            let parsed: Value = serde_json::from_str(tool.input_schema)
+                .unwrap_or_else(|e| panic!("tool {} has a malformed input schema: {e}", tool.name));
             assert_eq!(
-                ty,
+                parsed.get("type").and_then(Value::as_str),
                 Some("object"),
                 "tool {} schema is not an object schema",
                 tool.name
             );
-        }
-    }
-
-    /// A tiny destructuring helper so the schema test can read the parsed object without pulling in
-    /// a JSON DOM crate.
-    struct AnyValueMap<'a>(&'a Vec<(String, imbh::AnyValue)>);
-    impl<'a> AnyValueMap<'a> {
-        fn of(v: &'a imbh::AnyValue) -> Option<Self> {
-            match v {
-                imbh::AnyValue::Map(pairs) => Some(AnyValueMap(pairs)),
-                _ => None,
-            }
+            assert_eq!(tool.schema(), parsed);
         }
     }
 
@@ -959,7 +940,6 @@ mod tests {
 
     #[test]
     fn severities_parse_by_name_and_number() {
-        let args = |json: &str| Args::new(parse_json(json).as_ref());
         assert_eq!(
             severity(&args(r#"{"s":"error"}"#), "s").unwrap(),
             Some(SeverityNumber::ERROR)
@@ -979,7 +959,6 @@ mod tests {
 
     #[test]
     fn windows_prefer_explicit_bounds_over_since() {
-        let args = |json: &str| Args::new(parse_json(json).as_ref());
         let r = window(&args(r#"{"start_unix_nano":10,"end_unix_nano":20}"#), "1h").unwrap();
         assert_eq!((r.start.0, r.end.0), (10, 20));
 
@@ -1006,7 +985,6 @@ mod tests {
 
     #[test]
     fn steps_reject_zero() {
-        let args = |json: &str| Args::new(parse_json(json).as_ref());
         assert_eq!(step(&args("{}"), "1m").unwrap(), Duration::from_secs(60));
         assert_eq!(
             step(&args(r#"{"step":"30s"}"#), "1m").unwrap(),

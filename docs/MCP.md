@@ -10,8 +10,9 @@ OTLP in ──▶  imbhd  ──▶  imbh Db  ──▶  /mcp (tools)  ──▶
 ```
 
 This is one worked example of host wiring, like the rest of `imbh-server`. It is on in the default
-build and adds **no** dependency to the graph — the protocol is JSON-RPC over HTTP, and `imbhd`
-already hand-rolls its JSON (it parses with imbh-core's dependency-free parser).
+build and adds **no crate** to the graph: it speaks JSON-RPC through `serde_json` and Base64 through
+`base64`, both of which are already compiled under DataFusion (via `arrow-json` and `arrow-cast`), so
+the direct dependencies cost nothing.
 
 ## Quick start
 

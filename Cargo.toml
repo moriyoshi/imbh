@@ -126,8 +126,9 @@ prost = "0.14"
 tonic = { version = "0.14", default-features = false }
 # HTTP/1.1 for the reference server (`imbh-server`, ARCHITECTURE.md §10.16). axum supplies routing and
 # extractors, hyper the connection, hyper-util the tokio IO adapter and the graceful-drain watcher.
-# Trimmed hard: no `json`/`form`/`query`/`multipart`/`ws` (imbh hand-rolls its JSON so serde_json stays
-# out), no `http2` (OTLP/HTTP is 1.1; gRPC's h2 rides tonic under `--features grpc`), no
+# Trimmed hard: no `json`/`form`/`query`/`multipart`/`ws` (bodies arrive as `Bytes` and are decoded
+# where they are used, so axum's extractors buy nothing), no `http2` (OTLP/HTTP is 1.1; gRPC's h2
+# rides tonic under `--features grpc`), no
 # `tower-log`/`tracing`. Footprint: none of this reaches the `imbh` facade that the crate-count gate
 # measures (`scripts/footprint-gate.sh` counts `cargo tree -p imbh`) — the dependency direction is
 # `imbh ← imbh-server` — and the whole subtree is already compiled under `--features grpc`, since
@@ -192,8 +193,16 @@ serde = { version = "1", default-features = false, features = ["derive", "std"] 
 # RE2-style regular expressions for conformant language matchers. Already present through
 # DataFusion; this direct edge adds no third-party crate to the workspace graph.
 regex = { version = "1", default-features = false, features = ["std", "perf"] }
-# JSON round-trip tests for the serde DTOs (dev-only).
+# JSON: round-trip tests for the serde DTOs (dev-only), and the wire format of `imbh-server`'s MCP
+# endpoint (ARCHITECTURE.md §10.16.1), which is JSON-RPC. Footprint-neutral in both roles: serde_json
+# is already compiled in the default graph via `arrow-json` (arrow ← datafusion), so the direct edge
+# adds **no crate** — measured 275 → 275 on the facade, 293 → 293 on `imbh-server`.
 serde_json = "1"
+# Base64 for the MCP transport's `=?base64?…?=` header sentinel and for `AnyValue::Bytes` attributes,
+# whose canonical imbh encoding is base64 (§6.1). Also already in the default graph — `arrow-cast`
+# pulls the same 0.22 — so this edge adds no crate either. `default-features = false` + `std` keeps it
+# to the engine API without the deprecated top-level shims.
+base64 = { version = "0.22", default-features = false, features = ["std"] }
 # Self-observability facade (ARCHITECTURE.md §11). Feature-gated (`tracing`, off by default) so the
 # default footprint graph is unchanged; the `tracing` facade is near-zero-cost with no subscriber
 # installed. The heavier `tracing-subscriber` subtree is opt-in only: the `imbh` facade's stderr

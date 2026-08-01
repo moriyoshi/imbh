@@ -41,9 +41,10 @@ pub(crate) mod tools;
 
 use std::sync::Arc;
 
-use imbh::{AnyValue, Db, parse_json};
+use imbh::Db;
+use serde_json::{Value, json};
 
-use json::{Args, Arr, Obj, any_value, decode_header_value};
+use json::{Args, decode_header_value};
 
 /// The stateless revision this server implements. Modern requests must name exactly this.
 pub const LATEST_VERSION: &str = "2026-07-28";
@@ -90,13 +91,16 @@ pub(crate) struct Headers<'a> {
 }
 
 /// One MCP message's answer: a JSON-RPC body, or nothing at all for an accepted notification.
+///
+/// The body stays a [`Value`] rather than bytes so the transport owns serialization — which is what
+/// lets a future stdio loop reuse this dispatch unchanged.
 pub(crate) struct Reply {
     pub(crate) status: u16,
-    pub(crate) body: Option<String>,
+    pub(crate) body: Option<Value>,
 }
 
 impl Reply {
-    fn json(status: u16, body: String) -> Self {
+    fn json(status: u16, body: Value) -> Self {
         Reply {
             status,
             body: Some(body),
@@ -118,105 +122,97 @@ impl Reply {
 /// returns bytes, so the same dispatch can sit behind a stdio loop later without moving any of the
 /// protocol logic.
 pub(crate) async fn handle(db: &Arc<Db>, body: &[u8], headers: &Headers<'_>) -> Reply {
-    let Ok(text) = std::str::from_utf8(body) else {
-        return Reply::json(
-            400,
-            error_body(None, PARSE_ERROR, "request body is not UTF-8", None),
-        );
+    // `from_slice` covers invalid UTF-8 too, so there is one parse-failure path rather than two.
+    let message: Value = match serde_json::from_slice(body) {
+        Ok(message) => message,
+        Err(e) => {
+            return Reply::json(
+                400,
+                error_body(None, PARSE_ERROR, &format!("request body is not JSON: {e}")),
+            );
+        }
     };
-    let Some(AnyValue::Map(message)) = parse_json(text) else {
+    let Some(message) = message.as_object() else {
         return Reply::json(
             400,
-            error_body(None, PARSE_ERROR, "request body is not a JSON object", None),
+            error_body(
+                None,
+                INVALID_REQUEST,
+                "request body is not a JSON-RPC object",
+            ),
         );
     };
 
-    let field = |name: &str| {
-        message
-            .iter()
-            .find(|(k, _)| k == name)
-            .map(|(_, v)| v)
-            .filter(|v| !matches!(v, AnyValue::Null))
-    };
+    let field = |name: &str| message.get(name).filter(|v| !v.is_null());
     // A message with no usable id is a notification: it gets 202 and no body, whatever it asked for.
-    let id = field("id").map(any_value);
-    let id = id.as_deref();
-    let Some(AnyValue::Str(method)) = field("method") else {
+    let id = field("id").cloned();
+    let Some(method) = field("method").and_then(Value::as_str) else {
         return match id {
-            Some(_) => Reply::json(
+            Some(id) => Reply::json(
                 400,
-                error_body(id, INVALID_REQUEST, "missing `method`", None),
+                error_body(Some(id), INVALID_REQUEST, "missing `method`"),
             ),
             None => Reply::accepted(),
         };
     };
     let params = field("params");
-    let param = |name: &str| match params {
-        Some(AnyValue::Map(pairs)) => pairs
-            .iter()
-            .find(|(k, _)| k == name)
-            .map(|(_, v)| v)
-            .filter(|v| !matches!(v, AnyValue::Null)),
-        _ => None,
+    let param = |name: &str| {
+        params
+            .and_then(Value::as_object)
+            .and_then(|p| p.get(name))
+            .filter(|v| !v.is_null())
     };
 
     // The version a modern client declares in `_meta`; its presence is what selects the era.
-    let declared = match param("_meta") {
-        Some(AnyValue::Map(meta)) => meta
-            .iter()
-            .find(|(k, _)| k == META_VERSION)
-            .and_then(|(_, v)| v.as_str()),
-        _ => None,
-    };
+    let declared = param("_meta")
+        .and_then(|meta| meta.get(META_VERSION))
+        .and_then(Value::as_str);
     let modern = declared.is_some() || method == "server/discover";
 
-    if id.is_none() {
+    let Some(id) = id else {
         // Notifications carry no reply. `notifications/initialized` is the legacy handshake's third
         // leg and is the one that actually shows up here.
         return Reply::accepted();
-    }
-    let id = id.expect("checked just above");
+    };
 
-    if modern && let Some(reply) = validate_modern(id, method, declared, param("name"), headers) {
+    if modern && let Some(reply) = validate_modern(&id, method, declared, param("name"), headers) {
         return reply;
     }
 
-    match method.as_str() {
+    match method {
         // ── modern ──────────────────────────────────────────────────────────────────────────────
-        "server/discover" => Reply::json(200, result_body(id, &discover())),
+        "server/discover" => Reply::json(200, result_body(id, discover())),
 
         // ── legacy handshake ────────────────────────────────────────────────────────────────────
         "initialize" if !modern => {
-            let requested = param("protocolVersion").and_then(|v| v.as_str());
-            Reply::json(200, result_body(id, &initialize(requested)))
+            let requested = param("protocolVersion").and_then(Value::as_str);
+            Reply::json(200, result_body(id, initialize(requested)))
         }
 
         // ── both eras ───────────────────────────────────────────────────────────────────────────
-        "ping" => Reply::json(200, result_body(id, &new_result(modern).finish())),
+        "ping" => Reply::json(200, result_body(id, tag(modern, json!({})))),
         "tools/list" => {
-            let mut list = Arr::new();
-            for tool in tools::TOOLS {
-                list.raw(
-                    &Obj::new()
-                        .str("name", tool.name)
-                        .str("title", tool.title)
-                        .str("description", tool.description)
-                        .raw("inputSchema", tool.input_schema)
-                        .finish(),
-                );
-            }
-            let result = new_result(modern).raw("tools", &list.finish()).finish();
-            Reply::json(200, result_body(id, &result))
+            let list: Vec<Value> = tools::TOOLS
+                .iter()
+                .map(|tool| {
+                    json!({
+                        "name": tool.name,
+                        "title": tool.title,
+                        "description": tool.description,
+                        "inputSchema": tool.schema(),
+                    })
+                })
+                .collect();
+            Reply::json(200, result_body(id, tag(modern, json!({ "tools": list }))))
         }
         "tools/call" => {
-            let Some(AnyValue::Str(name)) = param("name") else {
+            let Some(name) = param("name").and_then(Value::as_str) else {
                 return Reply::json(
                     200,
                     error_body(
                         Some(id),
                         INVALID_PARAMS,
                         "missing tool name in `params.name`",
-                        None,
                     ),
                 );
             };
@@ -225,26 +221,20 @@ pub(crate) async fn handle(db: &Arc<Db>, body: &[u8], headers: &Headers<'_>) -> 
                 // An unknown tool is a protocol error: no argument the model could pick would fix it.
                 None => Reply::json(
                     200,
-                    error_body(
-                        Some(id),
-                        INVALID_PARAMS,
-                        &format!("Unknown tool: {name}"),
-                        None,
-                    ),
+                    error_body(Some(id), INVALID_PARAMS, &format!("Unknown tool: {name}")),
                 ),
                 Some(outcome) => {
+                    // A tool answers with one JSON document in a text block; a failure puts the
+                    // message a model can act on in that same block and flags `isError`.
                     let (text, is_error) = match outcome {
-                        Ok(json) => (json, false),
+                        Ok(value) => (value.to_string(), false),
                         Err(message) => (message, true),
                     };
-                    let content = Arr::new()
-                        .raw(&Obj::new().str("type", "text").str("text", &text).finish())
-                        .finish();
-                    let result = new_result(modern)
-                        .raw("content", &content)
-                        .bool("isError", is_error)
-                        .finish();
-                    Reply::json(200, result_body(id, &result))
+                    let result = json!({
+                        "content": [{"type": "text", "text": text}],
+                        "isError": is_error,
+                    });
+                    Reply::json(200, result_body(id, tag(modern, result)))
                 }
             }
         }
@@ -258,7 +248,6 @@ pub(crate) async fn handle(db: &Arc<Db>, body: &[u8], headers: &Headers<'_>) -> 
                 Some(id),
                 METHOD_NOT_FOUND,
                 &format!("Method not found: {other}"),
-                None,
             ),
         ),
     }
@@ -266,16 +255,16 @@ pub(crate) async fn handle(db: &Arc<Db>, body: &[u8], headers: &Headers<'_>) -> 
 
 /// Enforce the modern transport's header/body agreement and version support. `Some` is the refusal.
 fn validate_modern(
-    id: &str,
+    id: &Value,
     method: &str,
     declared: Option<&str>,
-    name: Option<&AnyValue>,
+    name: Option<&Value>,
     headers: &Headers<'_>,
 ) -> Option<Reply> {
     let mismatch = |message: String| {
         Some(Reply::json(
             400,
-            error_body(Some(id), HEADER_MISMATCH, &message, None),
+            error_body(Some(id.clone()), HEADER_MISMATCH, &message),
         ))
     };
 
@@ -300,7 +289,7 @@ fn validate_modern(
             Some(_) => {}
         }
         if method == "tools/call" {
-            let body_name = name.and_then(|v| v.as_str()).unwrap_or_default();
+            let body_name = name.and_then(Value::as_str).unwrap_or_default();
             let header_name = headers.name.map(decode_header_value);
             match header_name {
                 None => return mismatch("missing required `Mcp-Name` header".to_owned()),
@@ -324,101 +313,85 @@ fn validate_modern(
         Some(v) if v == LATEST_VERSION => None,
         // A `server/discover` with no declared version is the legitimate "what do you speak?" probe.
         None if method == "server/discover" => None,
-        _ => {
-            let data = Obj::new()
-                .raw("supported", &Arr::new().str(LATEST_VERSION).finish())
-                .opt_str("requested", requested)
-                .finish();
-            Some(Reply::json(
-                400,
-                error_body(
-                    Some(id),
-                    UNSUPPORTED_PROTOCOL_VERSION,
-                    "Unsupported protocol version",
-                    Some(&data),
-                ),
-            ))
-        }
+        _ => Some(Reply::json(
+            400,
+            error_with_data(
+                Some(id.clone()),
+                UNSUPPORTED_PROTOCOL_VERSION,
+                "Unsupported protocol version",
+                json!({"supported": [LATEST_VERSION], "requested": requested}),
+            ),
+        )),
     }
 }
 
 /// `server/discover` — the modern era's identity/capability probe.
-fn discover() -> String {
-    let meta = Obj::new()
-        .raw("io.modelcontextprotocol/serverInfo", &server_info())
-        .finish();
-    new_result(true)
-        .raw(
-            "supportedVersions",
-            &Arr::new().str(LATEST_VERSION).finish(),
-        )
-        .raw("capabilities", &Obj::new().raw("tools", "{}").finish())
-        .raw("_meta", &meta)
-        .str("instructions", INSTRUCTIONS)
-        .finish()
+fn discover() -> Value {
+    tag(
+        true,
+        json!({
+            "supportedVersions": [LATEST_VERSION],
+            "capabilities": {"tools": {}},
+            "_meta": {"io.modelcontextprotocol/serverInfo": server_info()},
+            "instructions": INSTRUCTIONS,
+        }),
+    )
 }
 
 /// `initialize` — the legacy era's handshake. An unknown requested version is answered with the
 /// newest legacy revision rather than refused, which is what the lifecycle asks for.
-fn initialize(requested: Option<&str>) -> String {
+fn initialize(requested: Option<&str>) -> Value {
     let negotiated = match requested {
         Some(v) if LEGACY_VERSIONS.contains(&v) => v,
         _ => LEGACY_VERSIONS[0],
     };
-    let capabilities = Obj::new()
-        .raw(
-            "tools",
-            // The tool table is a compile-time constant, so it never changes under a client.
-            &Obj::new().bool("listChanged", false).finish(),
-        )
-        .finish();
-    Obj::new()
-        .str("protocolVersion", negotiated)
-        .raw("capabilities", &capabilities)
-        .raw("serverInfo", &server_info())
-        .str("instructions", INSTRUCTIONS)
-        .finish()
+    json!({
+        "protocolVersion": negotiated,
+        // The tool table is a compile-time constant, so it never changes under a client.
+        "capabilities": {"tools": {"listChanged": false}},
+        "serverInfo": server_info(),
+        "instructions": INSTRUCTIONS,
+    })
 }
 
-fn server_info() -> String {
-    Obj::new()
-        .str("name", SERVER_NAME)
-        .str("title", "imbh embedded observability database")
-        .str("version", env!("CARGO_PKG_VERSION"))
-        .finish()
+fn server_info() -> Value {
+    json!({
+        "name": SERVER_NAME,
+        "title": "imbh embedded observability database",
+        "version": env!("CARGO_PKG_VERSION"),
+    })
 }
 
-/// Start a result object, tagged with `resultType` for the modern era (where every result carries
-/// one) and untagged for the legacy era (where the field does not exist).
-fn new_result(modern: bool) -> Obj {
-    let mut obj = Obj::new();
-    if modern {
-        obj.str("resultType", "complete");
+/// Tag a result with `resultType` for the modern era (where every result carries one) and leave it
+/// untagged for the legacy era (where the field does not exist).
+fn tag(modern: bool, mut result: Value) -> Value {
+    if modern && let Some(object) = result.as_object_mut() {
+        object.insert("resultType".to_owned(), json!("complete"));
     }
-    obj
+    result
 }
 
-fn result_body(id: &str, result: &str) -> String {
-    Obj::new()
-        .str("jsonrpc", "2.0")
-        .raw("id", id)
-        .raw("result", result)
-        .finish()
+fn result_body(id: Value, result: Value) -> Value {
+    json!({"jsonrpc": "2.0", "id": id, "result": result})
 }
 
 /// A JSON-RPC error response. `id` is `None` only where the request's id could not be read, which
 /// JSON-RPC spells as a null id.
-fn error_body(id: Option<&str>, code: i64, message: &str, data: Option<&str>) -> String {
-    let mut error = Obj::new();
-    error.int("code", code).str("message", message);
-    if let Some(data) = data {
-        error.raw("data", data);
-    }
-    Obj::new()
-        .str("jsonrpc", "2.0")
-        .raw("id", id.unwrap_or("null"))
-        .raw("error", &error.finish())
-        .finish()
+fn error_body(id: Option<Value>, code: i64, message: &str) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id.unwrap_or(Value::Null),
+        "error": {"code": code, "message": message},
+    })
+}
+
+/// [`error_body`] with the `data` payload the MCP-defined errors carry.
+fn error_with_data(id: Option<Value>, code: i64, message: &str, data: Value) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id.unwrap_or(Value::Null),
+        "error": {"code": code, "message": message, "data": data},
+    })
 }
 
 // ── DNS-rebinding defence ───────────────────────────────────────────────────────────────────────
@@ -507,20 +480,50 @@ mod tests {
 
     #[test]
     fn legacy_initialize_negotiates_a_version() {
-        assert!(initialize(Some("2025-06-18")).contains(r#""protocolVersion":"2025-06-18""#));
+        let version = |v: Option<&str>| initialize(v)["protocolVersion"].clone();
+        assert_eq!(version(Some("2025-06-18")), json!("2025-06-18"));
         // Unknown (or absent) → the newest legacy revision, never the stateless one, which a
         // handshake-era client could not speak.
-        assert!(initialize(Some("1999-01-01")).contains(r#""protocolVersion":"2025-11-25""#));
-        assert!(initialize(None).contains(r#""protocolVersion":"2025-11-25""#));
-        assert!(!initialize(None).contains(LATEST_VERSION));
+        assert_eq!(version(Some("1999-01-01")), json!("2025-11-25"));
+        assert_eq!(version(None), json!("2025-11-25"));
+        assert_ne!(version(None), json!(LATEST_VERSION));
+        // The handshake result carries no `resultType`: that field exists only in the modern era.
+        assert!(initialize(None).get("resultType").is_none());
+        assert_eq!(
+            initialize(None)["capabilities"],
+            json!({"tools": {"listChanged": false}})
+        );
     }
 
     #[test]
     fn discovery_reports_the_stateless_revision_and_tools() {
         let d = discover();
-        assert!(d.contains(r#""resultType":"complete""#));
-        assert!(d.contains(&format!(r#""supportedVersions":["{LATEST_VERSION}"]"#)));
-        assert!(d.contains(r#""capabilities":{"tools":{}}"#));
-        assert!(d.contains("io.modelcontextprotocol/serverInfo"));
+        assert_eq!(d["resultType"], json!("complete"));
+        assert_eq!(d["supportedVersions"], json!([LATEST_VERSION]));
+        assert_eq!(d["capabilities"], json!({"tools": {}}));
+        assert_eq!(
+            d["_meta"]["io.modelcontextprotocol/serverInfo"]["name"],
+            json!(SERVER_NAME)
+        );
+    }
+
+    #[test]
+    fn the_modern_tag_is_added_only_for_the_stateless_era() {
+        assert_eq!(tag(true, json!({})), json!({"resultType": "complete"}));
+        assert_eq!(tag(false, json!({})), json!({}));
+        // A non-object result (the protocol has none today) is passed through rather than mangled.
+        assert_eq!(tag(true, json!([1])), json!([1]));
+    }
+
+    #[test]
+    fn error_bodies_echo_the_id_verbatim() {
+        // JSON-RPC ids may be numbers or strings, and a client matches on the exact value it sent.
+        assert_eq!(error_body(Some(json!(7)), -32601, "nope")["id"], json!(7));
+        assert_eq!(
+            error_body(Some(json!("d1")), -32601, "nope")["id"],
+            json!("d1")
+        );
+        // An unreadable id is spelled null, which is what JSON-RPC asks for.
+        assert_eq!(error_body(None, -32700, "bad")["id"], Value::Null);
     }
 }

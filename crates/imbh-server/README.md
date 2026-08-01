@@ -48,8 +48,8 @@ claude mcp add --transport http imbh http://127.0.0.1:4318/mcp
 The 15 tools are read-only (`search_logs`, `search_traces`, `get_trace`, `span_metrics`,
 `query_metric_range`, `histogram_quantile`, `query_sql`, attribute discovery, `db_stats`, …) —
 nothing there can ingest, flush, compact, or apply retention. The endpoint is on in the default
-build and adds **no dependency**: MCP is JSON-RPC over HTTP, and this crate already hand-rolls its
-JSON.
+build and adds **no crate** to the graph: it speaks JSON-RPC through `serde_json` and Base64 through
+`base64`, both already compiled under DataFusion (via `arrow-json` and `arrow-cast`).
 
 Both protocol eras are served: the stateless `2026-07-28` revision (per-request `_meta`,
 `server/discover`, validated header mirror) and the `initialize` handshake of `2025-11-25` and

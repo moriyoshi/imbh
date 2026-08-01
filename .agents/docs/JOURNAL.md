@@ -1619,3 +1619,50 @@ against a fixture where *some* spans lack the key. That is correct SQL semantics
 attribute, not a bug: the assertion, not the code, was wrong. Worth stating because the empty label
 means two different things (this record has no such attribute vs. this key is never an attribute)
 and only the second is the trap.
+
+## 2026-08-01 — The MCP endpoint moves onto serde_json + base64 (and why that costs nothing)
+
+The MCP endpoint shipped with hand-rolled JSON — an `Obj`/`Arr` string builder, imbh-core's
+`parse_json` for input, and a 60-line Base64 codec — on the reasoning that `imbh-server` had no
+`serde_json` edge and the crate's convention was to hand-roll. **On user instruction, that is now
+`serde_json` and `base64`.** Worth recording because the footprint reasoning behind the original
+choice was wrong in an instructive way, and because the rewrite paid for itself in defect surface.
+
+**The footprint argument never applied.** Both crates were *already compiled in the default graph* —
+`serde_json` via `arrow-json`, `base64` via `arrow-cast`, both under DataFusion. Measured before and
+after with the gate's own counting method: **275 → 275** on the `imbh` facade, **293 → 293** on
+`imbh-server`. The hand-rolled code was avoiding a dependency the build already paid for. The general
+lesson: "this crate has no such dependency" is a claim about the *manifest*, and the footprint
+question is about the *graph* — check `cargo tree -i` before hand-rolling to protect a budget.
+
+**What the rewrite removed.** ~200 lines: the JSON writer, its string-escaping, the Base64
+encode/decode pair, and the `raw`-splicing discipline that came with building JSON as text (every
+nested value had to be rendered first, and any mistake produced malformed output rather than a
+compile error). Three specific hazards went with it:
+
+- `embed_json` existed only because a span's `events`/`links` column is stored JSON text that had to
+  be spliced into a hand-built document; it parsed the blob solely to prove it was safe to splice.
+  With `serde_json` it is one `from_str` with a string fallback.
+- Non-finite floats needed a bespoke `number()` guard to avoid emitting `NaN` (invalid JSON) from
+  p50/p95/p99 over empty buckets. `serde_json::Number::from_f64` rejects exactly those cases, so the
+  guard is now a two-line wrapper over the library's own invariant rather than a rule to remember.
+- JSON-RPC ids were echoed as pre-rendered *text*; they are now `Value`s, so a string id round-trips
+  as a string and a numeric id as a number without the writer having to be told which it was.
+
+**One deliberate behaviour change.** Without `serde_json`'s `preserve_order` feature, `Map` is a
+`BTreeMap`, so object keys now serialize **alphabetically** rather than in construction order. Left
+that way on purpose: enabling `preserve_order` flips the feature for *every* `serde_json` user in the
+graph (DataFusion included) through Cargo feature unification, which is a large blast radius to buy
+field order in an agent-facing payload. `POST /api/query` is unaffected — `batches_to_json` is
+untouched and still emits rows in schema order; the MCP `query_sql` tool parses that output back into
+a value, which is the one place the reorder is visible.
+
+Two smaller consequences, both fine: optional scalars now serialize as `null` instead of being
+omitted (a uniform key set is easier for a model to read than a shifting one; empty *collections* are
+still omitted, since `{}` on every entry of a 1000-row page is pure noise), and the tests now assert
+on parsed structure instead of substrings — `initialize(None)["protocolVersion"]` rather than
+`.contains(r#""protocolVersion":"2025-11-25""#)`.
+
+Verified: `fmt`/`build`/`clippy -D warnings` clean; `cargo test --workspace` green across 56 targets.
+The nine MCP e2e tests passed **unmodified** through the rewrite before their helpers were converted,
+which is the useful signal — the wire behaviour is unchanged, only the machinery under it.

@@ -968,8 +968,13 @@ transport**.
 `POST /mcp` serves the **Model Context Protocol** over its Streamable HTTP transport, so an agent can
 search logs, pull traces, and query metrics through the same process that ingests them — no Grafana,
 no datasource proxy, no export step. It is on in the default build and adds **no crate** to the
-graph: MCP is JSON-RPC over HTTP, requests parse through `imbh::parse_json` and responses are built
-with the same hand-rolled writer the rest of the crate uses, so `serde_json` stays out (§10.4). The
+graph: it speaks JSON-RPC through `serde_json`, and Base64 (the transport's `=?base64?…?=` header
+sentinel, and `AnyValue::Bytes` attributes) through `base64` — both already compiled in the default
+tree, `serde_json` via `arrow-json` and `base64` via `arrow-cast`, both under DataFusion, so the
+direct edges measured 275 → 275 on the facade and 293 → 293 on `imbh-server`. Note that `serde_json`
+here is the *default* build without `preserve_order`, so object keys serialize alphabetically;
+turning that feature on would flip it for every `serde_json` user in the graph, DataFusion included,
+to buy nothing but field order. The
 module (`imbh-server/src/mcp/`) is transport-agnostic — `handle(db, bytes, headers) -> Reply` — so a
 stdio transport can be added later without moving any protocol logic.
 

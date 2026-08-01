@@ -1,206 +1,97 @@
-//! JSON plumbing for the MCP endpoint: a writer for building responses, a reader for tool
-//! arguments, and the Base64 sentinel codec the transport's header validation needs.
+//! JSON plumbing for the MCP endpoint: typed access to a tool call's arguments, conversions from
+//! imbh's value types into `serde_json`, and the Base64 sentinel the transport's header validation
+//! needs.
 //!
-//! `imbhd` hand-rolls its JSON everywhere else (ARCHITECTURE.md §10.16 — `serde_json` is
-//! deliberately not a dependency of this crate), and the MCP endpoint keeps to that: parsing goes
-//! through [`imbh::parse_json`] (imbh-core's dependency-free parser) and writing through the
-//! builders below. Serving MCP therefore adds **no** crate to imbhd's graph.
+//! Both crates are footprint-neutral here — `serde_json` is already compiled in the default graph
+//! via `arrow-json` and `base64` via `arrow-cast`, both under DataFusion — so the MCP endpoint costs
+//! no crate despite speaking JSON-RPC (ARCHITECTURE.md §10.16.1).
+//!
+//! Note that `serde_json::Map` is a `BTreeMap` in this build (no `preserve_order` feature), so object
+//! keys serialize alphabetically. That is invisible to a JSON reader and deliberately not overridden:
+//! turning `preserve_order` on would flip the feature for *every* `serde_json` user in the graph,
+//! DataFusion included, to buy nothing but field order.
 
 use std::time::Duration;
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use imbh::{AnyValue, Attributes, parse_duration};
+use serde_json::{Map, Value, json};
 
-use crate::json_string;
+// ── imbh values → JSON ──────────────────────────────────────────────────────────────────────────
 
-// ── writing ─────────────────────────────────────────────────────────────────────────────────────
-
-/// A JSON object under construction. Fields are appended in call order (JSON objects are unordered,
-/// but a stable order keeps the golden tests and the wire output readable).
-pub(crate) struct Obj {
-    buf: String,
-    empty: bool,
+/// Encode a float. JSON has no NaN or infinity, so a non-finite value becomes `null` rather than the
+/// `{"$f":…}` sentinel imbh's *canonical* encoder uses: an MCP client is a generic JSON reader, not a
+/// reader of imbh's storage convention. `Number::from_f64` rejects exactly the non-finite cases.
+pub(crate) fn number(value: f64) -> Value {
+    serde_json::Number::from_f64(value).map_or(Value::Null, Value::Number)
 }
 
-impl Obj {
-    pub(crate) fn new() -> Self {
-        Obj {
-            buf: String::from("{"),
-            empty: true,
-        }
-    }
-
-    /// Append `name: value`, where `value` is already-encoded JSON text.
-    pub(crate) fn raw(&mut self, name: &str, value: &str) -> &mut Self {
-        if !self.empty {
-            self.buf.push(',');
-        }
-        self.empty = false;
-        self.buf.push_str(&json_string(name));
-        self.buf.push(':');
-        self.buf.push_str(value);
-        self
-    }
-
-    pub(crate) fn str(&mut self, name: &str, value: &str) -> &mut Self {
-        self.raw(name, &json_string(value))
-    }
-
-    /// Append `name: value` only when `value` is `Some` — absent beats `null` for optional fields a
-    /// model has to read.
-    pub(crate) fn opt_str(&mut self, name: &str, value: Option<&str>) -> &mut Self {
-        match value {
-            Some(v) => self.str(name, v),
-            None => self,
-        }
-    }
-
-    pub(crate) fn int(&mut self, name: &str, value: i64) -> &mut Self {
-        self.raw(name, &value.to_string())
-    }
-
-    pub(crate) fn uint(&mut self, name: &str, value: u64) -> &mut Self {
-        self.raw(name, &value.to_string())
-    }
-
-    pub(crate) fn float(&mut self, name: &str, value: f64) -> &mut Self {
-        self.raw(name, &number(value))
-    }
-
-    pub(crate) fn bool(&mut self, name: &str, value: bool) -> &mut Self {
-        self.raw(name, if value { "true" } else { "false" })
-    }
-
-    pub(crate) fn finish(&mut self) -> String {
-        let mut out = std::mem::take(&mut self.buf);
-        out.push('}');
-        out
-    }
-}
-
-/// A JSON array under construction.
-pub(crate) struct Arr {
-    buf: String,
-    empty: bool,
-}
-
-impl Arr {
-    pub(crate) fn new() -> Self {
-        Arr {
-            buf: String::from("["),
-            empty: true,
-        }
-    }
-
-    /// Append an already-encoded JSON element.
-    pub(crate) fn raw(&mut self, value: &str) -> &mut Self {
-        if !self.empty {
-            self.buf.push(',');
-        }
-        self.empty = false;
-        self.buf.push_str(value);
-        self
-    }
-
-    pub(crate) fn str(&mut self, value: &str) -> &mut Self {
-        self.raw(&json_string(value))
-    }
-
-    pub(crate) fn finish(&mut self) -> String {
-        let mut out = std::mem::take(&mut self.buf);
-        out.push(']');
-        out
-    }
-}
-
-/// Encode a float as JSON. JSON has no NaN or infinity, so a non-finite value becomes `null` rather
-/// than the `{"$f":…}` sentinel imbh's *canonical* encoder uses: an MCP client is a generic JSON
-/// reader, not a reader of imbh's storage convention.
-pub(crate) fn number(value: f64) -> String {
-    if value.is_finite() {
-        let mut s = value.to_string();
-        // `f64::to_string` renders whole floats without a fraction ("1"), which is valid JSON but
-        // reads as an integer; leave it — JSON numbers carry no type tag anyway.
-        if s == "-0" {
-            s = "0".to_owned();
-        }
-        s
-    } else {
-        "null".to_owned()
-    }
-}
-
-/// Encode an [`AnyValue`] as JSON. `Bytes` becomes a Base64 string, matching imbh's canonical
-/// encoding (imbh-core §6.1) — a JSON string carries no type tag either way.
-pub(crate) fn any_value(value: &AnyValue) -> String {
+/// Encode an [`AnyValue`]. `Bytes` becomes a Base64 string, matching imbh's canonical encoding
+/// (§6.1) — a JSON string carries no type tag either way.
+pub(crate) fn any_value(value: &AnyValue) -> Value {
     match value {
-        AnyValue::Null => "null".to_owned(),
-        AnyValue::Str(s) => json_string(s),
-        AnyValue::Int(i) => i.to_string(),
+        AnyValue::Null => Value::Null,
+        AnyValue::Str(s) => Value::String(s.clone()),
+        AnyValue::Int(i) => json!(i),
         AnyValue::Double(d) => number(*d),
-        AnyValue::Bool(b) => b.to_string(),
-        AnyValue::Bytes(b) => json_string(&base64_encode(b)),
-        AnyValue::Array(items) => {
-            let mut arr = Arr::new();
-            for item in items {
-                arr.raw(&any_value(item));
-            }
-            arr.finish()
-        }
-        AnyValue::Map(pairs) => {
-            let mut obj = Obj::new();
-            for (k, v) in pairs {
-                obj.raw(k, &any_value(v));
-            }
-            obj.finish()
-        }
+        AnyValue::Bool(b) => Value::Bool(*b),
+        AnyValue::Bytes(b) => Value::String(BASE64.encode(b)),
+        AnyValue::Array(items) => Value::Array(items.iter().map(any_value).collect()),
+        AnyValue::Map(pairs) => Value::Object(
+            pairs
+                .iter()
+                .map(|(k, v)| (k.clone(), any_value(v)))
+                .collect(),
+        ),
     }
 }
 
 /// Encode an attribute map as a JSON object. Duplicate keys (which `Attributes` permits) collapse
 /// the way any JSON reader would collapse them — last wins.
-pub(crate) fn attributes(attrs: &Attributes) -> String {
-    let mut obj = Obj::new();
-    for (k, v) in attrs.iter() {
-        obj.raw(k, &any_value(v));
-    }
-    obj.finish()
+pub(crate) fn attributes(attrs: &Attributes) -> Value {
+    Value::Object(
+        attrs
+            .iter()
+            .map(|(k, v)| (k.to_owned(), any_value(v)))
+            .collect(),
+    )
 }
 
 /// Encode `(key, value)` label pairs as a JSON object.
-pub(crate) fn labels(pairs: &[(String, String)]) -> String {
-    let mut obj = Obj::new();
-    for (k, v) in pairs {
-        obj.str(k, v);
-    }
-    obj.finish()
+pub(crate) fn labels(pairs: &[(String, String)]) -> Value {
+    Value::Object(
+        pairs
+            .iter()
+            .map(|(k, v)| (k.clone(), Value::String(v.clone())))
+            .collect(),
+    )
 }
 
-// ── reading ─────────────────────────────────────────────────────────────────────────────────────
+// ── reading tool arguments ──────────────────────────────────────────────────────────────────────
 
 /// A tool call's `arguments` object, with typed accessors.
 ///
 /// Every accessor that can fail returns the message a *model* should see: MCP reports argument
 /// problems as tool-execution errors (`isError: true`), not protocol errors, precisely so the model
 /// can correct itself and retry (MCP `server/tools` — Error Handling).
-pub(crate) struct Args(Vec<(String, AnyValue)>);
+pub(crate) struct Args(Map<String, Value>);
 
 impl Args {
     /// Wrap a parsed `arguments` value. A missing or non-object `arguments` is an empty map — the
     /// per-argument accessors then report exactly which required argument is missing, which is more
     /// useful than one blanket "arguments must be an object".
-    pub(crate) fn new(value: Option<&AnyValue>) -> Self {
+    pub(crate) fn new(value: Option<&Value>) -> Self {
         match value {
-            Some(AnyValue::Map(pairs)) => Args(pairs.clone()),
-            _ => Args(Vec::new()),
+            Some(Value::Object(map)) => Args(map.clone()),
+            _ => Args(Map::new()),
         }
     }
 
-    fn get(&self, key: &str) -> Option<&AnyValue> {
-        self.0
-            .iter()
-            .find(|(k, _)| k == key)
-            .map(|(_, v)| v)
-            .filter(|v| !matches!(v, AnyValue::Null))
+    /// An explicit `null` reads as absent, so a client that fills every optional field with null
+    /// still works.
+    fn get(&self, key: &str) -> Option<&Value> {
+        self.0.get(key).filter(|v| !v.is_null())
     }
 
     /// An optional string argument. A non-string value is an error rather than a coercion: silently
@@ -208,7 +99,7 @@ impl Args {
     pub(crate) fn str(&self, key: &str) -> Result<Option<&str>, String> {
         match self.get(key) {
             None => Ok(None),
-            Some(AnyValue::Str(s)) => Ok(Some(s.as_str())),
+            Some(Value::String(s)) => Ok(Some(s.as_str())),
             Some(_) => Err(format!("argument `{key}` must be a string")),
         }
     }
@@ -221,9 +112,12 @@ impl Args {
     pub(crate) fn i64(&self, key: &str) -> Result<Option<i64>, String> {
         match self.get(key) {
             None => Ok(None),
-            Some(AnyValue::Int(i)) => Ok(Some(*i)),
             // A JSON writer that emits `1e9` or `1.0` still means an integer here.
-            Some(AnyValue::Double(d)) if d.fract() == 0.0 && d.is_finite() => Ok(Some(*d as i64)),
+            Some(Value::Number(n)) => n
+                .as_i64()
+                .or_else(|| n.as_f64().filter(|d| d.fract() == 0.0).map(|d| d as i64))
+                .map(Some)
+                .ok_or_else(|| format!("argument `{key}` must be an integer")),
             Some(_) => Err(format!("argument `{key}` must be an integer")),
         }
     }
@@ -231,8 +125,10 @@ impl Args {
     pub(crate) fn f64(&self, key: &str) -> Result<Option<f64>, String> {
         match self.get(key) {
             None => Ok(None),
-            Some(AnyValue::Double(d)) => Ok(Some(*d)),
-            Some(AnyValue::Int(i)) => Ok(Some(*i as f64)),
+            Some(Value::Number(n)) => n
+                .as_f64()
+                .map(Some)
+                .ok_or_else(|| format!("argument `{key}` must be a number")),
             Some(_) => Err(format!("argument `{key}` must be a number")),
         }
     }
@@ -240,7 +136,7 @@ impl Args {
     pub(crate) fn bool(&self, key: &str) -> Result<Option<bool>, String> {
         match self.get(key) {
             None => Ok(None),
-            Some(AnyValue::Bool(b)) => Ok(Some(*b)),
+            Some(Value::Bool(b)) => Ok(Some(*b)),
             Some(_) => Err(format!("argument `{key}` must be a boolean")),
         }
     }
@@ -265,20 +161,20 @@ impl Args {
         }
     }
 
-    /// An object of string→string pairs, e.g. `{"http.route": "/cart"}`. Non-string values are
+    /// An object of string→string pairs, e.g. `{"http.route": "/cart"}`. Non-string scalars are
     /// rendered rather than rejected so `{"http.status_code": 500}` works the way a model expects.
     pub(crate) fn string_map(&self, key: &str) -> Result<Vec<(String, String)>, String> {
         match self.get(key) {
             None => Ok(Vec::new()),
-            Some(AnyValue::Map(pairs)) => Ok(pairs
+            Some(Value::Object(map)) => Ok(map
                 .iter()
                 .map(|(k, v)| {
                     let v = match v {
-                        AnyValue::Str(s) => s.clone(),
-                        AnyValue::Int(i) => i.to_string(),
-                        AnyValue::Double(d) => number(*d),
-                        AnyValue::Bool(b) => b.to_string(),
-                        other => any_value(other),
+                        Value::String(s) => s.clone(),
+                        // `to_string` on a non-string scalar is its JSON text, which for numbers and
+                        // booleans is exactly the value; containers keep their JSON form, which is
+                        // the only sensible reading of an attribute compared against one.
+                        other => other.to_string(),
                     };
                     (k.clone(), v)
                 })
@@ -293,89 +189,21 @@ impl Args {
     pub(crate) fn string_list(&self, key: &str) -> Result<Vec<String>, String> {
         match self.get(key) {
             None => Ok(Vec::new()),
-            Some(AnyValue::Array(items)) => items
+            Some(Value::Array(items)) => items
                 .iter()
                 .map(|item| match item {
-                    AnyValue::Str(s) => Ok(s.clone()),
+                    Value::String(s) => Ok(s.clone()),
                     _ => Err(format!("argument `{key}` must be an array of strings")),
                 })
                 .collect(),
             // A bare string is the obvious intent for a one-element list; accept it.
-            Some(AnyValue::Str(s)) => Ok(vec![s.clone()]),
+            Some(Value::String(s)) => Ok(vec![s.clone()]),
             Some(_) => Err(format!("argument `{key}` must be an array of strings")),
         }
     }
 }
 
-// ── Base64 (the transport's `=?base64?…?=` header sentinel) ─────────────────────────────────────
-
-const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
-/// RFC 4648 Base64 with padding.
-pub(crate) fn base64_encode(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let b = [
-            chunk[0],
-            *chunk.get(1).unwrap_or(&0),
-            *chunk.get(2).unwrap_or(&0),
-        ];
-        let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
-        out.push(B64[(n >> 18) as usize & 63] as char);
-        out.push(B64[(n >> 12) as usize & 63] as char);
-        out.push(if chunk.len() > 1 {
-            B64[(n >> 6) as usize & 63] as char
-        } else {
-            '='
-        });
-        out.push(if chunk.len() > 2 {
-            B64[n as usize & 63] as char
-        } else {
-            '='
-        });
-    }
-    out
-}
-
-/// RFC 4648 Base64 decode; `None` on any malformed input.
-pub(crate) fn base64_decode(s: &str) -> Option<Vec<u8>> {
-    let b = s.as_bytes();
-    if !b.len().is_multiple_of(4) {
-        return None;
-    }
-    let mut out = Vec::with_capacity(b.len() / 4 * 3);
-    for chunk in b.chunks(4) {
-        let mut n: u32 = 0;
-        let mut pad = 0;
-        for (i, &c) in chunk.iter().enumerate() {
-            let v = match c {
-                b'A'..=b'Z' => c - b'A',
-                b'a'..=b'z' => c - b'a' + 26,
-                b'0'..=b'9' => c - b'0' + 52,
-                b'+' => 62,
-                b'/' => 63,
-                // Padding is only legal in the last two positions, and never before a data byte.
-                b'=' if i >= 2 => {
-                    pad += 1;
-                    0
-                }
-                _ => return None,
-            };
-            if pad > 0 && c != b'=' {
-                return None;
-            }
-            n = (n << 6) | v as u32;
-        }
-        out.push((n >> 16) as u8);
-        if pad < 2 {
-            out.push((n >> 8) as u8);
-        }
-        if pad < 1 {
-            out.push(n as u8);
-        }
-    }
-    Some(out)
-}
+// ── the transport's `=?base64?…?=` header sentinel ──────────────────────────────────────────────
 
 /// Decode a Streamable HTTP header value, undoing the `=?base64?…?=` sentinel the transport defines
 /// for values that cannot travel as plain ASCII (MCP `basic/transports/streamable-http` — Value
@@ -388,60 +216,46 @@ pub(crate) fn decode_header_value(value: &str) -> Option<String> {
     else {
         return Some(value.to_owned());
     };
-    String::from_utf8(base64_decode(inner)?).ok()
+    String::from_utf8(BASE64.decode(inner).ok()?).ok()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use imbh::parse_json;
 
     fn args(json: &str) -> Args {
-        Args::new(parse_json(json).as_ref())
-    }
-
-    #[test]
-    fn objects_and_arrays_encode() {
-        let mut obj = Obj::new();
-        assert_eq!(Obj::new().finish(), "{}");
-        assert_eq!(Arr::new().finish(), "[]");
-        let body = obj
-            .str("service", "cart\"api")
-            .int("count", -3)
-            .float("ratio", 0.5)
-            .bool("ok", true)
-            .opt_str("missing", None)
-            .raw("nested", &Arr::new().str("a").finish())
-            .finish();
-        assert_eq!(
-            body,
-            r#"{"service":"cart\"api","count":-3,"ratio":0.5,"ok":true,"nested":["a"]}"#
-        );
+        let value: Value = serde_json::from_str(json).expect("test json");
+        Args::new(Some(&value))
     }
 
     #[test]
     fn non_finite_floats_become_null() {
         // JSON cannot spell NaN, and a p99 over an empty bucket is exactly where one shows up.
-        assert_eq!(number(f64::NAN), "null");
-        assert_eq!(number(f64::INFINITY), "null");
-        assert_eq!(number(-0.0), "0");
-        assert_eq!(number(1.5), "1.5");
+        assert_eq!(number(f64::NAN), Value::Null);
+        assert_eq!(number(f64::INFINITY), Value::Null);
+        assert_eq!(number(1.5).to_string(), "1.5");
     }
 
     #[test]
     fn any_values_encode() {
-        assert_eq!(any_value(&AnyValue::Null), "null");
-        assert_eq!(any_value(&AnyValue::Int(7)), "7");
+        assert_eq!(any_value(&AnyValue::Null), Value::Null);
+        assert_eq!(any_value(&AnyValue::Int(7)).to_string(), "7");
+        // Base64 per RFC 4648, which is what imbh's canonical encoder emits for `Bytes`.
         assert_eq!(
             any_value(&AnyValue::Bytes(b"foobar".to_vec())),
-            r#""Zm9vYmFy""#
+            json!("Zm9vYmFy")
         );
         assert_eq!(
             any_value(&AnyValue::Array(vec![
                 AnyValue::Bool(false),
                 AnyValue::Str("x".into())
             ])),
-            r#"[false,"x"]"#
+            json!([false, "x"])
+        );
+        // Escaping is serde_json's problem now, not a hand-rolled writer's.
+        assert_eq!(
+            any_value(&AnyValue::Str("cart\"api\n".into())).to_string(),
+            r#""cart\"api\n""#
         );
     }
 
@@ -459,6 +273,14 @@ mod tests {
         assert!(a.i64("service").is_err());
         assert_eq!(a.req_str("service").unwrap(), "cart");
         assert!(a.req_str("absent").unwrap_err().contains("required"));
+    }
+
+    #[test]
+    fn integers_accept_the_float_spellings_a_json_writer_emits() {
+        let a = args(r#"{"whole":1.0,"exp":1e3,"fractional":1.5}"#);
+        assert_eq!(a.i64("whole").unwrap(), Some(1));
+        assert_eq!(a.i64("exp").unwrap(), Some(1000));
+        assert!(a.i64("fractional").is_err());
     }
 
     #[test]
@@ -491,18 +313,6 @@ mod tests {
     }
 
     #[test]
-    fn base64_round_trips_and_rejects() {
-        for input in ["", "f", "fo", "foo", "foob", "fooba", "foobar"] {
-            let encoded = base64_encode(input.as_bytes());
-            assert_eq!(base64_decode(&encoded).as_deref(), Some(input.as_bytes()));
-        }
-        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
-        assert_eq!(base64_decode("Zm8"), None); // unpadded
-        assert_eq!(base64_decode("Zm8*"), None); // out of alphabet
-        assert_eq!(base64_decode("Z=8="), None); // padding before data
-    }
-
-    #[test]
     fn header_sentinel_decodes() {
         assert_eq!(
             decode_header_value("search_logs").as_deref(),
@@ -512,6 +322,8 @@ mod tests {
             decode_header_value("=?base64?SGVsbG8sIOS4lueVjA==?=").as_deref(),
             Some("Hello, 世界")
         );
+        // Malformed sentinels are refused rather than silently passed through as literals.
         assert_eq!(decode_header_value("=?base64?not!base64?="), None);
+        assert_eq!(decode_header_value("=?base64?Zm8?="), None); // unpadded
     }
 }
