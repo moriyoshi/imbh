@@ -6,11 +6,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crossterm::event::KeyEvent;
-use imbh::Db;
 use ratatui::layout::Rect;
 use tokio::sync::mpsc;
 
 use crate::app::App;
+use crate::backend::Backend;
 use crate::keys::{Control, handle_key};
 use crate::mascot::{MASCOT_IDLE_AFTER, MascotCtx, MascotEvent};
 use crate::model::{Mode, Options, Route, Update};
@@ -18,7 +18,15 @@ use crate::tasks::{request_refresh, request_waterfall};
 use crate::terminal::{TerminalGuard, input_reader, install_panic_hook};
 use crate::ui::draw;
 
-pub async fn run(db: Arc<Db>, options: Options) -> io::Result<()> {
+/// Drive the explorer over a backend until the user quits.
+///
+/// Takes anything that converts into a [`Backend`], so an embedder that already holds an
+/// `Arc<Db>` can go on passing it and a head passes [`Backend::connect`]'s result instead.
+pub async fn run(backend: impl Into<Backend>, options: Options) -> io::Result<()> {
+    run_backend(backend.into(), options).await
+}
+
+async fn run_backend(backend: Backend, options: Options) -> io::Result<()> {
     let mut terminal = TerminalGuard::enter()?;
     // Install the panic hook only after we have entered the alternate screen: if a panic unwinds
     // out of the event loop, the hook restores the normal screen (best-effort, idempotent with the
@@ -44,7 +52,7 @@ pub async fn run(db: Arc<Db>, options: Options) -> io::Result<()> {
     // A host (or the CLI `--from/--to`) may seed an initial absolute window; adopt it so the first
     // query and the header indicator reflect it.
     app.abs_window = options.window;
-    request_refresh(&mut app, db.clone(), options.clone(), sender.clone());
+    request_refresh(&mut app, backend.clone(), options.clone(), sender.clone());
 
     let outcome: io::Result<()> = async {
         loop {
@@ -131,12 +139,12 @@ pub async fn run(db: Arc<Db>, options: Options) -> io::Result<()> {
                             app.mascot_refresh_pending = true;
                             if app.pending_refresh {
                                 app.pending_refresh = false;
-                                request_refresh(&mut app, db.clone(), options.clone(), sender.clone());
+                                request_refresh(&mut app, backend.clone(), options.clone(), sender.clone());
                             }
                             // A fresh traces result: land on the focused trace (if navigated from a
                             // log) then fetch the selected/focused trace's waterfall.
                             app.focus_select_trace();
-                            request_waterfall(&mut app, &db, &sender, options.ascii);
+                            request_waterfall(&mut app, &backend, &sender, options.ascii);
                             // A log→trace / exemplar→trace jump wants the trace's *detail*, not the
                             // Traces list it routes through: open it right away when the waterfall was
                             // already retained (no fetch was issued above), else on its arrival below.
@@ -205,7 +213,7 @@ pub async fn run(db: Arc<Db>, options: Options) -> io::Result<()> {
                         Some(key) => {
                             // Any keystroke marks the user active (drives the mascot idle/active split).
                             app.mascot_last_input = Instant::now();
-                            if handle_key(&mut app, key, &db, &options, &sender) == Control::Quit {
+                            if handle_key(&mut app, key, &backend, &options, &sender) == Control::Quit {
                                 break;
                             }
                         }
@@ -220,7 +228,7 @@ pub async fn run(db: Arc<Db>, options: Options) -> io::Result<()> {
                         && app.mode == Mode::Normal
                         && app.last_refresh.elapsed() >= options.refresh_interval
                     {
-                        request_refresh(&mut app, db.clone(), options.clone(), sender.clone());
+                        request_refresh(&mut app, backend.clone(), options.clone(), sender.clone());
                     }
                 }
             }

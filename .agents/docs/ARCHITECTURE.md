@@ -1270,6 +1270,85 @@ The exact capability and deferred-construct matrices live in
 [QUERY_LANGUAGE_TRANSLATORS_PLAN.md](./QUERY_LANGUAGE_TRANSLATORS_PLAN.md), and
 [TUI_PLAN.md](./TUI_PLAN.md). Expanding a profile requires evaluator tests before parser support.
 
+### 10.19 Head API (`imbh-head`)
+
+A **head** is a user interface with no database of its own. `imbh-tui` is the one that ships, but
+nothing in this surface is specific to a terminal. A head reads its data one of two ways, and the
+head API is what makes the second possible:
+
+```text
+  imbh-tui <dir>                   imbh-tui --url http://host:4318
+       │                                       │
+       │ exec::*(db, req)             client::HeadClient (HTTP + JSON/Arrow IPC)
+       ▼                                       ▼
+     Db                              imbhd  ──►  exec::*(db, req)  ──►  Db
+```
+
+Locally the head opens the directory with `Db::open_read_only`, which takes no writer lock and so
+reads *alongside* a running `imbhd`. What that view cannot see is the writer's **unsealed buffer** —
+i.e. the most recent telemetry of all — which is precisely what a live UI wants. `--url` therefore
+asks the daemon instead, and as a side effect the database may live on another machine.
+
+**One implementation, two transports.** `imbh_head::exec` is the single implementation of every
+operation over a `Db`. `imbh-server` calls it behind `POST`/`GET /api/head/…`; `imbh-tui`'s local
+backend calls it directly, in-process. That is the load-bearing property and the reason the surface
+is a crate rather than a set of routes: the query-language translation, the evaluation caps, and the
+trace-window narrowing all happen in the same code either way, so the two modes cannot answer the
+same question differently. `crates/imbh-server/tests/head_e2e.rs` asserts exactly that, operation by
+operation, over a real loopback socket.
+
+The eleven operations are the ones a head cannot synthesize from anything else `imbhd` serves:
+`stats`, `metrics/catalog`, `metrics/promql`, `metrics/exemplars`, `traces/search`, `traces/get`,
+`logs/query`, `logs/volume`, `logs/logql`, `attributes/keys`, `attributes/values`. Four of those have
+no counterpart anywhere else in the server: nothing else **evaluates** PromQL, LogQL, or TraceQL
+(`query_metric_range`/`search_traces` are the *typed-builder* path — they cannot express
+`sum by (svc) (rate(x[5m]))`), and nothing else surfaces exemplars. `logs/query` additionally carries
+the `PageCursor` and span-id correlation that the viewer's paging and trace drill-down need.
+
+**Why not `/mcp`.** The MCP endpoint (§10.16.1) answers the same database for an *agent*: its tools
+are shaped for a model (`since` windows, prose descriptions, one JSON document per call) and are
+deliberately lossy — no paging cursors, no per-sample matrices, no waterfall. Reshaping them to serve
+a UI would change what every agent sees. The two surfaces share the `Db` and nothing else, which is
+also why the head API has a prefix of its own: `/api/head/*` is one unit a deployment can gate,
+disable, or mount behind a proxy.
+
+**Two response codecs, split by shape.** Requests are always JSON — they are query *descriptions*,
+not tables. Row-shaped results (the PromQL/LogQL matrices, the TraceQL matches, a log page, a trace)
+answer as **Arrow IPC**; the small scalar ones (stats, catalog, exemplars, attribute vocabularies) as
+JSON. The reason is soundness, not taste: JSON has no `NaN`, no `Infinity`, and no `-Infinity`, and
+`serde_json` writes all three as `null`, which then fails to read back as an `f64` — and a PromQL
+evaluation produces all three routinely (`histogram_quantile` over an empty window, a division by
+zero). Arrow stores the IEEE-754 bits, so the question does not arise. It is also the format these
+results are already in, and `arrow-ipc` is already compiled wherever DataFusion is, so the codec
+costs **no dependency**. The series schema is deliberately the one `imbh_lgtm::prom_matrix_schema`
+already defines (`{labels, ts, value}`, long form), pinned by a test. Anything not row-shaped — a
+paging cursor, the scan counters, a trace's assembled header, the narrowed window start — rides in
+the IPC schema's custom metadata, so a response stays one self-describing message. Failures are JSON
+in both cases, in the same `{"error": …}` shape as the rest of `imbhd` plus a `kind` discriminator a
+head branches on (the trace search retries on `limit_exceeded` and gives up on anything else).
+
+The encoders take the **materialized** result types rather than the engine's `*_batches` twins. That
+is what keeps `exec` at one return type for both backends — a local head uses the value and encodes
+nothing — and it keeps `imbh/proto` (and its protox codegen) out of both binaries. The server pays
+one extra materialize-then-encode on a page of at most a few thousand rows, which is not a cost worth
+a second execution path.
+
+**An eval request carries every sub-query**, because a head routinely asks for several: the metric
+catalog emits one selector per checked metric, and the evaluator has no `or`, so each must run on its
+own. Sending them together is one round trip and, more to the point, **one** metric-catalog read —
+the catalog is what PromQL translation resolves a selector's kind against, so a query apiece would
+re-read it apiece.
+
+**Footprint.** `imbh-head` is downstream of the facade, so the crate-count gate (`cargo tree -p imbh`)
+is unchanged at 275. The feature split keeps each consumer to the half it plays: `imbh-server` takes
+`exec` only, so the **client's reqwest subtree never enters `imbhd`** (297 crates, from 293; the
+release binary 32.6 → 32.9 MiB against a 42 MB target). `imbh-tui` takes both and pays for the
+transport (323 crates, from 313) — a binary that is already outside every library budget, and the
+alternative was a hand-written HTTP client in a terminal program.
+
+Read-only throughout: nothing below `/api/head` ingests, flushes, compacts, or applies retention.
+Like the rest of `imbhd` it is unauthenticated, so a real deployment gates the prefix.
+
 ## 11. Footprint engineering (continuous, not a phase)
 
 - **Feature matrix.** `search` (§10.13), `tracing` (self-observability), `serde` (DTO derives,
@@ -1327,6 +1406,7 @@ imbh/
                            # into a `Db` (self-observation, depends on imbh) (optional)
   examples/                # replay-otlp-file, embed-in-app, …
   docs/                    # EMBEDDING.md, PROMQL_TO_SQL.md
+  crates/imbh-head/        # the head API: wire types, Db-side execution, HTTP client (§10.19)
   .agents/docs/            # OVERVIEW.md, ARCHITECTURE.md (this file), JOURNAL.md, TODO.md, …
 ```
 
@@ -1338,6 +1418,10 @@ terminal crates.
 `imbh-mcp` sits in that same top tier — `imbh ← imbh-mcp ← {imbh-server, imbh-tui}` — and is where
 the MCP protocol lives *because* of this direction: the HTTP endpoint is in `imbh-server` and the
 stdio one in the `imbh-tui` binary, and neither of those crates may depend on the other (§10.16.1).
+`imbh-head` sits there for the same reason — `imbh ← imbh-head ← {imbh-server, imbh-tui}` — and is a
+separate crate from `imbh-mcp` because it is a separate facility: one surface is for a UI, the other
+for an agent (§10.19). Its features split the two halves so neither consumer carries the other's:
+`exec` (execute against a `Db`) for the daemon, `exec` + `client` (the HTTP client) for the head.
 `imbh-proto` is a prost-only leaf that `imbh` depends on **optionally**, under its `proto` feature
 (§10.17); it depends on nothing else in the workspace.
 `imbh-tracing` sits at the top tier alongside `{exporter, server}` and depends on `imbh`. It provides

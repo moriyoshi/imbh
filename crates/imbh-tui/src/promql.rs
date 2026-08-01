@@ -1,7 +1,9 @@
 //! Building and reading back PromQL: the queries the catalog emits, and recovering a metric name
 //! from a query for the exemplar lookup.
-
-use imbh_lgtm::{MetricKind, MetricResolution, TranslateContext};
+//!
+//! Translation itself is not here: a query's *meaning* depends on the metric catalog's recorded kinds
+//! and temporality, so it happens where the data is (`imbh_head::exec::metric_context`) rather than
+//! against a copy of the catalog a head would have to keep fresh.
 
 use crate::model::MetricDetail;
 use crate::syntax::is_ident_char;
@@ -156,38 +158,6 @@ pub(crate) fn discovery_promql(name: &str, kind: &str) -> String {
         "histogram" => format!("{name}_bucket"),
         _ => name.to_owned(),
     }
-}
-
-pub(crate) fn metric_context(catalog: &[imbh::MetricMeta]) -> TranslateContext {
-    let mut metrics = Vec::new();
-    for metric in catalog {
-        let kind = match (metric.kind.as_str(), metric.temporality.as_deref()) {
-            ("gauge", _) => Some(MetricKind::Gauge),
-            ("sum", Some(temporality)) if temporality.eq_ignore_ascii_case("cumulative") => {
-                Some(MetricKind::CumulativeCounter)
-            }
-            ("histogram", Some(temporality)) if temporality.eq_ignore_ascii_case("cumulative") => {
-                Some(MetricKind::CumulativeHistogram)
-            }
-            _ => None,
-        };
-        let Some(kind) = kind else {
-            continue;
-        };
-        metrics.push(MetricResolution {
-            query_name: metric.metric.clone(),
-            storage_name: metric.metric.clone(),
-            kind,
-        });
-        if kind == MetricKind::CumulativeHistogram {
-            metrics.push(MetricResolution {
-                query_name: format!("{}_bucket", metric.metric),
-                storage_name: metric.metric.clone(),
-                kind,
-            });
-        }
-    }
-    TranslateContext { metrics }
 }
 
 #[cfg(test)]

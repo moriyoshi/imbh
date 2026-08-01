@@ -20,6 +20,15 @@ imbh.workspace = true
 # (ARCHITECTURE.md §10.16.1). Adds no crate to the graph — it is imbh plus serde_json and base64,
 # both already compiled under DataFusion.
 imbh-mcp.workspace = true
+# The head API (ARCHITECTURE.md §10.19): the DTOs and the one implementation of each operation over a
+# `Db`. This crate contributes only the HTTP transport around it (`src/head.rs`) — the same functions
+# back `imbh-tui`'s local backend, which is what makes a head's two modes answer identically. Only
+# `exec` here: a daemon *serves* the head API, it does not drive one, so the crate's own HTTP client
+# stays out of the shipping graph (the tests pull it in as a dev-dependency).
+imbh-head = { workspace = true, features = ["exec"] }
+# The head API's request/response derives. Already compiled in the default graph (tantivy, DataFusion,
+# opentelemetry-proto), so this edge adds no crate.
+serde.workspace = true
 # One shared multi-threaded runtime drives the accept loop and every connection. `Db`'s futures do
 # blocking parquet/tantivy I/O inside themselves (there is no `spawn_blocking` anywhere in the
 # library), so a handler that called them on a runtime worker would park it — every `Db` call in
@@ -109,6 +118,10 @@ docker = ["dep:opentelemetry-proto", "dep:prost"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros"] }
+# The head API's *client*, so `tests/head_e2e.rs` can drive `imbhd` the way `imbh-tui --url` does and
+# assert that a remote head sees exactly what a local one sees. The shipping build needs only `exec`
+# (see the dependency above); this adds the other half for tests.
+imbh-head = { workspace = true, features = ["client"] }
 # The protocol tests build gzip and chunked request bodies by hand; a normal dependency is not in
 # scope for an integration test.
 flate2.workspace = true

@@ -1,0 +1,46 @@
+[package]
+name = "imbh-head"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "The head API for imbh: the read-only query surface a terminal (or any other) head drives a running imbhd over, as JSON DTOs plus an HTTP client."
+
+[dependencies]
+# The DTO layer reuses the facade's own `serde`-gated query builders and result types
+# (`LogQuery`/`LogPage`/`Trace`/`MetricMeta`), so a head sends the *same* value the local path would
+# have passed to `Db` rather than a parallel description of it. `serde` adds no crate to the graph
+# (ARCHITECTURE.md §10.13).
+imbh = { workspace = true, optional = true, features = ["serde"] }
+# The semantic layer the `exec` feature executes against: PromQL/LogQL/TraceQL translation and the
+# `*SemanticsExt` execution traits. Pulled only by `exec`, so a client-only consumer carries none of
+# it.
+imbh-core = { workspace = true, optional = true }
+imbh-lgtm = { workspace = true, optional = true, features = ["source"] }
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+# The head client's transport. Trimmed to plain HTTP/1.1 + JSON: no TLS (`imbhd` serves none — see
+# `Endpoint::parse`, which refuses an `https://` URL rather than silently downgrading it), no http2,
+# no cookies, no charset sniffing. Everything it pulls (hyper, tower, bytes, http-body-util) is
+# already compiled for `imbh-server`; it is new only to the `imbh-tui` binary, and neither reaches
+# the `imbh` facade the footprint gate measures.
+reqwest = { workspace = true, optional = true }
+
+[features]
+default = ["client", "exec"]
+# The JSON wire types themselves.
+dto = ["dep:imbh", "dep:imbh-core", "dep:serde", "dep:serde_json"]
+# The HTTP client a head drives a remote `imbhd` with.
+client = ["dto", "dep:reqwest"]
+# Server-side execution of every head operation against an open `Db`. Shared by `imbh-server` (which
+# serves it over HTTP) and by `imbh-tui`'s local backend (which calls it in-process), so the two can
+# never answer the same question two different ways. The futures block internally, exactly like the
+# `Db` ones underneath them, so it is the caller that decides how to offload them.
+exec = ["dto", "dep:imbh-lgtm"]
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros"] }
+tempfile.workspace = true
+imbh-test-support.workspace = true
