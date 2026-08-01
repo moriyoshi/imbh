@@ -199,7 +199,7 @@ are off to keep the [footprint](#footprint) gate honest. Each release also publi
 file:
 
 ```
-VERSION=0.1.1; TARGET=x86_64-unknown-linux-gnu
+VERSION=0.3.0; TARGET=x86_64-unknown-linux-gnu
 BASE=https://github.com/moriyoshi/imbh/releases/download/v${VERSION}
 curl -fLO ${BASE}/imbh-${VERSION}-${TARGET}.tar.gz
 curl -fLO ${BASE}/SHA256SUMS
@@ -222,7 +222,7 @@ it runs as an unprivileged user with the database on a volume at `/var/lib/imbh`
 docker run -d --name imbh \
   -p 4318:4318 -p 4317:4317 \
   -v imbh-data:/var/lib/imbh \
-  ghcr.io/moriyoshi/imbh:0.1.1
+  ghcr.io/moriyoshi/imbh:0.3.0
 
 curl -s 127.0.0.1:4318/api/query --data "SELECT count(*) FROM logs"
 
