@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 publish.workspace = true
-description = "imbhd: the reference HTTP server wiring for imbh (ARCHITECTURE.md §10.16). A minimal std-net HTTP/1.1 server — one worked example of host wiring, not the product."
+description = "imbhd: the reference HTTP server wiring for imbh (ARCHITECTURE.md §10.16). An axum/hyper HTTP/1.1 server — one worked example of host wiring, not the product."
 
 [[bin]]
 name = "imbhd"
@@ -14,9 +14,31 @@ path = "src/main.rs"
 
 [dependencies]
 imbh.workspace = true
-# Owned per-connection current-thread runtime; no async net (sockets are std blocking). The optional
-# `grpc` feature adds `rt-multi-thread`/`net`/`time` on top (tonic drives its accept loop on tokio).
-tokio = { workspace = true, features = ["rt"] }
+# One shared multi-threaded runtime drives the accept loop and every connection. `Db`'s futures do
+# blocking parquet/tantivy I/O inside themselves (there is no `spawn_blocking` anywhere in the
+# library), so a handler that called them on a runtime worker would park it — every `Db` call in
+# `route` therefore goes through `tokio::task::spawn_blocking`, and the blocking pool is what bounds
+# request concurrency. `net`/`time` are the listener and the deadlines.
+tokio = { workspace = true, features = [
+    "rt",
+    "rt-multi-thread",
+    "net",
+    "time",
+    "sync",
+    "io-util",
+] }
+# The HTTP/1.1 stack (see the workspace manifest for the feature-trimming rationale). axum owns
+# routing and extraction; hyper owns the connection, including the `header_read_timeout` that backs
+# `IMBH_HEADER_TIMEOUT`; hyper-util adapts tokio's `TcpStream` and tracks connections for the drain.
+axum.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+http-body-util.workspace = true
+http-body.workspace = true
+tower.workspace = true
+# gzip request bodies (`Content-Encoding: gzip`), which the OTel Collector's otlphttp exporter sends by
+# default. Already in the default graph via parquet — no new crate.
+flate2.workspace = true
 # ── gRPC (optional, off by default) ──────────────────────────────────────────────────────
 # OTLP/gRPC ingest for the reference server. All three deps are optional and pulled ONLY by the
 # `grpc` feature, so the default build (the footprint gate) carries no tonic/hyper/h2 subtree.
@@ -55,18 +77,15 @@ libc.workspace = true
 # Off by default so `cargo build -p imbh-server` (the footprint gate) stays at the measured crate count;
 # enable with `cargo build -p imbh-server --features tracing`.
 tracing = ["dep:tracing", "imbh/tracing", "imbh/tracing-console"]
-# OTLP/gRPC ingest on a second port (default 127.0.0.1:4317), served by tonic alongside the std-net
-# HTTP/1.1 server. Off by default so `cargo build -p imbh-server` (the footprint gate) stays at the
-# measured crate count; enable with `cargo build -p imbh-server --features grpc`. Pulls the tonic
-# subtree and the tokio net/multi-thread runtime tonic needs.
+# OTLP/gRPC ingest on a second port (default 127.0.0.1:4317), served by tonic alongside the axum
+# HTTP/1.1 server. Off by default; enable with `cargo build -p imbh-server --features grpc`. Adds only
+# tonic itself and h2 on top of the default graph — hyper, tower, and axum are already there for the
+# HTTP listener, and the runtime features tonic needs (`rt-multi-thread`/`net`/`time`) are too.
 grpc = [
     "dep:tonic",
     "dep:opentelemetry-proto",
     "opentelemetry-proto/gen-tonic",
     "dep:prost",
-    "tokio/rt-multi-thread",
-    "tokio/net",
-    "tokio/time",
 ]
 # Docker logging-driver plugin: serve the `docker.logdriver/1.0` plugin API on a Unix socket, read
 # each container's log FIFO, and ingest the lines as OTLP logs (`docs/DOCKER_LOG_DRIVER.md`). Unix
@@ -78,6 +97,9 @@ docker = ["dep:opentelemetry-proto", "dep:prost"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros"] }
+# The protocol tests build gzip and chunked request bodies by hand; a normal dependency is not in
+# scope for an integration test.
+flate2.workspace = true
 opentelemetry-proto.workspace = true
 prost.workspace = true
 tempfile.workspace = true

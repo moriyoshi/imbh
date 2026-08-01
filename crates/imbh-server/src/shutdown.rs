@@ -19,11 +19,10 @@
 //! The pieces here are the [`Shutdown`] token every accept loop watches and the signal plumbing that
 //! trips it. Two properties shape the implementation:
 //!
-//! - **No polling on the hot path.** A blocking `accept` cannot observe a flag, and a poll loop would
-//!   add up to a tick of latency to *every* request (each response carries `Connection: close`, so
-//!   that is one connection per request). Instead a listener registers a waker with
-//!   [`Shutdown::on_trigger`] — at trigger time it makes one throwaway connection to its own address,
-//!   which unblocks `accept` immediately and costs nothing while idle.
+//! - **No polling on the hot path.** A listener registers a wake-up with [`Shutdown::on_trigger`]
+//!   rather than checking a flag on a timer; both accept loops turn that into a `oneshot` they select
+//!   on, so an idle server costs nothing and shutdown is observed immediately. Draining what is
+//!   already in flight is hyper's `GracefulShutdown`, not something this module counts.
 //! - **The signal handler only does async-signal-safe work.** It stores an atomic and writes one byte
 //!   to a self-pipe; a watcher thread parked on the read end does the rest (taking locks, notifying a
 //!   condvar). Tripping the token from the handler itself would take a mutex inside a signal context.
@@ -31,21 +30,14 @@
 //! Footprint: signal handling needs `libc` (`std` has no way to catch `SIGTERM`), which is already in
 //! `imbhd`'s dependency graph via DataFusion — so this adds **no crate** (ARCHITECTURE.md §11).
 
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// How long a listener waits for its in-flight requests to finish before returning anyway. Docker's
 /// own `stop` grace is 10s and systemd's default `TimeoutStopSec` is 90s, so 5s leaves room for the
 /// final seal that follows.
 pub const DEFAULT_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// How often a drain rechecks the in-flight count. Only ever runs during shutdown.
-const DRAIN_POLL: Duration = Duration::from_millis(10);
-
-/// Bound on the throwaway connection that unblocks an `accept`. It is a connect to ourselves, so it
-/// either completes at once or something is wrong enough that waiting will not help.
-const WAKE_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// A one-shot listener wake-up, run when the token is tripped.
 type Waker = Box<dyn FnOnce() + Send>;
@@ -110,11 +102,11 @@ impl Shutdown {
             .filter(|signum| *signum != 0)
     }
 
-    /// Register a wake-up to run when the token trips — for a listener, a throwaway connection to its
-    /// own address, which is the only way to get a thread out of a blocking `accept`.
+    /// Register a wake-up to run when the token trips — for both listeners, sending on the `oneshot`
+    /// their accept loop selects on.
     ///
     /// Runs `waker` immediately if the token is already tripped, so a listener that registers late
-    /// (bound after the signal arrived) still winds down instead of blocking forever in `accept`.
+    /// (bound after the signal arrived) still winds down instead of parking in `accept` forever.
     pub fn on_trigger(&self, waker: impl FnOnce() + Send + 'static) {
         let mut wakers = self.lock();
         if self.is_triggered() {
@@ -298,64 +290,11 @@ pub fn signal_name(signum: i32) -> &'static str {
     "signal"
 }
 
-/// The count of live connection threads behind one listener, so it can wait for its in-flight work
-/// when shutdown begins.
-#[derive(Default)]
-pub(crate) struct InFlight {
-    count: AtomicUsize,
-}
-
-impl InFlight {
-    /// Count one connection in until the returned guard drops. Taken on the accept thread *before*
-    /// the worker starts, so a connection can never be missed by a drain that runs in between.
-    pub(crate) fn enter(self: &Arc<Self>) -> Busy {
-        self.count.fetch_add(1, Ordering::SeqCst);
-        Busy(Arc::clone(self))
-    }
-
-    /// Wait up to `timeout` for the count to reach zero; returns what is still in flight (0 when the
-    /// drain completed). Polls, which is free — nothing calls this except a shutting-down listener.
-    pub(crate) fn drain(&self, timeout: Duration) -> usize {
-        let deadline = Instant::now() + timeout;
-        loop {
-            let live = self.count.load(Ordering::SeqCst);
-            if live == 0 || Instant::now() >= deadline {
-                return live;
-            }
-            std::thread::sleep(DRAIN_POLL.min(timeout));
-        }
-    }
-}
-
-/// A live connection's claim on its listener's [`InFlight`] count. Counts down on drop, so a
-/// connection that panics still releases the drain.
-pub(crate) struct Busy(Arc<InFlight>);
-
-impl Drop for Busy {
-    fn drop(&mut self) {
-        self.0.count.fetch_sub(1, Ordering::SeqCst);
-    }
-}
-
-/// Unblock a listener parked in `accept` by connecting to it once; the accept loop sees the shutdown
-/// flag and drops the connection unserved.
-///
-/// A wildcard bind (`0.0.0.0` / `[::]`) is not itself a connectable destination, so aim at loopback
-/// on the same port — the listener accepts it either way.
-pub(crate) fn wake_tcp_listener(addr: std::net::SocketAddr) {
-    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream};
-
-    let ip = match addr.ip() {
-        IpAddr::V4(v4) if v4.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
-        IpAddr::V6(v6) if v6.is_unspecified() => IpAddr::V6(Ipv6Addr::LOCALHOST),
-        ip => ip,
-    };
-    let _ = TcpStream::connect_timeout(&SocketAddr::new(ip, addr.port()), WAKE_TIMEOUT);
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Not in the module's own imports: only the wake-up counter in the first test needs it.
+    use std::sync::atomic::AtomicUsize;
 
     #[test]
     fn a_token_starts_untripped_and_trips_once() {
@@ -407,26 +346,6 @@ mod tests {
         assert!(shutdown.is_triggered());
         // Waiting on an already-tripped token returns at once.
         assert_eq!(shutdown.wait(), None);
-    }
-
-    #[test]
-    fn in_flight_drains_and_reports_what_is_left() {
-        let live = Arc::new(InFlight::default());
-        assert_eq!(live.drain(Duration::ZERO), 0, "nothing in flight");
-
-        let busy = live.enter();
-        // A connection that will not finish: the drain gives up and reports it rather than hanging.
-        assert_eq!(live.drain(Duration::from_millis(30)), 1);
-        drop(busy);
-        assert_eq!(live.drain(Duration::from_millis(30)), 0);
-
-        // A guard released on another thread while the drain waits.
-        let busy = live.enter();
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(20));
-            drop(busy);
-        });
-        assert_eq!(live.drain(Duration::from_secs(5)), 0);
     }
 
     /// The signal path end to end: install the handlers, raise `SIGTERM` at ourselves, and require

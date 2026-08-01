@@ -2,13 +2,13 @@
 
 ## Summary
 
-The reference `imbhd` HTTP server (`imbh-server` crate) is host wiring, not the product: a std-only, zero-heavy-dependency HTTP/1.1 server that drives the embedded `Db` and demonstrates the ingest/query/ops surface a real host would build. Alongside it sit the ops/admin capabilities on `Db` itself (`stats()`, `snapshot()`, `export()`, engine gauges) and the optional `imbh-otel-exporter` crate, which lets an in-process OpenTelemetry SDK pipeline export straight into an embedded `Db` with zero network hops. These pieces share one ingest/validation story with the OTLP/HTTP path and add essentially zero core footprint.
+The reference `imbhd` HTTP server (`imbh-server` crate) is host wiring, not the product: an axum/hyper HTTP/1.1 server that drives the embedded `Db` and demonstrates the ingest/query/ops surface a real host would build. Alongside it sit the ops/admin capabilities on `Db` itself (`stats()`, `snapshot()`, `export()`, engine gauges) and the optional `imbh-otel-exporter` crate, which lets an in-process OpenTelemetry SDK pipeline export straight into an embedded `Db` with zero network hops. These pieces share one ingest/validation story with the OTLP/HTTP path and add essentially zero core footprint.
 
 ## Key Facts
 
-- Design axiom: any HTTP server is host wiring; `imbhd` is one example wiring, not the product. The DIY axum/hyper path is what a real host would choose; `imbhd` is deliberately hand-rolled to keep the footprint claim honest.
-- `imbh-server` (bin `imbhd`) adds **no new crates** in the default build (IMBH + tokio were already in the graph). The whole HTTP request parser + response writer is ~60 lines.
-- Routes: `POST /v1/logs`·`/v1/traces`·`/v1/metrics` (OTLP/HTTP protobuf, uncompressed), `POST /api/query` (SQL body → JSON rows), `GET /health`, `GET /stats`, `POST /admin/flush`, `POST /admin/compact`.
+- Design axiom: any HTTP server is host wiring; `imbhd` is one example wiring, not the product. It runs axum/hyper because that is what a real host would choose — and because the footprint claim never depended on avoiding it (see the next bullet).
+- The crate-count budget is measured on the **library** graph — `scripts/footprint-gate.sh` runs `cargo tree -p imbh` — and the dependency direction is `imbh <- imbh-server`. So `imbh-server`'s own dependencies are outside the gated number by construction: the facade is 275 crates with or without axum. What axum/hyper cost is ~17 crates in `imbh-server`'s own graph and ~1.4 MiB of `imbhd` binary (31.2 -> 32.6 MiB, budget 42 MB). Do not re-argue this on crate count; argue it on whether `imbh-server` should stay optional.
+- Routes: `POST /v1/logs`·`/v1/traces`·`/v1/metrics` (OTLP/HTTP protobuf, gzip accepted), `POST /api/query` (SQL body → JSON rows), `GET /health`, `GET /stats`, `POST /admin/flush`, `POST /admin/compact`. The table is a plain `axum::Router`, public as `imbh_server::app(db)` so a host can mount it in its own application.
 - `imbhd [DB_DIR] [ADDR]` defaults to `./imbh-data` and `127.0.0.1:4318` (the OTLP port). With the optional `grpc` feature a 3rd arg `GRPC_ADDR` defaults to `127.0.0.1:4317`.
 - Ops surface on `Db`: `stats() -> DbStats`, `snapshot(dest) -> SnapshotInfo`, `export(table, range) -> Result<Vec<u8>>` (Arrow-IPC stream). `DbStats` carries per-table stats plus engine gauges `buffer_bytes`/`wal_bytes`/`durable_lsn`.
 - `imbh-otel-exporter` provides the SDK-exporter trio: `ImbhSpanExporter`, `ImbhLogExporter`, `ImbhMetricExporter`. Footprint verified unchanged: `imbh` = 275 crates, `imbh-otel-exporter` = 276 (275 + the crate itself), tree-diff empty.
@@ -17,7 +17,7 @@ The reference `imbhd` HTTP server (`imbh-server` crate) is host wiring, not the 
 
 ### Reference `imbhd` HTTP server (M5, §10.16)
 
-A minimal std-`net` HTTP/1.1 server, thread-per-connection, each connection driving the async `Db` API on its own current-thread runtime. Sockets are std blocking; only the `Db` futures need `block_on`. **No axum/hyper/tower** — zero heavy dependencies, so `imbhd` does not blow up the footprint story. A bare current-thread runtime drives DataFusion fine because IMBH's IO is blocking parquet/tantivy, not tokio IO (the blocking-facade insight, reused).
+An axum/hyper HTTP/1.1 server on one shared multi-threaded runtime (migrated 2026-08-01 from a std-`net`, thread-per-connection server). The load-bearing detail is that IMBH's I/O is **blocking** parquet/tantivy inside async fns — there is no `spawn_blocking` anywhere in the library — so a handler that awaited a `Db` future directly would park a runtime worker and starve every other connection. Every `Db` call therefore goes through `offload`, which uses `tokio::task::block_in_place` (+ `Handle::block_on`) so tokio spawns a replacement worker; on a current-thread runtime (`#[tokio::test]`, where `block_in_place` panics) it falls back to a plain `.await`. This is the same blocking-facade insight as before, but it now has to be stated explicitly rather than being implied by one runtime per connection.
 
 `route()` is a pure async fn (`Db` + method + path + body → `Response`), unit-tested without sockets. OTLP body routes call `ingest_otlp_*`. `GET /health` is a liveness probe. `imbhd [DB_DIR] [ADDR]` — point a stock OTel SDK's OTLP/HTTP exporter at it.
 
@@ -51,10 +51,12 @@ Added behind a new **off-by-default `grpc` feature** so the default footprint ga
 Findings:
 - The generated OTLP tonic services live in **opentelemetry-proto, not imbh-proto**. The workspace already had `opentelemetry-proto` with `gen-tonic-messages` (messages only); flipping to `gen-tonic` (feature-unioned only when the optional dep is enabled) brought the `*_service_server` modules and `tonic-prost` codec for free — no separate `tonic-build` step. Sharing one handler across the three services needs `LogsServiceServer::from_arc(Arc<T>)`, not `new(T)`.
 - `tonic::transport::Server` needs only the `server` feature; `.add_service()`/Router needs `router`. `transport = ["server", "channel"]` would also pull the client `channel` subtree; the server path wants just `server` + `router` + `codegen`. (The e2e test's tonic *client* does need `channel`, which `gen-tonic` supplies — dev/test-only, still inside the feature.)
-- Footprint gate held: `cargo tree -p imbh-server -e no-dev` shows zero tonic/hyper/h2/tower/axum by default; they appear only under `--features grpc`. Adding the optional deps only writes lock entries — nothing new compiles in the default build.
+- tonic 0.14 **routes through axum**, so `--features grpc` always pulled axum/hyper/tower/h2. Once the HTTP listener moved onto that same stack, `grpc` stopped adding it: the full-feature graph is unchanged at 310 crates and `grpc`'s marginal cost is now just tonic + h2 (6 crates over default).
 - Table names bite: the traces query is `FROM spans`, not `FROM traces`. The physical table for the trace signal is `spans` (imbh-core enums); metrics split across `metrics_gauge`/`metrics_sum`/`metrics_histogram`/`metrics_exp_histogram`.
 
-Reference-server follow-ups (deferred): gzip request bodies, TLS, TOML config, Arrow-IPC query output, the OTLP partial-success response shape, `/admin/*` auth.
+Both listeners are on axum/hyper as of 2026-08-01 — the TCP server and the Docker plugin's Unix socket — sharing one `handle`, so body limits, phase deadlines, and decoding are identical on both. The crate's hand-rolled HTTP/1.1 parser is gone. `ReadLogs` keeps its blocking, `io::Write`-generic generator by running it on a `spawn_blocking` task whose sink is a bounded channel that the response body drains; that channel is also the backpressure and disconnect signal, arriving at the generator as ordinary `io::Error`s.
+
+Reference-server follow-ups (deferred): TLS, TOML config, Arrow-IPC query output, the OTLP partial-success response shape, `/admin/*` auth.
 
 ### Ops/admin/stats/export surface
 

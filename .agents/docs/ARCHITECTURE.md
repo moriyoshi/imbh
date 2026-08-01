@@ -928,31 +928,60 @@ result — see §10.16 and `docs/EMBEDDING.md`.
 
 ### 10.16 Reference server
 
-`imbh-server` / `imbhd` is a worked example, not the product: a minimal `std::net` HTTP/1.1 server
-(zero heavy web deps) exposing OTLP/HTTP ingest on `/v1/{logs,traces,metrics}` (protobuf), a SQL
-query endpoint `POST /api/query` (JSON rows or Arrow IPC out), `GET /stats`, admin
+`imbh-server` / `imbhd` is a worked example, not the product: an HTTP/1.1 server on **axum over
+hyper** exposing OTLP/HTTP ingest on `/v1/{logs,traces,metrics}` (protobuf, `Content-Encoding: gzip`
+accepted), a SQL query endpoint `POST /api/query` (JSON rows or Arrow IPC out), `GET /stats`, admin
 `POST /admin/{flush,compact}`, and `GET /health`.
 
+**Why a framework here does not cost the footprint claim.** The §11 crate budget is written against
+the *library* graph, and `scripts/footprint-gate.sh` measures exactly that (`cargo tree -p imbh`).
+The dependency direction is `imbh ← imbh-server`, so nothing this crate links is in that number: the
+facade sits at 275 crates with or without axum. `imbh-server` is optional and adds ~17 crates to its
+own graph; the release `imbhd` binary grew ~1.4 MiB (31.2 → 32.6 MiB) against a 42 MB target. The
+`grpc` feature got *cheaper*, not dearer — tonic 0.14 routes through axum, so hyper/tower/axum used
+to arrive with it and are now already present; `grpc` adds only tonic and h2 on top, and the
+full-feature graph is unchanged at 310 crates.
+
+Handlers run on one shared multi-threaded runtime, and every `Db` call goes through `offload`, which
+runs it under `tokio::task::block_in_place`. That is not incidental: `Db`'s futures do **blocking**
+parquet/tantivy I/O inside themselves (there is no `spawn_blocking` anywhere in the library), so
+awaiting one on a runtime worker would park it and starve every other connection. Offloading moves
+the bound from socket count to the blocking pool — i.e. onto actual work, which is the right axis
+once connections are tasks rather than threads. The route table is a plain `axum::Router`, exposed as
+`imbh_server::app(db)` so a host that already runs axum can mount imbh's endpoints directly rather
+than adopt `serve()`'s opinions about runtimes, ports, and shutdown.
+
 OTLP/gRPC ingest is available behind the **optional, off-by-default `grpc` feature** (`cargo build -p
-imbh-server --features grpc`). Since gRPC is HTTP/2 + protobuf framing that the hand-rolled HTTP/1.1
-server cannot speak, the feature pulls **tonic** and serves the three OTLP collector services
+imbh-server --features grpc`). Since gRPC is HTTP/2 + protobuf framing that the HTTP/1.1 listener
+does not speak, the feature pulls **tonic** and serves the three OTLP collector services
 (`LogsService` / `TraceService` / `MetricsService`) on a second port (default `127.0.0.1:4317`,
 alongside HTTP on `4318`). Both share one `Arc<Db>`; each gRPC `export` re-encodes the decoded request
 and funnels into the same `Db::ingest_otlp_*` path the HTTP routes use, so there is one ingest and
 validation story. Errors map to gRPC status via the §10.3 classifiers (not-found → `NotFound`, user
 error → `InvalidArgument`, else `Internal`), mirroring the HTTP status mapping. The whole tonic/hyper
-subtree is confined to that feature, so the **default build (the footprint gate) carries no gRPC
-transport** and its crate/binary graph is unchanged.
+subtree used to be confined to that feature; now that the HTTP listener brings hyper/tower/axum
+anyway, what `grpc` adds on top is just tonic and h2. The **default build still carries no gRPC
+transport**.
 
 A **Docker logging-driver plugin** is available behind the optional, off-by-default `docker` feature
 (`cargo build -p imbh-server --features docker`), turning `imbhd` into a `docker.logdriver/1.0`
 plugin: `--log-driver imbh` writes a container's stdout/stderr straight into the embedded `Db`. It is
 Unix-only (`#[cfg(unix)]`) and adds **no crate** to the graph — the plugin API is HTTP/1.1 over
-`AF_UNIX` (the same hand-rolled request parser the TCP server uses), its JSON goes through
+`AF_UNIX` on the same axum/hyper stack as the TCP listener, sharing its request handling and so its
+body limits, deadlines, and decoding), its JSON goes through
 `imbh::parse_json`, and its wire format (Docker's length-prefixed `logdriver.LogEntry` frames) is
 declared with prost's derive rather than generated, so it rides on the prost + opentelemetry-proto
 message types already present via `imbh-otlp`. All five endpoints are implemented
 (`Plugin.Activate`, `LogDriver.{StartLogging,StopLogging,Capabilities,ReadLogs}`).
+
+`ReadLogs` is the one endpoint that streams: it emits length-prefixed frames for as long as the client
+wants them, and the generator (`readlogs::stream`) is blocking, generic over `io::Write`, and under
+`Follow` runs until the container stops. Rather than rewrite it as a `Stream`, it runs unchanged on a
+`spawn_blocking` task whose sink is a bounded channel, and the response body drains that channel — so
+backpressure and client disconnects arrive at the generator as ordinary `io::Error`s, and a
+`docker logs -f` whose client stopped reading is abandoned after a bounded stall rather than held
+open. On the wire the body is now `Transfer-Encoding: chunked`, since its length is unknowable;
+Docker reads it through Go's `net/http`, which un-chunks transparently.
 
 Unlike the library, `imbhd` **runs a flush scheduler by default**: `Maintenance::Background` plus the
 `FlushPolicy` from `IMBH_FLUSH` (default `interval=5s`, i.e. seal every 5s or at the memory-budget byte
@@ -963,24 +992,32 @@ POSTed `/admin/flush`, so nothing reached Parquet and neither RSS nor WAL size w
 takes the §10.2 spec (`interval=`, `buffer=`, `rows=`, `wal=`, `idle=`, `tick=`, or `manual`); a
 malformed value is a startup error, never a silent fallback to a different cadence.
 
-**Connections carry phase deadlines** (`IoTimeouts`), because thread-per-connection means an idle client
-costs a thread and the hand-rolled parser blocks with no deadline of its own. The two phases get
-different rules on purpose: `IMBH_HEADER_TIMEOUT` (default `10s`) bounds the request head **in total**,
-`IMBH_BODY_TIMEOUT` (default `30s`) is a **per-read** allowance for the body plus the write allowance for
-the response, and `0` disables either. A blown deadline is answered `408 Request Timeout`, best-effort,
-and ingests nothing. The reasoning behind the split is that neither rule alone is right: a per-read
-allowance on the head lets a client dribble one byte per allowance and hold a thread forever (never idle,
-never finished), while a total deadline on the body would punish a large slow upload for its size rather
-than for stalling. The enforcement lives in an `Armed` reader wrapped **under** the `BufReader`, so it
-re-arms the socket against an absolute deadline on every real read; arming once per `read_line` would
-silently give each underlying read a fresh allowance, which is the per-read behaviour the head phase must
-not have. Steady-state cost is one extra `setsockopt` per request, since a `BufReader` normally takes a
-whole request head in a single read. Note the interaction with the shutdown drain below: an idle
-connection is cut off before the drain gives up only when `IMBH_HEADER_TIMEOUT` is shorter than
-`IMBH_SHUTDOWN_TIMEOUT`, which the stock defaults (`10s` head, `5s` drain) are not — the deadlines bound
-what a client can hold, and lining the two knobs up is what makes shutdown itself prompt.
+**Connections carry phase deadlines and size caps** (`Limits`). The two phases get different rules on
+purpose: `IMBH_HEADER_TIMEOUT` (default `10s`) bounds the request head **in total** — hyper's
+`header_read_timeout`, which also covers idle keep-alive gaps since it is armed for every head on a
+connection — while `IMBH_BODY_TIMEOUT` (default `30s`) is a **per-read** allowance for the body. Neither
+rule alone is right: a per-read allowance on the head lets a client dribble one byte per allowance and
+hold the connection forever (never idle, never finished), while a total deadline on the body would
+punish a large slow upload for its size rather than for stalling. A blown deadline is answered
+`408 Request Timeout` and ingests nothing. hyper reports the head deadline but does not answer it
+(`role::on_error` maps parse errors to a status and header timeouts to `None`), so the accept loop keeps
+a duplicate descriptor on each socket and writes that 408 itself — only when no request head ever
+arrived, so it is never appended after a keep-alive connection's last response.
 
-`imbhd` shuts down **gracefully** on `SIGINT`/`SIGTERM`: every accept loop stops accepting, in-flight
+`IMBH_MAX_BODY` (default `64MiB`) caps a request body, measured **after** `Content-Encoding` is undone,
+so a compression bomb is refused on its inflated size rather than its wire size; an oversized
+`Content-Length` is refused before a byte is read. `IMBH_MAX_CONNECTIONS` (default `512`, under the
+usual 1024 soft `RLIMIT_NOFILE` so parquet and tantivy keep their share of descriptors) caps
+simultaneous connections. Over the cap is `413 Payload Too Large`, and `0` disables any of the four
+bounds. The body is buffered in the connection service rather than by an extractor precisely so that
+"too big", "stalled", and "not actually gzip" each get their own status (413 / 408 / 400) instead of one
+blanket rejection. Note the interaction with the shutdown drain below: an idle connection is cut off
+before the drain gives up only when `IMBH_HEADER_TIMEOUT` is shorter than `IMBH_SHUTDOWN_TIMEOUT`, which
+the stock defaults (`10s` head, `5s` drain) are not — the deadlines bound what a client can hold, and
+lining the two knobs up is what makes shutdown itself prompt.
+
+`imbhd` shuts down **gracefully** on `SIGINT`/`SIGTERM`: every accept loop stops accepting (the HTTP
+one selects on a `oneshot` the token sends, then drains through hyper's `GracefulShutdown`), in-flight
 requests get `IMBH_SHUTDOWN_TIMEOUT` (default `5s`) to finish, the Docker plugin's container readers
 stop and its ingest queue is drained into the DB, and `Db::close()` seals the buffer before the process
 exits 0. Without it the default disposition killed the process with everything since the last seal
@@ -991,12 +1028,12 @@ way out. A **second** signal `_exit`s with `128 + signum` — the operator has s
 The mechanism is a `Shutdown` token every endpoint watches (`imbh_server::shutdown`), and its two
 non-obvious properties are worth keeping:
 
-- **`accept` is woken, not polled.** A listener registers a waker on the token; at trigger time that
-  makes one throwaway connection to its own address, which unblocks the thread immediately. Polling the
-  flag instead would put a tick of latency on *every* request, since each response carries
-  `Connection: close` — one connection per request. The gRPC side is the exception and does poll a
-  50 ms tick inside tonic's `serve_with_shutdown` future, which costs nothing per request because
-  HTTP/2 connections are long-lived.
+- **`accept` is woken, not polled.** A listener registers a waker on the token; both the HTTP and
+  plugin loops turn that into a `oneshot` their `select!` waits on alongside `accept`, so shutdown is
+  observed the moment it happens and an idle server costs nothing in between. Draining what is already
+  in flight is hyper's `GracefulShutdown`, bounded by `IMBH_SHUTDOWN_TIMEOUT`. The gRPC side is the
+  exception and does poll a 50 ms tick inside tonic's `serve_with_shutdown` future, which costs nothing
+  per request because HTTP/2 connections are long-lived.
 - **The signal handler only does async-signal-safe work**: an atomic store plus one byte down a
   self-pipe. A watcher thread parked on the read end takes the locks and notifies the condvar. Tripping
   the token from the handler would take a mutex in a signal context.

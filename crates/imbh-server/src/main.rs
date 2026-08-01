@@ -77,12 +77,16 @@ fn main() -> Result<(), Box<dyn Error>> {
     let maintenance_interval =
         imbh_server::maintenance_interval(std::env::var("IMBH_MAINTENANCE_INTERVAL").ok())?;
     let drain = imbh_server::shutdown_timeout(std::env::var("IMBH_SHUTDOWN_TIMEOUT").ok())?;
-    // Per-connection deadlines. Thread-per-connection means an idle client costs a thread, so these
-    // bound how long one can hold it; `0` on either phase disables that deadline.
-    let timeouts = imbh_server::io_timeouts(
-        std::env::var("IMBH_HEADER_TIMEOUT").ok(),
-        std::env::var("IMBH_BODY_TIMEOUT").ok(),
-    )?;
+    // What bounds one connection: how long it may go quiet in each phase, how large a body it may
+    // send, and how many of them may be open at once. `0` disables any of them individually.
+    let limits = imbh_server::Limits {
+        timeouts: imbh_server::io_timeouts(
+            std::env::var("IMBH_HEADER_TIMEOUT").ok(),
+            std::env::var("IMBH_BODY_TIMEOUT").ok(),
+        )?,
+        max_body: imbh_server::max_body(std::env::var("IMBH_MAX_BODY").ok())?,
+        max_connections: imbh_server::max_connections(std::env::var("IMBH_MAX_CONNECTIONS").ok())?,
+    };
 
     // The token every endpoint watches. Installed before anything is served, so a signal arriving
     // during startup is honoured by the listeners that come up after it rather than lost.
@@ -106,7 +110,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         &flush,
         maintenance_interval,
         drain,
-        timeouts,
+        limits,
     );
 
     // Every configured endpoint runs on its own thread and `main` parks until shutdown. The uniform
@@ -148,7 +152,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         serve_on_thread("HTTP", &stopped_tx, {
             let shutdown = shutdown.clone();
             move || {
-                imbh_server::serve_with_until(http_db, &addr, timeouts, shutdown)
+                imbh_server::serve_with_limits_until(http_db, &addr, limits, shutdown)
                     .map_err(|e| format!("HTTP server error on {addr}: {e}"))
             }
         });
@@ -288,7 +292,7 @@ fn banner(
     flush: &imbh::FlushPolicy,
     maintenance_interval: Duration,
     drain: Duration,
-    timeouts: imbh_server::IoTimeouts,
+    limits: imbh_server::Limits,
 ) {
     #[cfg(feature = "tracing")]
     {
@@ -304,8 +308,10 @@ fn banner(
             policy = %flush,
             retention_interval_secs = maintenance_interval.as_secs(),
             shutdown_drain_secs = drain.as_secs_f64(),
-            header_timeout_secs = timeouts.header.as_secs_f64(),
-            body_timeout_secs = timeouts.body.as_secs_f64(),
+            header_timeout_secs = limits.timeouts.header.as_secs_f64(),
+            body_timeout_secs = limits.timeouts.body.as_secs_f64(),
+            max_body_bytes = limits.max_body,
+            max_connections = limits.max_connections,
             "flush scheduler"
         );
     }
@@ -332,9 +338,19 @@ fn banner(
             false => format!("{d:?}"),
         };
         println!(
-            "  timeouts:  headers {} (total) · body/write {} (per read)",
-            show(timeouts.header),
-            show(timeouts.body)
+            "  timeouts:  headers {} (total) · body {} (per read)",
+            show(limits.timeouts.header),
+            show(limits.timeouts.body)
+        );
+        // Zero means "no cap" for both of these, same as for the deadlines above.
+        let cap = |n: u64| match n {
+            0 => "off".to_owned(),
+            n => n.to_string(),
+        };
+        println!(
+            "  limits:    body {} bytes · {} connections",
+            cap(limits.max_body),
+            cap(limits.max_connections as u64)
         );
     }
 }

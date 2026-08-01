@@ -45,12 +45,16 @@ impl Reply {
     }
 }
 
-/// `POST path` to the plugin socket, reading the whole response (the plugin always closes).
+/// `POST path` to the plugin socket, reading the whole response.
+///
+/// `Connection: close` is explicit because the plugin speaks HTTP/1.1 with keep-alive now: without
+/// it this read-to-EOF would sit out the server's header deadline between requests. Real Docker uses
+/// Go's `net/http`, which reuses the connection and reads `Content-Length` instead.
 fn post(socket: &Path, path: &str, body: &[u8]) -> Reply {
     let mut stream = UnixStream::connect(socket).expect("connect to the plugin socket");
     let head = format!(
         "POST {path} HTTP/1.1\r\nHost: docker\r\nContent-Type: application/json\r\n\
-         Content-Length: {}\r\n\r\n",
+         Connection: close\r\nContent-Length: {}\r\n\r\n",
         body.len()
     );
     stream.write_all(head.as_bytes()).expect("write head");
@@ -69,9 +73,92 @@ fn post(socket: &Path, path: &str, body: &[u8]) -> Reply {
         .nth(1)
         .and_then(|s| s.parse().ok())
         .expect("status code");
-    Reply {
-        status,
-        body: raw[split + 4..].to_vec(),
+    // `ReadLogs` has no knowable length, so hyper frames it as `Transfer-Encoding: chunked`; the
+    // small JSON endpoints carry a `Content-Length` and arrive verbatim.
+    let raw_body = &raw[split + 4..];
+    let body = match head
+        .split("\r\n")
+        .any(|l| l.to_ascii_lowercase().starts_with("transfer-encoding:") && l.contains("chunked"))
+    {
+        true => dechunk(raw_body),
+        false => raw_body.to_vec(),
+    };
+    Reply { status, body }
+}
+
+/// Decode a complete `Transfer-Encoding: chunked` body.
+fn dechunk(raw: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut reader = ChunkedReader::new(std::io::BufReader::new(raw));
+    reader.read_to_end(&mut out).expect("decode a chunked body");
+    out
+}
+
+/// Un-chunks a `Transfer-Encoding: chunked` body as it arrives, so a streaming `ReadLogs` response
+/// can be read frame by frame.
+///
+/// The plugin used to write frames raw and close the socket, which needed no decoding at all. hyper
+/// frames a body of unknowable length properly; Docker's own client is Go's `net/http`, which
+/// un-chunks transparently, so this is the test catching up to the wire rather than a behaviour
+/// regression.
+struct ChunkedReader<R: std::io::BufRead> {
+    inner: R,
+    /// Bytes left in the chunk currently being read.
+    remaining: usize,
+    /// Whether the terminating zero-length chunk has been seen.
+    done: bool,
+}
+
+impl<R: std::io::BufRead> ChunkedReader<R> {
+    fn new(inner: R) -> Self {
+        ChunkedReader {
+            inner,
+            remaining: 0,
+            done: false,
+        }
+    }
+
+    /// Read the next chunk-size line, skipping the CRLF that terminates the previous chunk's data.
+    fn next_chunk_size(&mut self) -> std::io::Result<Option<usize>> {
+        for _ in 0..2 {
+            let mut line = String::new();
+            if self.inner.read_line(&mut line)? == 0 {
+                return Ok(None);
+            }
+            let line = line.trim();
+            if line.is_empty() {
+                continue; // the CRLF after the previous chunk's data
+            }
+            let size = line.split(';').next().unwrap_or_default();
+            return usize::from_str_radix(size, 16).map(Some).map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("not a chunk size: {line:?}"),
+                )
+            });
+        }
+        Ok(None)
+    }
+}
+
+impl<R: std::io::BufRead> Read for ChunkedReader<R> {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        if self.done {
+            return Ok(0);
+        }
+        if self.remaining == 0 {
+            match self.next_chunk_size()? {
+                Some(0) | None => {
+                    self.done = true;
+                    return Ok(0);
+                }
+                Some(size) => self.remaining = size,
+            }
+        }
+        let want = out.len().min(self.remaining);
+        let read = self.inner.read(&mut out[..want])?;
+        self.remaining -= read;
+        Ok(read)
     }
 }
 
@@ -437,7 +524,7 @@ fn follow_mode_streams_new_lines_and_ends_with_the_container() {
 
     let mut reader = std::io::BufReader::new(follow.try_clone().expect("clone the follow socket"));
     skip_headers(&mut reader);
-    let mut frames = EntryReader::new(reader);
+    let mut frames = EntryReader::new(ChunkedReader::new(reader));
     assert_eq!(
         frames
             .next_entry()
@@ -513,7 +600,7 @@ fn follow_delivers_a_line_timestamped_before_the_follow_began() {
     follow.flush().expect("flush");
     let mut reader = std::io::BufReader::new(follow.try_clone().expect("clone"));
     skip_headers(&mut reader);
-    let mut frames = EntryReader::new(reader);
+    let mut frames = EntryReader::new(ChunkedReader::new(reader));
 
     // Now produce a line stamped well in the past — the shape of a line emitted before the follow
     // opened but batched into the DB after it.

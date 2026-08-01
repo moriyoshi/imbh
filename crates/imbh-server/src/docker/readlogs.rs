@@ -97,8 +97,10 @@ pub fn stream<W: Write>(
     if req.container_id.is_empty() {
         return Ok(());
     }
-    // The plugin server is a blocking thread-per-connection design; the typed query API is async, so
-    // this connection owns a current-thread runtime, exactly as the HTTP server's does.
+    // This generator is blocking by design — it runs on a `spawn_blocking` task (see
+    // `super::read_logs`) — while the typed query API is async, so it owns a current-thread runtime to
+    // drive it. A blocking-pool thread is allowed to create and drive one: tokio marks it a blocking
+    // region, so the "cannot start a runtime from within a runtime" rule does not apply there.
     let rt = tokio::runtime::Builder::new_current_thread()
         .build()
         .expect("build docker ReadLogs runtime");

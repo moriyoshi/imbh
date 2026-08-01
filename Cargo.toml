@@ -124,6 +124,34 @@ prost = "0.14"
 # Version tracks opentelemetry-proto 0.32's `gen-tonic` (tonic 0.14.x), so the generated OTLP
 # collector services and this dep resolve to one tonic.
 tonic = { version = "0.14", default-features = false }
+# HTTP/1.1 for the reference server (`imbh-server`, ARCHITECTURE.md §10.16). axum supplies routing and
+# extractors, hyper the connection, hyper-util the tokio IO adapter and the graceful-drain watcher.
+# Trimmed hard: no `json`/`form`/`query`/`multipart`/`ws` (imbh hand-rolls its JSON so serde_json stays
+# out), no `http2` (OTLP/HTTP is 1.1; gRPC's h2 rides tonic under `--features grpc`), no
+# `tower-log`/`tracing`. Footprint: none of this reaches the `imbh` facade that the crate-count gate
+# measures (`scripts/footprint-gate.sh` counts `cargo tree -p imbh`) — the dependency direction is
+# `imbh ← imbh-server` — and the whole subtree is already compiled under `--features grpc`, since
+# tonic 0.14 routes through axum.
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+hyper = { version = "1", default-features = false, features = ["http1", "server"] }
+hyper-util = { version = "0.1", default-features = false, features = [
+    "server",
+    "server-graceful",
+    "service",
+    "http1",
+    "tokio",
+] }
+tower = { version = "0.5", default-features = false, features = ["util"] }
+http-body-util = "0.1"
+# The Docker plugin's `ReadLogs` response is a hand-written streaming `Body` over a channel, so it
+# implements the `http_body::Body` trait directly. Already in the graph via hyper.
+http-body = "1"
+# gzip request bodies for OTLP/HTTP: the OTel Collector's `otlphttp` exporter defaults to
+# `compression: gzip`, so a stock collector pointed at `imbhd` sends compressed protobuf. The backend
+# is pinned to `zlib-rs` to match what parquet already enables (`parquet/flate2-zlib-rs`); taking
+# flate2's default `rust_backend` instead would pull miniz_oxide as a *new* crate. As pinned this adds
+# none — flate2 and zlib-rs are both already in the default graph.
+flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
 # Build-time only (imbh-proto's build.rs): protox is a pure-Rust protobuf compiler, so codegen needs
 # no system `protoc` and stays hermetic/offline. prost-build turns the descriptor set into Rust types.
 prost-build = "0.14"
