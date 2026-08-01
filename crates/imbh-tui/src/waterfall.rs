@@ -230,20 +230,26 @@ pub(crate) fn build_trace_detail(trace: &imbh::Trace, ascii: bool) -> TraceDetai
     }
 }
 
-/// Paint a [`Waterfall`] into text lines whose bars span exactly `bar_cells` cells, so both the
+/// The draw-time parameters a [`Waterfall`] is painted with: everything that depends on the pane's
+/// width and on where it is scrolled to. Kept as one named-field literal rather than a growing
+/// argument list (the same shape `SpanSpec` uses in `gen-demo-db`).
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct WaterfallView {
+    /// Cells the `|bar|` axis spans.
+    pub(crate) bar_cells: usize,
+    /// Horizontal scroll of the name column (see [`name_offset`]).
+    pub(crate) name_offset: usize,
+    /// Indent *levels* subtracted from every row, so the shallowest span on screen sits flush against
+    /// the name column and the rows below keep their offsets relative to it (see
+    /// [`visible_indent_base`]). `0` renders absolute depth.
+    pub(crate) indent_base: usize,
+}
+
+/// Paint a [`Waterfall`] into text lines whose bars span exactly `view.bar_cells` cells, so both the
 /// opening and closing `|` line up in a column and the bars stretch to fill the pane.
-///
-/// `name_offset` scrolls the name column horizontally (see [`name_offset`]); every row is shifted by
-/// the same amount so the column stays a column, with `<`/`>` markers on the rows that are clipped.
-pub(crate) fn render_waterfall(
-    waterfall: &Waterfall,
-    bar_cells: usize,
-    name_offset: usize,
-) -> Vec<String> {
+pub(crate) fn render_waterfall(waterfall: &Waterfall, view: &WaterfallView) -> Vec<String> {
     (0..waterfall.rows.len())
-        .map(|index| {
-            render_waterfall_row(waterfall, index, bar_cells, name_offset, waterfall.marker)
-        })
+        .map(|index| render_waterfall_row(waterfall, index, view, waterfall.marker))
         .collect()
 }
 
@@ -253,11 +259,10 @@ pub(crate) fn render_waterfall(
 pub(crate) fn render_waterfall_row(
     waterfall: &Waterfall,
     index: usize,
-    bar_cells: usize,
-    name_offset: usize,
+    view: &WaterfallView,
     marker: char,
 ) -> String {
-    let cells = bar_cells.max(1);
+    let cells = view.bar_cells.max(1);
     let row = &waterfall.rows[index];
     let start = ((row.start * cells as f64) as usize).min(cells - 1);
     let width = ((row.frac * cells as f64).round() as usize)
@@ -270,7 +275,7 @@ pub(crate) fn render_waterfall_row(
     // The indent is laid down verbatim and the name scrolls inside what it leaves, so the trace's
     // shape survives however far the column has scrolled. Clamping to the row's own offset keeps a
     // row that has nothing left to hide from scrolling into blankness.
-    let indent = (row.indent * 2).min(WATERFALL_NAME_W);
+    let indent = row_indent_cells(row, view.indent_base);
     format!(
         "{}{}{}|{}|{}",
         row.marker,
@@ -278,18 +283,45 @@ pub(crate) fn render_waterfall_row(
         clip_field(
             &row.name,
             WATERFALL_NAME_W - indent,
-            name_offset.min(row_name_offset(row))
+            view.name_offset.min(row_name_offset(row, view.indent_base))
         ),
         bar,
         row.suffix
     )
 }
 
+/// Cells of leading indent a row renders, once the on-screen base is subtracted.
+fn row_indent_cells(row: &WaterfallRow, indent_base: usize) -> usize {
+    (row.indent.saturating_sub(indent_base) * 2).min(WATERFALL_NAME_W)
+}
+
 /// How far this row's name may usefully scroll: enough to bring its tail to the last cell of the
 /// window the indent leaves it, and no further (scrolling past that only pads with blanks).
-fn row_name_offset(row: &WaterfallRow) -> usize {
-    let window = WATERFALL_NAME_W.saturating_sub(row.indent * 2);
+fn row_name_offset(row: &WaterfallRow, indent_base: usize) -> usize {
+    let window = WATERFALL_NAME_W.saturating_sub(row_indent_cells(row, indent_base));
     UnicodeWidthStr::width(row.name.as_str()).saturating_sub(window)
+}
+
+/// The indent level every rendered row is shifted left by: the shallowest indent currently on screen.
+/// Scrolling into a deep subtree otherwise spends the whole name column on indentation that is
+/// identical on every visible row, so the outermost visible span sits flush against the column and the
+/// rows below keep only their offsets *relative* to it.
+///
+/// Anchored on the shallowest **rendered** row rather than literally the topmost one. They are the
+/// same row in the usual case — the pinned block is the cursor's ancestor chain, so it is ordered
+/// outermost-first — but a shallower sibling scrolling into the window underneath would otherwise
+/// force a negative shift, and clamping that at zero would collapse two different depths onto the same
+/// column. Taking the minimum keeps every relative distinction on screen intact.
+pub(crate) fn visible_indent_base(rows: &[WaterfallRow], layout: &StickyLayout) -> usize {
+    let window = layout.offset..(layout.offset + layout.height).min(rows.len());
+    layout
+        .pinned
+        .iter()
+        .copied()
+        .chain(window)
+        .filter_map(|index| rows.get(index).map(|row| row.indent))
+        .min()
+        .unwrap_or(0)
 }
 
 /// How far the name column scrolls horizontally to reveal the tail of the name under the cursor.
@@ -300,8 +332,9 @@ fn row_name_offset(row: &WaterfallRow) -> usize {
 /// scrolls as one while no row is ever scrolled past its own text into an empty field. That clamp is
 /// what keeps the pinned ancestors — the shallowest rows, and so usually the shortest names —
 /// readable while the deep rows below them are shifted well to the right.
-pub(crate) fn name_offset(rows: &[WaterfallRow], cursor: usize) -> usize {
-    rows.get(cursor).map_or(0, row_name_offset)
+pub(crate) fn name_offset(rows: &[WaterfallRow], cursor: usize, indent_base: usize) -> usize {
+    rows.get(cursor)
+        .map_or(0, |row| row_name_offset(row, indent_base))
 }
 
 /// The rows of `row`'s ancestors, outermost first.
@@ -439,7 +472,14 @@ mod tests {
         // every row's name field and can land a clip marker on half of a wide glyph.
         for cells in [40usize, 77] {
             for offset in [0usize, 1, 5, 9] {
-                let lines = render_waterfall(&waterfall, cells, offset);
+                let lines = render_waterfall(
+                    &waterfall,
+                    &WaterfallView {
+                        bar_cells: cells,
+                        name_offset: offset,
+                        indent_base: 0,
+                    },
+                );
                 assert_eq!(lines.len(), 2);
                 // Everything before the first `|` is a constant width across rows, so the bars line
                 // up: marker (1) + name field (WATERFALL_NAME_W == 20).
@@ -506,6 +546,13 @@ mod tests {
                 suffix: String::new(),
             })
             .collect()
+    }
+
+    fn row_at_depth(name: &str, indent: usize, parent_row: Option<usize>) -> WaterfallRow {
+        WaterfallRow {
+            indent,
+            ..row_with_parent(name, parent_row)
+        }
     }
 
     fn row_with_parent(name: &str, parent_row: Option<usize>) -> WaterfallRow {
@@ -675,16 +722,110 @@ mod tests {
     }
 
     #[test]
+    fn the_indent_is_relative_to_the_shallowest_row_on_screen() {
+        // A 12-deep chain: scrolled to the bottom, every visible row sits at the capped indent, so an
+        // absolute indent would spend ten cells of every row's name column saying the same thing.
+        let rows = chain_rows(13);
+        let layout = sticky_layout(&rows, 12, 9, true);
+        let base = visible_indent_base(&rows, &layout);
+        // The shallowest row on screen is the outermost pinned ancestor...
+        let shallowest = layout
+            .pinned
+            .iter()
+            .chain(
+                (layout.offset..layout.offset + layout.height)
+                    .collect::<Vec<_>>()
+                    .iter(),
+            )
+            .map(|&i| rows[i].indent)
+            .min()
+            .unwrap();
+        assert_eq!(base, shallowest);
+        // ...and it renders flush against the name column, with the rows below keeping their offsets
+        // relative to it rather than their absolute depth.
+        assert_eq!(rows[layout.pinned[0]].indent.saturating_sub(base), 0);
+
+        // Nothing is shifted while the pane is at the top, so an unscrolled trace looks unchanged.
+        let top = sticky_layout(&rows, 0, 9, true);
+        assert_eq!(visible_indent_base(&rows, &top), 0);
+    }
+
+    #[test]
+    fn the_indent_base_is_the_shallowest_row_not_merely_the_first() {
+        // A deep row followed by a shallower sibling scrolling in underneath it. Anchoring literally on
+        // the topmost row would need a negative shift for the sibling; clamping that at zero would draw
+        // two different depths in the same column. The minimum keeps them distinct.
+        let rows = vec![
+            row_at_depth("deep", 4, None),
+            row_at_depth("deeper", 5, Some(0)),
+            row_at_depth("shallow-sibling", 1, None),
+        ];
+        let layout = StickyLayout {
+            pinned: vec![],
+            offset: 0,
+            height: 3,
+        };
+        let base = visible_indent_base(&rows, &layout);
+        assert_eq!(base, 1, "the shallowest rendered row anchors the column");
+        let indents = rows
+            .iter()
+            .map(|row| row.indent.saturating_sub(base))
+            .collect::<Vec<_>>();
+        assert_eq!(indents, vec![3, 4, 0], "relative depths stay distinct");
+    }
+
+    #[test]
+    fn the_relative_indent_hands_cells_back_to_the_name() {
+        // The point of the shift: a deep row's name gets the cells the shared indent was consuming.
+        let rows = vec![row_at_depth("db.query.orders-by-customer", 5, None)];
+        let waterfall = Waterfall {
+            rows,
+            marker: '#',
+            light_marker: '-',
+        };
+        let absolute = render_waterfall(
+            &waterfall,
+            &WaterfallView {
+                bar_cells: 10,
+                ..WaterfallView::default()
+            },
+        );
+        let relative = render_waterfall(
+            &waterfall,
+            &WaterfallView {
+                bar_cells: 10,
+                indent_base: 5,
+                ..WaterfallView::default()
+            },
+        );
+        // Absolute: 10 cells of indent leave 10 for the name, so it truncates hard.
+        assert!(
+            absolute[0].starts_with("           db.query"),
+            "{:?}",
+            absolute[0]
+        );
+        // Relative: the whole 20-cell column is the name.
+        assert!(
+            relative[0].starts_with(" db.query.orders-by-"),
+            "{:?}",
+            relative[0]
+        );
+        // The axis is unmoved either way — the shift happens inside the fixed-width column.
+        let axis = |line: &str| UnicodeWidthStr::width(line.split('|').next().unwrap());
+        assert_eq!(axis(&absolute[0]), axis(&relative[0]));
+    }
+
+    #[test]
     fn name_offset_follows_the_cursor_row() {
         let rows = vec![
             row_with_parent("short", None),
             row_with_parent("a-very-long-span-name-indeed", Some(0)),
         ];
         // A name that fits leaves the column unscrolled.
-        assert_eq!(name_offset(&rows, 0), 0);
+        assert_eq!(name_offset(&rows, 0, 0), 0);
         // A longer one scrolls just enough to bring its tail to the field's last cell: the whole
         // field is text apart from the `<` marker, with nothing wasted on padding.
-        let offset = name_offset(&rows, 1);
+        let offset = name_offset(&rows, 1, 0);
         assert_eq!(
             offset,
             "a-very-long-span-name-indeed".len() - WATERFALL_NAME_W
@@ -693,7 +834,7 @@ mod tests {
         assert!(field.starts_with('<'), "{field:?}");
         assert!(field.ends_with("indeed"), "{field:?}");
         // An out-of-range cursor is a no-op rather than a panic.
-        assert_eq!(name_offset(&rows, 99), 0);
+        assert_eq!(name_offset(&rows, 99, 0), 0);
     }
 
     #[test]
@@ -724,9 +865,16 @@ mod tests {
         )
         .waterfall;
         // Scrolled hard right by the deepest row's long name...
-        let offset = name_offset(&waterfall.rows, 4);
+        let offset = name_offset(&waterfall.rows, 4, 0);
         assert!(offset > 0);
-        let lines = render_waterfall(&waterfall, 20, offset);
+        let lines = render_waterfall(
+            &waterfall,
+            &WaterfallView {
+                bar_cells: 20,
+                name_offset: offset,
+                indent_base: 0,
+            },
+        );
         // ...the indent of each row still steps by two cells after the status marker.
         for (depth, line) in lines.iter().enumerate() {
             let field = &line[1..line.find('|').unwrap()];

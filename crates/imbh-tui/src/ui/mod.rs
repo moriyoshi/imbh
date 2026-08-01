@@ -30,7 +30,7 @@ use crate::ui::logs::draw_log_detail;
 use crate::ui::metrics::{draw_metric_detail, draw_metric_table};
 use crate::ui::overlays::{draw_absolute_range, draw_completion_popup, draw_time_range_picker};
 use crate::ui::traces::{draw_span_detail, draw_trace_detail};
-use crate::waterfall::{WATERFALL_NAME_W, WATERFALL_SUFFIX_W, render_waterfall};
+use crate::waterfall::{WATERFALL_NAME_W, WATERFALL_SUFFIX_W, WaterfallView, render_waterfall};
 
 /// The smallest terminal the full UI lays out in; below either dimension `draw` shows a resize prompt
 /// instead (first-release acceptance criterion, TUI_PLAN.md §10). Kept at/under the smallest size the
@@ -521,8 +521,15 @@ pub(crate) fn draw(frame: &mut ratatui::Frame<'_>, app: &App, options: &Options)
             let bar_cells = (detail_area.width as usize)
                 .saturating_sub(1 + WATERFALL_NAME_W + 2 + WATERFALL_SUFFIX_W)
                 .max(1);
-            // No span cursor on this pane, so the name column never scrolls horizontally here.
-            let rows = render_waterfall(waterfall, bar_cells, 0);
+            // No span cursor on this pane and it always shows the trace from its root, so neither the
+            // horizontal name scroll nor the relative indent has anything to anchor to.
+            let rows = render_waterfall(
+                waterfall,
+                &WaterfallView {
+                    bar_cells,
+                    ..WaterfallView::default()
+                },
+            );
             // This preview pane is a fixed slice of the results area and does not scroll: say so when a
             // deep trace overflows it, so the hidden spans are never silently dropped. The full,
             // scrolling waterfall is one Enter away (`Route::TraceDetail`).

@@ -13,8 +13,8 @@ use crate::time::{format_duration_ns, format_timestamp_ns};
 use crate::ui::focus_border;
 use crate::ui::glyphs::Glyphs;
 use crate::waterfall::{
-    SpanRecord, TraceDetail, WATERFALL_NAME_W, WATERFALL_SUFFIX_W, name_offset, render_waterfall,
-    render_waterfall_row, sticky_layout,
+    SpanRecord, TraceDetail, WATERFALL_NAME_W, WATERFALL_SUFFIX_W, WaterfallView, name_offset,
+    render_waterfall, render_waterfall_row, sticky_layout, visible_indent_base,
 };
 
 /// Height (rows, borders included) the selected-span summary pane claims on the trace detail. Below
@@ -112,8 +112,15 @@ pub(crate) fn draw_trace_detail(
             Style::default()
         }
     };
-    let column_offset = name_offset(&detail.waterfall.rows, cursor);
-    let lines = render_waterfall(&detail.waterfall, bar_cells, column_offset);
+    // Indent relative to the shallowest span on screen: scrolled deep into a trace every visible row
+    // carries the same leading indent, which buys nothing and costs the name column.
+    let indent_base = visible_indent_base(&detail.waterfall.rows, &layout);
+    let view = WaterfallView {
+        bar_cells,
+        name_offset: name_offset(&detail.waterfall.rows, cursor, indent_base),
+        indent_base,
+    };
+    let lines = render_waterfall(&detail.waterfall, &view);
     let items = if detail.spans.is_empty() {
         // A trace with no spans is a real (if degenerate) result, not a blank pane.
         vec![ListItem::new(Span::styled(
@@ -170,8 +177,7 @@ pub(crate) fn draw_trace_detail(
                 let mut text = render_waterfall_row(
                     &detail.waterfall,
                     index,
-                    bar_cells,
-                    column_offset,
+                    &view,
                     detail.waterfall.light_marker,
                 );
                 // Pad to the pane's full inner width so the styling covers the whole row. A waterfall

@@ -2030,3 +2030,34 @@ when the question is about attributes. Ratatui writes only changed cells, so SGR
 cursor moves in ways a naive parser mis-attributes — the pty dump reported underline on rows that the
 exact buffer assertions prove are clean. Use the pty for *layout* (it caught the blank pinned names
 and the scrolled-away indent earlier); use `TestBackend` for *style*.
+
+## Waterfall indent goes relative to the pane, not the trace root (2026-08-01)
+
+Scrolled deep into a subtree, every visible waterfall row carried the same leading indent. It
+distinguished nothing between the rows on screen and spent the whole name column saying it — at the
+capped depth of 5, ten of twenty cells on every single row.
+
+`visible_indent_base` now takes the minimum indent across the *rendered* rows (the pinned ancestors
+plus the scrolling window) and `render_waterfall` subtracts it, so the outermost visible span sits
+flush against the name column and the rows below keep only their offsets relative to it. Deep names
+gain those ten cells back; measured against the demo database, `<kout-ser>` became
+`<s.checkout-ser>`, and the topmost row went from nine readable cells to twenty.
+
+Anchored on the shallowest rendered row rather than literally the topmost one. They are the same row
+in the usual case — the pinned block is the cursor's ancestor chain, ordered outermost-first — but a
+shallower sibling scrolling into the window underneath would otherwise require a negative shift, and
+clamping that at zero would draw two genuinely different depths in the same column. Taking the
+minimum keeps every relative distinction on screen intact. That is the whole subtlety, and it has its
+own test (`the_indent_base_is_the_shallowest_row_not_merely_the_first`).
+
+This composes with the earlier `WATERFALL_MAX_INDENT` cap rather than replacing it: the cap bounds
+the absolute worst case (a pathologically deep chain still cannot eat the column), the relative base
+handles the common one (a normally-nested trace scrolled into). Worth noting that the cap alone was
+the wrong instinct — it treats depth as the problem, when the problem was only ever *shared* depth
+among the rows you can actually see.
+
+The draw-time parameters (`bar_cells`, `name_offset`, `indent_base`) now travel as one
+`WaterfallView` named-field literal instead of a fourth and fifth positional argument, following the
+`SpanSpec` shape already used in `gen-demo-db` for exactly this reason.
+
+119 unit tests in `imbh-tui` (3 new). Verified against a `gen-demo-db` database in a pty.
