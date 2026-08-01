@@ -2,9 +2,9 @@ use std::io::Write as _;
 
 use imbh::Db;
 use imbh_mcp::proxy::Endpoint;
-use imbh_mcp::stdio::{self, Backend};
+use imbh_mcp::stdio::{self, Backend as McpBackend};
 use imbh_tui::cli::{self, Mode, Source, USAGE};
-use imbh_tui::run;
+use imbh_tui::{Backend, run};
 
 /// `main` reports failures itself rather than returning them: `Result`'s exit path prints an error
 /// with `Debug`, which would render the usage block as one line of `\n` escapes.
@@ -34,9 +34,19 @@ async fn dispatch(mode: Mode) -> Result<(), Box<dyn std::error::Error>> {
             println!("{USAGE}");
             Ok(())
         }
-        Mode::Tui { path, options } => {
-            let db = Db::open_read_only(path)?;
-            run(db, options).await?;
+        Mode::Tui { source, options } => {
+            let backend = match source {
+                Source::Db(path) => Backend::open(path)?,
+                Source::Url(url) => {
+                    let backend = Backend::connect(&url)?;
+                    // Said before the alternate screen swallows it: a head that cannot reach its
+                    // daemon otherwise reports it only inside a panel, and the address it is
+                    // actually using (port and scheme filled in) is the thing worth checking.
+                    note(&format!("browsing {}", backend.describe()));
+                    backend
+                }
+            };
+            run(backend, options).await?;
             Ok(())
         }
         Mode::McpStdio(source) => serve_mcp(source).await,
@@ -55,12 +65,12 @@ async fn serve_mcp(source: Source) -> Result<(), Box<dyn std::error::Error>> {
             // the answer.
             let db = Db::open_read_only(&path)?;
             note(&format!("serving MCP over stdio from {}", path.display()));
-            Backend::Local(db)
+            McpBackend::Local(db)
         }
         Source::Url(url) => {
             let endpoint = Endpoint::parse(&url)?;
             note(&format!("serving MCP over stdio via {}", endpoint.url()));
-            Backend::Remote(endpoint)
+            McpBackend::Remote(endpoint)
         }
     };
     // The blocking std handles are deliberate: this loop is the only thing on the runtime, and

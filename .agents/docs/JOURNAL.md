@@ -2341,3 +2341,154 @@ navigation feature keyed off the enum will silently skip any view the enum does 
 declaring a per-screen chain complete, enumerate the *rendered* views (what the user sees as a
 distinct screen), not the routes — the Metrics screen renders three from two variants. The
 divergence was invisible to the unit tests because they, too, were written over `Route`.
+
+## The TUI as a head, over a new head API (2026-08-01)
+
+`imbh-tui --url http://host:4318` now drives the full explorer against a running `imbhd`, over a new
+`/api/head/*` surface owned by a new `imbh-head` crate (ARCHITECTURE.md §10.19). The motivation is
+what a `Db::open_read_only` view *cannot* see: the writer's unsealed buffer, i.e. the most recent
+telemetry of all. As a side effect the database may now live on another machine.
+
+Four design questions came up, and the answers are worth keeping.
+
+**Can the existing endpoints serve a head?** Mostly no, and the gap analysis is the useful artifact.
+Of the eleven data operations the TUI performs, `GET /stats` covers one (short three ingest gauges),
+five exist only as MCP tools, and **four have no counterpart anywhere**: nothing else in the server
+*evaluates* PromQL, LogQL, or TraceQL, and nothing surfaces exemplars. The trap is that
+`query_metric_range` / `histogram_quantile` / `search_traces` look like they would do — they are the
+**typed-builder** path (`MetricQuery`/`TraceQuery`), not the evaluators, so they cannot express
+`sum by (svc) (rate(x[5m]))`, which is literally what the TUI's query box takes. `logs/query`
+additionally needs the `PageCursor` and span-id correlation `search_logs` has no room for.
+
+**Could the languages be compiled to SQL and pushed through `POST /api/query`?** No, and the reason
+is structural rather than effort: `imbh-lgtm` is *fetch-then-evaluate*, not a SQL compiler. The
+`to_sql` methods that exist render only the **fetch** step. Pushing that down and evaluating on the
+head founders on TraceQL — `execute_traceql` deliberately streams one complete trace at a time
+(`fetch_candidates` then `fetch_trace` per candidate, so peak memory is one trace), which over HTTP
+is `max_traces` round trips per refresh — and it inverts the payload everywhere else (a `sum by`
+would ship every raw sample instead of a handful of series). It would also couple the head to the
+daemon's *physical schema* rather than to a versioned API. Filed here because the idea recurs.
+
+**Why not fold this into `imbh-mcp`?** It is a separate facility. MCP's tools are shaped for a model
+and are deliberately lossy — no cursors, no per-sample matrices, no waterfall — and reshaping them
+for a UI would change what every agent sees. `imbh-head` sits in the same tier for the same
+dependency reason (`imbh ← imbh-head ← {imbh-server, imbh-tui}`; §12 forbids `imbh-tui` reaching into
+`imbh-server`), with features splitting the halves so `imbhd` never links the HTTP client.
+
+**JSON is not sound for these responses.** It has no `NaN`/`±Inf`, and `serde_json` writes all three
+as `null`, which then fails to deserialize as `f64` — and a PromQL evaluation produces all three
+routinely. Row-shaped results therefore answer as **Arrow IPC** (`arrow-ipc` is already compiled
+wherever DataFusion is, so this costs no dependency), scalar ones stay JSON. Two things fell out that
+were not obvious going in: the encoders take the *materialized* types rather than the `*_batches`
+twins, which keeps `exec` at one return type for both backends and keeps `imbh/proto` + protox out of
+both binaries; and everything not row-shaped (paging cursor, scan counters, the assembled trace
+header, the narrowed window start) rides in the IPC **schema metadata**, so a response stays one
+self-describing message. `PageCursor` has a private field, so it travels as its own serde form inside
+that metadata — the only way anything outside the facade can construct one.
+
+**The load-bearing invariant** is that `imbh_head::exec` is the *single* implementation over a `Db`:
+`imbhd` calls it behind the routes, and the TUI's local backend calls it in-process. So the two modes
+cannot diverge on translation, caps, or trace-window narrowing. `head_e2e.rs` asserts it directly —
+every operation run both ways over the same `Arc<Db>`, results compared — which is a much stronger
+test than checking either path alone.
+
+Two things worth flagging for future work. The trace-window narrowing moved *into* `exec`, so a
+remote head spends one round trip where a naive port would have spent up to seven. And an eval
+request carries a **list** of queries: the catalog view emits one selector per checked metric, and a
+query-apiece request would re-read the metric catalog apiece (the catalog is what PromQL translation
+resolves a selector's kind against) — this was a real regression during the port, caught by asking
+whether the direct-query path was preserved.
+
+Footprint: the facade gate is unchanged at 275 crates (the head API is downstream of it). `imbhd`
+went 293 → 297 crates and 32.6 → 32.9 MiB; `imbh-tui` 313 → 323, paying for reqwest, which the
+feature split keeps out of the daemon entirely.
+
+## Head API: what shipped, what the codebase taught us, and how it was verified (2026-08-01)
+
+Companion to the entry above, which records the *design* questions. This one records the inventory,
+the facts the codebase forced on the implementation, and the verification — the things a future
+change to this surface will want to know before it starts.
+
+### Inventory
+
+New crate `imbh-head` (15th shipping crate), five modules:
+
+| module | what |
+| --- | --- |
+| `dto` | wire types. Requests are JSON throughout; reuses the facade's own `serde`-gated types (`LogQuery`, `LogPage`, `Trace`, `MetricMeta`, `VolumeBucket`) so a remote head sends the *same value* its local twin hands to `Db` |
+| `exec` | the **single** implementation of all eleven operations over a `Db` — both backends call it |
+| `ipc` | Arrow IPC codec for the five row-shaped results |
+| `client` | `HeadClient`, one async method per operation, reqwest |
+| `path` | the eleven route constants, shared by the client that composes them and the server that registers them |
+
+Elsewhere: `crates/imbh-server/src/head.rs` (the HTTP transport, `pub fn routes()` so a host can
+mount the surface alone), `crates/imbh-tui/src/backend.rs` (`Backend::{Local,Remote}`), and the
+`Arc<Db>` → `Backend` rewiring through `fetch`/`tasks`/`keys`/`runtime`. `metric_context` **moved**
+out of `imbh-tui/src/promql.rs` into `exec` — translation belongs where the catalog is, not against a
+copy a head would have to keep fresh. The TraceQL narrowing (`narrowing_starts` +
+`execute_traceql_adaptive`) moved out of `fetch.rs` into `exec` for the same reason, and its tests
+moved with it.
+
+### What the codebase forced
+
+Findings that changed the design mid-flight, each one a fact rather than a preference:
+
+- **`arrow-ipc` is already in the `imbh` graph** (DataFusion pulls it) and `imbh::arrow::ipc::writer::
+  StreamWriter` compiles with **no new dependency**. Verified with a throwaway probe before
+  committing to the codec. This is what made "Arrow IPC for row-shaped results" free.
+- **`imbh-lgtm`'s `trace_matches_to_batch` is `{trace_id, span_ids}` — no `start_time_ns`.** The trace
+  list renders *when* each match happened, so the head's own schema is a superset. Deliberately not a
+  change to the published lgtm schema.
+- **The facade's `*_batches` twins are gated behind `imbh/proto`** (`query_batches_with_stats`,
+  `get_batches`), which pulls `imbh-proto` + protox codegen. Encoding from the **materialized** types
+  instead avoided that on both binaries *and* kept `exec` at one return type. The server pays one
+  materialize-then-encode on a page of at most a few thousand rows.
+- **`PageCursor` has a private field** — no public constructor. It crosses as its own serde form
+  inside the IPC schema metadata, which is the only way anything outside the facade can build one.
+  Same for `QueryStats`, which also has no `Default`.
+- **Log/span attributes are stored as canonical-JSON `Utf8` columns**, not Arrow maps
+  (`imbh-storage/src/schema.rs`), so `Attributes` ↔ Arrow is `Attributes::from_canonical_json` /
+  `imbh_core::canonical_json_object`. This is what made the log-page and trace encoders tractable;
+  had they been nested unions it would have been a different decision.
+- **`Db`, `LogPage`, `QueryStats` are not `Debug`/`Clone`/`Default`** in the combinations the DTOs
+  wanted. `Backend` gets a hand-written `Debug` that prints only which kind it is and what it reads.
+- **Cargo:** a member cannot set `default-features = false` on a workspace dependency unless the
+  `[workspace.dependencies]` entry sets it too. `imbh-head` is declared `default-features = false`
+  there so each consumer names the half it plays.
+
+### Verification
+
+Three layers, because the interesting property is a *relationship* between two paths, not either one:
+
+1. `crates/imbh-head/src/ipc.rs` unit tests — every codec round-trips, including `NaN`/`±Inf`, empty
+   results, a `None` cursor, "missing trace" vs "trace with no spans", and a schema-equality test
+   pinning the series layout to `imbh_lgtm::prom_matrix_schema`.
+2. `crates/imbh-server/tests/head_e2e.rs` — every operation run **both ways over the same
+   `Arc<Db>`**, results compared, over a real loopback socket. This is the test that would catch a
+   divergence between local and remote; neither path tested alone would.
+3. `crates/imbh-tui/src/backend.rs` tests — the direct-query path (`imbh-tui <directory>`) driving
+   every screen against an in-process `Db`, so the pre-existing behaviour is pinned independently.
+
+Plus a live run against a real `imbhd` over a generated demo DB: both modes rendered all four
+screens, and over an **absolute** `--from/--to` window both reported `60 matching traces`. Worth
+recording the trap: an earlier comparison showed 88 vs 76 and looked like a discrepancy — it was the
+rolling `last 15m` window sliding between the two runs. Pin the window before comparing modes.
+
+### Found by asking whether the old path still worked
+
+The port initially made `exec::promql` read the metric catalog per query, while the old code read it
+once and reused the context across the newline-separated sub-queries the catalog view emits. That is
+N catalog reads where there had been 1. Fixed by making an eval request carry a **list** of queries
+(`dto::EvalRequest::queries`), which also collapses N round trips to one remotely. Worth noting as a
+class of bug: extracting a shared implementation from a caller can silently move a hoisted read
+*inside* a loop, and nothing about the types complains.
+
+### Follow-ups (in TODO.md)
+
+- **Semver.** `imbh-head` is a new published crate, and `cli::Mode::Tui` gained a `source` field in
+  place of `path` — a `0.4.0` under the 0.x rule. `imbh_tui::run` is *not* breaking: it takes
+  `impl Into<Backend>` and `From<Arc<Db>>` keeps `run(db, options)` compiling.
+- **`GET /stats`** still cannot be parsed back into a typed value and omits the three ingest gauges.
+  The head answers `/api/head/stats` instead of widening it; converging the two would be additive
+  except for the `durable_lsn` spelling (`None` is written as `0`).
+

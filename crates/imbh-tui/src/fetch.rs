@@ -2,58 +2,62 @@
 //! (trace waterfalls, catalog dimensions, the evaluation window).
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
 use std::time::Duration;
 
-use imbh::{Db, PageCursor, SpanId, Table as DbTable, Timestamp, TraceId};
+use imbh::{PageCursor, SpanId, Table as DbTable, Timestamp, TraceId};
+use imbh_head::HeadError;
+use imbh_head::exec::table_from_name;
 use imbh_lgtm::{
     EvalLimits, EvalRange, FetchBounds, ImbhQueryModel, LogFetchRequest, LogFilter,
-    LogStreamSchema, LogsSemanticsExt, MetricsSemanticsExt, SemanticError, SpansetExpr,
-    TraceQueryMatch, TracesSemanticsExt, TranslateContext, build_log_query, translate_logql,
-    translate_promql, translate_traceql,
+    LogStreamSchema, TranslateContext, build_log_query, translate_logql,
 };
 
+use crate::backend::Backend;
 use crate::chart::chart_values;
 use crate::format::{attrs_to_pairs, format_metric_value, severity_label};
 use crate::model::{
     DetailPane, DimNode, LogCorrelation, LogRecord, Options, Screen, SeriesData, Snapshot,
     TableData,
 };
-use crate::promql::{discovery_promql, metric_context};
+use crate::promql::discovery_promql;
 use crate::time::{format_timestamp_ns, humanize_secs};
 use crate::ui::glyphs::Glyphs;
 use crate::waterfall::{TraceDetail, build_trace_detail};
 
-/// The `[min, max]` timestamp span across all metric tables, from `db.stats()`. Falls back to a wide
-/// window ending at `now` if no metric data has a recorded span. Makes catalog dimension discovery
-/// independent of the selected time range.
-pub(crate) async fn metric_time_span(db: &Arc<Db>) -> (i64, i64) {
+/// The `[min, max]` timestamp span across all metric tables, from the backend's stats. Falls back to
+/// a wide window ending at `now` if no metric data has a recorded span. Makes catalog dimension
+/// discovery independent of the selected time range.
+pub(crate) async fn metric_time_span(backend: &Backend) -> (i64, i64) {
     const WIDE_NS: i64 = 3_600_000_000_000 * 24 * 365 * 30; // ~30 years
     let now = Timestamp::now().0;
     let fallback = (now.saturating_sub(WIDE_NS), now);
-    let Ok(stats) = db.stats().await else {
+    let Ok(stats) = backend.stats().await else {
         return fallback;
     };
-    let is_metric = |table: DbTable| {
+    // The wire carries the physical table *name*; map it back so the metric families are matched as
+    // tables rather than by string prefix.
+    let is_metric = |name: &str| {
         matches!(
-            table,
-            DbTable::MetricsGauge
-                | DbTable::MetricsSum
-                | DbTable::MetricsHistogram
-                | DbTable::MetricsExpHistogram
-                | DbTable::MetricsSummary
+            table_from_name(name),
+            Some(
+                DbTable::MetricsGauge
+                    | DbTable::MetricsSum
+                    | DbTable::MetricsHistogram
+                    | DbTable::MetricsExpHistogram
+                    | DbTable::MetricsSummary
+            )
         )
     };
     let min = stats
         .tables
         .iter()
-        .filter(|t| is_metric(t.table))
+        .filter(|t| is_metric(&t.table))
         .filter_map(|t| t.min_time_unix_nano)
         .min();
     let max = stats
         .tables
         .iter()
-        .filter(|t| is_metric(t.table))
+        .filter(|t| is_metric(&t.table))
         .filter_map(|t| t.max_time_unix_nano)
         .max();
     match (min, max) {
@@ -67,12 +71,12 @@ pub(crate) async fn metric_time_span(db: &Arc<Db>) -> (i64, i64) {
 /// returned series (labels include the resource `service` and data-point attributes; `__name__`/`le`
 /// are internal and excluded). Empty on any failure.
 pub(crate) async fn discover_dims(
-    db: &Arc<Db>,
+    backend: &Backend,
     name: &str,
     kind: &str,
     max_series: usize,
 ) -> Vec<DimNode> {
-    let (span_start, span_end) = metric_time_span(db).await;
+    let (span_start, span_end) = metric_time_span(backend).await;
     // One instant just past the last sample, looking back across the whole span.
     let at = span_end.saturating_add(1);
     let eval_range = EvalRange {
@@ -85,32 +89,22 @@ pub(crate) async fn discover_dims(
         max_series,
         ..EvalLimits::default()
     };
-    let Ok(catalog) = db.metrics().catalog().await else {
-        return Vec::new();
-    };
-    let context = metric_context(&catalog);
-    let query = discovery_promql(name, kind);
-    let Ok(translated) = translate_promql(&query, &context) else {
-        return Vec::new();
-    };
-    let ImbhQueryModel::Prom(expression) = translated.model else {
-        return Vec::new();
-    };
-    let Ok(series) = db
-        .metrics()
-        .execute_promql(&expression, eval_range, limits)
+    let Ok(series) = backend
+        .promql(&[discovery_promql(name, kind)], eval_range, limits)
         .await
     else {
         return Vec::new();
     };
     let mut by_label: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for item in &series {
-        for (key, value) in item.labels.iter() {
-            let (key, value) = (key.to_string(), value.to_string());
-            if key == "__name__" || key == "le" {
+        for label in &item.labels {
+            if label.name == "__name__" || label.name == "le" {
                 continue;
             }
-            by_label.entry(key).or_default().insert(value);
+            by_label
+                .entry(label.name.clone())
+                .or_default()
+                .insert(label.value.clone());
         }
     }
     by_label
@@ -128,19 +122,16 @@ pub(crate) async fn discover_dims(
 /// message on a missing/invalid id or a source error. The materialized trace is returned alongside the
 /// pane so the app can open the full trace detail (`Route::TraceDetail`) without a second fetch.
 pub(crate) async fn build_waterfall_detail(
-    db: &Arc<Db>,
+    backend: &Backend,
     trace_id_hex: &str,
     ascii: bool,
 ) -> (DetailPane, Option<TraceDetail>) {
     // Success carries a structured `Waterfall` so the bars reflow to the pane width at draw time;
     // the miss/error branches only have a message, delivered through `lines`.
-    let (lines, trace) = match TraceId::from_hex(trace_id_hex) {
-        Some(trace_id) => match db.traces().get(trace_id).await {
-            Ok(Some(trace)) => (Vec::new(), Some(build_trace_detail(&trace, ascii))),
-            Ok(None) => (vec!["trace not found.".to_owned()], None),
-            Err(error) => (vec![format!("error: {error}")], None),
-        },
-        None => (vec!["invalid trace id.".to_owned()], None),
+    let (lines, trace) = match backend.trace(trace_id_hex).await {
+        Ok(Some(trace)) => (Vec::new(), Some(build_trace_detail(&trace, ascii))),
+        Ok(None) => (vec!["trace not found.".to_owned()], None),
+        Err(error) => (vec![format!("error: {error}")], None),
     };
     let pane = DetailPane {
         title: format!("Waterfall: {trace_id_hex}  (enter: detail)"),
@@ -150,59 +141,10 @@ pub(crate) async fn build_waterfall_detail(
     (pane, trace)
 }
 
-/// How many progressively narrower windows to try after the full window overflows the trace cap.
-pub(crate) const TRACE_NARROW_STEPS: usize = 6;
-
-/// Candidate window starts to try, most-recent-first, after the full `[start, end)` window overflows
-/// the trace cap: each halves the span measured back from `end_ns`, so the searched window shrinks
-/// toward the present. Returns only the *narrowed* starts — the caller tries the full `start_ns`
-/// first — and never reaches `end_ns` (that would be an empty window).
-pub(crate) fn narrowing_starts(start_ns: i64, end_ns: i64, steps: usize) -> Vec<i64> {
-    let mut out = Vec::new();
-    let mut span = end_ns.saturating_sub(start_ns).max(0);
-    for _ in 0..steps {
-        span /= 2;
-        if span <= 0 {
-            break;
-        }
-        out.push(end_ns.saturating_sub(span));
-    }
-    out
-}
-
-/// Execute a TraceQL query, transparently narrowing the time window toward `end` whenever the trace
-/// cap is hit. Returns the matches together with the window start actually used (equal to `start`
-/// when no narrowing was needed). A failed attempt costs only the candidate `search` (the cap is
-/// checked before complete traces are fetched), so the retries are cheap.
-pub(crate) async fn execute_traceql_adaptive(
-    db: &Arc<Db>,
-    expression: &SpansetExpr,
-    start: i64,
-    end: i64,
-    limits: EvalLimits,
-) -> Result<(Vec<TraceQueryMatch>, i64), SemanticError> {
-    let mut starts = Vec::with_capacity(TRACE_NARROW_STEPS + 1);
-    starts.push(start);
-    starts.extend(narrowing_starts(start, end, TRACE_NARROW_STEPS));
-    let mut last = SemanticError::LimitExceeded("TraceQL source traces");
-    for candidate_start in starts {
-        match db
-            .traces()
-            .execute_traceql(expression, FetchBounds::new(candidate_start, end)?, limits)
-            .await
-        {
-            Ok(matches) => return Ok((matches, candidate_start)),
-            Err(error) if matches!(error, SemanticError::LimitExceeded(_)) => last = error,
-            Err(error) => return Err(error),
-        }
-    }
-    Err(last)
-}
-
-/// Turn the residual trace-limit error (the window could not be narrowed enough) into actionable
-/// guidance; pass other semantic errors through unchanged.
-pub(crate) fn trace_limit_message(error: &SemanticError, cap: usize) -> String {
-    if matches!(error, SemanticError::LimitExceeded(_)) {
+/// Turn the residual trace-limit failure (the window could not be narrowed enough) into actionable
+/// guidance; pass every other failure through unchanged.
+pub(crate) fn trace_limit_message(error: &HeadError, cap: usize) -> String {
+    if error.is_limit_exceeded() {
         format!(
             "too many traces even in the most recent sub-window (cap {cap}). Add filters (e.g. \
              status=error, duration>Nms) or pick a shorter time range."
@@ -262,7 +204,7 @@ pub(crate) fn eval_window(options: &Options) -> (i64, i64, EvalRange, EvalLimits
 }
 
 pub(crate) async fn load_snapshot(
-    db: Arc<Db>,
+    backend: Backend,
     screen: Screen,
     query: &str,
     options: &Options,
@@ -278,7 +220,7 @@ pub(crate) async fn load_snapshot(
     let g = Glyphs::new(options.ascii);
     match screen {
         Screen::Overview => {
-            let stats = db.stats().await.map_err(|error| error.to_string())?;
+            let stats = backend.stats().await.map_err(|error| error.to_string())?;
             let mut lines = vec![
                 format!("buffer: {} bytes", stats.buffer_bytes),
                 format!("WAL: {} bytes", stats.wal_bytes),
@@ -287,10 +229,7 @@ pub(crate) async fn load_snapshot(
             lines.extend(stats.tables.into_iter().map(|table| {
                 format!(
                     "{:<24} rows={}+{} segments={}",
-                    table.table.as_str(),
-                    table.segment_rows,
-                    table.buffer_rows,
-                    table.segment_count
+                    table.table, table.segment_rows, table.buffer_rows, table.segment_count
                 )
             }));
             Ok(Snapshot {
@@ -306,12 +245,13 @@ pub(crate) async fn load_snapshot(
             })
         }
         Screen::Metrics => {
-            let catalog = db
-                .metrics()
-                .catalog()
-                .await
-                .map_err(|error| error.to_string())?;
             if query.trim().is_empty() {
+                // Only the catalog listing needs the catalog itself; an evaluation gets its
+                // translation context from the executing side, which reads it there.
+                let catalog = backend
+                    .metric_catalog()
+                    .await
+                    .map_err(|error| error.to_string())?;
                 let rows = catalog
                     .iter()
                     .map(|metric| {
@@ -348,7 +288,6 @@ pub(crate) async fn load_snapshot(
                     next_cursor: None,
                 });
             }
-            let context = metric_context(&catalog);
             // One or more newline-separated PromQL queries (the catalog joins several when multiple
             // metrics are checked; the executor has no `or`, so each runs on its own). Their result
             // series are concatenated — each keeps its `__name__` label, so they stay distinguishable.
@@ -356,32 +295,23 @@ pub(crate) async fn load_snapshot(
                 .split('\n')
                 .map(str::trim)
                 .filter(|q| !q.is_empty())
+                .map(str::to_owned)
                 .collect::<Vec<_>>();
-            let mut series = Vec::new();
-            for sub in &sub_queries {
-                let translated =
-                    translate_promql(sub, &context).map_err(|diagnostic| diagnostic.message)?;
-                let ImbhQueryModel::Prom(expression) = translated.model else {
-                    return Err("translator returned a non-metric model".to_owned());
-                };
-                let mut result = db
-                    .metrics()
-                    .execute_promql(&expression, eval_range, limits)
-                    .await
-                    .map_err(|error| error.to_string())?;
-                series.append(&mut result);
-            }
+            let series = backend
+                .promql(&sub_queries, eval_range, limits)
+                .await
+                .map_err(|error| error.to_string())?;
             // Build the summary rows and, in the same pass, retain each series' full
             // `(timestamp_ns, value)` history so the detailed viewer can plot the selected one.
             let mut rows = Vec::with_capacity(series.len());
             let mut series_data = Vec::with_capacity(series.len());
             for item in &series {
-                let labels = if item.labels.iter().next().is_none() {
+                let labels = if item.labels.is_empty() {
                     "{}".to_owned()
                 } else {
                     item.labels
                         .iter()
-                        .map(|(key, value)| format!("{key}={value}"))
+                        .map(|label| format!("{}={}", label.name, label.value))
                         .collect::<Vec<_>>()
                         .join(",")
                 };
@@ -420,7 +350,7 @@ pub(crate) async fn load_snapshot(
             let title_query = if sub_queries.len() > 1 {
                 format!("{} metrics", sub_queries.len())
             } else {
-                sub_queries.first().copied().unwrap_or(query).to_owned()
+                sub_queries.first().map_or(query, String::as_str).to_owned()
             };
             Ok(Snapshot {
                 title: format!(
@@ -454,19 +384,15 @@ pub(crate) async fn load_snapshot(
             })
         }
         Screen::Traces => {
-            let translated = translate_traceql(query, &TranslateContext::default())
-                .map_err(|diagnostic| diagnostic.message)?;
-            let ImbhQueryModel::Trace(expression) = translated.model else {
-                return Err("translator returned a non-trace model".to_owned());
-            };
             // The trace cap is applied to candidate traces in the time *window*, before the TraceQL
             // predicate runs, so a busy window overflows however selective the query is. Rather than
-            // dead-end on "TraceQL source traces limit exceeded", focus on the most recent sub-window
-            // that fits and say so loudly.
-            let (matches, effective_start) =
-                execute_traceql_adaptive(&db, &expression, start, end, limits)
-                    .await
-                    .map_err(|error| trace_limit_message(&error, limits.max_traces))?;
+            // dead-end on "TraceQL source traces limit exceeded", the executing side focuses on the
+            // most recent sub-window that fits and reports which one — and we say so loudly.
+            let search = backend
+                .traceql(query, start, end, limits)
+                .await
+                .map_err(|error| trace_limit_message(&error, limits.max_traces))?;
+            let effective_start = search.effective_start_ns;
             let narrowed = effective_start > start;
             let mut lines = Vec::new();
             if narrowed {
@@ -487,17 +413,17 @@ pub(crate) async fn load_snapshot(
                 );
                 lines.push(String::new());
             }
-            lines.push(format!("{} matching traces", matches.len()));
+            lines.push(format!("{} matching traces", search.matches.len()));
             // Rows below the header count are the selectable trace entries.
             let list_from = lines.len();
             // The trace id stays the leading whitespace-delimited token (`selected_trace_id` /
             // `focus_select_trace` parse it), so the trace's start time is appended after it.
-            lines.extend(matches.into_iter().map(|item| {
+            lines.extend(search.matches.into_iter().map(|item| {
                 format!(
                     "{}  {}  selected={}",
                     item.trace_id,
                     format_timestamp_ns(item.start_time_ns),
-                    item.spanset.selected_span_ids.join(",")
+                    item.selected_span_ids.join(",")
                 )
             }));
             // The waterfall is fetched on demand for the selected trace (`request_waterfall`); ship a
@@ -534,16 +460,18 @@ pub(crate) async fn load_snapshot(
             // filters the list, or a range-aggregation metric expression (`rate({}[5m])`), which also
             // drives the sparkline. Both forms yield a `LogFilter` that filters the displayed list; an
             // empty box means "all logs". `|?`/`!?` (imbh dialect) push down to the Tantivy `.tidx`.
-            let (filter, range_expr) = if query.trim().is_empty() {
-                (LogFilter::All, None)
+            // Only the *filter* is derived here: it is what builds the native `LogQuery` the list is
+            // paged with, correlation and cursor included, and that query travels to the backend as
+            // itself. A range expression additionally drives the sparkline, which the backend
+            // evaluates from the same query text (`Backend::logql`) rather than from a re-sent AST.
+            let (filter, is_range_expr) = if query.trim().is_empty() {
+                (LogFilter::All, false)
             } else {
                 let translated = translate_logql(query, &TranslateContext::default())
                     .map_err(|diagnostic| diagnostic.message)?;
                 match translated.model {
-                    ImbhQueryModel::LogSelector(filter) => (filter, None),
-                    ImbhQueryModel::Log(expression) => {
-                        (expression.filter.clone(), Some(expression))
-                    }
+                    ImbhQueryModel::LogSelector(filter) => (filter, false),
+                    ImbhQueryModel::Log(expression) => (expression.filter.clone(), true),
                     _ => return Err("translator returned a non-log model".to_owned()),
                 }
             };
@@ -576,38 +504,32 @@ pub(crate) async fn load_snapshot(
             if let Some(cursor) = after {
                 list_query = list_query.after(cursor);
             }
-            let page = db
-                .logs()
-                .query(list_query.clone())
+            let page = backend
+                .log_query(list_query.clone())
                 .await
                 .map_err(|error| error.to_string())?;
             let page_next = page.next;
             // The sparkline: the synthesized metric for a range expression, else the log volume of the
             // filtered set over the same window.
-            let chart = match &range_expr {
-                Some(expression) => {
-                    let derived = db
-                        .logs()
-                        .execute_logql(expression, eval_range, limits, &schema)
-                        .await
-                        .map_err(|error| error.to_string())?;
-                    chart_values(
-                        derived
-                            .first()
-                            .map_or(&[][..], |series| series.samples.as_slice())
-                            .iter()
-                            .map(|sample| sample.value),
-                    )
-                }
-                None => {
-                    let step = Duration::from_nanos(eval_range.step_ns.max(1));
-                    let buckets = db
-                        .logs()
-                        .volume(volume_query, step)
-                        .await
-                        .map_err(|error| error.to_string())?;
-                    chart_values(buckets.iter().map(|bucket| bucket.count as f64))
-                }
+            let chart = if is_range_expr {
+                let derived = backend
+                    .logql(query, eval_range, limits)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                chart_values(
+                    derived
+                        .first()
+                        .map_or(&[][..], |series| series.samples.as_slice())
+                        .iter()
+                        .map(|sample| sample.value),
+                )
+            } else {
+                let step = Duration::from_nanos(eval_range.step_ns.max(1));
+                let buckets = backend
+                    .log_volume(volume_query, step)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                chart_values(buckets.iter().map(|bucket| bucket.count as f64))
             };
             let mut lines = vec![format!(
                 "viewer rows={} scanned={} bytes={} index={}",
@@ -652,7 +574,7 @@ pub(crate) async fn load_snapshot(
             // The title reflects any active trace→log drill-down and whether an older page is shown; the
             // `n`/`p` keys page older/newer (see `handle_key`).
             let paged = if after.is_some() { " [older]" } else { "" };
-            let title = match (&correlation, range_expr.is_some()) {
+            let title = match (&correlation, is_range_expr) {
                 (Some(correlation), _) => {
                     let short = &correlation.trace_id[..correlation.trace_id.len().min(8)];
                     let span = correlation
@@ -684,16 +606,6 @@ pub(crate) async fn load_snapshot(
 mod tests {
     use super::*;
     use crate::time::parse_datetime;
-
-    #[test]
-    fn narrowing_starts_shrink_the_window_toward_the_end() {
-        // Each step halves the span from `end`, so starts increase monotonically toward `end`.
-        assert_eq!(narrowing_starts(0, 800, 4), vec![400, 600, 700, 750]);
-        // A zero-width window yields nothing to try.
-        assert_eq!(narrowing_starts(100, 100, 4), Vec::<i64>::new());
-        // Steps stop once the span rounds down to zero rather than emitting `end` (an empty window).
-        assert_eq!(narrowing_starts(0, 4, 8), vec![2, 3]);
-    }
 
     #[test]
     fn eval_window_honors_the_absolute_window() {

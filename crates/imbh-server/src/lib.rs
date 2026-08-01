@@ -23,6 +23,11 @@
 //! - `POST /v1/logs` · `/v1/traces` · `/v1/metrics` — OTLP/HTTP protobuf ingest, `Content-Encoding:
 //!   gzip` accepted (the OTel Collector's `otlphttp` exporter compresses by default).
 //! - `POST /api/query` — a SQL string body → JSON rows.
+//! - `POST`/`GET /api/head/…` — the **head API** (see [`head`] and ARCHITECTURE.md §10.19): the
+//!   typed, read-only query surface a UI with no database of its own drives this daemon over —
+//!   PromQL/LogQL/TraceQL evaluation, log paging, waterfalls, exemplars, catalog and attribute
+//!   vocabularies, and stats. `imbh-tui --url` is the head that ships. Distinct from `/mcp` on
+//!   purpose: that surface is shaped for a model and is lossy by design.
 //! - `POST /mcp` — the Model Context Protocol endpoint (see [`mcp`]): read-only telemetry tools for
 //!   an agent, over MCP's Streamable HTTP transport. `GET`/`DELETE` there answer `405`.
 //! - `GET /stats` — DB operational stats (per-table counts + buffer/WAL bytes + durable LSN) as JSON.
@@ -53,6 +58,7 @@
 pub mod docker;
 #[cfg(feature = "grpc")]
 pub mod grpc;
+pub mod head;
 pub mod shutdown;
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -734,6 +740,10 @@ pub fn app(db: Arc<Db>) -> Router {
         .route("/v1/metrics", post(ingest_metrics))
         .route("/api/query", post(query))
         .route("/stats", get(stats))
+        // The head API (§10.19). A `merge` rather than a `nest` so the paths this crate registers are
+        // exactly the ones `imbh_head::path` names, which is what lets the client compose them
+        // without knowing how the server is assembled.
+        .merge(head::routes())
         .route("/admin/flush", post(admin_flush))
         .route("/admin/compact", post(admin_compact))
         // MCP's Streamable HTTP endpoint. `GET`/`DELETE` are the SSE-stream and session-teardown

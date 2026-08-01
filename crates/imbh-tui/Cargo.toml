@@ -16,14 +16,24 @@ imbh.workspace = true
 # `imbhd` serves (ARCHITECTURE.md §10.16.1); this binary only chooses the backend. Adds no crate to
 # the graph: it is `imbh` plus serde_json and base64, both already compiled under DataFusion.
 imbh-mcp.workspace = true
+# The head API (ARCHITECTURE.md §10.19). Both halves: `exec` is what the local backend runs against an
+# open `Db`, `client` is what the `--url` backend drives a running `imbhd` with — the same operations
+# either side of one HTTP request, which is what makes the two modes answer identically.
+imbh-head = { workspace = true, features = ["client", "exec"] }
 imbh-lgtm = { workspace = true, features = ["source"] }
 ratatui.workspace = true
 crossterm.workspace = true
 unicode-width.workspace = true
-tokio = { workspace = true, features = ["rt", "macros", "sync", "time"] }
+# `net` is the head client's transport (reqwest, under imbh-head); the rest is the event loop.
+tokio = { workspace = true, features = ["rt", "macros", "sync", "time", "net"] }
 # Drives the mascot easter eggs' randomness (seeded per run for reproducible tests). imbh-tui is not
 # part of the core library, so a small extra dependency here is acceptable.
 rand = { version = "0.9", features = ["small_rng"] }
+
+[dev-dependencies]
+# OTLP fixture builders for the local-backend tests, which drive every screen against an in-process
+# `Db` to hold the direct-query path (`imbh-tui <directory>`) intact.
+imbh-test-support.workspace = true
 
 [[bin]]
 name = "imbh-tui"

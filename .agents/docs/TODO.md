@@ -9,6 +9,24 @@ git history); this file tracks only what is still open.
 
 ## Open Items
 
+- [ ] **The head API needs a semver bump before release (`imbh-head` is a new published crate).** The
+      TUI-as-a-head work (ARCHITECTURE.md §10.19, JOURNAL 2026-08-01) added a 15th shipping crate,
+      `imbh-head`, and made one **breaking** change to `imbh-tui`'s published surface:
+      `cli::Mode::Tui { path: PathBuf, .. }` is now `cli::Mode::Tui { source: Source, .. }`, since the
+      explorer takes `--url` as well as a directory. `imbh_tui::run` is *not* breaking — it now takes
+      `impl Into<Backend>` and `From<Arc<Db>>` keeps `run(db, options)` compiling. Under the 0.x rule
+      that is a `0.4.0`, not a patch. `cargo release` also has to learn the new crate (it inherits
+      `version.workspace` and `publish = true`, so it should be picked up automatically — worth
+      confirming on the dry run). Not done here: releases are cut only when explicitly asked.
+
+- [ ] **`GET /stats` still cannot be parsed back into a typed value, and omits the ingest gauges.** The
+      head API answers `GET /api/head/stats` with a complete, serde-round-trippable `Stats` instead of
+      widening `/stats`, whose hand-written JSON (`imbh_mcp::stats_json`, shared with the `db_stats`
+      tool) is an existing public contract reporting neither `ingest_queue_depth` nor `ingest_dropped`
+      nor `ingest_errors`, and spelling a `None` durable LSN as `0`. Adding the three gauges is purely
+      additive and would let the two converge on one serializer; the `durable_lsn` spelling is the part
+      that would actually change what a current consumer sees.
+
 - [ ] **Decide whether to restore the `v0.3.0` git tag on the remote.** It was deleted while trying to
       retry the failed CD run, and only the local signed tag at `07b72dd` survives, so nothing on the
       remote marks the commit that produced crates.io 0.3.0 (`CHANGELOG.md` links the commit instead).

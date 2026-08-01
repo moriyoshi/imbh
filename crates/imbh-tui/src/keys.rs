@@ -1,14 +1,13 @@
 //! Key handling: the detail-route keys, the global key map, and the small navigation helpers they
 //! share.
 
-use std::sync::Arc;
 use std::time::Instant;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use imbh::Db;
 use tokio::sync::mpsc;
 
 use crate::app::App;
+use crate::backend::Backend;
 use crate::model::{
     Focus, LogCorrelation, Mode, Options, Route, Screen, Snapshot, TIME_RANGES, Update,
 };
@@ -31,7 +30,7 @@ pub(crate) enum Control {
 pub(crate) fn handle_detail_key(
     app: &mut App,
     key: KeyEvent,
-    db: &Arc<Db>,
+    backend: &Backend,
     options: &Options,
     sender: &mpsc::UnboundedSender<Update>,
 ) -> Option<Control> {
@@ -50,7 +49,7 @@ pub(crate) fn handle_detail_key(
             KeyCode::Enter => {
                 app.open_span_detail();
             }
-            KeyCode::Char('L') => span_logs_drilldown(app, db, options, sender),
+            KeyCode::Char('L') => span_logs_drilldown(app, backend, options, sender),
             // Pin/unpin the selected span's scrolled-off ancestors at the top of the waterfall. Bound
             // here rather than globally: it only means anything on this route.
             KeyCode::Char('s') => app.sticky_waterfall = !app.sticky_waterfall,
@@ -72,7 +71,9 @@ pub(crate) fn handle_detail_key(
             KeyCode::PageUp => app.scroll = app.scroll.saturating_sub(app.page_rows.get()),
             KeyCode::Home => app.scroll = 0,
             KeyCode::End => app.scroll = app.max_scroll.get(),
-            KeyCode::Char('L') | KeyCode::Enter => span_logs_drilldown(app, db, options, sender),
+            KeyCode::Char('L') | KeyCode::Enter => {
+                span_logs_drilldown(app, backend, options, sender)
+            }
             _ => return None,
         }
         return Some(Control::Continue);
@@ -89,7 +90,7 @@ pub(crate) fn handle_detail_key(
                     switch_screen(
                         app,
                         Screen::Traces,
-                        db.clone(),
+                        backend.clone(),
                         options.clone(),
                         sender.clone(),
                     );
@@ -140,7 +141,7 @@ pub(crate) fn handle_detail_key(
                 switch_screen(
                     app,
                     Screen::Traces,
-                    db.clone(),
+                    backend.clone(),
                     options.clone(),
                     sender.clone(),
                 );
@@ -157,7 +158,7 @@ pub(crate) fn handle_detail_key(
 /// trace detail (the span under the waterfall cursor) or the span detail; a no-op elsewhere.
 pub(crate) fn span_logs_drilldown(
     app: &mut App,
-    db: &Arc<Db>,
+    backend: &Backend,
     options: &Options,
     sender: &mpsc::UnboundedSender<Update>,
 ) {
@@ -169,7 +170,7 @@ pub(crate) fn span_logs_drilldown(
     switch_screen(
         app,
         Screen::Logs,
-        db.clone(),
+        backend.clone(),
         options.clone(),
         sender.clone(),
     );
@@ -179,7 +180,7 @@ pub(crate) fn span_logs_drilldown(
 pub(crate) fn handle_key(
     app: &mut App,
     key: KeyEvent,
-    db: &Arc<Db>,
+    backend: &Backend,
     options: &Options,
     sender: &mpsc::UnboundedSender<Update>,
 ) -> Control {
@@ -205,7 +206,7 @@ pub(crate) fn handle_key(
                     }
                     // Running the query moves the user's attention to the results, so focus lands there.
                     app.focus = Focus::Primary;
-                    request_refresh(app, db.clone(), options.clone(), sender.clone());
+                    request_refresh(app, backend.clone(), options.clone(), sender.clone());
                 }
                 // Tab accepts the highlighted completion; ↑/↓ move within the popup.
                 KeyCode::Tab => app.accept_completion(),
@@ -223,12 +224,12 @@ pub(crate) fn handle_key(
                 KeyCode::Backspace => {
                     app.active_query_mut().pop();
                     app.refresh_completion();
-                    maybe_discover_label_dims(app, db, options, sender);
+                    maybe_discover_label_dims(app, backend, options, sender);
                 }
                 KeyCode::Char(character) => {
                     app.active_query_mut().push(character);
                     app.refresh_completion();
-                    maybe_discover_label_dims(app, db, options, sender);
+                    maybe_discover_label_dims(app, backend, options, sender);
                 }
                 _ => {}
             }
@@ -259,7 +260,7 @@ pub(crate) fn handle_key(
                         if changed {
                             app.scroll = 0;
                             app.selected = 0;
-                            request_refresh(app, db.clone(), options.clone(), sender.clone());
+                            request_refresh(app, backend.clone(), options.clone(), sender.clone());
                         }
                     }
                 }
@@ -290,7 +291,7 @@ pub(crate) fn handle_key(
                 // `commit_absolute` always runs (recording a parse error on failure); the guard only
                 // gates the follow-up refresh on a successful commit.
                 KeyCode::Enter if app.commit_absolute() => {
-                    request_refresh(app, db.clone(), options.clone(), sender.clone());
+                    request_refresh(app, backend.clone(), options.clone(), sender.clone());
                 }
                 _ => {}
             }
@@ -308,7 +309,7 @@ pub(crate) fn handle_key(
                         switch_screen_history(
                             app,
                             screen,
-                            db.clone(),
+                            backend.clone(),
                             options.clone(),
                             sender.clone(),
                         );
@@ -340,7 +341,13 @@ pub(crate) fn handle_key(
         KeyCode::Enter => match app.effective_focus() {
             Focus::Menu(index) => {
                 if let Some(&screen) = Screen::ORDER.get(index) {
-                    switch_screen_history(app, screen, db.clone(), options.clone(), sender.clone());
+                    switch_screen_history(
+                        app,
+                        screen,
+                        backend.clone(),
+                        options.clone(),
+                        sender.clone(),
+                    );
                 }
                 return Control::Continue;
             }
@@ -349,7 +356,7 @@ pub(crate) fn handle_key(
                 return Control::Continue;
             }
             Focus::Query => {
-                begin_editing(app, db, sender);
+                begin_editing(app, backend, sender);
                 return Control::Continue;
             }
             Focus::Primary => {}
@@ -369,7 +376,7 @@ pub(crate) fn handle_key(
     // Detail routes interpret a few keys of their own (scroll, chart cursor, trace jump); everything
     // else — history nav, screen switches, the menu, the range picker — falls through to the global
     // handling below, so the detail views are ordinary content, not modal.
-    if let Some(control) = handle_detail_key(app, key, db, options, sender) {
+    if let Some(control) = handle_detail_key(app, key, backend, options, sender) {
         return control;
     }
     match key.code {
@@ -381,15 +388,15 @@ pub(crate) fn handle_key(
         // never `→` — so `→` only redoes a Back and never jumps somewhere unvisited.
         KeyCode::Left | KeyCode::Esc => {
             if app.go_back() {
-                request_refresh(app, db.clone(), options.clone(), sender.clone());
+                request_refresh(app, backend.clone(), options.clone(), sender.clone());
                 // Landing back on a metric detail refetches its exemplar markers (no-op otherwise).
-                request_metric_exemplars(app, db, sender);
+                request_metric_exemplars(app, backend, sender);
             }
         }
         KeyCode::Right => {
             if app.go_forward() {
-                request_refresh(app, db.clone(), options.clone(), sender.clone());
-                request_metric_exemplars(app, db, sender);
+                request_refresh(app, backend.clone(), options.clone(), sender.clone());
+                request_metric_exemplars(app, backend, sender);
             }
         }
         // Backspace walks one step *up the screen series* — the chain a screen drills through (Metrics
@@ -398,8 +405,8 @@ pub(crate) fn handle_key(
         // where Esc/← would return to the log it came from. A no-op on a screen's list route.
         KeyCode::Backspace => {
             if app.go_up() {
-                request_refresh(app, db.clone(), options.clone(), sender.clone());
-                request_metric_exemplars(app, db, sender);
+                request_refresh(app, backend.clone(), options.clone(), sender.clone());
+                request_metric_exemplars(app, backend, sender);
             }
         }
         // Logs list → log detail (Enter): open the detail for the selected entry.
@@ -423,7 +430,13 @@ pub(crate) fn handle_key(
         KeyCode::Char(' ') if app.on_catalog() => {
             if let Some((name, kind)) = app.toggle_node() {
                 // Discovery spans all metric data (picker-independent); only the series cap matters.
-                request_metric_dims(name, kind, db.clone(), options.max_series, sender.clone());
+                request_metric_dims(
+                    name,
+                    kind,
+                    backend.clone(),
+                    options.max_series,
+                    sender.clone(),
+                );
             }
         }
         // Catalog → series list (Enter): build the matching PromQL and visualize it — every metric
@@ -437,7 +450,7 @@ pub(crate) fn handle_key(
                 *app.active_query_mut() = queries.join("\n");
                 app.selected = 0;
                 app.scroll = 0;
-                request_refresh(app, db.clone(), options.clone(), sender.clone());
+                request_refresh(app, backend.clone(), options.clone(), sender.clone());
             }
         }
         // Series list → series detail (Enter): open the detailed time-series viewer for the selection.
@@ -448,7 +461,7 @@ pub(crate) fn handle_key(
             if app.open_metric_detail() {
                 app.push_entry(departing);
                 // Load the series' exemplar→trace markers for the just-opened detail.
-                request_metric_exemplars(app, db, sender);
+                request_metric_exemplars(app, backend, sender);
             }
         }
         // Time pan/zoom: `[`/`]` pan the window earlier/later by half its span; `-`/`+` (or `=`) zoom
@@ -456,34 +469,34 @@ pub(crate) fn handle_key(
         // and re-queries. No-ops (no window change) skip the refresh.
         KeyCode::Char('[') => {
             if app.pan_window(-0.5) {
-                request_refresh(app, db.clone(), options.clone(), sender.clone());
+                request_refresh(app, backend.clone(), options.clone(), sender.clone());
             }
         }
         KeyCode::Char(']') => {
             if app.pan_window(0.5) {
-                request_refresh(app, db.clone(), options.clone(), sender.clone());
+                request_refresh(app, backend.clone(), options.clone(), sender.clone());
             }
         }
         KeyCode::Char('-') => {
             if app.zoom_window(2.0) {
-                request_refresh(app, db.clone(), options.clone(), sender.clone());
+                request_refresh(app, backend.clone(), options.clone(), sender.clone());
             }
         }
         KeyCode::Char('+') | KeyCode::Char('=') => {
             if app.zoom_window(0.5) {
-                request_refresh(app, db.clone(), options.clone(), sender.clone());
+                request_refresh(app, backend.clone(), options.clone(), sender.clone());
             }
         }
         // Older/newer log paging (Logs list): `n` = older page, `p` = newer page. No-ops off the Logs
         // list or at the ends (`logs_page_*` guards the screen and the cursor stack).
         KeyCode::Char('n') => {
             if app.logs_page_older() {
-                request_refresh(app, db.clone(), options.clone(), sender.clone());
+                request_refresh(app, backend.clone(), options.clone(), sender.clone());
             }
         }
         KeyCode::Char('p') => {
             if app.logs_page_newer() {
-                request_refresh(app, db.clone(), options.clone(), sender.clone());
+                request_refresh(app, backend.clone(), options.clone(), sender.clone());
             }
         }
         // Trace → logs drill-down: open the Logs screen filtered to the selected trace's records (the
@@ -498,7 +511,7 @@ pub(crate) fn handle_key(
                 switch_screen(
                     app,
                     Screen::Logs,
-                    db.clone(),
+                    backend.clone(),
                     options.clone(),
                     sender.clone(),
                 );
@@ -508,33 +521,35 @@ pub(crate) fn handle_key(
         KeyCode::Char('1') => switch_screen_history(
             app,
             Screen::Overview,
-            db.clone(),
+            backend.clone(),
             options.clone(),
             sender.clone(),
         ),
         KeyCode::Char('2') => switch_screen_history(
             app,
             Screen::Metrics,
-            db.clone(),
+            backend.clone(),
             options.clone(),
             sender.clone(),
         ),
         KeyCode::Char('3') => switch_screen_history(
             app,
             Screen::Traces,
-            db.clone(),
+            backend.clone(),
             options.clone(),
             sender.clone(),
         ),
         KeyCode::Char('4') => switch_screen_history(
             app,
             Screen::Logs,
-            db.clone(),
+            backend.clone(),
             options.clone(),
             sender.clone(),
         ),
-        KeyCode::Char('e') if app.has_query() => begin_editing(app, db, sender),
-        KeyCode::Char('r') => request_refresh(app, db.clone(), options.clone(), sender.clone()),
+        KeyCode::Char('e') if app.has_query() => begin_editing(app, backend, sender),
+        KeyCode::Char('r') => {
+            request_refresh(app, backend.clone(), options.clone(), sender.clone())
+        }
         // Shift+R (the uppercase char crossterm delivers) toggles background auto-refresh.
         KeyCode::Char('R') => app.auto_refresh = !app.auto_refresh,
         // Toggle the animated mascot (hidden by default). No effect on `--ascii` terminals, where its
@@ -572,7 +587,7 @@ pub(crate) fn handle_key(
         _ => {}
     }
     // If the row cursor moved to a different trace, refresh the waterfall pane (no-op otherwise).
-    request_waterfall(app, db, sender, options.ascii);
+    request_waterfall(app, backend, sender, options.ascii);
     Control::Continue
 }
 
@@ -609,11 +624,15 @@ pub(crate) fn open_time_range(app: &mut App) {
 /// Enter query-editing mode, fetching the completion vocabulary on first use and moving focus to the
 /// query pane. Shared by the `e` key and a focus-`Enter` on the query pane; the caller guarantees the
 /// current view has a query pane.
-pub(crate) fn begin_editing(app: &mut App, db: &Arc<Db>, sender: &mpsc::UnboundedSender<Update>) {
+pub(crate) fn begin_editing(
+    app: &mut App,
+    backend: &Backend,
+    sender: &mpsc::UnboundedSender<Update>,
+) {
     app.mode = Mode::Editing;
     app.focus = Focus::Query;
     if app.screen() == Screen::Metrics && app.metric_names.is_empty() {
-        request_vocabulary(app.screen(), db.clone(), sender.clone());
+        request_vocabulary(app.screen(), backend.clone(), sender.clone());
     }
     app.refresh_completion();
 }
@@ -623,20 +642,20 @@ pub(crate) fn begin_editing(app: &mut App, db: &Arc<Db>, sender: &mpsc::Unbounde
 pub(crate) fn switch_screen_history(
     app: &mut App,
     screen: Screen,
-    db: Arc<Db>,
+    backend: Backend,
     options: Options,
     sender: mpsc::UnboundedSender<Update>,
 ) {
     if app.screen() != screen {
         app.push_history();
     }
-    switch_screen(app, screen, db, options, sender);
+    switch_screen(app, screen, backend, options, sender);
 }
 
 pub(crate) fn switch_screen(
     app: &mut App,
     screen: Screen,
-    db: Arc<Db>,
+    backend: Backend,
     options: Options,
     sender: mpsc::UnboundedSender<Update>,
 ) {
@@ -661,10 +680,10 @@ pub(crate) fn switch_screen(
     }
     app.metric_exemplars.clear();
     if screen == Screen::Metrics && app.metric_names.is_empty() {
-        request_vocabulary(screen, db.clone(), sender.clone());
+        request_vocabulary(screen, backend.clone(), sender.clone());
     }
     app.snapshot = Snapshot::message(screen.title(), "Loading...");
-    request_refresh(app, db, options, sender);
+    request_refresh(app, backend, options, sender);
 }
 
 #[cfg(test)]

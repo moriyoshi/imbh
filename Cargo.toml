@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "crates/imbh-core",
+    "crates/imbh-head",
     "crates/imbh-lgtm",
     "crates/imbh-mcp",
     "crates/imbh-tui",
@@ -56,6 +57,12 @@ pre-release-hook = ["git", "cliff", "-o", "CHANGELOG.md", "--tag", "{{version}}"
 imbh = { path = "crates/imbh", version = "0.3.0" }
 imbh-core = { path = "crates/imbh-core", version = "0.3.0" }
 imbh-lgtm = { path = "crates/imbh-lgtm", version = "0.3.0" }
+# The head API (ARCHITECTURE.md §10.19): the JSON wire types a read-only head drives a running
+# `imbhd` over, the server-side execution of each operation against an open `Db`, and the HTTP client
+# the remote head uses. Shared by `imbh-server` (which serves it) and `imbh-tui` (which is a head).
+# `default-features = false` so each consumer names the halves it plays: `imbh-server` serves the API
+# (`exec`), `imbh-tui` both serves it in-process and drives a remote one (`exec` + `client`).
+imbh-head = { path = "crates/imbh-head", version = "0.3.0", default-features = false }
 # The MCP server (protocol dispatch + tools + the stdio transport), shared by the HTTP endpoint in
 # `imbh-server` and the stdio one in the `imbh-tui` binary.
 imbh-mcp = { path = "crates/imbh-mcp", version = "0.3.0" }
@@ -153,6 +160,14 @@ hyper-util = { version = "0.1", default-features = false, features = [
 ] }
 tower = { version = "0.5", default-features = false, features = ["util"] }
 http-body-util = "0.1"
+# The head client's HTTP transport (`imbh-head`, ARCHITECTURE.md §10.19). Trimmed hard:
+# `default-features = false` drops the default TLS backend, http2, cookies, and charset sniffing,
+# leaving plain HTTP/1.1 + the `json` helper. `imbhd` serves no TLS, and `Endpoint::parse` refuses an
+# `https://` URL rather than silently downgrading one. Footprint: the whole subtree (hyper,
+# hyper-util, tower, http-body-util, bytes) is already compiled for `imbh-server`'s listener, and
+# none of it reaches the `imbh` facade the crate-count gate measures — the dependency direction is
+# `imbh ← imbh-head`.
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
 # The Docker plugin's `ReadLogs` response is a hand-written streaming `Body` over a channel, so it
 # implements the `http_body::Body` trait directly. Already in the graph via hyper.
 http-body = "1"
