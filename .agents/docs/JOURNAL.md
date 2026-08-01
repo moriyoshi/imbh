@@ -1981,3 +1981,52 @@ all roots, so sticky is provably inert on a flat trace. Full workspace `fmt`/`bu
 green; no dependency changes, so the footprint gate is a no-op.
 
 
+
+## Sticky waterfall follow-up: dim is a bet on terminal support (2026-08-01)
+
+Three user-reported defects on the pinned rows, all one root cause and one consequence of it.
+
+**"Lines in the sticky spans aren't rendered dimmed while the name and status are."** The pinned rows
+carried `Modifier::DIM` on the whole line, so the first instinct — a code bug leaving the bar
+unstyled — was wrong. Dumping `buffer[(x, y)].modifier` across a whole pinned row showed every cell
+*including* the bar carrying `DIM`, and the first scrolling row carrying none. The attribute was
+being set correctly and the terminal was ignoring it: many terminals draw box-drawing characters
+procedurally, from a built-in geometry renderer rather than the font, and that path honours the cell's
+foreground colour but not the faint attribute. Ordinary text (name, duration) dims; `━` does not.
+
+The fix rides three channels instead of one: an explicit `fg` (`DarkGray`, which the geometry renderer
+does honour; error rows keep `Red`, since a failing ancestor is still worth seeing), a lighter bar
+glyph (`Waterfall::light_marker` — `─`/`-` against `━`/`#`), and `DIM` for terminals that honour it.
+The generalisable rule: **an attribute-only visual distinction is a bet on terminal support.** Carry
+anything load-bearing on colour or on the glyph itself, and keep the attribute as a bonus.
+
+Choosing the lighter glyph required checking it against the crate's EAW rule, which turned up a
+**pre-existing latent bug**: `━` U+2501, the bar glyph the waterfall has always used, is East-Asian-
+width *ambiguous* (`width` 1, `width_cjk` 2). The project's own pitfall list forbids exactly this for
+width-measured text — under a CJK locale each bar cell renders two columns wide and the axis
+desyncs. The substitution is safe because `─` U+2500 is ambiguous in precisely the same way, so the
+two can never disagree with each other; but the underlying glyph choice predates this work and is
+recorded as a separate finding rather than fixed here.
+
+**"Draw divider (underline) at the bottom of the sticky span rows"**, reversing the earlier
+"dim only, no rule" call. Implemented as `UNDERLINED` on the *last pinned row* rather than a `───`
+rule row: the rule would cost a viewport row out of a pane whose entire problem is being too short,
+and the underline already sits exactly on the boundary.
+
+**"The divider doesn't stretch out to the right border of the pane."** A waterfall line ends after its
+duration column, several cells short of the pane's inner width, and `Paragraph` does not pad — so the
+styled span ended there and the rule stopped short, which does not read as a rule. Fixed by padding
+each pinned row to `inner.width` before styling. Any full-width row styling has this requirement.
+
+The test lesson is the sharpest one here: the original render test asserted on `buffer[(2, y)]` — a
+single cell in the *name* column — so it passed while the bar rendered at full intensity, and would
+have passed just as happily through all three defects. **A styling assertion has to quantify over
+every cell of the row it claims something about.** The test now checks `DIM` across all non-blank
+cells, the explicit `fg`, the light-vs-heavy bar glyph, and the divider spanning every column between
+the borders while the pane title above it stays clean.
+
+Also worth recording: a crude ANSI replay over a pty capture is *not* a substitute for `TestBackend`
+when the question is about attributes. Ratatui writes only changed cells, so SGR state carries across
+cursor moves in ways a naive parser mis-attributes — the pty dump reported underline on rows that the
+exact buffer assertions prove are clean. Use the pty for *layout* (it caught the blank pinned names
+and the scrolled-away indent earlier); use `TestBackend` for *style*.

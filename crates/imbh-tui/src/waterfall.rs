@@ -17,6 +17,15 @@ pub(crate) struct Waterfall {
     pub(crate) rows: Vec<WaterfallRow>,
     /// The bar glyph (`━`, or `#` in ASCII mode).
     pub(crate) marker: char,
+    /// The de-emphasised bar glyph for pinned rows (`─`, or `-` in ASCII mode).
+    ///
+    /// A lighter *glyph* is used rather than relying on `Modifier::DIM` alone because many terminals
+    /// draw box-drawing characters procedurally — from a built-in geometry renderer rather than the
+    /// font — and that path honours the cell's foreground colour but ignores the faint attribute. The
+    /// symptom is a pinned row whose name and duration dim while its bar stays at full intensity. Both
+    /// glyphs are EAW-ambiguous in exactly the same way (`width` 1, `width_cjk` 2), so substituting one
+    /// for the other cannot shift the `|bar|` axis relative to the scrolling rows.
+    pub(crate) light_marker: char,
 }
 
 /// One waterfall row: the name column's raw pieces and trailing column, plus the bar's position as
@@ -215,6 +224,7 @@ pub(crate) fn build_trace_detail(trace: &imbh::Trace, ascii: bool) -> TraceDetai
         waterfall: Waterfall {
             rows,
             marker: if ascii { '#' } else { '━' },
+            light_marker: if ascii { '-' } else { '─' },
         },
         spans,
     }
@@ -231,16 +241,21 @@ pub(crate) fn render_waterfall(
     name_offset: usize,
 ) -> Vec<String> {
     (0..waterfall.rows.len())
-        .map(|index| render_waterfall_row(waterfall, index, bar_cells, name_offset))
+        .map(|index| {
+            render_waterfall_row(waterfall, index, bar_cells, name_offset, waterfall.marker)
+        })
         .collect()
 }
 
-/// One [`render_waterfall`] line. Panics on an out-of-range index.
-fn render_waterfall_row(
+/// One [`render_waterfall`] line, painted with `marker` as the bar glyph — so a caller that wants a
+/// de-emphasised row (the pinned ancestors, via [`Waterfall::light_marker`]) can paint it without
+/// re-rendering the whole waterfall. Panics on an out-of-range index.
+pub(crate) fn render_waterfall_row(
     waterfall: &Waterfall,
     index: usize,
     bar_cells: usize,
     name_offset: usize,
+    marker: char,
 ) -> String {
     let cells = bar_cells.max(1);
     let row = &waterfall.rows[index];
@@ -250,7 +265,7 @@ fn render_waterfall_row(
         .min(cells - start);
     let mut bar = String::with_capacity(cells);
     bar.extend(std::iter::repeat_n(' ', start));
-    bar.extend(std::iter::repeat_n(waterfall.marker, width));
+    bar.extend(std::iter::repeat_n(marker, width));
     bar.extend(std::iter::repeat_n(' ', cells - start - width));
     // The indent is laid down verbatim and the name scrolls inside what it leaves, so the trace's
     // shape survives however far the column has scrolled. Clamping to the row's own offset keeps a
