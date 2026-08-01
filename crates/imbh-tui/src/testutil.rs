@@ -23,6 +23,40 @@ pub(crate) fn ascii_trace() -> imbh::Trace {
     }
 }
 
+/// A nested trace shaped like a real waterfall: a root, one span beneath it, and sixteen leaves
+/// beneath *that* — enough rows to overflow a pane, so scrolling to the leaves pushes both enclosing
+/// spans off the top. The two ancestors fit under the sticky depth cap, so both stay pinned (the
+/// straight-chain case, where the cap has to drop the outermost, is covered by the pure unit tests).
+///
+/// The leaf names are deliberately longer than `WATERFALL_NAME_W` while the two ancestors' names fit,
+/// so the name column's horizontal scrolling is exercised *and* has somewhere to scroll back to.
+/// `root_service`/`root_name` are `None` so the header cannot leak those names into a render
+/// assertion about the waterfall rows.
+pub(crate) fn nested_trace() -> imbh::Trace {
+    // 1: root, 2: the span under it, 3..=18: leaves, all children of 2.
+    let mut spans = vec![
+        waterfall_span(1, None, "zz-root", 0, 100_000),
+        waterfall_span(2, Some(1), "yy-mid", 1_000, 98_000),
+    ];
+    for id in 3..=18u8 {
+        spans.push(waterfall_span(
+            id,
+            Some(2),
+            &format!("work-{}-with-a-long-name", id - 3),
+            id as i64 * 1_000,
+            90_000 - id as u64 * 1_000,
+        ));
+    }
+    imbh::Trace {
+        trace_id: TraceId([0xaa; 16]),
+        root_service: None,
+        root_name: None,
+        start_time: Timestamp(0),
+        duration_ns: imbh::DurationNs(100_000),
+        spans,
+    }
+}
+
 pub(crate) fn waterfall_span(
     id: u8,
     parent: Option<u8>,

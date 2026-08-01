@@ -114,6 +114,10 @@ pub(crate) struct App {
     /// Whether the animated mascot is shown. Off by default; toggled with `m` (a no-op on `--ascii`
     /// terminals, where the block-glyph art is never rendered).
     pub(crate) show_mascot: bool,
+    /// Whether the trace detail's waterfall pins the selected span's scrolled-off ancestors at the top
+    /// of the pane. On by default; toggled with `s` there. A display preference like `show_mascot`
+    /// rather than view state, so it is deliberately *not* captured by the navigation history.
+    pub(crate) sticky_waterfall: bool,
     /// The mascot controller (position, motions, event igniters). Advanced once per redraw in
     /// [`run`](crate::runtime::run).
     pub(crate) mascot: Mascot,
@@ -196,6 +200,7 @@ impl App {
             forward: Vec::new(),
             focus: Focus::Primary,
             show_mascot: false,
+            sticky_waterfall: true,
             mascot: Mascot::new(),
             chart_geom: RefCell::new(None),
             mascot_route_tag: 0,
@@ -344,6 +349,11 @@ mod tests {
     #[test]
     fn mascot_is_hidden_by_default() {
         assert!(!App::new().show_mascot);
+    }
+
+    #[test]
+    fn sticky_waterfall_is_on_by_default() {
+        assert!(App::new().sticky_waterfall);
     }
 
     #[test]

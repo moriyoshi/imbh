@@ -1902,3 +1902,228 @@ familiar "delete it and retry" is the one move that cannot be undone, and it is 
 half-finished publish invites. Any step that publishes something frozen must therefore be the *last*
 step, and the failure message at that step has to tell the operator what not to do — by the time
 they are reading it, the destructive option looks like the obvious one.
+
+## Sticky waterfall: the obvious fixpoint cycles, and depth broke two things nobody had rendered (2026-08-01)
+
+The trace detail's waterfall now pins the selected span's scrolled-off ancestors at the top of the
+pane, dimmed, so scrolling into a deep trace no longer strands you on a `db.query` at indent 3 with
+no way to see what it hangs off. `s` toggles it, bound in the trace-detail arm of `handle_detail_key`
+rather than globally; it is on by default and the hint line reads `s sticky:on|off`. The state is an
+`App` field alongside `show_mascot` and deliberately *not* in `NavEntry` — a display preference should
+survive Back/Forward, not be captured by it.
+
+The shape of it: a pure `sticky_layout(rows, cursor, viewport, enabled) -> StickyLayout { pinned,
+offset, height }`, so the whole geometry is unit-testable without a terminal, and the renderer just
+splits the block's inner rect into a pinned `Paragraph` and an offset-pinned `List`. The pinned block
+is capped at a third of the viewport, keeping the *innermost* ancestors — the nearest context is worth
+more than the root when the chain will not fit. `WaterfallRow` gained `parent_row` (a *row* index, not
+a span id, and only ever walked upward: spans come back `ORDER BY start_time`, not as a tree, so clock
+skew across services can put a parent below its child — walking strictly upward is what makes the walk
+both correct and cycle-safe without a visited set) and lost its pre-baked `prefix` in favour of
+`marker`/`indent`/`name`, because horizontal scrolling needs the raw text at draw time. Three findings
+worth keeping.
+
+**The obvious formulation of "sticky" does not converge.** The natural reading — pin the ancestors of
+the *topmost visible row* — is a fixpoint problem, because pinning rows shrinks the window, which
+moves the offset, which changes whose ancestors you are pinning. That function is **not monotone**.
+With rows `A`, `B` (child of `A`), `C` (child of `B`), `D` (a fresh root), the pinned count runs
+`1 → 2 → 0 → 1 → 2 → 0 …` with period 3, so any iteration budget returns a budget-dependent answer and
+the block visibly flickers as the user holds `↓`. Anchoring on the **cursor's** ancestor chain instead
+makes it monotone: more pinned rows ⇒ shorter window ⇒ larger offset ⇒ weakly more ancestors above it,
+so iterating from zero reaches the least fixpoint on `{0..=cap}` in at most `cap + 1` steps. The two
+anchors describe the same pane *only* because the offset is stateless here (a fresh `ListState` each
+frame ⇒ either `offset == 0` or the cursor sits on the last visible row — one degree of freedom). If
+that offset ever becomes stateful, the anchor has to be revisited; the doc comment says so.
+
+The general lesson: when a layout quantity feeds back into the geometry that produces it, the choice
+of anchor is not cosmetic — it decides whether the recursion is a fixpoint or an oscillator. Picking
+the anchor that makes the function monotone is worth more than any iteration cap. A counterexample
+test (`sticky_layout_is_stable_across_a_subtree_boundary`, asserting the invariants at *every* cursor
+value over exactly that shape) is the regression guard, and a 20 000-case fuzz over random forests
+confirmed cursor-visibility, pinned-above-window, and the cap.
+
+**Depth broke two things that had simply never been rendered.** The waterfall had only ever been
+exercised at depth ≤ 4. The indent shares the 20-cell name column at two cells per level, so at depth
+8 a name had four readable cells — and `clamp_field` truncated with a hard-coded `…`, meaning
+`--ascii` mode leaked a Unicode glyph the moment a trace nested deep enough. The `--ascii` sweep never
+caught it because no fixture nested that far, and it runs at 48×10 where the pane is too short for
+sticky to engage at all. So: the indent is capped at 5 levels (≥ 10 name cells always, with the
+hierarchy the cap gives up now supplied by the pinned ancestors), and `clamp_field` became
+`clip_field(text, width, offset)`, which marks clipping with ASCII `<`/`>` written *into* an edge cell
+rather than stealing width — the field stays exactly `width` cells, which is what the bar-axis
+alignment invariant rests on, and the ASCII leak disappears by construction rather than by a flag.
+
+**The pty caught what 116 unit tests could not.** The name column also scrolls horizontally, following
+the cursor. Two failure modes only showed up driving the real binary against a `gen-demo-db` database
+in a sized pty (a small Python `pty.fork` + `TIOCSWINSZ` harness; `script` gives a 0×0 window and the
+TUI renders nothing). First, pinned ancestors are the *shallowest* rows and so usually the *shortest*
+names — sharing the cursor's offset outright scrolled them clean out of their own field and the
+context band rendered blank, i.e. the feature silently deleted itself exactly when it mattered. Fixed
+by clamping every row to its own maximum useful offset, so the column still moves as one but no row
+scrolls into emptiness. Second, and worse: scrolling the column shifted the *indent* off the left
+edge, so the whole trace's shape vanished the instant the cursor landed on a long name. `WaterfallRow`
+now keeps `indent` and `name` apart and only the name scrolls — the tree is never negotiable. Both
+bugs were invisible to substring assertions over a `TestBackend`, because both produced perfectly
+well-formed rows; they were only wrong *as a picture*. Render tests prove structure, not legibility.
+
+`examples/gen-demo-db` gained a deep trace per step so any of this is reachable in the demo data: a
+checkout entry chaining `--deep-hops` (default 5) service hops, 23 spans nested 11 deep, names longer
+than the name column, and ~1 in 4 failing at the innermost `db.query` so the ERROR propagates up the
+whole pinned chain. It reuses every existing `Role`, so `logs_body`/`log_line` needed no changes.
+
+Verification: 116 unit tests in `imbh-tui` (16 new — the cycling counterexample, the cap keeping the
+innermost ancestors, cycle-safe `ancestor_rows`, degenerate viewports, `clip_field` exactness at every
+offset including wide-glyph boundaries, the indent cap, the indent-never-scrolls guard, and two
+`TestBackend` renders asserting the pinned rows carry `Modifier::DIM` while the cursor row does not
+and that the whole sticky render stays ASCII). The pre-existing
+`trace_detail_waterfall_scrolls_to_keep_the_span_cursor_visible` passes unchanged — its 40 spans are
+all roots, so sticky is provably inert on a flat trace. Full workspace `fmt`/`build`/`clippy`/`test`
+green; no dependency changes, so the footprint gate is a no-op.
+
+
+
+## Sticky waterfall follow-up: dim is a bet on terminal support (2026-08-01)
+
+Three user-reported defects on the pinned rows, all one root cause and one consequence of it.
+
+**"Lines in the sticky spans aren't rendered dimmed while the name and status are."** The pinned rows
+carried `Modifier::DIM` on the whole line, so the first instinct — a code bug leaving the bar
+unstyled — was wrong. Dumping `buffer[(x, y)].modifier` across a whole pinned row showed every cell
+*including* the bar carrying `DIM`, and the first scrolling row carrying none. The attribute was
+being set correctly and the terminal was ignoring it: many terminals draw box-drawing characters
+procedurally, from a built-in geometry renderer rather than the font, and that path honours the cell's
+foreground colour but not the faint attribute. Ordinary text (name, duration) dims; `━` does not.
+
+The fix rides three channels instead of one: an explicit `fg` (`DarkGray`, which the geometry renderer
+does honour; error rows keep `Red`, since a failing ancestor is still worth seeing), a lighter bar
+glyph (`Waterfall::light_marker` — `─`/`-` against `━`/`#`), and `DIM` for terminals that honour it.
+The generalisable rule: **an attribute-only visual distinction is a bet on terminal support.** Carry
+anything load-bearing on colour or on the glyph itself, and keep the attribute as a bonus.
+
+Choosing the lighter glyph required checking it against the crate's EAW rule, which turned up a
+**pre-existing latent bug**: `━` U+2501, the bar glyph the waterfall has always used, is East-Asian-
+width *ambiguous* (`width` 1, `width_cjk` 2). The project's own pitfall list forbids exactly this for
+width-measured text — under a CJK locale each bar cell renders two columns wide and the axis
+desyncs. The substitution is safe because `─` U+2500 is ambiguous in precisely the same way, so the
+two can never disagree with each other; but the underlying glyph choice predates this work and is
+recorded as a separate finding rather than fixed here.
+
+**"Draw divider (underline) at the bottom of the sticky span rows"**, reversing the earlier
+"dim only, no rule" call. Implemented as `UNDERLINED` on the *last pinned row* rather than a `───`
+rule row: the rule would cost a viewport row out of a pane whose entire problem is being too short,
+and the underline already sits exactly on the boundary.
+
+**"The divider doesn't stretch out to the right border of the pane."** A waterfall line ends after its
+duration column, several cells short of the pane's inner width, and `Paragraph` does not pad — so the
+styled span ended there and the rule stopped short, which does not read as a rule. Fixed by padding
+each pinned row to `inner.width` before styling. Any full-width row styling has this requirement.
+
+The test lesson is the sharpest one here: the original render test asserted on `buffer[(2, y)]` — a
+single cell in the *name* column — so it passed while the bar rendered at full intensity, and would
+have passed just as happily through all three defects. **A styling assertion has to quantify over
+every cell of the row it claims something about.** The test now checks `DIM` across all non-blank
+cells, the explicit `fg`, the light-vs-heavy bar glyph, and the divider spanning every column between
+the borders while the pane title above it stays clean.
+
+Also worth recording: a crude ANSI replay over a pty capture is *not* a substitute for `TestBackend`
+when the question is about attributes. Ratatui writes only changed cells, so SGR state carries across
+cursor moves in ways a naive parser mis-attributes — the pty dump reported underline on rows that the
+exact buffer assertions prove are clean. Use the pty for *layout* (it caught the blank pinned names
+and the scrolled-away indent earlier); use `TestBackend` for *style*.
+
+## Waterfall indent goes relative to the pane, not the trace root (2026-08-01)
+
+Scrolled deep into a subtree, every visible waterfall row carried the same leading indent. It
+distinguished nothing between the rows on screen and spent the whole name column saying it — at the
+capped depth of 5, ten of twenty cells on every single row.
+
+`visible_indent_base` now takes the minimum indent across the *rendered* rows (the pinned ancestors
+plus the scrolling window) and `render_waterfall` subtracts it, so the outermost visible span sits
+flush against the name column and the rows below keep only their offsets relative to it. Deep names
+gain those ten cells back; measured against the demo database, `<kout-ser>` became
+`<s.checkout-ser>`, and the topmost row went from nine readable cells to twenty.
+
+Anchored on the shallowest rendered row rather than literally the topmost one. They are the same row
+in the usual case — the pinned block is the cursor's ancestor chain, ordered outermost-first — but a
+shallower sibling scrolling into the window underneath would otherwise require a negative shift, and
+clamping that at zero would draw two genuinely different depths in the same column. Taking the
+minimum keeps every relative distinction on screen intact. That is the whole subtlety, and it has its
+own test (`the_indent_base_is_the_shallowest_row_not_merely_the_first`).
+
+This composes with the earlier `WATERFALL_MAX_INDENT` cap rather than replacing it: the cap bounds
+the absolute worst case (a pathologically deep chain still cannot eat the column), the relative base
+handles the common one (a normally-nested trace scrolled into). Worth noting that the cap alone was
+the wrong instinct — it treats depth as the problem, when the problem was only ever *shared* depth
+among the rows you can actually see.
+
+The draw-time parameters (`bar_cells`, `name_offset`, `indent_base`) now travel as one
+`WaterfallView` named-field literal instead of a fourth and fifth positional argument, following the
+`SpanSpec` shape already used in `gen-demo-db` for exactly this reason.
+
+119 unit tests in `imbh-tui` (3 new). Verified against a `gen-demo-db` database in a pty.
+
+## Removing the indent cap: clamp the view, not the fact (2026-08-01)
+
+`WATERFALL_MAX_INDENT` is gone. `WaterfallRow::indent` now stores the span's true depth, and the only
+remaining bound is `WATERFALL_MIN_NAME_W` (10) — a floor on the *rendered* indent, applied after
+`visible_indent_base` has subtracted the shallowest depth on screen.
+
+The cap was the wrong instinct, and the previous entry said so before this change made it actionable:
+it treated *depth* as the problem when the problem was only ever depth **shared** by the rows you can
+see. Flattening at level 5 in the row model paid a permanent cost — every trace past that depth lost
+its shape — to solve a case the relative base already handles.
+
+But removing it outright would have been wrong too, and checking that was the whole job. Without the
+cap, a window that happens to span the root and a deep leaf together renders `depth * 2` cells of
+indent into a 20-cell column: at depth 16 that is 32 cells, the name gets `clip_field(name, 0, ..)`,
+and the row draws as pure indent with **no name at all**. Not a crash — the `.min(WATERFALL_NAME_W)`
+clamp was already there — just a silently nameless row. That case is reachable in ordinary data: a
+start-time-ordered waterfall puts a shallow sibling directly under a deep subtree, which is exactly
+what drops the base back to zero. So the bound moved rather than vanished, from the stored fact to
+the drawn quantity.
+
+The general shape is worth keeping: **prefer clamping a derived, view-dependent quantity at draw time
+over truncating the underlying fact at build time.** The model should not lose information the view
+merely cannot show today — the view's constraints change (a wider pane, a relative base, a different
+column layout) and a truncated model cannot recover what it threw away. Same discipline as storing
+the bars as duration *fractions* and resolving cells at draw time, which this crate already had.
+
+Verified against `gen-demo-db --deep-hops 8` (38 spans, depth 17) in a pty: at the top of the pane
+true depth now renders where it used to flatten at level 5; scrolled to the bottom, where a shallow
+sibling pulls the base to zero and the visible rows span more than five levels, the floor engages and
+every row still keeps its ten name cells. 119 unit tests in `imbh-tui`; the cap's test became
+`depth_is_stored_uncapped_and_floored_only_at_draw_time`, which asserts the model keeps every level
+and that no rendered row can lose its name.
+
+## Correction: the ambiguous bar glyph is not a bug (2026-08-01)
+
+The 2026-08-01 sticky-waterfall follow-up entry above records, as a "pre-existing latent bug", that
+`━` U+2501 is East-Asian-width ambiguous and therefore violates this crate's own EAW rule. That
+finding is **wrong** and is retracted here; no code changed.
+
+The user's one-line objection was decisive: *"Don't we already use the symbols for pane frames?"* We
+do. Probed, every glyph in ratatui's default `border::PLAIN` set — `│ ─ ┌ ┐ └ ┘` — is ambiguous in
+exactly the same way as the bar, `width` 1 against `width_cjk` 2. So the bar is not an outlier
+violating a rule the rest of the UI obeys; it is consistent with every bordered pane on the screen.
+
+Which means the framing was incoherent from the start. If a terminal really renders ambiguous as two
+cells, the frames break identically and the entire UI is already unusable — fixing the bar alone
+would buy nothing. And if it does not, nothing was broken. ratatui's cell grid assumes
+ambiguous-as-narrow, as does essentially every terminal UI framework; that is why CJK users generally
+configure ambiguous-width to 1, and it is what `--ascii` exists for.
+
+The mistake was over-applying a documented rule past its actual scope. The LTM pitfall said
+"decorative glyphs must be EAW-unambiguous", with examples (`● • · ▼ ▶`) that are all accent glyphs
+inside strings *our own* alignment arithmetic measures — the menu-bar brand, hint separators, tree
+markers. Box-drawing chrome that ratatui lays out on its grid was never the target. The tell I walked
+straight past: when a "violation" turns out to be everywhere in a codebase that documents the rule it
+supposedly violates, the rule almost certainly means something narrower than the reading that
+produced the finding. Checking the *neighbours* of a suspected violation is cheap and would have
+caught this before it was written down as a defect.
+
+The rule in `LTM/imbh-tui-and-gen-demo-db.md` has been split in two so the next reader cannot repeat
+it: an explicit "box-drawing is the deliberate exception, do not fix it" entry, and the original rule
+restated with its real scope. The probe result is recorded there too, since it is the useful part of
+the exercise: the whole box-drawing *and* block-element repertoire is ambiguous (`━ ─ ═ ┄ █ ▄ ▀ ▂ ▁
+■ — ― ‾`), and the only safe bar-ish glyphs are `▬ ╌ − ⎯ ⸺ ¯ ‗` plus ASCII — so there is no drop-in
+replacement that preserves the look, which is the second reason not to have gone down this road.

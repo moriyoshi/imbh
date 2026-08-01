@@ -15,13 +15,15 @@
 //! deliberately anchored to the current time. Options:
 //!
 //! ```text
-//! gen-demo-db <dir> [--minutes N] [--step-seconds N]
+//! gen-demo-db <dir> [--minutes N] [--step-seconds N] [--deep-hops N]
 //! ```
 //!
 //! `--minutes` (default 15) is how far back the demo history reaches; `--step-seconds` (default 15)
-//! is the sample spacing. The random signal *content* comes from a fixed-seed PRNG, but trace and
-//! span ids are salted with the run's wall-clock anchor so re-running against an already-populated
-//! directory appends fresh, non-colliding traces instead of corrupting the earlier run's.
+//! is the sample spacing; `--deep-hops` (default 5) is how many service hops the deep trace each step
+//! chains together, which sets both its span count and its nesting depth. The random signal *content*
+//! comes from a fixed-seed PRNG, but trace and span ids are salted with the run's wall-clock anchor so
+//! re-running against an already-populated directory appends fresh, non-colliding traces instead of
+//! corrupting the earlier run's.
 
 use std::error::Error;
 use std::path::PathBuf;
@@ -43,6 +45,16 @@ use prost::Message;
 const SERVICES: [&str; 4] = ["cart", "checkout", "search", "payments"];
 const HOSTS: [&str; 2] = ["host-a", "host-b"];
 const ROUTES: [&str; 4] = ["/cart", "/checkout", "/search", "/pay"];
+/// Entry route of the deep trace ([`deep_trace_body`]). Distinct from [`ROUTES`] so the deep trace is
+/// instantly recognisable in the explorer's trace list.
+const DEEP_ROUTE: &str = "/checkout/payment-authorization";
+/// Routes the deep trace's downstream handlers serve, cycled per hop.
+const DEEP_HOP_ROUTES: [&str; 4] = [
+    "/orders/reserve",
+    "/payments/authorize",
+    "/ledger/post-entry",
+    "/notifications/enqueue",
+];
 /// Cumulative histogram bucket upper bounds (seconds), shared by every latency histogram.
 const LATENCY_BOUNDS: [f64; 7] = [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5];
 
@@ -78,7 +90,8 @@ fn main() -> Result<(), Box<dyn Error>> {
             b.ingest_otlp_metrics(&metrics_body(t, &mut state, &mut rng, &mut n_metrics))?;
             // Generate the traces first, then derive the log records from the spans they emitted so
             // each log carries a valid trace/span id.
-            let (traces, spans) = traces_body(t, &mut rng, &mut span_seq, &mut n_spans);
+            let (traces, spans) =
+                traces_body(t, &mut rng, &mut span_seq, &mut n_spans, config.deep_hops);
             b.ingest_otlp_traces(&traces)?;
             b.ingest_otlp_logs(&logs_body(t, &spans, &mut rng, &mut n_logs))?;
         }
@@ -137,6 +150,9 @@ struct Config {
     dir: PathBuf,
     minutes: u64,
     step_seconds: u64,
+    /// Service hops in the deep trace emitted each step (see [`deep_trace_body`]). Each hop adds two
+    /// nesting levels and four spans, so this is the knob for how deep and how long that trace is.
+    deep_hops: u64,
 }
 
 impl Config {
@@ -144,11 +160,12 @@ impl Config {
         let mut args = std::env::args_os().skip(1);
         let dir = args
             .next()
-            .ok_or("usage: gen-demo-db <dir> [--minutes N] [--step-seconds N]")?;
+            .ok_or("usage: gen-demo-db <dir> [--minutes N] [--step-seconds N] [--deep-hops N]")?;
         let mut config = Config {
             dir: PathBuf::from(dir),
             minutes: 15,
             step_seconds: 15,
+            deep_hops: 5,
         };
         while let Some(flag) = args.next() {
             let mut value = || -> Result<u64, Box<dyn Error>> {
@@ -161,6 +178,7 @@ impl Config {
             match flag.to_string_lossy().as_ref() {
                 "--minutes" => config.minutes = value()?,
                 "--step-seconds" => config.step_seconds = value()?,
+                "--deep-hops" => config.deep_hops = value()?,
                 other => return Err(format!("unknown argument: {other}").into()),
             }
         }
@@ -373,16 +391,19 @@ fn nest(start: u64, dur: u64, start_pct: u64, dur_pct: u64) -> (u64, u64) {
 /// ERROR status propagates up the calling path (downstream SERVER → rpc → entry), while the sibling
 /// branches stay OK — as a real bubbled-up error would. Returns the encoded body along with a
 /// [`SpanRef`] per emitted span so `logs_body` can correlate log records to real spans.
+///
+/// Each step also emits one deep, span-heavy trace ([`deep_trace_body`]) alongside these three.
 fn traces_body(
     t: u64,
     rng: &mut Rng,
     span_seq: &mut u64,
     count: &mut usize,
+    deep_hops: u64,
 ) -> (Vec<u8>, Vec<SpanRef>) {
     const TRACES_PER_STEP: usize = 3;
     const SPANS_PER_TRACE: usize = 7;
-    let mut resource_spans = Vec::with_capacity(TRACES_PER_STEP * 2);
-    let mut refs = Vec::with_capacity(TRACES_PER_STEP * SPANS_PER_TRACE);
+    let mut resource_spans = Vec::with_capacity(TRACES_PER_STEP * 2 + SERVICES.len());
+    let mut refs = Vec::with_capacity(TRACES_PER_STEP * SPANS_PER_TRACE + 4 * deep_hops as usize);
     for _ in 0..TRACES_PER_STEP {
         let entry_idx = rng.below(SERVICES.len() as u64) as usize;
         let entry_service = SERVICES[entry_idx];
@@ -592,10 +613,245 @@ fn traces_body(
         });
     }
 
+    let (deep_spans, deep_refs) = deep_trace_body(t, rng, span_seq, count, deep_hops);
+    resource_spans.extend(deep_spans);
+    refs.extend(deep_refs);
+
     (
         ExportTraceServiceRequest { resource_spans }.encode_to_vec(),
         refs,
     )
+}
+
+/// One deep, span-heavy trace: a checkout entry point that fans out locally and then chains
+/// `hops` service-to-service calls, each nesting two levels deeper than the last:
+///
+/// ```text
+/// POST /checkout/payment-authorization  SERVER    entry  depth 0
+/// ├─ authz.check.entitlements           INTERNAL  entry  depth 1
+/// ├─ cart.load.line-items               INTERNAL  entry  depth 1
+/// ├─ inventory.check.availability       INTERNAL  entry  depth 1
+/// ├─ cache.get.customer-session         INTERNAL  entry  depth 1
+/// ├─ db.query.checkout-summary          CLIENT    entry  depth 1
+/// └─ rpc svc-1                          CLIENT    entry  depth 1
+///    └─ POST /hop-1                     SERVER    svc-1  depth 2
+///       ├─ db.query.orders-by-customer  CLIENT    svc-1  depth 3
+///       ├─ cache.get.customer-session   INTERNAL  svc-1  depth 3
+///       └─ rpc svc-2                    CLIENT    svc-1  depth 3
+///          └─ POST /hop-2               SERVER    svc-2  depth 4   … and so on, `hops` times
+/// ```
+///
+/// At the default 5 hops that is 23 spans nested 11 deep — far more than a terminal pane shows at
+/// once, which is the point: it is the fixture for the trace detail's sticky waterfall, where the
+/// enclosing spans stay pinned as you scroll into the leaves. The names are deliberately longer than
+/// the waterfall's name column so its horizontal scrolling has something to reveal.
+///
+/// Every span reuses an existing [`Role`], so `logs_body` correlates log records to these spans with
+/// no special casing. Roughly one deep trace in four fails at the *innermost* `db.query`, with ERROR
+/// propagating up the whole chain — the case where pinned ancestors matter most.
+fn deep_trace_body(
+    t: u64,
+    rng: &mut Rng,
+    span_seq: &mut u64,
+    count: &mut usize,
+    hops: u64,
+) -> (Vec<ResourceSpans>, Vec<SpanRef>) {
+    let entry_idx = rng.below(SERVICES.len() as u64) as usize;
+    let entry_service = SERVICES[entry_idx];
+    let is_error = rng.below(4) == 0;
+    let trace = trace_id(bump(span_seq));
+
+    // The chain revisits services once it is longer than SERVICES, so spans are collected with their
+    // service and grouped into one ResourceSpans each at the end rather than per-hop.
+    let mut spans: Vec<(&'static str, Span)> = Vec::new();
+    let mut refs = Vec::new();
+
+    let root_id = span_id(bump(span_seq));
+    let root_dur = 200_000_000 + rng.below(100_000_000); // 200–300 ms
+    spans.push((
+        entry_service,
+        build_span(
+            &trace,
+            SpanSpec {
+                id: root_id.clone(),
+                parent: Vec::new(),
+                name: format!("POST {DEEP_ROUTE}"),
+                kind: 2, // SERVER
+                start: t,
+                dur: root_dur,
+                is_error,
+                attributes: vec![
+                    kv("http.route", str_val(DEEP_ROUTE)),
+                    kv("http.method", str_val("POST")),
+                ],
+            },
+        ),
+    ));
+    refs.push(span_ref(
+        &trace,
+        root_id.clone(),
+        entry_service,
+        DEEP_ROUTE,
+        Role::Entry,
+        is_error,
+    ));
+
+    // The entry service's own leaves, so the root has enough children to fill a pane on its own.
+    for (offset, (name, kind, role)) in [
+        ("authz.check.entitlements", 1, Role::Authz),
+        ("cart.load.line-items", 1, Role::Authz),
+        ("inventory.check.availability", 1, Role::Authz),
+        ("cache.get.customer-session", 1, Role::Cache),
+        ("db.query.checkout-summary", 3, Role::Db),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let id = span_id(bump(span_seq));
+        let (start, dur) = nest(t, root_dur, 2 + offset as u64 * 3, 8);
+        spans.push((
+            entry_service,
+            build_span(
+                &trace,
+                SpanSpec {
+                    id: id.clone(),
+                    parent: root_id.clone(),
+                    name: name.to_owned(),
+                    kind,
+                    start,
+                    dur,
+                    is_error: false,
+                    attributes: vec![kv("code.namespace", str_val(name))],
+                },
+            ),
+        ));
+        refs.push(span_ref(&trace, id, entry_service, DEEP_ROUTE, role, false));
+    }
+
+    // The hop chain. Each hop is a CLIENT `rpc` under the previous handler plus the SERVER handler it
+    // calls, so every hop nests two levels deeper. `nest` keeps each window inside its parent's; at
+    // 90 %/94 % per hop a five-hop chain still retains ~45 % of the root, so no bar collapses to the
+    // one-cell floor the waterfall renderer clamps to.
+    let (mut parent_id, mut parent_start, mut parent_dur) = (root_id, t, root_dur);
+    for hop in 1..=hops {
+        let service = SERVICES[(entry_idx + hop as usize) % SERVICES.len()];
+        let route: &'static str = DEEP_HOP_ROUTES[(hop as usize - 1) % DEEP_HOP_ROUTES.len()];
+        let innermost = hop == hops;
+
+        let rpc_id = span_id(bump(span_seq));
+        let (rpc_start, rpc_dur) = nest(parent_start, parent_dur, 5, 90);
+        spans.push((
+            SERVICES[(entry_idx + hop as usize - 1) % SERVICES.len()],
+            build_span(
+                &trace,
+                SpanSpec {
+                    id: rpc_id.clone(),
+                    parent: parent_id,
+                    name: format!("rpc {service}.checkout-service"),
+                    kind: 3, // CLIENT
+                    start: rpc_start,
+                    dur: rpc_dur,
+                    is_error,
+                    attributes: vec![kv("rpc.service", str_val(service))],
+                },
+            ),
+        ));
+        refs.push(span_ref(
+            &trace,
+            rpc_id.clone(),
+            SERVICES[(entry_idx + hop as usize - 1) % SERVICES.len()],
+            route,
+            Role::Rpc,
+            is_error,
+        ));
+
+        let handler_id = span_id(bump(span_seq));
+        let (handler_start, handler_dur) = nest(rpc_start, rpc_dur, 3, 94);
+        spans.push((
+            service,
+            build_span(
+                &trace,
+                SpanSpec {
+                    id: handler_id.clone(),
+                    parent: rpc_id,
+                    name: format!("POST {route}"),
+                    kind: 2, // SERVER
+                    start: handler_start,
+                    dur: handler_dur,
+                    is_error,
+                    attributes: vec![kv("http.route", str_val(route))],
+                },
+            ),
+        ));
+        refs.push(span_ref(
+            &trace,
+            handler_id.clone(),
+            service,
+            route,
+            Role::Downstream,
+            is_error,
+        ));
+
+        // Two leaves under each handler. Only the innermost hop's query is the failure's origin.
+        for (name, kind, role, failing, start_pct, dur_pct) in [
+            (
+                "db.query.orders-by-customer",
+                3,
+                Role::Db,
+                innermost && is_error,
+                6u64,
+                30u64,
+            ),
+            ("cache.get.customer-session", 1, Role::Cache, false, 40, 30),
+        ] {
+            let id = span_id(bump(span_seq));
+            let (start, dur) = nest(handler_start, handler_dur, start_pct, dur_pct);
+            spans.push((
+                service,
+                build_span(
+                    &trace,
+                    SpanSpec {
+                        id: id.clone(),
+                        parent: handler_id.clone(),
+                        name: name.to_owned(),
+                        kind,
+                        start,
+                        dur,
+                        is_error: failing,
+                        attributes: vec![kv("code.namespace", str_val(name))],
+                    },
+                ),
+            ));
+            refs.push(span_ref(&trace, id, service, route, role, failing));
+        }
+
+        parent_id = handler_id;
+        parent_start = handler_start;
+        parent_dur = handler_dur;
+    }
+
+    *count += spans.len();
+
+    // Group by service: one ResourceSpans per service that appears anywhere in the chain.
+    let resource_spans = SERVICES
+        .iter()
+        .filter_map(|service| {
+            let owned: Vec<Span> = spans
+                .iter()
+                .filter(|(name, _)| name == service)
+                .map(|(_, span)| span.clone())
+                .collect();
+            (!owned.is_empty()).then(|| ResourceSpans {
+                resource: Some(service_resource(service)),
+                scope_spans: vec![ScopeSpans {
+                    spans: owned,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })
+        })
+        .collect();
+    (resource_spans, refs)
 }
 
 fn span_ref(
