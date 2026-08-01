@@ -2284,3 +2284,60 @@ ambiguous as one cell is the assumption every bordered pane already makes (see t
 above). `--ascii` mode uses `...` and stays exact. If a CJK-configured terminal ever shows a truncated
 row's bar one cell right of its neighbours', this is the cause and the fix is an ASCII marker in both
 modes.
+
+## Backspace walks the screen series, not the visit history (2026-08-01)
+
+**Ask.** Bind Backspace to "go to the previous screen in the screen series it belongs to" —
+explicitly *not* the existing `←`/Esc, which pop the browser-style visit history.
+
+**Model.** Each `Screen` owns a fixed chain of views: `Metrics → MetricDetail`,
+`Traces → TraceDetail → SpanDetail`, `Logs → LogDetail`, `Overview` alone. `App::series_parent`
+maps the current `Route` to the previous rung of that chain (`None` on a list route, which is a
+series' first view), and `App::go_up` performs the move. The two axes now read cleanly: `←`/`→`
+are *how you got here*, Backspace is *where this view sits*. They diverge whenever a view was
+reached by a jump — a trace detail opened by the log→trace drill-down steps up to the Traces list,
+where Back returns to the log.
+
+**Rebuilding the parent.** `Route` variants carry their own data, so most rungs are trivial to
+mint. `SpanDetail` is the exception: it holds `trace_id` + one span, not the whole trace. The trace
+is recovered from `App::trace_detail` (the materialized trace retained behind the Traces preview
+pane) and, failing that, from a `TraceDetail` still on the back stack — a *data* lookup only, never
+a choice of destination. With neither available the step lands on the Traces list: still up its own
+series, just skipping the rung there is no longer data for.
+
+**State hygiene.** `go_up` pushes the departed view (so `←` undoes the step), resets focus/scroll,
+and drops the intents scoped to the view being left (`pending_trace_open`, the trace focus, the
+metric exemplars) — otherwise a late waterfall could yank the user back down into the detail they
+just stepped out of. `span_cursor` is deliberately *kept* when stepping from a span detail up to its
+trace (the cursor lands back on the span that was open) and cleared only when leaving the trace
+views for a list.
+
+**Lesson.** A keymap change is a hint-string change: the four detail hint bars (`ui/logs.rs`,
+`ui/traces.rs` ×2, `ui/metrics.rs`) each grew a `bksp …` item. The global footer did not — Backspace
+is a no-op on list routes, and advertising an inert key is worse than not advertising it.
+
+## Follow-up: the Metrics series has a rung that is not a `Route` (2026-08-01)
+
+**Report.** "Backspace doesn't work in the metrics screen series." Reproduced by driving the real
+TUI against a `gen-demo-db` database in a tmux session (`tmux send-keys` + `capture-pane` — a
+practical way to exercise a key path end-to-end without a pty test harness): the series *detail*
+stepped up to the series list fine, but on the series list Backspace did nothing.
+
+**Cause.** `series_parent` was written over `Route`, and the Metrics screen's first rung is not one.
+Its chain is catalog → series list → series detail, but the catalog and the series list are *the
+same* `Route::Metrics`, told apart by whether the query is empty (`App::on_catalog`) — the
+catalog→series drilldown is pure query state, no new route (see the earlier entry on it). So the
+series list looked like a series' first view and returned `None`.
+
+**Fix.** The up-step became a small `SeriesUp` enum: `Route(Box<Route>)` for the ordinary rungs plus
+a `Catalog` variant that clears the query instead of changing route (the refresh the key handler
+already issues then renders the tree). Boxed because `Route` inlines its view's whole data (~340
+bytes for a trace detail) while the other variant carries none — clippy's `large_enum_variant` is
+right that a 344-byte enum for a one-bit distinction is the wrong trade when one allocation per
+keypress buys it back.
+
+**Lesson.** "What view am I on" and "what `enum` variant am I in" are not the same question, and a
+navigation feature keyed off the enum will silently skip any view the enum does not name. Before
+declaring a per-screen chain complete, enumerate the *rendered* views (what the user sees as a
+distinct screen), not the routes — the Metrics screen renders three from two variants. The
+divergence was invisible to the unit tests because they, too, were written over `Route`.

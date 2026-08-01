@@ -1,7 +1,27 @@
-//! Navigation state: the menu bar, the keyboard focus ring, and the back/forward history.
+//! Navigation state: the menu bar, the keyboard focus ring, the back/forward history, and the
+//! walk up a screen's own view series.
 
 use crate::app::App;
-use crate::model::{Focus, MENU_LEN, Mode, NavEntry, Screen};
+use crate::model::{Focus, MENU_LEN, Mode, NavEntry, Route, Screen};
+use crate::waterfall::TraceDetail;
+
+/// One step up a screen's view series (see [`App::series_parent`]). Most rungs are a different
+/// [`Route`], but the Metrics series' first one is not: the catalog and the series list are the same
+/// route told apart by whether the query is empty, so stepping onto it is a query change.
+#[derive(Debug, Clone)]
+pub(crate) enum SeriesUp {
+    /// An earlier route in the chain. Boxed because a `Route` carries its view's whole data (a trace
+    /// detail is ~340 bytes) and the other variant carries none — one allocation per `Backspace`.
+    Route(Box<Route>),
+    /// The Metrics catalog — `Route::Metrics` with the query cleared.
+    Catalog,
+}
+
+impl SeriesUp {
+    fn route(route: Route) -> Self {
+        Self::Route(Box::new(route))
+    }
+}
 
 impl App {
     /// Activate the menu bar (`F9`), starting the highlight on the current screen.
@@ -171,13 +191,90 @@ impl App {
             false
         }
     }
+
+    /// The materialized trace for `trace_id`: the one retained behind the Traces preview pane, else a
+    /// trace detail still sitting on the back stack. Purely a *data* lookup for rebuilding the parent
+    /// view — where an up-navigation goes is fixed by the series, never by what was visited.
+    fn series_trace(&self, trace_id: &str) -> Option<TraceDetail> {
+        if let Some(detail) = self
+            .trace_detail
+            .as_ref()
+            .filter(|detail| detail.trace_id == trace_id)
+        {
+            return Some(detail.clone());
+        }
+        self.back.iter().rev().find_map(|entry| match &entry.route {
+            Route::TraceDetail { detail } if detail.trace_id == trace_id => Some(detail.clone()),
+            _ => None,
+        })
+    }
+
+    /// The view one step earlier in this screen's *series* — the chain a screen drills through
+    /// (`catalog → Metrics → MetricDetail`, `Traces → TraceDetail → SpanDetail`, `Logs → LogDetail`) —
+    /// regardless of how the current view was reached. `None` on a series' first view, which has
+    /// nothing above it.
+    ///
+    /// A span detail whose trace can no longer be materialized (see [`Self::series_trace`]) steps to the
+    /// Traces list instead: still up its own series, just skipping the rung there is no longer data for.
+    pub(crate) fn series_parent(&self) -> Option<SeriesUp> {
+        match &self.route {
+            Route::MetricDetail { .. } => Some(SeriesUp::route(Route::Metrics)),
+            Route::LogDetail { .. } => Some(SeriesUp::route(Route::Logs)),
+            Route::TraceDetail { .. } => Some(SeriesUp::route(Route::Traces)),
+            Route::SpanDetail { trace_id, .. } => Some(SeriesUp::route(
+                self.series_trace(trace_id)
+                    .map_or(Route::Traces, |detail| Route::TraceDetail { detail }),
+            )),
+            // The Metrics series has a rung below its list route: the catalog the series list was built
+            // from. `on_catalog` (an empty query) tells the two apart, so a series list steps up to the
+            // catalog and only the catalog itself is the series' first view.
+            Route::Metrics if !self.on_catalog() => Some(SeriesUp::Catalog),
+            Route::Overview | Route::Metrics | Route::Traces | Route::Logs => None,
+        }
+    }
+
+    /// Walk one step up the screen series (`Backspace`), recording the departed view so `←` undoes the
+    /// move. Unlike [`Self::go_back`] this ignores the visit history entirely: a trace detail opened by
+    /// a log→trace jump steps up to the Traces list, where Back would return to the log it came from.
+    /// Returns whether a move happened, so the caller reloads the destination's data.
+    pub(crate) fn go_up(&mut self) -> bool {
+        let Some(step) = self.series_parent() else {
+            return false;
+        };
+        self.push_history();
+        match step {
+            SeriesUp::Route(route) => self.route = *route,
+            // The catalog is reached by dropping the query, not by changing route; the refresh the
+            // caller issues then renders the tree instead of a series table. The row cursor indexed the
+            // series rows, which mean nothing in the catalog, so it restarts at the top.
+            SeriesUp::Catalog => {
+                self.active_query_mut().clear();
+                self.selected = 0;
+            }
+        }
+        self.scroll = 0;
+        self.focus = Focus::Primary;
+        self.mode = Mode::Normal;
+        self.completion = None;
+        // Drill-down intents and exemplar markers belong to the view being left; a late waterfall must
+        // not yank the user back down into the detail they just stepped out of.
+        self.pending_trace_open = false;
+        self.clear_trace_focus();
+        self.metric_exemplars.clear();
+        // Stepping out of the trace views entirely retires the waterfall cursor; stepping from a span
+        // detail up to its trace keeps it, so the cursor lands back on the span that was open.
+        if !self.route.is_detail() {
+            self.span_cursor = 0;
+        }
+        true
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::model::{LogCorrelation, MetricDetail, Route};
-    use crate::testutil::sample_log_record;
+    use crate::testutil::{metrics_app_with_series, sample_log_record, traces_app_with_trace};
 
     #[test]
     fn menu_cursor_wraps_over_screens_and_the_range_item() {
@@ -336,6 +433,122 @@ mod tests {
             !app.go_forward(),
             "a new navigation clears the redo history"
         );
+    }
+
+    #[test]
+    fn up_walks_the_screen_series_regardless_of_how_the_view_was_reached() {
+        // The state a log→trace jump leaves: parked on a trace detail with the *log* detail behind it.
+        let mut app = traces_app_with_trace();
+        app.route = Route::LogDetail {
+            record: sample_log_record(Some("aa")),
+        };
+        app.push_history();
+        let detail = app.trace_detail.clone().expect("materialized trace");
+        app.route = Route::TraceDetail { detail };
+
+        // Up follows the Traces series (→ the trace list), where Back would return to the log detail.
+        assert!(app.go_up());
+        assert!(matches!(app.route, Route::Traces));
+        // The departed view is recorded, so `←` undoes the step up.
+        assert!(app.go_back());
+        assert!(app.route_trace_detail().is_some());
+
+        // Back on the log detail, Up follows the *Logs* series instead.
+        assert!(app.go_back());
+        assert!(app.route_log_record().is_some());
+        assert!(app.go_up());
+        assert!(matches!(app.route, Route::Logs));
+    }
+
+    #[test]
+    fn up_from_a_span_detail_lands_on_its_trace_with_the_cursor_on_that_span() {
+        let mut app = traces_app_with_trace();
+        assert!(app.open_trace_detail());
+        app.move_span_cursor(2);
+        assert!(app.open_span_detail());
+
+        assert!(app.go_up());
+        let detail = app.route_trace_detail().expect("stepped up to the trace");
+        assert_eq!(detail.spans.len(), 3);
+        assert_eq!(app.span_cursor, 2, "the cursor is back on the open span");
+
+        // One more step up leaves the trace views for the list, retiring the waterfall cursor.
+        assert!(app.go_up());
+        assert!(matches!(app.route, Route::Traces));
+        assert_eq!(app.span_cursor, 0);
+    }
+
+    #[test]
+    fn up_from_a_span_detail_falls_back_to_the_list_when_its_trace_is_gone() {
+        // A span detail whose trace is neither retained nor on the back stack: the trace-detail rung
+        // has no data to rebuild from, so the step lands on the Traces list instead.
+        let mut app = traces_app_with_trace();
+        let span = app.trace_detail.as_ref().unwrap().spans[1].clone();
+        app.trace_detail = None;
+        app.route = Route::SpanDetail {
+            trace_id: "0123456789abcdef0123456789abcdef".to_owned(),
+            span,
+        };
+        assert!(app.go_up());
+        assert!(matches!(app.route, Route::Traces));
+    }
+
+    #[test]
+    fn up_is_a_noop_on_a_series_first_view() {
+        let mut app = App::new();
+        // The Metrics list route is the *catalog* only while its query is empty, which `App::new` is.
+        for route in [Route::Overview, Route::Metrics, Route::Traces, Route::Logs] {
+            app.route = route;
+            assert!(app.series_parent().is_none());
+            assert!(!app.go_up(), "the first view of a series has nothing above");
+            assert!(app.back.is_empty(), "a no-op records no history");
+        }
+
+        // A metric detail, by contrast, steps up to the series list.
+        app.route = Route::MetricDetail {
+            detail: MetricDetail {
+                labels: "svc=a".into(),
+                query: "up".into(),
+                points: vec![(1, 1.0)],
+            },
+        };
+        assert!(app.go_up());
+        assert!(matches!(app.route, Route::Metrics));
+    }
+
+    #[test]
+    fn up_walks_the_metrics_series_through_the_series_list_to_the_catalog() {
+        // The Metrics series has a rung that is not a route: the catalog the series list was built
+        // from, told apart by an empty query. Drill catalog -> series list -> series detail...
+        let mut app = metrics_app_with_series();
+        app.selected = 0;
+        assert!(app.open_metric_detail());
+        assert_eq!(app.metric_exemplars.len(), 0);
+
+        // ...then walk back up it. The detail steps to the series list, query intact.
+        assert!(app.go_up());
+        assert!(matches!(app.route, Route::Metrics));
+        assert_eq!(app.active_query(), "up");
+        assert!(!app.on_catalog(), "still the series list");
+
+        // The series list steps to the catalog: same route, query dropped.
+        assert!(app.go_up());
+        assert!(matches!(app.route, Route::Metrics));
+        assert_eq!(app.active_query(), "");
+        assert!(app.on_catalog());
+        assert_eq!(
+            app.selected, 0,
+            "the series row cursor does not index the tree"
+        );
+
+        // The catalog is the series' first view.
+        assert!(!app.go_up());
+
+        // Each step is recorded, so `←` walks back down: catalog -> series list -> detail.
+        assert!(app.go_back());
+        assert_eq!(app.active_query(), "up");
+        assert!(app.go_back());
+        assert!(app.route_metric_detail().is_some());
     }
 
     #[test]
