@@ -3,93 +3,52 @@
 use imbh::{AnyValue, Attributes, SeverityNumber};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-/// Left-align a horizontally scrolled window of `text` into a field that is exactly `width`
-/// *terminal cells* wide, showing the text from `offset` cells in. Honors East Asian width: wide
-/// glyphs (CJK, etc.) count as two cells, so the window is measured by display width rather than by
-/// `char` count, and a wide glyph straddling either edge is dropped in favour of a pad space so the
-/// total stays exact.
+/// Left-align `text` into a field that is exactly `width` *terminal cells* wide, padding when it fits
+/// and truncating it with a trailing `ellipsis` when it does not. Honors East Asian width: wide
+/// glyphs (CJK, etc.) count as two cells, so the field is measured by display width rather than by
+/// `char` count, and a wide glyph straddling the cut is dropped in favour of a pad space so the total
+/// stays exact.
 ///
-/// Clipping is marked in-band: a `<` in the first cell means text is hidden to the left, a `>` in
-/// the last cell means text is hidden to the right. Both *overwrite* an edge cell rather than
-/// stealing width, so the field is always exactly `width` cells — which is what keeps the
-/// waterfall's `|bar|` axis aligned across rows of any depth. Both markers are ASCII, so this is
-/// also what keeps a truncated name from leaking a non-ASCII glyph in `--ascii` mode.
-pub(crate) fn clip_field(text: &str, width: usize, offset: usize) -> String {
+/// The `ellipsis` is *reserved out of* the field rather than overwriting its last cell, so the result
+/// is always exactly `width` cells — which is what keeps the waterfall's `|bar|` axis aligned across
+/// rows. Pass the caller's mode-appropriate marker ([`Glyphs::ellipsis`](crate::ui::glyphs::Glyphs),
+/// `"..."` in `--ascii` mode) so a truncated name cannot leak a non-ASCII glyph.
+///
+/// A field too narrow to hold the marker at all drops it: an exact-width field matters more than
+/// announcing the truncation, and a field that is *all* marker says nothing anyway.
+pub(crate) fn fit_field(text: &str, width: usize, ellipsis: &str) -> String {
     if width == 0 {
         return String::new();
     }
     let total = UnicodeWidthStr::width(text);
-    // Walk the text once, keeping the cells that fall inside the `[offset, offset + width)` window.
-    // A glyph straddling either edge is dropped and its cells are padded, so `used` stays exact.
-    let mut out = String::new();
-    let mut at = 0usize; // cells consumed from `text` so far
-    let mut used = 0usize; // cells written into the window so far
-    for ch in text.chars() {
-        let w = UnicodeWidthChar::width(ch).unwrap_or(0);
-        if at + w > offset + width {
-            break;
-        }
-        if at >= offset {
-            out.push(ch);
-            used += w;
-        } else if at + w > offset {
-            // A wide glyph straddling the left edge: pad the cells that fall inside the window.
-            let inside = at + w - offset;
-            out.extend(std::iter::repeat_n(' ', inside));
-            used += inside;
-        }
-        at += w;
-    }
-    out.extend(std::iter::repeat_n(' ', width - used));
-
-    // Overwrite the edge cells with the clip markers, replacing whatever glyph sits there. Done on
-    // the char sequence (not by byte index) so a multi-byte glyph at an edge is replaced whole.
-    let hidden_left = offset > 0 && total > 0;
-    let hidden_right = total > offset + width;
-    if !hidden_left && !hidden_right {
+    if total <= width {
+        let mut out = text.to_owned();
+        out.extend(std::iter::repeat_n(' ', width - total));
         return out;
     }
-    let mut cells: Vec<String> = Vec::with_capacity(width);
-    for ch in out.chars() {
-        let w = UnicodeWidthChar::width(ch).unwrap_or(0);
-        cells.push(ch.to_string());
-        // A wide glyph owns two cells; the trailing one is a placeholder we can drop if a marker
-        // lands on it, in which case the glyph itself is replaced by a pad space.
-        for _ in 1..w {
-            cells.push(String::new());
-        }
-    }
-    let mark = |cells: &mut Vec<String>, index: usize, marker: char| {
-        // Walking back to the owning glyph keeps the field exact when a marker lands on the second
-        // half of a wide glyph: the glyph goes, a marker plus a pad space take its two cells.
-        let mut owner = index;
-        while owner > 0 && cells[owner].is_empty() {
-            owner -= 1;
-        }
-        let span = 1 + cells[owner + 1..]
-            .iter()
-            .take_while(|c| c.is_empty())
-            .count();
-        cells[owner] = if owner == index {
-            marker.to_string()
-        } else {
-            " ".to_owned()
-        };
-        for (slot, cell) in cells[owner + 1..owner + span].iter_mut().enumerate() {
-            *cell = if owner + 1 + slot == index {
-                marker.to_string()
-            } else {
-                " ".to_owned()
-            };
-        }
+    let marker = UnicodeWidthStr::width(ellipsis);
+    let (keep, marker) = if marker < width {
+        (width - marker, marker)
+    } else {
+        (width, 0)
     };
-    if hidden_left {
-        mark(&mut cells, 0, '<');
+    let mut out = String::new();
+    let mut used = 0usize; // cells written so far
+    for ch in text.chars() {
+        let w = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if used + w > keep {
+            break;
+        }
+        out.push(ch);
+        used += w;
     }
-    if hidden_right {
-        mark(&mut cells, width - 1, '>');
+    // A wide glyph straddling the cut is dropped whole, so pad the single cell it would have half
+    // filled — dropping it silently would leave the field a cell short and shift the axis.
+    out.extend(std::iter::repeat_n(' ', keep - used));
+    if marker > 0 {
+        out.push_str(ellipsis);
     }
-    cells.concat()
+    out
 }
 
 /// Compact display of a metric value: integers without a fractional part, non-integers to 4 dp, and
@@ -178,64 +137,44 @@ mod tests {
     use super::*;
 
     #[test]
-    fn clip_field_pads_and_truncates_by_display_width() {
-        // ASCII: padded to the exact cell count, no markers when nothing is hidden.
-        assert_eq!(clip_field("ab", 5, 0), "ab   ");
-        assert_eq!(UnicodeWidthStr::width(clip_field("ab", 5, 0).as_str()), 5);
+    fn fit_field_pads_and_truncates_by_display_width() {
+        // ASCII: padded to the exact cell count, no marker when nothing is hidden.
+        assert_eq!(fit_field("ab", 5, "…"), "ab   ");
+        assert_eq!(fit_field("abcde", 5, "…"), "abcde", "an exact fit is bare");
         // Wide (CJK) glyphs count as two cells each: 3 chars == 6 cells, padded to 8.
-        let jp = clip_field("あいう", 8, 0);
+        let jp = fit_field("あいう", 8, "…");
         assert_eq!(UnicodeWidthStr::width(jp.as_str()), 8);
         assert!(jp.starts_with("あいう"));
-        // Truncation keeps the field exactly `width` cells including the marker, never over. A wide
-        // glyph straddling the right boundary is dropped and its cells are space-padded.
-        let cut = clip_field("あいうえお", 6, 0);
+        // Truncation keeps the field exactly `width` cells including the marker, never over.
+        assert_eq!(fit_field("abcdef", 5, "…"), "abcd…");
+        assert_eq!(fit_field("abcdefgh", 5, "..."), "ab...");
+        // A wide glyph straddling the cut is dropped whole and its orphaned cell padded.
+        let cut = fit_field("あいうえお", 6, "…");
         assert_eq!(UnicodeWidthStr::width(cut.as_str()), 6);
-        assert!(cut.ends_with('>'), "{cut:?}");
-        // An odd width makes the marker land on the second half of a wide glyph: the glyph goes and
-        // a pad space plus the marker take its two cells, keeping the field exact.
-        let cut_odd = clip_field("あいうえお", 5, 0);
-        assert_eq!(UnicodeWidthStr::width(cut_odd.as_str()), 5);
-        assert!(cut_odd.ends_with('>'), "{cut_odd:?}");
+        assert_eq!(cut, "あい …", "the odd cell is padded, not half a glyph");
     }
 
     #[test]
-    fn clip_field_scrolls_horizontally_and_marks_both_edges() {
-        // Scrolled into the middle: both edges hide text, so both markers show.
-        let mid = clip_field("abcdefghij", 5, 3);
-        assert_eq!(mid, "<efg>");
-        // Scrolled to the tail: nothing hidden on the right, so only `<`.
-        let tail = clip_field("abcdefghij", 5, 5);
-        assert_eq!(tail, "<ghij");
-        // Offset past the end of the text: an honest all-blank window that still marks the left.
-        let past = clip_field("abc", 4, 9);
-        assert_eq!(past, "<   ");
-        // A zero offset over text that fits leaves the field marker-free.
-        assert_eq!(clip_field("abc", 4, 0), "abc ");
-
-        // The field is exactly `width` cells at every offset, for wide glyphs too, and a marker only
-        // ever claims an edge cell — the invariant the waterfall's bar alignment rests on.
-        for text in ["abcdefghij", "あいうえお", "aあbいc"] {
-            for width in 1..=8usize {
-                for offset in 0..12usize {
-                    let out = clip_field(text, width, offset);
+    fn fit_field_is_exactly_width_cells_for_every_input() {
+        // The invariant the waterfall's bar alignment rests on, over narrow fields, wide glyphs, and
+        // both markers — including widths too small to hold the marker at all, where it is dropped.
+        for text in ["", "abcdefghij", "あいうえお", "aあbいc"] {
+            for width in 0..=8usize {
+                for ellipsis in ["…", "..."] {
+                    let out = fit_field(text, width, ellipsis);
                     assert_eq!(
                         UnicodeWidthStr::width(out.as_str()),
                         width,
-                        "clip_field({text:?}, {width}, {offset}) == {out:?}"
+                        "fit_field({text:?}, {width}, {ellipsis:?}) == {out:?}"
                     );
                 }
             }
         }
-    }
-
-    #[test]
-    fn clip_field_marks_an_edge_only_when_text_is_really_hidden() {
-        // Text exactly filling the window: no marker on either side.
-        assert_eq!(clip_field("abcde", 5, 0), "abcde");
-        // One cell over on the right only.
-        assert_eq!(clip_field("abcdef", 5, 0), "abcd>");
-        // Empty text never claims to hide anything, whatever the offset.
-        assert_eq!(clip_field("", 3, 4), "   ");
+        // Too narrow for the marker: the text is cut bare rather than replaced by a marker that
+        // would fill the field and say nothing.
+        assert_eq!(fit_field("abcdef", 3, "..."), "abc");
+        // Empty text never claims to hide anything.
+        assert_eq!(fit_field("", 3, "…"), "   ");
     }
 
     #[test]

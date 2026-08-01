@@ -13,8 +13,8 @@ use crate::time::{format_duration_ns, format_timestamp_ns};
 use crate::ui::focus_border;
 use crate::ui::glyphs::Glyphs;
 use crate::waterfall::{
-    SpanRecord, TraceDetail, WATERFALL_NAME_W, WATERFALL_SUFFIX_W, WaterfallView, name_offset,
-    render_waterfall, render_waterfall_row, sticky_layout, visible_indent_base,
+    SpanRecord, TraceDetail, WATERFALL_NAME_W, WATERFALL_SUFFIX_W, render_waterfall,
+    render_waterfall_row, sticky_layout,
 };
 
 /// Height (rows, borders included) the selected-span summary pane claims on the trace detail. Below
@@ -112,15 +112,7 @@ pub(crate) fn draw_trace_detail(
             Style::default()
         }
     };
-    // Indent relative to the shallowest span on screen: scrolled deep into a trace every visible row
-    // carries the same leading indent, which buys nothing and costs the name column.
-    let indent_base = visible_indent_base(&detail.waterfall.rows, &layout);
-    let view = WaterfallView {
-        bar_cells,
-        name_offset: name_offset(&detail.waterfall.rows, cursor, indent_base),
-        indent_base,
-    };
-    let lines = render_waterfall(&detail.waterfall, &view);
+    let lines = render_waterfall(&detail.waterfall, bar_cells);
     let items = if detail.spans.is_empty() {
         // A trace with no spans is a real (if degenerate) result, not a blank pane.
         vec![ListItem::new(Span::styled(
@@ -177,7 +169,7 @@ pub(crate) fn draw_trace_detail(
                 let mut text = render_waterfall_row(
                     &detail.waterfall,
                     index,
-                    &view,
+                    bar_cells,
                     detail.waterfall.light_marker,
                 );
                 // Pad to the pane's full inner width so the styling covers the whole row. A waterfall
@@ -482,9 +474,9 @@ mod tests {
             "the pane title must not be underlined:\n{sticky}"
         );
 
-        // A pinned ancestor is scrolled only as far as it has name to hide, so the context band shows
-        // real names even while the scrolling rows below it are shifted well to the right.
-        assert!(sticky.contains("| zz-root  "), "{sticky}");
+        // A pinned ancestor renders its name exactly as a scrolling row would, so the context band
+        // reads as the same waterfall rather than as a differently-laid-out strip above it.
+        assert!(sticky.contains("| zz-root             |"), "{sticky}");
 
         // The pinned block is the crate's `--ascii` guarantee too. The whole-UI sweep runs at 48x10,
         // too short for sticky to engage, so this is the only place that covers it.
@@ -502,33 +494,29 @@ mod tests {
     }
 
     #[test]
-    fn trace_detail_scrolls_the_name_column_to_the_cursors_span_name() {
-        // Every name in this fixture is longer than the 20-cell name column, so the column has to
-        // scroll to show the selected span's name — with `<` marking what it hid.
+    fn trace_detail_truncates_long_span_names_with_an_ellipsis() {
+        // The leaf names in this fixture are longer than the 20-cell name column, so they are cut
+        // with a trailing ellipsis (`...` here, since the test renders in `--ascii` mode). The column
+        // does not scroll, so what it shows does not depend on where the cursor is.
         let mut app = App::new();
         app.route = Route::TraceDetail {
             detail: build_trace_detail(&nested_trace(), true),
         };
-        app.span_cursor = 17;
-        let scrolled = buffer_text(&render_buffer(&app, 80, 24));
-        // A waterfall row is a bordered `|...|` line; the `<` in the ASCII hint line ("esc/< back")
-        // is not, so counting only bordered rows matches real left-clipped names.
-        let clipped = |text: &str| {
-            text.lines()
-                .filter(|line| line.starts_with('|') && line.contains('<'))
-                .count()
-        };
-        assert!(clipped(&scrolled) > 0, "no clip marker:\n{scrolled}");
-        // The cursor row's name is readable right through to its tail.
-        assert!(scrolled.contains("with-a-long-name"), "{scrolled}");
-
-        // Back on the root, whose name fits, the column returns to its unscrolled position: names
-        // read from their first character and nothing claims to be hidden on the left.
         app.span_cursor = 0;
         let home = buffer_text(&render_buffer(&app, 80, 24));
-        assert!(home.contains("| zz-root  "), "{home}");
-        // The long leaf names still overflow the column, but from their *start*, marked with `>`.
-        assert!(home.contains("work-0-with-a-l>"), "{home}");
-        assert_eq!(clipped(&home), 0, "nothing should be clipped left:\n{home}");
+        // A name that fits is shown whole, padded out to the column.
+        assert!(home.contains("| zz-root             |"), "{home}");
+        // One that does not is cut from its start and says so.
+        assert!(home.contains("| work-0-with-a-lon...|"), "{home}");
+
+        // Moving the cursor onto a long name changes the highlight, not the column: the name is cut
+        // at exactly the same place, and no row is ever scrolled off its own start.
+        app.span_cursor = 17;
+        let deep = buffer_text(&render_buffer(&app, 80, 24));
+        assert!(deep.contains("| work-15-with-a-lo...|"), "{deep}");
+        assert!(deep.contains("| zz-root             |"), "{deep}");
+        for line in deep.lines().filter(|line| line.starts_with('|')) {
+            assert!(!line.contains('<'), "a row was scrolled: {line:?}");
+        }
     }
 }

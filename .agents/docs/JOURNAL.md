@@ -2159,3 +2159,128 @@ directly.
 share one flag. When a drill-down is implemented as *switch screen, then let the data pull you the
 rest of the way*, the intent has to be scoped to the thing it is waiting for (here: the trace focus),
 not to the screen it happens to pass through.
+
+## The waterfall name column goes flat: the indent is removed (2026-08-01)
+
+**Change.** Span names in the Traces waterfall are no longer indented by depth. Every row's name
+starts at the first cell of the `WATERFALL_NAME_W` (20) column and gets all of it, at any depth.
+
+**What went with it.** The whole draw-time indent apparatus, since none of it had another consumer:
+`WaterfallRow::indent` (and the `depth` counter in `build_trace_detail` that fed it — the ancestor
+walk stays, it is what flags `malformed`), `WaterfallView::indent_base`, `visible_indent_base`,
+`row_indent_cells`, and the `WATERFALL_MIN_NAME_W` floor. `row_name_offset` / `name_offset` lose
+their `indent_base` parameter: the scroll window is now unconditionally the full column.
+
+**What still carries the tree.** `WaterfallRow::parent_row` and the sticky pinned-ancestor block are
+untouched — the ancestor chain is walked from `parent_row`, never from the depth counter, so pinning,
+the divider underline, and the de-emphasis all behave exactly as before. The bars themselves still
+show containment. This is why the removal is a rendering change and not a data-model loss.
+
+**Consequences worth noting.** The two earlier entries above — *Waterfall indent goes relative to the
+pane* and *Removing the indent cap* — describe machinery that no longer exists; their general lessons
+(clamp the view, not the fact; a shared prefix on every visible row distinguishes nothing) survive the
+code that occasioned them. Two facts they turned on are now moot rather than wrong: the axis-alignment
+invariant no longer depends on `indent + name` summing to a fixed field, because there is no indent to
+sum, and deep rows can never lose name cells to a prefix.
+
+**Tests.** `depth_is_stored_uncapped_and_floored_only_at_draw_time` →
+`the_name_column_is_flush_at_every_depth` (asserts the field starts with the name and is exactly
+`WATERFALL_NAME_W` cells at every depth of a 12-deep chain, and that `ancestor_rows` still walks the
+full chain); `the_indent_never_scrolls_away_under_a_long_name` →
+`a_short_name_is_never_scrolled_into_blankness` (the per-row clamp is what that test now guards, and
+it is the half of the behaviour that survives). The three `indent_base` tests are gone with the
+function. `trace_detail_scrolls_the_name_column_to_the_cursors_span_name` now expects
+`| work-0-with-a-long->`: the leaf name that used to lose five cells to the prefix.
+
+## The name column stops scrolling: ellipsis instead (2026-08-01)
+
+**Change.** The waterfall's name column no longer scrolls horizontally to chase the cursor row's
+name. A name that fits is shown whole; one that does not is cut with a trailing ellipsis. Follows the
+flat-column change above.
+
+**`clip_field` → `fit_field`.** `clip_field(text, width, offset)` was used by nothing but the
+waterfall, so the offset went with the feature rather than surviving as dead generality:
+`fit_field(text, width, ellipsis)`. The bulk of the old function was the marker-overwrite pass — a
+cell-by-cell rebuild so a `<`/`>` landing on the second half of a wide glyph replaced the glyph whole
+and kept the field exact. Truncation with a *reserved* marker needs none of it: measure the ellipsis,
+keep `width - marker` cells of text, pad the one cell an unfittable wide glyph orphans, append.
+Roughly 80 lines to 40, and the exact-width invariant is now obvious by construction instead of
+resting on that pass.
+
+**`WaterfallView` is gone.** With `name_offset` removed it held only `bar_cells`, so it was a
+one-field wrapper standing for a "growing argument list" that had in fact shrunk twice in a row
+(`indent_base`, then `name_offset`). `render_waterfall(waterfall, bar_cells)`.
+
+**Where the ellipsis comes from.** `Waterfall::ellipsis: &'static str`, set from the `ascii` flag next
+to `marker`/`light_marker` — `"..."` / `"…"`, the same pair `Glyphs::ellipsis` already uses. It rides
+the waterfall rather than being read from `Glyphs` at draw time because `render_waterfall` is the one
+renderer with no `Glyphs` in scope, and the mode is already known where the other two glyphs are
+picked. `…` is EAW-ambiguous, and this *is* a field our own arithmetic measures — the narrow reading
+of the EAW rule, not the box-drawing exception. Kept anyway: it is the UI's existing ellipsis, and
+`UnicodeWidthStr::width` giving it 1 cell is the same ambiguous-as-narrow assumption every bordered
+pane on the screen already makes (see the retraction entry above). `--ascii` remains exact.
+
+**What this buys.** The pane is now genuinely stateless left-to-right: the name column shows the same
+thing wherever the cursor is, so the pinned ancestors and the scrolling rows are laid out identically
+and moving the cursor no longer shifts text under the user's eye. The clamp that used to keep short
+names from scrolling into blankness, and the whole class of bug it existed for, are gone with the
+offset. The tail of a long name is still one row away in the span summary pane.
+
+**Tests.** `format`: `clip_field_*` (three) → `fit_field_pads_and_truncates_by_display_width` and
+`fit_field_is_exactly_width_cells_for_every_input` (sweeps text × width `0..=8` × both markers,
+including widths too narrow for the marker, where it is dropped rather than filling the field).
+`waterfall`: `name_offset_follows_the_cursor_row` / `a_short_name_is_never_scrolled_into_blankness` →
+`a_long_name_is_truncated_with_an_ellipsis_and_a_short_one_is_left_alone` and
+`the_ellipsis_follows_the_ascii_mode_the_trace_was_built_in`. `ui::traces`:
+`trace_detail_scrolls_the_name_column_to_the_cursors_span_name` →
+`trace_detail_truncates_long_span_names_with_an_ellipsis`, which asserts the column is *identical* at
+two cursor positions — the property that replaced the scroll.
+
+## Session summary: the waterfall name column lost two features and got simpler (2026-08-01)
+
+Consolidates the two entries above, which record the changes themselves. This one is the arc and what
+is worth carrying forward.
+
+**What was done.** Two user-directed removals from the Traces waterfall's name column, in sequence:
+depth indentation, then horizontal scrolling (replaced by ellipsis truncation). Net: **-235 lines**
+across `waterfall.rs`, `format.rs`, `ui/traces.rs`, `ui/mod.rs`, with the test suite steady at 117
+passing in `imbh-tui` and the full workspace gate clean.
+
+**What came out with them.** `WaterfallRow::indent`, `WaterfallView` (whole struct), `WATERFALL_MIN_NAME_W`,
+`visible_indent_base`, `row_indent_cells`, `row_name_offset`, `name_offset`, and `clip_field`'s entire
+offset/edge-marker machinery. Every one of these existed *only* to serve the two features; none had a
+second consumer. That is the tell worth remembering: when a feature is removed and nothing else in the
+crate wants the machinery it accumulated, the machinery was never general — it was one feature spread
+across four files.
+
+**Finding: the design weight around a feature is not evidence the feature is needed.** The removed
+indent had three journal entries behind it (relative-to-pane basing, cap removal, the min-name floor),
+each a genuinely careful piece of reasoning — the relative-indent argument about anchoring on the
+*shallowest* rendered row rather than the topmost is still correct, and still subtle. All of it was in
+service of fitting a tree prefix into a 20-cell column that the trace's other affordances (pinned
+ancestors from `parent_row`, the bars) already conveyed. Sunk design effort reads as justification
+after the fact; it isn't. The same held for the scroll: its cleverest part, the per-row clamp keeping
+short names from scrolling into blankness, was a fix for a problem the feature itself created.
+
+**Finding: removals compose, so re-check the survivors after each one.** Dropping the indent left
+`WaterfallView` with two fields, which still justified the struct; dropping the scroll left it with
+one, which did not. Likewise `clip_field` was still load-bearing after the first removal and dead
+generality after the second. Neither collapse was visible from inside its own change — both only
+showed up on the second pass. Worth a deliberate look at what a removal *leaves* rather than only at
+what it takes.
+
+**Finding: the invariant survived both changes, and it was always the real constraint.** Everything
+left of the first `|` must sum to a fixed cell count or the bars stop lining up. The indent honoured
+it by sharing the column; the scroll by overwriting edge cells rather than stealing width; the
+ellipsis now by reserving its own cells. Three quite different mechanisms, one unchanged requirement —
+which is why the axis-alignment test needed no rework across either removal, only the removal of the
+now-meaningless `offset` loop. When a test survives two feature deletions untouched, it was testing
+the right thing.
+
+**Open point, deliberately accepted.** The Unicode ellipsis `…` is EAW-ambiguous and now sits inside a
+field this crate's own arithmetic measures — the narrow scope the EAW rule actually targets, not the
+box-drawing exception. Kept because it is the UI's existing `Glyphs::ellipsis`, and because treating
+ambiguous as one cell is the assumption every bordered pane already makes (see the retraction entry
+above). `--ascii` mode uses `...` and stays exact. If a CJK-configured terminal ever shows a truncated
+row's bar one cell right of its neighbours', this is the cause and the fix is an ASCII marker in both
+modes.
