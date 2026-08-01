@@ -1525,3 +1525,97 @@ committed — 17 modified files plus the new test.
 Still open from this arc (TODO.md): no write-side deadline on *buffered* responses — the streaming
 `ReadLogs` case is covered by its channel sink, which can see backpressure where a buffered response
 cannot.
+
+## 2026-08-01 — `imbhd` serves MCP: a gap analysis that chose the smaller build
+
+**Where this started.** The ask was to look at `grafana/mcp-grafana` and report what stands between
+it and `imbhd`. The finding that mattered was structural rather than a list of missing endpoints:
+**mcp-grafana is a client of the Grafana API, not of a telemetry backend.** Every datasource tool
+resolves a UID through `GET /api/datasources/uid/{uid}` and tunnels through Grafana's proxy
+(`.../resources`, falling back to `.../proxy` on 403/500). So "use mcp-grafana with imbhd" can only
+mean `agent → mcp-grafana → Grafana → datasource proxy → imbhd`, which requires imbhd to be
+registerable as a Prometheus *and* Loki datasource and byte-compatible on the wire — the question
+ARCHITECTURE.md §15 Q5 left open. Of its ~80 tools only 13 could ever reach imbh data; traces are a
+dead end entirely (there is no `tempo.go`, and `prom_backend.go` explicitly errors on datasource type
+`"tempo"`), so `imbh.traceql.t1.v1` would get zero leverage from the integration.
+
+That reframed the work: building the Prom+Loki HTTP surface is the *expensive* path to a *smaller*
+capability. A native MCP server reaches everything mcp-grafana structurally cannot — SQL, traces,
+full-text `matches()`, segment stats — for far less. The user picked that, hosted in `imbh-server`
+rather than as a new crate.
+
+**What shipped.** `POST /mcp` on the existing axum router: `crates/imbh-server/src/mcp/{mod,json,
+tools}.rs`, 15 read-only tools over §10.5–§10.9, plus `tests/mcp_e2e.rs` (9 tests driving the router
+through `tower::oneshot`, which is what lets a test set the headers `route()` cannot). Details worth
+keeping:
+
+- **Zero new dependencies, on purpose.** MCP is JSON-RPC over HTTP; requests parse through
+  `imbh::parse_json` (imbh-core's dependency-free parser, already in the graph) and responses are
+  built with a small `Obj`/`Arr` writer over the existing `json_string`. `serde_json` *is* compiled
+  transitively (arrow-json ← arrow ← datafusion), so pulling it in would have been footprint-neutral
+  in crate count — but the crate's own convention is hand-rolled JSON, and the writer that respects
+  it is ~120 lines.
+- **The spec moved.** Revision `2026-07-28` made MCP **stateless**: no `initialize`, per-request
+  `params._meta` carrying the version, a mandatory `server/discover`, `resultType: "complete"` on
+  every result, and a *validated header mirror* (`MCP-Protocol-Version` / `Mcp-Method` / `Mcp-Name`
+  must match the body, `-32020` otherwise). Clients in the field are still on the `initialize`
+  handshake of `2025-11-25` and earlier. Implementing either alone would have been unusable by half
+  of them, so the endpoint chooses **era per request**: a declared `_meta` version (or
+  `server/discover`) selects the stateless path, anything else the handshake path. Reading the spec
+  first was load-bearing — the pre-2026 shape was the one in memory, and it is now the *legacy* one.
+- **Tool errors are not protocol errors.** A bad duration, an unparseable trace id, or a SQL syntax
+  error comes back as `isError: true` in the result, not as a JSON-RPC error, because that is what a
+  model can self-correct from. Only an unknown *tool* is a protocol error (`-32602`): no argument
+  would fix it.
+- **The default window is a real usability trap.** Tools default to a 1h look-back, so a replayed or
+  historical database answers "nothing" to every question. Mitigated by pointing `instructions` and
+  the tool descriptions at `db_stats` first (it reports each table's true time span) — and the e2e
+  tests hit it immediately, since the OTLP fixtures sit at epoch nanosecond ~1 and every assertion
+  had to pass explicit `start_unix_nano`/`end_unix_nano`.
+- **`Origin` is the one defence implemented.** The endpoint is unauthenticated like the rest of
+  `imbhd`, but the transport's DNS-rebinding rule is enforced: a browser `Origin` outside the loopback
+  set is refused `403` (`IMBH_MCP_ALLOWED_ORIGINS` widens it). Non-browser clients send no `Origin`,
+  so agents are unaffected. Worth remembering that `/mcp` shares a port with OTLP ingest and
+  `/admin/*`: exposing one exposes all three.
+- **`stats_json` was extracted** from `stats_response` so `GET /stats` and the `db_stats` tool cannot
+  describe the same database differently.
+
+**Verified.** `fmt` / `build` / `clippy -D warnings` clean; `cargo test --workspace` green (56 test
+targets, no failures), of which 24 are new (15 unit + 9 e2e). No dependency change, so the footprint
+gate's inputs are untouched — the crate-count gate measures `cargo tree -p imbh` and the direction is
+still `imbh ← imbh-server`. Docs: `docs/MCP.md` (new), ARCHITECTURE.md §10.16.1, plus the root
+README, the crate README, and the `imbhd` banner/module docs. Nothing committed.
+
+**Open.** The stdio transport for `imbh-tui` is not built (TODO.md); `mcp::handle` was kept
+transport-agnostic (`bytes + headers → Reply`) so it can be lifted without touching protocol logic.
+
+### Addendum — what the smoke test against real data caught
+
+Two defects survived a green `cargo test --workspace` and were found only by running the actual
+binary against a `gen-demo-db` database. Both were *description* defects, which is the class this
+endpoint is most exposed to: a wrong tool description silently misroutes every model that reads it,
+and no assertion about response shape can see it.
+
+1. **`query_sql` listed six of the seven signal tables** — `metrics_summary` was missing, so a model
+   would never query it. The test meant to prevent exactly this (`the_sql_tool_lists_every_table`)
+   passed, because it iterated a **hand-written** `TABLES` const in the test file that had the same
+   omission. Fixed by driving it off `imbh::Table::ALL`, which is the authority. Same lesson as the
+   doc sweep two entries up: a check written from memory verifies memory, not reality.
+
+2. **`group_by: ["service.name"]` silently yields one empty-labelled series.** Both my `log_volume`
+   and `span_metrics` descriptions used it as the *example*. The cause is library-side and
+   pre-existing: `SqlParams::attr_field` (`crates/imbh/src/sql.rs:47`) resolves a key to a real
+   column only when it is in the DB's configured `Promote` list, and otherwise emits
+   `json_get_str(attributes, key)`. `service.name` lives in the `resource` column and the promoted
+   `service` column — never in record `attributes` — so it reads NULL for every row, and the group
+   collapses to `{"service.name": ""}` with the counts merged. `service` as a *filter* works fine;
+   only grouping is affected, and it affects `LogsApi::volume_by`, `TracesApi::span_metrics`, and the
+   metrics group-by equally. Descriptions now say group keys are record attributes and point at the
+   `service` filter for per-service splits; the behaviour is pinned by a test so a library-side fix
+   surfaces as a failure, and the underlying quirk is in TODO.md.
+
+The first assertion attempt for (2) over-corrected — "no group label may be empty" — and failed
+against a fixture where *some* spans lack the key. That is correct SQL semantics for a missing
+attribute, not a bug: the assertion, not the code, was wrong. Worth stating because the empty label
+means two different things (this record has no such attribute vs. this key is never an attribute)
+and only the second is the trap.

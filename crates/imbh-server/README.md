@@ -19,6 +19,7 @@ Routes:
 - `POST /v1/logs` · `/v1/traces` · `/v1/metrics` — OTLP/HTTP protobuf ingest. `Content-Encoding:
   gzip` is accepted, which the OpenTelemetry Collector's `otlphttp` exporter sends by default.
 - `POST /api/query` — a SQL string body → JSON rows.
+- `POST /mcp` — the Model Context Protocol endpoint (below). `GET`/`DELETE` there answer `405`.
 - `GET /stats` — DB operational stats (per-table counts + buffer/WAL bytes + durable LSN) as JSON.
 - `POST /admin/flush` · `/admin/compact` — maintenance actions. Unauthenticated by design; a real
   deployment gates `/admin/*` itself.
@@ -33,6 +34,31 @@ The Docker logging-driver plugin (`docker` feature, Unix only) is a different pr
 socket, but runs on this same stack and shares its request handling, so the body limits, deadlines,
 and decoding are identical on both sockets. Its one streaming endpoint, `LogDriver.ReadLogs`, is
 served as a `Transfer-Encoding: chunked` body fed by a bounded channel.
+
+## MCP endpoint
+
+`POST /mcp` serves the **Model Context Protocol** over its Streamable HTTP transport, so an agent can
+search logs, pull traces, and query metrics through the same process that ingests them — no Grafana,
+no datasource proxy, no export step:
+
+```sh
+claude mcp add --transport http imbh http://127.0.0.1:4318/mcp
+```
+
+The 15 tools are read-only (`search_logs`, `search_traces`, `get_trace`, `span_metrics`,
+`query_metric_range`, `histogram_quantile`, `query_sql`, attribute discovery, `db_stats`, …) —
+nothing there can ingest, flush, compact, or apply retention. The endpoint is on in the default
+build and adds **no dependency**: MCP is JSON-RPC over HTTP, and this crate already hand-rolls its
+JSON.
+
+Both protocol eras are served: the stateless `2026-07-28` revision (per-request `_meta`,
+`server/discover`, validated header mirror) and the `initialize` handshake of `2025-11-25` and
+earlier. Nothing streams, so responses are single JSON bodies and no session is kept.
+
+Like the rest of `imbhd` it is unauthenticated, but it does enforce the transport's DNS-rebinding
+defence: a browser `Origin` outside the loopback set is refused `403`, widened by
+`IMBH_MCP_ALLOWED_ORIGINS` (comma-separated, or `*`). See
+[`docs/MCP.md`](https://github.com/moriyoshi/imbh/blob/main/docs/MCP.md).
 
 ## Connection deadlines
 

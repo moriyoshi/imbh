@@ -19,6 +19,11 @@
 //! buffer is sealed, rows live in the WAL + memory only, so this is also what bounds `imbhd`'s RSS and
 //! WAL growth.
 //!
+//! `POST /mcp` serves the **Model Context Protocol** over its Streamable HTTP transport, so an agent
+//! can search logs, pull traces, and query metrics through the same process that ingests them. The
+//! tools are read-only; `IMBH_MCP_ALLOWED_ORIGINS` (comma-separated, or `*`) widens the default
+//! loopback-only `Origin` check that guards against DNS rebinding. See `docs/MCP.md`.
+//!
 //! Built with `--features docker`, `imbhd` additionally serves the Docker logging-driver plugin API
 //! when `IMBH_DOCKER_PLUGIN_SOCKET` is set (a managed plugin's `config.json` sets it to
 //! `/run/docker/plugins/imbh.sock`); container output then lands in the same DB the query endpoint
@@ -301,6 +306,7 @@ fn banner(
                 tracing::info!(%addr, %dir, "imbhd listening");
                 tracing::info!("OTLP/HTTP: POST /v1/logs, /v1/traces, /v1/metrics");
                 tracing::info!("query: POST /api/query (SQL body -> JSON)");
+                tracing::info!("mcp: POST /mcp (Model Context Protocol, read-only tools)");
             }
             None => tracing::info!(%dir, "imbhd started with no HTTP listener"),
         }
@@ -322,6 +328,7 @@ fn banner(
                 println!("imbhd listening on http://{addr}  (data dir: {dir})");
                 println!("  OTLP/HTTP: POST /v1/logs · /v1/traces · /v1/metrics");
                 println!("  query:     POST /api/query  (SQL body → JSON)");
+                println!("  mcp:       POST /mcp  (Model Context Protocol, read-only tools)");
             }
             None => println!("imbhd started, no HTTP listener  (data dir: {dir})"),
         }

@@ -13,6 +13,30 @@ release aborts if it is missing or duplicated.
 
 ## [Unreleased]
 
+### Added
+
+- **`imbhd` serves the Model Context Protocol at `POST /mcp`**, so an agent can search logs, pull
+  traces, and query metrics through the same process that ingests them — no Grafana, no datasource
+  proxy, no export step. Point a client at `http://127.0.0.1:4318/mcp` (e.g.
+  `claude mcp add --transport http imbh http://127.0.0.1:4318/mcp`).
+
+  The 15 tools are **read-only** — `search_logs`, `count_logs`, `log_volume`, `search_traces`,
+  `get_trace`, `span_metrics`, `list_metrics`, `metric_series`, `query_metric_range`,
+  `query_metric_instant`, `histogram_quantile`, `list_attribute_keys`, `list_attribute_values`,
+  `db_stats`, and `query_sql`. Nothing there can ingest, flush, compact, or apply retention.
+
+  Both protocol eras are served: the stateless `2026-07-28` revision (per-request `_meta`,
+  `server/discover`, validated `MCP-Protocol-Version`/`Mcp-Method`/`Mcp-Name` header mirror) and the
+  `initialize` handshake of `2025-11-25` and earlier. Nothing streams, so responses are single JSON
+  bodies and no session id is minted; `GET`/`DELETE /mcp` answer `405`.
+
+  On in the default build, and it adds **no crate** to any dependency graph — MCP is JSON-RPC over
+  HTTP, which this crate already has the JSON plumbing for. Like the rest of `imbhd` the endpoint is
+  unauthenticated, but it enforces the transport's DNS-rebinding defence: a browser `Origin` outside
+  loopback is refused `403`, widened by the new `IMBH_MCP_ALLOWED_ORIGINS` (comma-separated, or `*`).
+  Public API additions: `imbh_server::mcp` and `imbh_server::mcp_allowed_origins`. See
+  [`docs/MCP.md`](./docs/MCP.md).
+
 ### Changed
 
 - **`imbh-server` now serves HTTP on axum/hyper** instead of its own `std::net`, thread-per-connection

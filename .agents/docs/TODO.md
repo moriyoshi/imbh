@@ -9,6 +9,36 @@ git history); this file tracks only what is still open.
 
 ## Open Items
 
+- [ ] **MCP over stdio, hosted by `imbh-tui`.** `imbhd` serves MCP over HTTP (§10.16.1); the other
+      half of the plan is a stdio transport in the TUI binary, since stdio is what MCP clients
+      "SHOULD support whenever possible" and it needs no listening port. `mcp::handle` is already
+      transport-agnostic (`bytes + headers → Reply`), so this is a newline-delimited read/write loop
+      plus a data-access flag: `--db <path>` opening the directory read-only (`Db::open_read_only`,
+      which reads alongside a live `imbhd` writer) or `--url <addr>` proxying to a running `imbhd`.
+      Note the dependency direction — the protocol module currently lives in `imbh-server`, so
+      sharing it with `imbh-tui` means lifting `mcp/` into a crate both can depend on. —
+      *source: JOURNAL (MCP endpoint, 2026-08-01)*
+
+- [ ] **`service.name` is not groupable, only filterable.** `SqlParams::attr_field`
+      (`crates/imbh/src/sql.rs:47`) resolves a group/filter key to a real column only when it is in
+      the DB's configured `Promote` list, and otherwise emits `json_get_str(attributes, key)`.
+      `service.name` lives in the `resource` column and the built-in promoted `service` column, never
+      in record `attributes`, so `LogsApi::volume_by`, `TracesApi::span_metrics`, and the metrics
+      group-by all collapse it to a single `{"service.name": ""}` series with the counts merged —
+      silently, since a missing attribute is a legitimate NULL. Filtering by service is unaffected.
+      The fix is to special-case the built-in promoted columns (`service`, and `service.name` as its
+      OTel spelling) in `attr_field`, the way a configured `Promote` key already is. Pinned by a test
+      in `crates/imbh-server/tests/mcp_e2e.rs` so a fix shows up as a failure there. —
+      *source: JOURNAL (MCP endpoint smoke test, 2026-08-01)*
+
+- [ ] **MCP tools have no cost ceiling of their own.** Every tool bounds its own result (`limit`
+      clamps, `max_rows` on `query_sql`), but nothing bounds the *work*: an agent can ask
+      `query_sql` for a full-table aggregate over the whole retention window and park a blocking-pool
+      slot for as long as it takes. `IMBH_BODY_TIMEOUT` does not cover it (the body is long since
+      read) and the endpoint is unauthenticated. If this matters for a deployment, the fix is a
+      per-call deadline around `tools::call` plus a scanned-bytes ceiling from `QueryStats`. —
+      *source: JOURNAL (MCP endpoint, 2026-08-01)*
+
 - [ ] **No write-side deadline on buffered HTTP responses.** `IMBH_BODY_TIMEOUT` used to bound the
       response write as well as body reads, via `set_write_timeout` on the socket; hyper exposes no
       equivalent, so a client that stops reading a *buffered* response holds a connection until it goes
