@@ -1666,3 +1666,79 @@ on parsed structure instead of substrings — `initialize(None)["protocolVersion
 Verified: `fmt`/`build`/`clippy -D warnings` clean; `cargo test --workspace` green across 56 targets.
 The nine MCP e2e tests passed **unmodified** through the rewrite before their helpers were converted,
 which is the useful signal — the wire behaviour is unchanged, only the machinery under it.
+
+## 2026-08-01 — `imbh-tui` split: one 9,384-line `lib.rs` into 27 modules (and a gate that could not run)
+
+`crates/imbh-tui/src/lib.rs` had grown to 9,384 lines — 6,900 of source and a single 2,480-line
+`mod tests`. Split it along the boundaries the code already had, with **no behaviour change**: every
+line of the original either moved verbatim or is one of the four accounted-for edits below.
+
+**The seams.** The file was already layered; the split just names the layers.
+
+| module | contents |
+| --- | --- |
+| `model` | `Route`, `Snapshot`, `Mode`/`Focus`/`Screen`, catalog nodes, `Update`, `Options`, `TIME_RANGES` |
+| `app/` | `App` + its state machine, split by concern: `mod` (struct, `apply`, query accessors), `nav`, `window`, `catalog`, `views`, `completion` |
+| `ui/` | `draw` and the frame chrome, plus `glyphs`, `metrics`, `logs`, `traces`, `overlays` |
+| `keys`, `runtime`, `terminal` | key map, event loop, raw-mode/panic-hook/input-reader |
+| `fetch`, `tasks` | the queries behind a refresh; the `request_*` spawners that keep them off the loop |
+| `syntax`, `completion`, `promql` | query-language support behind the editor |
+| `format`, `time`, `waterfall`, `detail_text`, `chart`, `mascot` | display helpers and the easter egg |
+
+`App`'s ~1,250-line inherent impl became six `impl App` blocks, one per `app/` submodule — Rust lets
+inherent impls span modules, so the concerns separate without a trait or a wrapper type. Largest file
+is now `mascot.rs` at 885 lines; the median is ~280.
+
+**Tests moved next to what they exercise.** The 95 tests were redistributed into 21 per-module
+`#[cfg(test)] mod tests` blocks; the nine shared fixtures (`sample_trace`, `catalog_app`,
+`app_with_discovered_dims`, …) live in a new `#[cfg(test)] mod testutil` and are imported by name.
+
+**The four deliberate edits.** (1) Item visibility: cross-module items, struct fields, and inherent
+methods became `pub(crate)`; `Options`/`parse_datetime`/`run` stay `pub` and are re-exported from
+`lib.rs`. (2) The one `use` block became per-module headers. (3) The two banner comments (mascot
+motion foundation, chart geometry) became `//!` module docs. (4) Doc links that crossed a module
+boundary were qualified, e.g. ``[`run`](crate::runtime::run)``. Six signatures were rewrapped because
+`pub(crate) ` pushed them past 100 columns.
+
+**The gate ran late, and the static checks earned their keep.** The environment had no Rust
+toolchain when the split was made (no `~/.cargo`, no rustup, mise carrying only go/node), so the
+whole refactor was done and verified *without a compiler* — then the toolchain was installed and the
+real gate run. Worth recording what each pass caught, because the ratio is the interesting part.
+
+Verified mechanically, before any compilation:
+
+- **Nothing lost or duplicated**: a multiset diff of every non-blank line, old vs new, with the
+  visibility prefix normalised away. The only residue is the four deliberate edits above.
+- **Name resolution**: every crate item referenced in a module is defined there or imported; every
+  import is referenced (the `-D warnings` failure mode), with trait-by-method-call imports
+  (`UnicodeWidthStr`, `SeedableRng`, the three `*SemanticsExt`) checked by their call sites.
+- **Visibility**: no private item reachable only across a module boundary, and no `pub(crate)` item
+  exposing a more-private type — which is why `MascotMotion`/`MascotIgniter` had to become
+  `pub(crate)`: they appear in `Mascot`'s field types, and a private type behind a `pub(crate)` field
+  is a `private_interfaces` warning, i.e. an error under the gate.
+- **rustfmt shape by emulation**: `use` blocks re-sorted and wrapped following the ordering the
+  repo's own formatted files demonstrate (`super` < `crate` < plain idents; `ratatui::Terminal`
+  before `ratatui::backend::…`), no code line over 100 columns, no double blank lines.
+
+That pass caught three real defects, each of the same species: **name-scan import inference is
+exactly wrong for extension traits and for aliases.** `Table as DbTable` landed in `ui/metrics`
+(where it matched *ratatui's* `Table`) instead of `fetch`; the three `*SemanticsExt` traits were
+dropped from `fetch` entirely (their only use is a method call, invisible to a name scan); and
+`UnicodeWidthChar` was imported into `chart`, where only the `str` trait is used.
+
+The compiler then found a fourth species the scan could not: **enum variants that share a name with
+a type.** `Route::MetricDetail { .. }` and `Update::Waterfall { .. }` made `MetricDetail` and
+`Waterfall` look imported-and-used in four modules where the *type* was never named — plus a
+mirror-image case where `MetricDetail` was dropped from a module header but the module's own tests
+constructed it through `use super::*`. Total compiler-only findings: 6 unused imports, 3 redundant
+inline `use`s in tests, 2 genuinely missing test-scope imports. Zero behavioural failures.
+
+Gate: `cargo fmt --all --check` clean, `cargo build --workspace` clean, `cargo clippy --workspace
+--all-targets -- -D warnings` clean, `cargo test --workspace` green — **95 tests in `imbh-tui`**, all
+of them the pre-split tests, unmodified, now distributed across 21 module test blocks. No dependency
+change, so the footprint budget is untouched.
+
+The takeaway for the next mechanical refactor: static checks got ~85% of the way and were the only
+thing keeping the work honest while no compiler existed, but the last 15% — anything where a *name*
+means two things (variant vs type, alias vs original, trait vs method) — is compiler territory. Do
+not ship a split of this size on inference alone.
