@@ -243,8 +243,10 @@ Unlike the bare binary, the image binds both listeners to `0.0.0.0` (`IMBH_LISTE
 floating `X.Y`, and `latest`. Build it yourself for the host architecture with
 `./scripts/build-image.sh` (see [`docker/Dockerfile`](./docker/Dockerfile)).
 
-> This image is **not** the Docker logging-driver plugin, which is a separate artifact with its own
-> install path (`docker plugin install`) — see the [log-driver guide](./docs/DOCKER_LOG_DRIVER.md).
+> This image is **not** the Docker logging-driver plugin. That is a separate artifact in its own
+> repository, `ghcr.io/moriyoshi/imbh-log-driver`, with its own install path
+> (`docker plugin install`) and one tag per architecture — see the
+> [log-driver guide](./docs/DOCKER_LOG_DRIVER.md).
 
 ## Reference server (`imbhd`)
 
@@ -316,6 +318,8 @@ Built with `--features docker`, `imbhd` also speaks the Docker logging-driver pl
 container stdout/stderr is written directly into the embedded database — no collector, no sidecar:
 
 ```
+docker plugin install --alias imbh ghcr.io/moriyoshi/imbh-log-driver:0.4.0-amd64   # or -arm64
+
 docker run --log-driver imbh --log-opt imbh-service=web nginx
 
 docker logs <container>                       # served back out of the database
@@ -326,8 +330,11 @@ curl -s 127.0.0.1:4318/api/query --data \
 Container identity lands on the OTel resource (`container.id`, `container.name`,
 `container.image.name`, …), stdout/stderr map to severities, split lines are reassembled, and
 `docker logs` (including `--tail`, `--since`, and `-f`) is answered from stored rows. Unix only, off
-by default, and it adds **no crate** to the dependency graph. See the
-[Docker log-driver guide](./docs/DOCKER_LOG_DRIVER.md).
+by default, and it adds **no crate** to the dependency graph.
+
+The managed plugin ships per architecture (`X.Y.Z-amd64` / `X.Y.Z-arm64`, plus floating `X.Y-<arch>`
+and `latest-<arch>`), because managed plugins have no manifest-list support to hang a single
+multi-arch tag on. See the [Docker log-driver guide](./docs/DOCKER_LOG_DRIVER.md).
 
 ## Companion TUI (`imbh-tui`)
 

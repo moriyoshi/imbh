@@ -20,26 +20,57 @@ container stdout/stderr
 > container you `docker run` and point OTLP exporters at (see README.md "Install the binaries"). A
 > logging-driver plugin is a different Docker artifact with a different lifecycle: it is installed with
 > `docker plugin install`, the daemon starts it, and it is addressed by `--log-driver` rather than by a
-> port. The two can be used together — and the plugin is still built locally, per the quick start
-> below; it is not published yet.
+> port. The two can be used together, and they are separate registry repositories because they have to
+> be: a managed plugin's manifest points at an `application/vnd.docker.plugin.v1+json` config, so
+> `docker pull` refuses a plugin and `docker plugin install` refuses an image. One repository, one
+> artifact kind, one verb.
 
-The feature is **off by default**. Build it with:
+The feature is **off by default** in a source build:
 
 ```sh
 cargo build --release -p imbh-server --features docker
 ```
 
-The prebuilt Linux binaries from a GitHub release already include it (`--features docker,grpc,tracing`),
-so you can register the plugin without a Rust toolchain if you supply the rootfs yourself; the macOS
-builds omit it, since a plugin socket must be reachable by a *local* daemon and on macOS the daemon
-runs inside a VM.
+The published plugin and the prebuilt Linux binaries from a GitHub release both carry it
+(`--features docker,grpc,tracing`); the macOS builds omit it, since a plugin socket must be reachable
+by a *local* daemon and on macOS the daemon runs inside a VM.
 
 It adds no crate to the dependency graph (the protobuf and OTLP message types are already there via
 `imbh-otlp`) and is **Unix only** — the module is `#[cfg(unix)]`.
 
-## Quick start
+## Install
 
-Build and register the managed plugin:
+The release publishes the plugin **per architecture**, and you name the one you want:
+
+```sh
+docker plugin install --alias imbh --disable ghcr.io/moriyoshi/imbh-log-driver:0.4.0-amd64
+docker plugin set     imbh data.source=/var/lib/imbh
+docker plugin enable  imbh
+```
+
+Tags are `X.Y.Z-amd64` / `X.Y.Z-arm64`, plus the floating `X.Y-<arch>` and `latest-<arch>`. There is
+no architecture-agnostic tag, and that is not an oversight: managed plugins have no manifest-list
+support — moby's plugin fetch path resolves a single manifest and does no platform matching, so a
+multi-arch tag would have nothing to select from. Install asks to grant the two permissions
+`config.json` declares (host networking and the host path for the database); `--grant-all-permissions`
+answers them for a script.
+
+`--alias imbh` is what makes the driver addressable as plain `--log-driver imbh` instead of by its
+full registry path. `--disable` installs without starting it, so the settings below apply before its
+first run rather than after a restart.
+
+**Set the OTLP address before enabling it**, unless you want the compiled-in default of
+`172.17.0.1:4318` (see [Networking](#networking)). Unlike `build.sh`, an install cannot probe your
+daemon, so check what the bridge gateway actually is:
+
+```sh
+docker network inspect bridge --format '{{range .IPAM.Config}}{{.Gateway}}{{end}}'
+docker plugin set imbh IMBH_LISTEN_ADDR=172.17.0.1:4318 IMBH_GRPC_LISTEN_ADDR=172.17.0.1:4317
+```
+
+### Building it yourself
+
+Only needed if you are changing imbh:
 
 ```sh
 ./crates/imbh-server/docker-plugin/build.sh
@@ -47,14 +78,19 @@ docker plugin set    imbh/log-driver:latest data.source=/var/lib/imbh
 docker plugin enable imbh/log-driver:latest
 ```
 
-`build.sh` honors a few environment variables: `PLUGIN` (the plugin name), `DOCKER` (the container
-engine — `DOCKER=podman`, or `DOCKER="sudo docker"` to reach a rootful daemon), and `IMBH_BIND` (see
-[Networking](#networking)).
+It compiles `imbhd`, packages it into a rootfs, registers the plugin on the local daemon, and points
+the OTLP listeners at the bridge gateway it read from that daemon. Environment variables: `PLUGIN`
+(the plugin name), `DOCKER` (the container engine — `DOCKER=podman`, or `DOCKER="sudo docker"` to
+reach a rootful daemon), `FEATURES` (the `imbhd` feature set), `BASE` (the rootfs base image; raise it
+when your host's glibc is newer than `debian:bookworm-slim`'s — the script's smoke test tells you),
+and `IMBH_BIND` (see [Networking](#networking)).
+
+## Using it
 
 Run something that logs:
 
 ```sh
-docker run --rm --log-driver imbh/log-driver:latest --log-opt imbh-service=web nginx
+docker run --rm --log-driver imbh --log-opt imbh-service=web nginx
 ```
 
 Read it back — either the Docker way:
@@ -64,8 +100,9 @@ docker logs <container>
 docker logs -f --tail 100 --since 10m <container>
 ```
 
-…or the imbh way, over the query endpoint `imbhd` is already serving. `build.sh` binds it to this
-daemon's bridge gateway (`172.17.0.1` on a default install — see [Networking](#networking) below):
+…or the imbh way, over the query endpoint `imbhd` is already serving — at whatever
+`IMBH_LISTEN_ADDR` you set above, the daemon's bridge gateway (`172.17.0.1` on a default install —
+see [Networking](#networking) below):
 
 ```sh
 curl -s 172.17.0.1:4318/api/query --data \
@@ -144,9 +181,9 @@ rebuilding the plugin (a plugin's entrypoint arguments are frozen in its `config
 declared `settable` are not):
 
 ```sh
-docker plugin disable imbh/log-driver:latest
-docker plugin set     imbh/log-driver:latest IMBH_LISTEN_ADDR=172.17.0.1:4318
-docker plugin enable  imbh/log-driver:latest
+docker plugin disable imbh
+docker plugin set     imbh IMBH_LISTEN_ADDR=172.17.0.1:4318
+docker plugin enable  imbh
 ```
 
 The same mechanism tunes the **flush scheduler**, which decides when buffered lines become Parquet
@@ -155,7 +192,7 @@ together, so a plugin capturing bursty containers can add a size or idle trigger
 `IMBH_MAINTENANCE_INTERVAL` (default `60s`) sets the retention cadence:
 
 ```sh
-docker plugin set imbh/log-driver:latest IMBH_FLUSH=interval=10s,buffer=32MiB,idle=2s
+docker plugin set imbh IMBH_FLUSH=interval=10s,buffer=32MiB,idle=2s
 ```
 
 `IMBH_HEADER_TIMEOUT` (default `10s`) and `IMBH_BODY_TIMEOUT` (default `30s`) bound how long one client
@@ -180,7 +217,7 @@ so one endpoint value works everywhere:
 docker run --add-host=host.docker.internal:host-gateway \
   -e OTEL_EXPORTER_OTLP_ENDPOINT=http://host.docker.internal:4318 \
   -e OTEL_SERVICE_NAME=web \
-  --log-driver imbh/log-driver:latest --log-opt imbh-service=web \
+  --log-driver imbh --log-opt imbh-service=web \
   myapp
 ```
 
@@ -200,7 +237,7 @@ If the driver is only meant to capture logs, give it no TCP listeners:
 ```sh
 IMBH_BIND=none ./crates/imbh-server/docker-plugin/build.sh
 # or, on an existing plugin:
-docker plugin set imbh/log-driver:latest IMBH_LISTEN_ADDR= IMBH_GRPC_LISTEN_ADDR=
+docker plugin set imbh IMBH_LISTEN_ADDR= IMBH_GRPC_LISTEN_ADDR=
 ```
 
 Container logging is unaffected -- the plugin protocol and the per-container FIFOs are filesystem
