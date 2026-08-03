@@ -2492,3 +2492,90 @@ class of bug: extracting a shared implementation from a caller can silently move
   The head answers `/api/head/stats` instead of widening it; converging the two would be additive
   except for the `durable_lsn` spelling (`None` is written as `0`).
 
+
+## Publishing the log-driver plugin: two artifacts, never one tag (2026-08-03)
+
+`release.yml` now has a `plugin` job that publishes the Docker logging-driver plugin to
+`ghcr.io/moriyoshi/imbh-log-driver`, closing the TODO left open by the first CD pass. The question
+that started it — "can we publish images that are *also* installable as a Docker plugin?" — has a
+firm no at its centre, and the shape of everything else follows from it.
+
+### One tag cannot be both
+
+A managed plugin lives in a registry exactly where an image does (same repository namespace, same
+blob store) but its manifest points at a config blob of media type
+`application/vnd.docker.plugin.v1+json` — the `config.json` itself — over a single flattened-rootfs
+layer. `docker plugin install` requires that config type and `docker pull` requires
+`application/vnd.docker.container.image.v1+json`, so a tag serves one lifecycle or the other. Verified
+against a local `registry:2`: the pushed manifest is
+`{manifest: …manifest.v2+json, config: …plugin.v1+json, layers: [rootfs.diff.tar.gzip]}`, and
+`docker pull` of that same reference fails with
+
+    Encountered remote "application/vnd.docker.plugin.v1+json"(plugin) when fetching
+
+Hence a separate repository (`imbh-log-driver`), not another tag on `imbh`.
+
+### No manifest lists, so one tag per architecture
+
+`docker manifest create` over plugin tags fails with `did not find plugin config for specified
+reference`, and moby's plugin fetch path (`daemon/pkg/plugin/fetch_linux.go`) only unpacks
+`ocispec.MediaTypeImageManifest` / `MediaTypeDockerSchema2Manifest` — it lists index media types in
+its Accept header but has no platform-selection logic behind them. So even a hand-assembled index
+would not be resolved. The published tags are `X.Y.Z-amd64` / `X.Y.Z-arm64` plus floating
+`X.Y-<arch>` and `latest-<arch>`; there is deliberately no bare `X.Y.Z`, since it would be silently
+wrong for half the users.
+
+### The plugin store is content-addressed — one plugin per rootfs digest
+
+The trap that would have broken the release run. Creating the same rootfs under a second name while
+the first still exists fails:
+
+    Error response from daemon: content sha256:937dbf00…: already exists
+
+There is no `docker plugin tag`, and the floating tags are by definition the same content under
+another name, so the job creates → pushes → **removes**, one tag at a time. Found only by pushing all
+three tags for real against a local registry; a single-tag test would have passed. (Docker 29.2.1.)
+
+### The rootfs stopped compiling, which is what made arm64 free
+
+The old `docker-plugin/Dockerfile` compiled `imbhd` from source on `rust:1-alpine`. Under the release
+matrix that is a fat-LTO build under QEMU for the arm64 leg — hours — and musl means it could not
+reuse the archives the matrix already produced. It now mirrors `docker/Dockerfile`: a
+`debian:bookworm-slim` base and a `COPY` of the prebuilt binary, staged from the release archive,
+with the same `linux/<goarch>/` context layout (minus `imbh-tui`, which a plugin has no way to run —
+a plugin has exactly one entrypoint, fixed in `config.json`).
+
+Two details worth keeping:
+
+- **No `RUN` step anywhere**, so no leg ever executes a foreign-architecture instruction and binfmt
+  stays out of the pipeline. The three directories the plugin runtime needs are created with
+  `WORKDIR`, which is a builder-side metadata operation, where `RUN mkdir -p` would have dragged QEMU
+  into the arm64 leg for the sake of three `mkdir`s.
+- **buildx `--output type=tar` is the rootfs**, directly. CI skips the `docker create` + `docker
+  export` round trip entirely; `build.sh` keeps it, because it is BuildKit-only and the local path
+  stays engine-agnostic so `DOCKER=podman` keeps working.
+
+Image metadata (`ENTRYPOINT`, `ENV`, `USER`, `VOLUME`) is discarded when the rootfs is flattened, so
+the Dockerfile now declares none — `config.json` is the sole source of truth and a second, inert copy
+in the Dockerfile would only look authoritative.
+
+### What the local path lost, and the escape hatch
+
+Compiling inside the container meant `build.sh` worked on any host. Staging a host-compiled binary
+into bookworm does not: a dev machine whose glibc is newer than 2.36 can produce a binary the plugin
+cannot start, and under the plugin lifecycle that surfaces as a bare `docker plugin enable` failure
+with the real error buried in the daemon log — there is no `docker plugin logs`. So the base is an
+`ARG BASE` (CI never overrides it), and `build.sh` runs the same "nothing to serve" smoke assertion
+`release.yml` uses on the archives, inside the rootfs, before it ever reaches `plugin create`. On
+this host (glibc 2.39 → bookworm 2.36) the binary in fact links fine; the guard is for when it does
+not, and it names `BASE=debian:trixie-slim` in the failure message.
+
+### Verified
+
+End to end on Docker 29.2.1, aarch64: both arch rootfs tars built (the amd64 leg on an arm64 host,
+no QEMU), the plugin created from the buildx tar + `config.json`, enabled, a container run under
+`--log-driver`, its stdout **and** stderr read back through `docker logs` — served out of the
+database — with Parquet segments and a Tantivy `.tidx` on the host mount. Then pushed to a local
+`registry:2` under all three tags and re-installed with `docker plugin install`. The one thing that
+could not be covered locally is `docker plugin push` to **GHCR** under `${{ github.token }}`; that is
+in TODO.md against the first `workflow_dispatch` rehearsal.

@@ -8,6 +8,7 @@ name: Release
 #   build     imbhd + imbh-tui, release profile, one leg per published target
 #   publish   checksums + upload the archives into a DRAFT Release, then publish it
 #   image     linux/amd64 + linux/arm64 manifest -> ghcr.io/<owner>/imbh
+#   plugin    one Docker log-driver plugin PER ARCH -> ghcr.io/<owner>/imbh-log-driver:<ver>-<arch>
 #
 # `build` depends on `licenses` on purpose: the notices file it packages into every archive is the
 # one generated in this run, and we do not hand out binaries whose license gate failed.
@@ -54,6 +55,7 @@ jobs:
       prerelease: ${{ steps.resolve.outputs.prerelease }}
       publish: ${{ steps.resolve.outputs.publish }}
       image: ${{ steps.resolve.outputs.image }}
+      plugin: ${{ steps.resolve.outputs.plugin }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - id: resolve
@@ -84,12 +86,18 @@ jobs:
           fi
           # Registry paths must be lowercase; the repository slug usually already is.
           image="ghcr.io/$(printf '%s' "${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')"
+          # The logging-driver plugin gets its OWN repository rather than another tag on ${image}, and
+          # that is forced, not stylistic: a managed plugin's manifest points at an
+          # application/vnd.docker.plugin.v1+json config, so `docker pull` refuses it and
+          # `docker plugin install` refuses an image. One repository, one artifact kind, one verb.
+          plugin="${image}-log-driver"
           {
             echo "version=${version}"
             echo "tag=${tag}"
             echo "prerelease=${prerelease}"
             echo "publish=${publish}"
             echo "image=${image}"
+            echo "plugin=${plugin}"
           } | tee -a "${GITHUB_OUTPUT}"
 
       # Fail in seconds rather than after five fat-LTO build legs. An already-published Release is
@@ -512,3 +520,175 @@ jobs:
           # `mode=min` records the build inputs without embedding the full environment (which
           # `mode=max` does, and which can capture secrets).
           provenance: mode=min
+
+  plugin:
+    name: Log-driver plugin (${{ matrix.arch }})
+    needs: [meta, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Pushing to GHCR.
+      packages: write
+    # ONE PLUGIN PER ARCHITECTURE, and there is no way around it: managed plugins have no manifest
+    # lists. `docker manifest create` over plugin tags fails ("did not find plugin config for
+    # specified reference") because a plugin's config is application/vnd.docker.plugin.v1+json rather
+    # than an image config, and moby's plugin fetch path resolves a single manifest with no platform
+    # matching, so even a hand-assembled index would not be selected from. Hence `:X.Y.Z-amd64` and
+    # `:X.Y.Z-arm64` where the image job gets one multi-arch `:X.Y.Z`. Users pick.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The goarch-to-Rust-triple mapping mirrors the `image` job's; keep the two in step with
+          # the Linux legs of the build matrix.
+          - arch: amd64
+            target: x86_64-unknown-linux-gnu
+          - arch: arm64
+            target: aarch64-unknown-linux-gnu
+    steps:
+      # Only the plugin directory is needed: like the image, this compiles nothing, so there is no
+      # toolchain and no full source checkout here. config.json travels with the rootfs.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: crates/imbh-server/docker-plugin
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: dist-${{ matrix.target }}
+          path: archives
+
+      # Deliberately inline rather than calling the plugin's build.sh, for the same reason the image
+      # job does not call scripts/build-image.sh: that script's job is to *compile*, and this one must
+      # not. crates/imbh-server/docker-plugin/Dockerfile's header is the contract for the layout below.
+      - name: Stage the build context
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ needs.meta.outputs.version }}"
+          ctx=crates/imbh-server/docker-plugin/ctx
+
+          mkdir -p "${ctx}/linux/${{ matrix.arch }}"
+          tar -xzf "archives/imbh-${version}-${{ matrix.target }}.tar.gz" \
+            -C "${ctx}/linux/${{ matrix.arch }}" --strip-components=1
+          chmod 0755 "${ctx}/linux/${{ matrix.arch }}/imbhd"
+          # The archive also carries imbh-tui, which a plugin has no way to run — a plugin has exactly
+          # one entrypoint, fixed in config.json. Dropping it keeps the rootfs to what it can execute.
+          rm -f "${ctx}/linux/${{ matrix.arch }}/imbh-tui"
+          # Apache-2.0 §4(d), same reasoning as the image job: lifting the notices out of the archive
+          # is what guarantees the plugin ships the copies this run's `licenses` job generated.
+          mv "${ctx}/linux/${{ matrix.arch }}/LICENSE" "${ctx}/LICENSE"
+          mv "${ctx}/linux/${{ matrix.arch }}/THIRD-PARTY-NOTICES.txt" "${ctx}/THIRD-PARTY-NOTICES.txt"
+
+          find "${ctx}" -type f -printf '  %10s  %p\n'
+
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      # A plugin needs the *flattened* filesystem, not an image, and buildx will hand that over
+      # directly — no `docker create` + `docker export` round trip through a container, and nothing
+      # that has to run on the target platform. That is what lets the arm64 rootfs be assembled on an
+      # amd64 runner with no QEMU: the Dockerfile has no RUN step (see its WORKDIR block).
+      - name: Build the rootfs
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker buildx build \
+            --platform linux/${{ matrix.arch }} \
+            -f crates/imbh-server/docker-plugin/Dockerfile \
+            --output type=tar,dest=rootfs.tar \
+            crates/imbh-server/docker-plugin/ctx
+          mkdir -p plugin/rootfs
+          # Extracted as the runner user, so the files lose their root ownership. That is fine and is
+          # what the local build.sh has always produced: the plugin process runs as root (config.json
+          # declares no user), so 0755 is readable and executable either way, and every path it writes
+          # to is a bind mount supplied by the daemon.
+          tar -xf rootfs.tar -C plugin/rootfs
+          cp crates/imbh-server/docker-plugin/config.json plugin/config.json
+
+      - name: Smoke-test the rootfs
+        # amd64 only: the arm64 binary cannot execute here without QEMU, and it does not need to —
+        # the `build` job already ran this exact assertion against it on a native arm64 runner. What
+        # is new in this job is the base image, and bookworm's glibc 2.36 is the same on both arches,
+        # so the amd64 leg proves the pairing. Cheap, and it is the only check that the thing being
+        # published can actually start: a plugin that fails to launch shows up as a bare
+        # `docker plugin enable` failure with the real error buried in the daemon log.
+        if: matrix.arch == 'amd64'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Rebuilt with --load rather than --output=tar so there is an image to run; every layer is
+          # already in the builder's cache, so this costs a COPY.
+          docker buildx build \
+            --platform linux/amd64 \
+            -f crates/imbh-server/docker-plugin/Dockerfile \
+            --load -t imbh-log-driver-rootfs:smoke \
+            crates/imbh-server/docker-plugin/ctx
+          # imbhd has no --version flag; with every listener disabled and no plugin socket it
+          # initialises the database and exits non-zero with "nothing to serve", which proves the
+          # binary loads, links, and can open a DB inside this rootfs.
+          out="$(docker run --rm -e IMBH_LISTEN_ADDR= -e IMBH_GRPC_LISTEN_ADDR= \
+            imbh-log-driver-rootfs:smoke /usr/bin/imbhd /var/lib/imbh 2>&1 || true)"
+          printf '%s\n' "${out}"
+          printf '%s' "${out}" | grep -qi 'nothing to serve'
+
+      - id: tags
+        shell: bash
+        run: |
+          set -euo pipefail
+          plugin="${{ needs.meta.outputs.plugin }}"
+          version="${{ needs.meta.outputs.version }}"
+          arch="${{ matrix.arch }}"
+          # Hand-rolled rather than docker/metadata-action, which emits whole refs and has no notion
+          # of an architecture suffix. Same policy as the image job's `tags:` block: the exact
+          # version always, and the floating tags only for a real, non-prerelease tag.
+          tags="${plugin}:${version}-${arch}"
+          if [ "${{ needs.meta.outputs.prerelease }}" = false ] && [ "${GITHUB_REF_TYPE}" = tag ]; then
+            tags="${tags} ${plugin}:${version%.*}-${arch} ${plugin}:latest-${arch}"
+          fi
+          echo "tags=${tags}" | tee -a "${GITHUB_OUTPUT}"
+
+      - name: Log in to GHCR
+        if: needs.meta.outputs.publish == 'true'
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      # `plugin create` is local and cheap, so it runs on a dry run too — that is the point of the
+      # rehearsal: the whole path is exercised and only the push is skipped.
+      - name: Create and push the plugin
+        shell: bash
+        run: |
+          set -euo pipefail
+          publish='${{ needs.meta.outputs.publish }}'
+          for tag in ${{ steps.tags.outputs.tags }}; do
+            # STRICTLY ONE TAG AT A TIME, create -> push -> remove. The daemon's plugin store is
+            # content-addressed and holds one plugin per rootfs digest, so creating the second tag
+            # over the same rootfs while the first still exists fails with
+            # `content sha256:...: already exists`. There is no `docker plugin tag`, and pushing the
+            # same content under several names is exactly what the floating tags need — so the first
+            # one has to be gone before the next is made. (Measured on Docker 29.2.1.)
+            docker plugin create "${tag}" plugin
+            docker plugin inspect "${tag}" \
+              --format 'created {{.Name}}  interface={{.Config.Interface.Types}}  entrypoint={{.Config.Entrypoint}}'
+            if [ "${publish}" = true ]; then
+              docker plugin push "${tag}"
+            fi
+            docker plugin rm -f "${tag}" > /dev/null
+          done
+
+      - name: Summarise
+        shell: bash
+        run: |
+          {
+            echo "### Log-driver plugin (${{ matrix.arch }})"
+            echo ''
+            for tag in ${{ steps.tags.outputs.tags }}; do
+              echo "- \`${tag}\`"
+            done
+            echo ''
+            if [ "${{ needs.meta.outputs.publish }}" = true ]; then
+              echo "\`docker plugin install ${{ needs.meta.outputs.plugin }}:${{ needs.meta.outputs.version }}-${{ matrix.arch }}\`"
+            else
+              echo '_Dry run — created locally, nothing pushed._'
+            fi
+          } >> "${GITHUB_STEP_SUMMARY}"

@@ -45,6 +45,12 @@ dependent-version = "upgrade"
 pre-release-replacements = [
   {file="README.md", search="(VERSION=)[^;]+", replace="$1{{version}}", min=0},
   {file="README.md", search="(ghcr.io/moriyoshi/imbh:)[^ ]+", replace="$1{{version}}", min=0},
+  # The log-driver plugin is tagged `<version>-<arch>` (managed plugins have no manifest lists, so
+  # each architecture is its own tag). Stop at the `-` so the arch suffix survives the bump. The
+  # `imbh:` rule above does not cover these: its literal ends in a colon, which `imbh-log-driver`
+  # does not match.
+  {file="README.md", search="(ghcr.io/moriyoshi/imbh-log-driver:)[0-9][^- ]*", replace="$1{{version}}", min=0},
+  {file="docs/DOCKER_LOG_DRIVER.md", search="(ghcr.io/moriyoshi/imbh-log-driver:)[0-9][^- ]*", replace="$1{{version}}", min=0},
 ]
 pre-release-hook = ["git", "cliff", "-o", "CHANGELOG.md", "--tag", "{{version}}" ]
 
