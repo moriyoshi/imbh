@@ -51,6 +51,12 @@ pub struct MetricsApi {
 }
 
 impl MetricsApi {
+    /// The database's metric duplicate-timestamp policy (issue #27), so a semantic layer evaluating
+    /// PromQL over this namespace can honor it without reaching for the [`Db`] itself.
+    pub fn duplicates(&self) -> imbh_core::Duplicates {
+        self.db.duplicates()
+    }
+
     /// The metric catalog: distinct (metric, unit, temporality) per kind (ARCHITECTURE.md §10.8). Covers all
     /// materialized tables — gauge, sum, histogram, exponential histogram, and summary (each carries
     /// the `metric`/`unit`/`temporality` identity columns; summaries leave `temporality` null).

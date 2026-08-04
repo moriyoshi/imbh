@@ -192,6 +192,32 @@ pub fn flush_policy(env: Option<String>) -> imbh::Result<FlushPolicy> {
     }
 }
 
+/// `imbhd`'s default metric duplicate-timestamp policy: the library default, which accepts every
+/// point at ingest and fails a PromQL query that finds two of them at one instant. Rejecting is
+/// opt-in because dropping a producer's data must never be something a deployment gets by accident.
+pub const DEFAULT_DUPLICATES: &str = "error_on_read";
+
+/// Resolve the metric duplicate-timestamp policy from `IMBH_DUPLICATES` (issue #27), falling back to
+/// [`DEFAULT_DUPLICATES`].
+///
+/// The value is a [`imbh::Duplicates`] spec: `error_on_read` (the default), `last_wins` to collapse a
+/// duplicated instant at read time instead of failing the query, or `reject[,recent=N]` to drop the
+/// repeat at ingest and report it in the ingest response's `rejected` count. `reject` costs a fixed
+/// ~13 MB at the default lookback and nothing under the other two.
+///
+/// Empty means unset; a malformed value is an error, never a silent fallback — a typo must not
+/// quietly leave a deployment accepting the duplicates it asked to reject, nor rejecting data it
+/// did not.
+pub fn duplicates(env: Option<String>) -> imbh::Result<imbh::Duplicates> {
+    let spec = env.unwrap_or_default();
+    let spec = spec.trim();
+    if spec.is_empty() {
+        DEFAULT_DUPLICATES.parse()
+    } else {
+        spec.parse()
+    }
+}
+
 /// Resolve the retention cadence from `IMBH_MAINTENANCE_INTERVAL` (a duration such as `60s`, `5m`),
 /// falling back to [`DEFAULT_MAINTENANCE_INTERVAL`]. Empty means unset; a malformed value is an error.
 pub fn maintenance_interval(env: Option<String>) -> imbh::Result<Duration> {
@@ -1042,6 +1068,35 @@ mod tests {
         // A typo is fatal, not a silent fallback to a different cadence than was asked for.
         let err = flush_policy(Some("intrval=5s".to_owned())).unwrap_err();
         assert!(err.is_user_error(), "{err}");
+    }
+
+    #[test]
+    fn duplicates_defaults_to_the_read_time_error_and_rejects_typos() {
+        // Unset and empty both mean the library default: accept at ingest, fail the PromQL read.
+        // Dropping a producer's data must never be something a deployment gets by accident.
+        for env in [None, Some(String::new()), Some("  ".to_owned())] {
+            let d = duplicates(env).unwrap();
+            assert_eq!(d, imbh::Duplicates::ErrorOnRead);
+            assert!(!d.rejects_at_ingest());
+            assert!(!d.collapses_at_read());
+        }
+        assert_eq!(
+            duplicates(Some("last_wins".to_owned())).unwrap(),
+            imbh::Duplicates::LastWins
+        );
+        assert_eq!(
+            duplicates(Some("reject".to_owned())).unwrap(),
+            imbh::Duplicates::reject()
+        );
+        assert_eq!(
+            duplicates(Some("reject,recent=1024".to_owned())).unwrap(),
+            imbh::Duplicates::Reject { recent: 1024 }
+        );
+        // A typo must not quietly leave the deployment accepting what it asked to reject.
+        for spec in ["rejcet", "reject,recnt=8", "reject,recent=x"] {
+            let err = duplicates(Some(spec.to_owned())).unwrap_err();
+            assert!(err.is_user_error(), "{spec}: {err}");
+        }
     }
 
     #[test]

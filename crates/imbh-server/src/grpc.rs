@@ -23,7 +23,7 @@ use opentelemetry_proto::tonic::collector::logs::v1::{
     logs_service_server::{LogsService, LogsServiceServer},
 };
 use opentelemetry_proto::tonic::collector::metrics::v1::{
-    ExportMetricsServiceRequest, ExportMetricsServiceResponse,
+    ExportMetricsPartialSuccess, ExportMetricsServiceRequest, ExportMetricsServiceResponse,
     metrics_service_server::{MetricsService, MetricsServiceServer},
 };
 use opentelemetry_proto::tonic::collector::trace::v1::{
@@ -87,11 +87,23 @@ impl MetricsService for OtlpGrpc {
         request: Request<ExportMetricsServiceRequest>,
     ) -> Result<Response<ExportMetricsServiceResponse>, Status> {
         let bytes = request.into_inner().encode_to_vec();
-        self.db
+        let receipt = self
+            .db
             .ingest_otlp_metrics(&bytes)
             .await
             .map_err(|e| to_status(&e))?;
-        Ok(Response::new(ExportMetricsServiceResponse::default()))
+        // Only metrics have a rejection policy (`Duplicates::Reject`, issue #27), and the OTLP spec
+        // wants `partial_success` left unset on full success — a message on every export is noise a
+        // compliant client is entitled to log.
+        let partial_success = (receipt.rejected > 0).then(|| ExportMetricsPartialSuccess {
+            rejected_data_points: receipt.rejected as i64,
+            error_message:
+                "duplicate (series, timestamp) rejected by the database's duplicate policy"
+                    .to_owned(),
+        });
+        Ok(Response::new(ExportMetricsServiceResponse {
+            partial_success,
+        }))
     }
 }
 

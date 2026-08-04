@@ -354,3 +354,49 @@ fn the_head_prefix_is_a_gateable_unit() {
         );
     }
 }
+
+/// Issue #27's user-visible symptom, end to end: two stored points at one instant made every PromQL
+/// query of that metric a bare `400 Bad Request` naming nothing. The failure still happens under the
+/// default policy — but it now names the metric, the label set and the instant, and it carries a
+/// machine-readable kind so a head can say "fix the producer" rather than "try a shorter range".
+#[tokio::test]
+async fn a_duplicate_timestamp_names_the_series_over_the_wire() {
+    use imbh_test_support::otlp::otlp_sum;
+
+    let addr = free_addr();
+    let db: Arc<Db> = Db::in_memory().open().expect("open in-memory db");
+    let served = Arc::clone(&db);
+    let serve_addr = addr.clone();
+    std::thread::spawn(move || {
+        let _ = serve(served, &serve_addr);
+    });
+    for _ in 0..200 {
+        if let Ok(resp) = http::get(&addr, "/health")
+            && resp.status == 200
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    // Two points at one instant, exactly as a source republishing its own last reading produces.
+    let body = otlp_sum("cart", "dupe", 2, &[(1_000, 1.0), (1_000, 5.0)]);
+    let resp = http::post(&addr, "/v1/metrics", "application/x-protobuf", &body).expect("ingest");
+    assert_eq!(resp.status, 200, "ingest still succeeds: {}", resp.text());
+
+    let client = HeadClient::new(&addr).expect("head client");
+    let request = eval("dupe");
+    let local = exec::promql(&db, &request).await.expect_err("local");
+    let remote = client.promql(&request).await.expect_err("remote");
+
+    assert_eq!(local.status(), 400);
+    assert_eq!(local.message(), remote.message(), "one message, both paths");
+    assert!(remote.is_duplicate_timestamp(), "{}", remote.message());
+    for expected in ["__name__=\"dupe\"", "service=\"cart\"", "1000"] {
+        assert!(
+            remote.message().contains(expected),
+            "message should name {expected}: {}",
+            remote.message()
+        );
+    }
+}

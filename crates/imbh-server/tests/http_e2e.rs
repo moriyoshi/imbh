@@ -24,8 +24,12 @@ fn free_addr() -> String {
 
 /// Start `imbhd` on a background thread over an in-memory DB and wait until it answers `/health`.
 fn start_server() -> String {
+    start_server_with(Db::in_memory().open().expect("open in-memory db"))
+}
+
+/// Start `imbhd` over a caller-configured DB, so a test can exercise a non-default policy.
+fn start_server_with(db: Arc<Db>) -> String {
     let addr = free_addr();
-    let db: Arc<Db> = Db::in_memory().open().expect("open in-memory db");
     let serve_addr = addr.clone();
     std::thread::spawn(move || {
         let _ = serve(db, &serve_addr);
@@ -255,4 +259,38 @@ fn ingested_rows_are_sealed_without_an_admin_flush() {
     .expect("POST /api/query");
     assert_eq!(rows.status, 200);
     assert!(rows.text().contains("\"n\":1"), "{}", rows.text());
+}
+
+/// A duplicate `(series, timestamp)` reaching a `Duplicates::Reject` database is reported on the
+/// wire in the ingest response's `rejected` count — the field that was dead before issue #27, and
+/// the signal the reporter never got while their producer republished 1136 unreadable points.
+#[test]
+fn http_ingest_reports_rejected_duplicate_points() {
+    use imbh_test_support::otlp::otlp_sum;
+
+    let addr = start_server_with(
+        Db::in_memory()
+            .duplicates(imbh::Duplicates::reject())
+            .open()
+            .expect("open in-memory db"),
+    );
+    let body = otlp_sum("cart", "m", 2, &[(10, 1.0)]);
+
+    let first = http::post(&addr, "/v1/metrics", "application/x-protobuf", &body).expect("post");
+    assert_eq!(first.status, 200);
+    assert!(first.text().contains("\"accepted\":1"), "{}", first.text());
+    assert!(first.text().contains("\"rejected\":0"), "{}", first.text());
+
+    let second = http::post(&addr, "/v1/metrics", "application/x-protobuf", &body).expect("post");
+    assert_eq!(second.status, 200, "a duplicate is not a request error");
+    assert!(
+        second.text().contains("\"accepted\":0"),
+        "{}",
+        second.text()
+    );
+    assert!(
+        second.text().contains("\"rejected\":1"),
+        "{}",
+        second.text()
+    );
 }

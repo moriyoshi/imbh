@@ -186,3 +186,60 @@ async fn shutdown_stops_the_grpc_listener_and_frees_the_port() {
     // And the row exported a moment before the trigger is in the DB.
     assert_eq!(count_rows(&db, "SELECT body FROM logs").await, 1);
 }
+
+/// OTLP's own channel for "I took some of that, not all of it": under `Duplicates::Reject` a
+/// duplicate `(series, timestamp)` comes back as `partial_success.rejected_data_points`, which is
+/// what an SDK exporter surfaces to the producer (issue #27). A fully accepted export leaves
+/// `partial_success` unset, as the spec asks.
+#[tokio::test(flavor = "multi_thread")]
+async fn grpc_metrics_export_reports_partial_success_on_duplicates() {
+    use imbh_test_support::otlp::otlp_sum;
+
+    let addr = free_addr();
+    let db: Arc<Db> = Db::in_memory()
+        .duplicates(imbh::Duplicates::reject())
+        .open()
+        .expect("open in-memory db");
+
+    let serve_db = db.clone();
+    let serve_addr = addr.clone();
+    tokio::spawn(async move {
+        let _ = serve_grpc(serve_db, serve_addr.parse().expect("addr")).await;
+    });
+
+    let endpoint = format!("http://{addr}");
+    let mut metrics = None;
+    for _ in 0..200 {
+        if let Ok(c) = MetricsServiceClient::connect(endpoint.clone()).await {
+            metrics = Some(c);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let mut metrics = metrics.expect("gRPC server did not become ready");
+
+    let request = || {
+        ExportMetricsServiceRequest::decode(otlp_sum("cart", "m", 2, &[(10, 1.0)]).as_slice())
+            .unwrap()
+    };
+
+    let first = metrics.export(request()).await.expect("first export");
+    assert!(
+        first.into_inner().partial_success.is_none(),
+        "a fully accepted export must not carry a partial-success message"
+    );
+
+    let second = metrics.export(request()).await.expect("duplicate export");
+    let partial = second
+        .into_inner()
+        .partial_success
+        .expect("the rejected duplicate is reported");
+    assert_eq!(partial.rejected_data_points, 1);
+    assert!(!partial.error_message.is_empty(), "the reason is named");
+
+    assert_eq!(
+        count_rows(&db, "SELECT * FROM metrics_sum WHERE metric = 'm'").await,
+        1,
+        "only the first point was stored"
+    );
+}

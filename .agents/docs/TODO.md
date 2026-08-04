@@ -132,6 +132,16 @@ git history); this file tracks only what is still open.
       accepting it, or tracking an ingest-time column alongside event time so the tail can watermark
       on arrival order. — *source: JOURNAL (E2E against a real dockerd, 2026-07-30)*
 
+- [ ] **Typed `MetricsApi` still counts duplicate metric points.** Issue #27 gave PromQL a
+      `Duplicates` policy (ARCHITECTURE.md §10.5.1), but `MetricsApi::range`/`instant`
+      (`crates/imbh/src/metrics.rs`) still `SUM`/`COUNT` two points sharing a series and a timestamp,
+      so `sum`/`count` inflate and `avg` skews (`RateMode::Counter`'s `max - min` is immune). A known
+      asymmetry rather than an oversight: that path degrades a number instead of denying service, and
+      a SQL dedup would need either `SELECT DISTINCT` (wrong the moment the duplicated *values*
+      differ) or `ROW_NUMBER() OVER (…)` with a deterministic ordering key — which needs the
+      ingest-sequence column the metric schemas do not have. Note the item above wants that same
+      column for the log-driver tail race; one column would close both. — *source: issue #27*
+
 ## Closed, awaiting the next sweep
 
 - [x] **MCP over stdio, hosted by `imbh-tui`.** *Closed 2026-08-01.* `imbhd` served MCP over HTTP

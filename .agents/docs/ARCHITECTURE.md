@@ -718,8 +718,54 @@ have no caller to return to). A clean `close()` drains the queue before the fina
 last `Db` handle without `close()` discards any in-flight queued jobs (same `Weak` lifecycle as the
 maintenance worker).
 
-> *Deviation:* there is no `partial_errors` field and `rejected` is currently always `0` — the
-> OTLP partial-success surface is not built.
+> *Deviation:* there is no `partial_errors` field. `rejected` is `0` under the default duplicate
+> policy; it becomes non-zero under `Duplicates::Reject` (below), which is also what populates the
+> OTLP/gRPC `partial_success.rejected_data_points` on the metrics export.
+
+#### 10.5.1 Duplicate metric timestamps
+
+Two metric datapoints sharing a series **and** a timestamp have no PromQL meaning — its series
+identity is `service` + `__name__` + the string attributes, and there is no rule for two values at one
+instant. `Duplicates` (in `imbh-core::config`, set via `DbBuilder::duplicates`, `IMBH_DUPLICATES` on
+`imbhd`) picks which end of the pipeline says so:
+
+- `ErrorOnRead` (default) — ingest takes everything; a PromQL query that materializes such a series
+  fails with `SemanticError::DuplicateTimestamp`, naming the metric, the label set and the instant,
+  and carrying `dto::KIND_DUPLICATE_TIMESTAMP` over the head wire.
+- `LastWins` — the duplicated instant collapses to one point at read time, so a bad point degrades one
+  datapoint instead of the whole metric. The survivor is chosen by a **total order on the value** (any
+  real number outranks NaN, then `f64::total_cmp`; for histograms, greatest total bucket count then
+  the bucket vector and boundaries), never by scan order: metric segments carry no ingest-sequence
+  column and the read SQL orders by time alone, so a positional rule would let two identical queries
+  disagree after a flush or compaction. The collapse is a pure function of the fetched sample
+  multiset. This is the only remedy for data already written.
+- `Reject { recent }` — ingest drops a point whose `(series, timestamp)` is already among the last
+  `recent` accepted, counting it in `IngestReceipt::rejected`. Reads stay as strict as the default,
+  since points written before it was enabled are still there.
+
+The guard (`imbh/src/dedup.rs`, `#[cfg(feature = "ingest")]`, `std` only) is a two-generation set of
+`(series_hash_128, timestamp)` keys, preallocated so it never rehashes: fixed ~13 MB at the default
+`recent = 262144`, and nothing at all under the other two policies. It runs at the **decode** site,
+above `Storage`, shared by the inline path, the async decode and WAL replay — which is what lets the
+async path report an exact `rejected` count, since the queued receipt returns before the worker runs.
+
+A per-series `last_timestamp` rule was rejected: it is order-sensitive, and since the WAL stores the
+raw body and replay starts with an empty guard, it could reject on replay a point the writer had
+accepted. The set rule is order-commutative, so `G_replay ⊆ G_original` holds at every replayed
+record and **replay is strictly more permissive** — it can never drop a row the writer kept. It also
+leaves out-of-order and late-arriving data accepted, as §7 has always allowed.
+
+Consequently the guard is best-effort by design and does **not** catch: out-of-order points; duplicates
+older than `recent`; duplicates straddling a restart (the guard starts empty at every open); points
+differing only in a non-string attribute (the key is the byte-exact canonical `attributes` blob, while
+PromQL lifts only the string entries); or a metric name emitted as both a gauge and a sum, which is
+kept on separate discriminants so a legitimate sum is never dropped because of a same-named gauge — an
+instant selector unions those two tables, so that one is a *structural* duplicate the read side
+resolves. Which of two differing values survives is also not stable across a restart.
+
+> Known asymmetry: the typed `MetricsApi::range`/`instant` path still `SUM`/`COUNT`s duplicate points
+> rather than resolving them. It degrades a number rather than denying service, and a SQL window dedup
+> would need an ingest-sequence column that does not exist.
 
 ### 10.6 Logs API
 
@@ -1224,8 +1270,8 @@ The first compatibility profiles are explicit and immutable:
 | `imbh.traceql.t1.v1` | Tempo 2.10.5 | typed scoped attributes and intrinsics; spanset logic; child/parent/ancestor/descendant/sibling relations and union variants; `count()` comparison |
 
 Within a profile, boundary and absence behaviour follows the reference implementation exactly, even
-where it disagrees with the other two languages or with SQL. Two rules are load-bearing enough to
-state here, because both are easy to "simplify" into a divergence:
+where it disagrees with the other two languages or with SQL. Three rules are load-bearing enough to
+state here, because each is easy to "simplify" into a divergence:
 
 - **PromQL lookback is left-open**, `(at - lookback, at]`. A sample exactly `lookback` old is
   *dropped*, matching Prometheus's `vectorSelectorSingle` rule (`t <= refTime - lookbackDelta`);
@@ -1234,6 +1280,11 @@ state here, because both are easy to "simplify" into a divergence:
   operators included. `!=` / `!~` on a missing attribute evaluate to *not matched*, not true; this is
   Tempo's semantics, not SQL/PromQL three-valued NULL logic. The only presence test is the explicit
   `nil` literal: `{ .foo = nil }` matches a span missing `foo`, `{ .foo != nil }` does not.
+- **A duplicated timestamp is resolved by value, never by scan order.** Under `Duplicates::LastWins`
+  (§10.5.1) the surviving point of a duplicated instant is picked by a total order on the value, so
+  the result is a pure function of the fetched sample multiset. "Keep whichever the scan emitted
+  last" looks equivalent and is not: there is no ingest-sequence column, so it would let two
+  identical queries disagree after a flush or a compaction.
 
 The contrast with the native surface is deliberate and must not be homogenized: IMBH's own
 `attr_not_in` matcher *is* NULL-aware and keeps rows lacking the key (§10.4), and PromQL label

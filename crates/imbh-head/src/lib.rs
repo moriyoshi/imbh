@@ -117,6 +117,16 @@ impl HeadError {
         )
     }
 
+    /// Whether stored metric points sharing a series and a timestamp are what failed (issue #27).
+    /// Distinct from a bad query: narrowing the range will not help, so a head can say so instead of
+    /// suggesting it.
+    pub fn is_duplicate_timestamp(&self) -> bool {
+        matches!(
+            self,
+            HeadError::Api { kind: Some(kind), .. } if kind == dto::KIND_DUPLICATE_TIMESTAMP
+        )
+    }
+
     /// The message a head shows, without the transport framing.
     pub fn message(&self) -> &str {
         match self {
@@ -173,8 +183,12 @@ impl HeadError {
         use imbh_lgtm::SemanticError::*;
         let (status, kind) = match &error {
             LimitExceeded(_) => (400, Some(dto::KIND_LIMIT_EXCEEDED.to_owned())),
+            DuplicateTimestamp(_) => (400, Some(dto::KIND_DUPLICATE_TIMESTAMP.to_owned())),
             InvalidRange | Incompatible(_) | Malformed(_) => (400, None),
             Source(_) => (500, None),
+            // `SemanticError` is `#[non_exhaustive]`; an unknown variant is the caller's fault by
+            // default, matching the arms above rather than blaming the storage layer.
+            _ => (400, None),
         };
         HeadError::Api {
             status,
