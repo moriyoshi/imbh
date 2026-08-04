@@ -200,7 +200,7 @@ are off to keep the [footprint](#footprint) gate honest. Each release also publi
 file:
 
 ```
-VERSION=0.2.0; TARGET=x86_64-unknown-linux-gnu
+VERSION=0.5.0; TARGET=x86_64-unknown-linux-gnu
 BASE=https://github.com/moriyoshi/imbh/releases/download/v${VERSION}
 curl -fLO ${BASE}/imbh-${VERSION}-${TARGET}.tar.gz
 curl -fLO ${BASE}/SHA256SUMS
@@ -213,8 +213,8 @@ tar xzf imbh-${VERSION}-${TARGET}.tar.gz
 under [immutable releases](https://docs.github.com/en/code-security/concepts/supply-chain-security/immutable-releases)
 that publish froze it empty and reserved the `v0.3.0` tag name permanently, so the archives can
 never be attached. The release itself is otherwise complete — take 0.3.0 from the [container
-image](#container-image) or `cargo install imbh-server imbh-tui`, or use the 0.2.0 archives above.
-Archives resume with the next version.
+image](#container-image) or `cargo install imbh-server imbh-tui`, or use the 0.2.0 archives (set
+`VERSION=0.2.0` in the recipe above). Archives resumed with 0.4.0.
 
 `docker` and `macOS`: the log-driver feature is deliberately omitted from the macOS builds. A
 logging-driver plugin talks to a *local* Docker daemon over a Unix socket, and on macOS that daemon
@@ -230,7 +230,7 @@ it runs as an unprivileged user with the database on a volume at `/var/lib/imbh`
 docker run -d --name imbh \
   -p 4318:4318 -p 4317:4317 \
   -v imbh-data:/var/lib/imbh \
-  ghcr.io/moriyoshi/imbh:0.3.0
+  ghcr.io/moriyoshi/imbh:0.5.0
 
 curl -s 127.0.0.1:4318/api/query --data "SELECT count(*) FROM logs"
 
@@ -326,7 +326,7 @@ Built with `--features docker`, `imbhd` also speaks the Docker logging-driver pl
 container stdout/stderr is written directly into the embedded database — no collector, no sidecar:
 
 ```
-docker plugin install --alias imbh ghcr.io/moriyoshi/imbh-log-driver:0.4.0-amd64   # or -arm64
+docker plugin install --alias imbh ghcr.io/moriyoshi/imbh-log-driver:0.5.0-amd64   # or -arm64
 
 docker run --log-driver imbh --log-opt imbh-service=web nginx
 
