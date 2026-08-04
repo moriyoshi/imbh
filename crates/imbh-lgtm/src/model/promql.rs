@@ -1,6 +1,9 @@
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
+
+use imbh_core::Duplicates;
 
 use crate::{LabelSet, SemanticError};
 
@@ -242,6 +245,141 @@ pub fn plan_prom_fetch(
     requests.dedup();
     Ok(PromFetchPlan { requests })
 }
+/// Total order over two sample values observed at the same instant.
+///
+/// A real number always outranks NaN, so a NaN reading can never displace an observation — note that
+/// `f64::total_cmp` on its own ranks NaN *above* `+INFINITY`, which would let one NaN row punch a
+/// hole in an otherwise good series. Otherwise `total_cmp` decides, which makes the winner a function
+/// of the values alone and never of the order storage happened to scan them in.
+fn duplicate_value_cmp(left: f64, right: f64) -> Ordering {
+    left.is_nan()
+        .cmp(&right.is_nan())
+        .reverse()
+        .then_with(|| left.total_cmp(&right))
+}
+
+/// Sort one series by timestamp and collapse every group of samples sharing a timestamp to a single
+/// point, keeping the greatest value under [`duplicate_value_cmp`]. Returns how many were dropped.
+///
+/// PromQL has no meaning for two values at one instant, but a duplicated timestamp is a property of
+/// the *data*, not of the query: failing on it (imbh's only behavior before issue #27) made every
+/// query of the affected metric fail for the metric's whole retention period, with no way to recover
+/// short of waiting retention out. Collapsing degrades one instant instead.
+///
+/// The rule is deliberately value-based rather than "last one the scan emitted". Metric segments
+/// carry no ingest-sequence column and the read SQL orders by time alone, so scan order among ties is
+/// undefined — a positional rule would let two identical queries disagree after a flush or a
+/// compaction, which for a range query means a chart that redraws differently on refresh. The
+/// guarantee here is stronger: **the output is a pure function of the multiset of input samples.**
+///
+/// Duplicates are not only a producer fault. An instant selector reads the gauge table *and* the sum
+/// table and unions the results, and nothing in the derived label set distinguishes them, so a metric
+/// name recorded as both instrument kinds produces them structurally.
+pub fn collapse_duplicate_samples(samples: &mut Vec<FloatSample>) -> usize {
+    let before = samples.len();
+    // Unstable is fine and cheaper: the comparator is total up to bit-identical samples, which are
+    // indistinguishable in the output.
+    samples.sort_unstable_by(|left, right| {
+        left.timestamp_ns
+            .cmp(&right.timestamp_ns)
+            .then_with(|| duplicate_value_cmp(left.value, right.value).reverse())
+    });
+    // `dedup_by` keeps the *first* of each run, and the sort above put the winner there.
+    samples.dedup_by(|later, kept| later.timestamp_ns == kept.timestamp_ns);
+    before - samples.len()
+}
+
+/// Rank two histogram points observed at the same instant: the more advanced cumulative reading wins
+/// (greater total observation count), with the bucket vector and then the boundaries breaking any
+/// remaining tie.
+///
+/// The trailing clauses are not decoration — they make the order *total*. Without them, two points
+/// with equal totals but different bucket layouts would reintroduce scan-order dependence, which then
+/// nondeterministically decides whether `eval_histogram_quantiles` reports that bucket boundaries
+/// changed within the range: precisely the flapping error this is meant to eliminate.
+fn duplicate_histogram_cmp(left: &HistogramPoint<'_>, right: &HistogramPoint<'_>) -> Ordering {
+    let total = |point: &HistogramPoint<'_>| {
+        point
+            .bucket_counts
+            .iter()
+            .copied()
+            .fold(0_u64, u64::saturating_add)
+    };
+    total(left)
+        .cmp(&total(right))
+        .then_with(|| left.bucket_counts.cmp(right.bucket_counts))
+        .then_with(|| left.explicit_bounds.len().cmp(&right.explicit_bounds.len()))
+        .then_with(|| {
+            left.explicit_bounds
+                .iter()
+                .zip(right.explicit_bounds)
+                .map(|(l, r)| l.total_cmp(r))
+                .find(|ordering| ordering.is_ne())
+                .unwrap_or(Ordering::Equal)
+        })
+}
+
+/// Histogram twin of [`collapse_duplicate_samples`].
+pub fn collapse_duplicate_histogram_points(points: &mut Vec<HistogramPoint<'_>>) -> usize {
+    let before = points.len();
+    points.sort_unstable_by(|left, right| {
+        left.timestamp_ns
+            .cmp(&right.timestamp_ns)
+            .then_with(|| duplicate_histogram_cmp(left, right).reverse())
+    });
+    points.dedup_by(|later, kept| later.timestamp_ns == kept.timestamp_ns);
+    before - points.len()
+}
+
+/// Sort one series and apply `duplicates` to any repeated timestamp: collapse under
+/// [`Duplicates::LastWins`], otherwise fail naming the series and the instant.
+fn resolve_duplicate_samples(
+    samples: &mut Vec<FloatSample>,
+    labels: &LabelSet<'_>,
+    duplicates: Duplicates,
+) -> Result<(), SemanticError> {
+    if duplicates.collapses_at_read() {
+        collapse_duplicate_samples(samples);
+        return Ok(());
+    }
+    samples.sort_by_key(|sample| sample.timestamp_ns);
+    match samples
+        .windows(2)
+        .find(|pair| pair[0].timestamp_ns == pair[1].timestamp_ns)
+    {
+        Some(pair) => Err(SemanticError::duplicate_timestamp(
+            "series",
+            labels,
+            pair[0].timestamp_ns,
+        )),
+        None => Ok(()),
+    }
+}
+
+/// Histogram twin of [`resolve_duplicate_samples`].
+fn resolve_duplicate_histogram_points(
+    points: &mut Vec<HistogramPoint<'_>>,
+    labels: &LabelSet<'_>,
+    duplicates: Duplicates,
+) -> Result<(), SemanticError> {
+    if duplicates.collapses_at_read() {
+        collapse_duplicate_histogram_points(points);
+        return Ok(());
+    }
+    points.sort_by_key(|point| point.timestamp_ns);
+    match points
+        .windows(2)
+        .find(|pair| pair[0].timestamp_ns == pair[1].timestamp_ns)
+    {
+        Some(pair) => Err(SemanticError::duplicate_timestamp(
+            "histogram series",
+            labels,
+            pair[0].timestamp_ns,
+        )),
+        None => Ok(()),
+    }
+}
+
 /// Reference evaluator over an already bounded normalized working set.
 /// Production callers should use [`execute_prom`], which plans and enforces bounded storage reads.
 pub fn eval_prom_reference<'a>(
@@ -273,12 +411,32 @@ pub fn eval_prom_with_histograms_reference<'a>(
     )
 }
 
-/// Plan bounded reads, fetch them from storage, and evaluate the resulting working set.
+/// Plan bounded reads, fetch them from storage, and evaluate the resulting working set, failing on a
+/// duplicated timestamp ([`Duplicates::ErrorOnRead`]).
+///
+/// Use [`execute_prom_with_duplicates`] to honor a database's configured policy instead.
 pub async fn execute_prom<S: PromSeriesSource + ?Sized>(
     source: &S,
     expr: &PromExpr,
     range: crate::EvalRange,
     limits: crate::EvalLimits,
+) -> Result<Vec<PromSeries<'static>>, SemanticError> {
+    execute_prom_with_duplicates(source, expr, range, limits, Duplicates::ErrorOnRead).await
+}
+
+/// Plan bounded reads, fetch them from storage, and evaluate the resulting working set, resolving a
+/// duplicated timestamp per `duplicates` (issue #27).
+///
+/// Under [`Duplicates::LastWins`] a timestamp carrying more than one point collapses to a single
+/// point; under every other policy it fails the query with a [`SemanticError::DuplicateTimestamp`]
+/// naming the series. [`Duplicates::Reject`] reads as strictly as the default on purpose: it guards
+/// *ingest*, and points written before it was enabled are still there.
+pub async fn execute_prom_with_duplicates<S: PromSeriesSource + ?Sized>(
+    source: &S,
+    expr: &PromExpr,
+    range: crate::EvalRange,
+    limits: crate::EvalLimits,
+    duplicates: Duplicates,
 ) -> Result<Vec<PromSeries<'static>>, SemanticError> {
     let plan = plan_prom_fetch(expr, range, limits)?;
     // Fetch every bounded read up front and hold the packs for the whole evaluation: their labels
@@ -354,15 +512,9 @@ pub async fn execute_prom<S: PromSeriesSource + ?Sized>(
     }
     let mut working_set = Vec::with_capacity(by_labels.len());
     for (labels, mut samples) in by_labels {
-        samples.sort_by_key(|sample| sample.timestamp_ns);
-        if samples
-            .windows(2)
-            .any(|pair| pair[0].timestamp_ns == pair[1].timestamp_ns)
-        {
-            return Err(SemanticError::Malformed(
-                "duplicate timestamps in one PromQL series",
-            ));
-        }
+        // Duplicates are resolved *after* the `max_samples` accounting above: that budget covers the
+        // source read, and storage really did return those rows.
+        resolve_duplicate_samples(&mut samples, &labels, duplicates)?;
         working_set.push(PromSeries { labels, samples });
     }
     if histogram_by_labels.len() > limits.max_series {
@@ -372,15 +524,7 @@ pub async fn execute_prom<S: PromSeriesSource + ?Sized>(
     }
     let mut histogram_working_set = Vec::with_capacity(histogram_by_labels.len());
     for (labels, mut points) in histogram_by_labels {
-        points.sort_by_key(|point| point.timestamp_ns);
-        if points
-            .windows(2)
-            .any(|pair| pair[0].timestamp_ns == pair[1].timestamp_ns)
-        {
-            return Err(SemanticError::Malformed(
-                "duplicate timestamps in one PromQL histogram series",
-            ));
-        }
+        resolve_duplicate_histogram_points(&mut points, &labels, duplicates)?;
         histogram_working_set.push(PromHistogramSeries { labels, points });
     }
     let evaluated = eval_prom_with_histograms_reference(
@@ -580,6 +724,11 @@ fn eval_histogram_quantiles<'a>(
             if selected.len() < 2 {
                 continue;
             }
+            // `execute_prom` guarantees this via `resolve_duplicate_histogram_points`, so the check
+            // is unreachable from there. Keep it: this function is reached from the public
+            // `eval_prom_with_histograms_reference`, whose working set is caller-supplied and
+            // unvalidated, and a silently mis-ordered series would produce a wrong quantile rather
+            // than an error.
             if selected
                 .windows(2)
                 .any(|pair| pair[0].timestamp_ns >= pair[1].timestamp_ns)
@@ -675,6 +824,10 @@ pub fn extrapolated_rate(
     if samples.len() < 2 {
         return Ok(None);
     }
+    // As with `eval_histogram_quantiles`: `execute_prom` now guarantees one sample per timestamp, so
+    // this is unreachable from there — but this function is public and `eval_prom_reference` takes a
+    // caller-supplied working set. Equal timestamps would otherwise yield a zero sampled interval and
+    // an inflated sample count, i.e. a silently wrong rate.
     if samples
         .windows(2)
         .any(|pair| pair[0].timestamp_ns >= pair[1].timestamp_ns)
@@ -1292,5 +1445,203 @@ mod tests {
         .unwrap();
         assert_eq!(result[0].labels.get("route"), Some("/checkout"));
         assert!((result[0].samples[0].value - 1.5).abs() < 1e-12);
+    }
+
+    // ── duplicate timestamps (issue #27) ────────────────────────────────────────────────────────
+
+    fn sample(timestamp_ns: i64, value: f64) -> FloatSample {
+        FloatSample {
+            timestamp_ns,
+            value,
+        }
+    }
+
+    fn labelled(metric: &str) -> LabelSet<'static> {
+        LabelSet::new([
+            ("__name__".to_owned(), metric.to_owned()),
+            ("service".to_owned(), "cart".to_owned()),
+        ])
+    }
+
+    #[test]
+    fn collapse_is_independent_of_input_order() {
+        // The property that rules out "keep whichever the scan emitted last": segments carry no
+        // ingest-sequence column, so a positional rule would let two identical queries disagree.
+        let expected = vec![sample(10, 5.0), sample(20, 2.0)];
+        for input in [
+            vec![sample(10, 1.0), sample(10, 5.0), sample(20, 2.0)],
+            vec![sample(20, 2.0), sample(10, 5.0), sample(10, 1.0)],
+            vec![sample(10, 5.0), sample(20, 2.0), sample(10, 1.0)],
+        ] {
+            let mut samples = input.clone();
+            assert_eq!(collapse_duplicate_samples(&mut samples), 1, "{input:?}");
+            assert_eq!(
+                samples, expected,
+                "collapse depended on input order: {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn collapse_prefers_an_observation_over_nan() {
+        // `f64::total_cmp` alone ranks NaN above +INFINITY, so a naive max would let one NaN row
+        // punch a hole in an otherwise readable series.
+        let mut samples = vec![sample(10, f64::NAN), sample(10, 3.0)];
+        assert_eq!(collapse_duplicate_samples(&mut samples), 1);
+        assert_eq!(samples, vec![sample(10, 3.0)]);
+
+        // …but an all-NaN instant still collapses to one point rather than vanishing.
+        let mut samples = vec![sample(10, f64::NAN), sample(10, f64::NAN)];
+        assert_eq!(collapse_duplicate_samples(&mut samples), 1);
+        assert_eq!(samples.len(), 1);
+        assert!(samples[0].value.is_nan());
+    }
+
+    #[test]
+    fn collapse_of_identical_duplicates_keeps_the_value() {
+        // The common real case: a source republishing its own last reading unchanged.
+        let mut samples = vec![sample(10, 4.0), sample(10, 4.0), sample(20, 6.0)];
+        assert_eq!(collapse_duplicate_samples(&mut samples), 1);
+        assert_eq!(samples, vec![sample(10, 4.0), sample(20, 6.0)]);
+    }
+
+    #[test]
+    fn histogram_collapse_keeps_the_more_advanced_reading() {
+        const BOUNDS: [f64; 1] = [1.0];
+        let point = |timestamp_ns, counts: &'static [u64]| HistogramPoint {
+            timestamp_ns,
+            explicit_bounds: &BOUNDS,
+            bucket_counts: counts,
+        };
+        for input in [
+            vec![point(10, &[1, 1]), point(10, &[2, 3]), point(20, &[4, 4])],
+            vec![point(20, &[4, 4]), point(10, &[2, 3]), point(10, &[1, 1])],
+        ] {
+            let mut points = input.clone();
+            assert_eq!(collapse_duplicate_histogram_points(&mut points), 1);
+            assert_eq!(points.len(), 2);
+            assert_eq!(points[0].bucket_counts, &[2, 3]);
+            assert_eq!(points[1].bucket_counts, &[4, 4]);
+        }
+    }
+
+    /// A source returning two entries that share a label set, which is exactly how `execute_prom`
+    /// sees a metric recorded as both a gauge and a sum (the two tables are unioned into one pack and
+    /// nothing in the derived label set distinguishes them).
+    struct DuplicateSource(Vec<(LabelSet<'static>, Vec<FloatSample>)>);
+
+    impl PromSeriesSource for DuplicateSource {
+        fn fetch<'a>(
+            &'a self,
+            _request: &'a PromFetchRequest,
+        ) -> Pin<Box<dyn Future<Output = Result<PromSeriesPack, SemanticError>> + Send + 'a>>
+        {
+            let entries = self.0.clone();
+            Box::pin(async move {
+                PromSeriesPack::try_new(Box::new(entries), |owner| -> Result<_, SemanticError> {
+                    let entries = owner
+                        .downcast_ref::<Vec<(LabelSet<'static>, Vec<FloatSample>)>>()
+                        .expect("owner is the entry list");
+                    Ok(entries
+                        .iter()
+                        .map(|(labels, samples)| PromSeries {
+                            labels: labels.clone(),
+                            samples: samples.clone(),
+                        })
+                        .collect())
+                })
+            })
+        }
+    }
+
+    fn duplicate_source() -> DuplicateSource {
+        DuplicateSource(vec![
+            (
+                labelled("m"),
+                vec![sample(10 * S, 1.0), sample(20 * S, 2.0)],
+            ),
+            (labelled("m"), vec![sample(10 * S, 9.0)]),
+        ])
+    }
+
+    fn selector() -> PromExpr {
+        PromExpr::Selector {
+            matchers: vec![LabelMatcher {
+                name: "__name__".to_owned(),
+                op: MatchOp::Eq,
+                value: "m".to_owned(),
+            }],
+        }
+    }
+
+    #[tokio::test]
+    async fn error_on_read_names_the_series_and_the_instant() {
+        // The whole point of issue #27's third ask: the old message named nothing, so the failure
+        // read as "the query language is broken" and narrowing the range did not isolate it.
+        let error = execute_prom(
+            &duplicate_source(),
+            &selector(),
+            crate::EvalRange::instant(20 * S),
+            crate::EvalLimits::default(),
+        )
+        .await
+        .expect_err("duplicates must fail under the default policy");
+        let message = error.to_string();
+        assert!(
+            matches!(error, SemanticError::DuplicateTimestamp(_)),
+            "{error:?}"
+        );
+        assert!(message.contains("__name__=\"m\""), "{message}");
+        assert!(message.contains("service=\"cart\""), "{message}");
+        assert!(message.contains(&(10 * S).to_string()), "{message}");
+    }
+
+    #[tokio::test]
+    async fn last_wins_collapses_the_merged_series_instead_of_failing() {
+        let series = execute_prom_with_duplicates(
+            &duplicate_source(),
+            &selector(),
+            crate::EvalRange::instant(20 * S),
+            crate::EvalLimits::default(),
+            Duplicates::LastWins,
+        )
+        .await
+        .expect("last_wins resolves the duplicate");
+        assert_eq!(series.len(), 1);
+        // An instant selector at 20s reports the newest sample; the duplicated 10s instant is what
+        // used to fail the query outright.
+        assert_eq!(series[0].samples, vec![sample(20 * S, 2.0)]);
+    }
+
+    #[tokio::test]
+    async fn reject_reads_as_strictly_as_the_default() {
+        // `Reject` guards ingest; points written before it was enabled are still there, so a read
+        // must not silently paper over them.
+        let error = execute_prom_with_duplicates(
+            &duplicate_source(),
+            &selector(),
+            crate::EvalRange::instant(20 * S),
+            crate::EvalLimits::default(),
+            Duplicates::reject(),
+        )
+        .await
+        .expect_err("reject keeps the read-side error");
+        assert!(
+            matches!(error, SemanticError::DuplicateTimestamp(_)),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn the_reference_rate_still_rejects_unordered_samples() {
+        // `execute_prom` now guarantees one sample per timestamp, so this check is unreachable from
+        // there — but `extrapolated_rate` is public and `eval_prom_reference` takes a caller-supplied
+        // working set, where equal timestamps would otherwise yield a silently wrong rate.
+        let error = extrapolated_rate(&[sample(10, 1.0), sample(10, 2.0)], 0, 20)
+            .expect_err("a malformed caller-supplied series must still error");
+        assert_eq!(
+            error,
+            SemanticError::Malformed("counter samples are not strictly ordered")
+        );
     }
 }

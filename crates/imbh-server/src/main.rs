@@ -19,6 +19,16 @@
 //! buffer is sealed, rows live in the WAL + memory only, so this is also what bounds `imbhd`'s RSS and
 //! WAL growth.
 //!
+//! `IMBH_DUPLICATES` decides what happens to two metric datapoints sharing a series **and** a
+//! timestamp, which has no PromQL meaning (issue #27). The default `error_on_read` accepts them at
+//! ingest and fails a PromQL query that finds them, naming the metric, the label set and the instant.
+//! `last_wins` collapses the duplicated instant at read time instead, so one bad point degrades one
+//! datapoint rather than the whole metric — the escape hatch for a database that already holds
+//! duplicates. `reject[,recent=N]` drops the repeat at ingest and reports it in the ingest response's
+//! `rejected` count (and in OTLP/gRPC `partial_success`), so the responsible producer sees it at write
+//! time; `recent` (default 262144) bounds both the guard's lookback and its memory, costing a fixed
+//! ~13 MB. Rejecting is opt-in on purpose: dropping a producer's data should never happen by accident.
+//!
 //! `POST /mcp` serves the **Model Context Protocol** over its Streamable HTTP transport, so an agent
 //! can search logs, pull traces, and query metrics through the same process that ingests them. The
 //! tools are read-only; `IMBH_MCP_ALLOWED_ORIGINS` (comma-separated, or `*`) widens the default
@@ -82,6 +92,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     let maintenance_interval =
         imbh_server::maintenance_interval(std::env::var("IMBH_MAINTENANCE_INTERVAL").ok())?;
     let drain = imbh_server::shutdown_timeout(std::env::var("IMBH_SHUTDOWN_TIMEOUT").ok())?;
+    // What happens to two metric points sharing a series and a timestamp (issue #27). Fatal on a
+    // typo for the same reason as the flush spec: quietly running a different policy than the
+    // deployment asked for either drops data it wanted or keeps data it wanted rejected.
+    let duplicates = imbh_server::duplicates(std::env::var("IMBH_DUPLICATES").ok())?;
     // What bounds one connection: how long it may go quiet in each phase, how large a body it may
     // send, and how many of them may be open at once. `0` disables any of them individually.
     let limits = imbh_server::Limits {
@@ -107,6 +121,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let db = imbh::Db::builder(&dir)
         .maintenance(imbh::Maintenance::Background(maintenance_interval))
         .flush(flush)
+        .duplicates(duplicates)
         .open()?;
 
     banner(
@@ -116,6 +131,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         maintenance_interval,
         drain,
         limits,
+        duplicates,
     );
 
     // Every configured endpoint runs on its own thread and `main` parks until shutdown. The uniform
@@ -298,6 +314,7 @@ fn banner(
     maintenance_interval: Duration,
     drain: Duration,
     limits: imbh_server::Limits,
+    duplicates: imbh::Duplicates,
 ) {
     #[cfg(feature = "tracing")]
     {
@@ -318,6 +335,7 @@ fn banner(
             body_timeout_secs = limits.timeouts.body.as_secs_f64(),
             max_body_bytes = limits.max_body,
             max_connections = limits.max_connections,
+            %duplicates,
             "flush scheduler"
         );
     }
@@ -359,5 +377,7 @@ fn banner(
             cap(limits.max_body),
             cap(limits.max_connections as u64)
         );
+        // In the same syntax IMBH_DUPLICATES accepts, so an operator can copy it back out.
+        println!("  metrics:   duplicate timestamps → {duplicates}");
     }
 }

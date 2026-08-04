@@ -37,9 +37,10 @@ pub use model::promql::{
     ClassicHistogramBucket, FloatSample, Grouping, HistogramPoint, HistogramQuantileResult,
     LabelMatcher, MatchOp, PromAggregate, PromExpr, PromFetchPlan, PromFetchPurpose,
     PromFetchRequest, PromHistogramPack, PromHistogramSeries, PromSeries, PromSeriesPack,
-    PromSeriesSource, aggregate_instant, classic_histogram_quantile, eval_prom_reference,
-    eval_prom_with_histograms_reference, execute_prom, extrapolated_rate, plan_prom_fetch,
-    select_instant, select_range,
+    PromSeriesSource, aggregate_instant, classic_histogram_quantile,
+    collapse_duplicate_histogram_points, collapse_duplicate_samples, eval_prom_reference,
+    eval_prom_with_histograms_reference, execute_prom, execute_prom_with_duplicates,
+    extrapolated_rate, plan_prom_fetch, select_instant, select_range,
 };
 pub use model::traceql::{
     AttributeScope, Intrinsic, SemanticSpan, SemanticTrace, SemanticValue, SpanCandidateFilter,

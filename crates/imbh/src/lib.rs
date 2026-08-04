@@ -34,6 +34,8 @@ mod attrs;
 #[cfg(feature = "tracing-console")]
 pub mod console;
 #[cfg(feature = "ingest")]
+mod dedup;
+#[cfg(feature = "ingest")]
 mod ingest_queue;
 #[cfg(feature = "query")]
 mod logs;
@@ -91,10 +93,10 @@ pub use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
 #[cfg(feature = "cdata")]
 pub use arrow::ffi_stream::FFI_ArrowArrayStream;
 pub use imbh_core::{
-    Access, AnyValue, Attributes, Compression, Direction, DurationNs, Error, FlushPolicy,
-    FlushSize, Ingest, LogRow, Lsn, Maintenance, MemoryBudget, Overflow, Promote, Refresh, Result,
-    Retention, SegmentRef, SeverityNumber, SpanId, Table, TimeRange, Timestamp, TraceId, WalMode,
-    parse_bytes, parse_duration, parse_json,
+    Access, AnyValue, Attributes, Compression, Direction, Duplicates, DurationNs, Error,
+    FlushPolicy, FlushSize, Ingest, LogRow, Lsn, Maintenance, MemoryBudget, Overflow, Promote,
+    Refresh, Result, Retention, SegmentRef, SeverityNumber, SpanId, Table, TimeRange, Timestamp,
+    TraceId, WalMode, parse_bytes, parse_duration, parse_json,
 };
 
 pub use imbh_storage::{CompactionReport, FlushGauges, SnapshotInfo, TableStats};
@@ -106,17 +108,19 @@ use arrow::record_batch::RecordBatch;
 #[cfg(feature = "query")]
 use datafusion::scalar::ScalarValue;
 
-/// Record the ingest outcome (`accepted`/`lsn`/`durable`) onto the current `tracing` span. A no-op
-/// (compiled away) without the `tracing` feature — the shared tail of the three `ingest_*_inner`
-/// spans so the field-recording lives in one place.
+/// Record the ingest outcome (`accepted`/`rejected`/`lsn`/`durable`) onto the current `tracing`
+/// span. A no-op (compiled away) without the `tracing` feature — the shared tail of the three
+/// `ingest_*_inner` spans so the field-recording lives in one place. Logs and traces have no
+/// duplicate policy and always pass `rejected = 0`, which keeps the signature uniform.
 #[inline]
 #[cfg(feature = "ingest")]
 #[cfg_attr(not(feature = "tracing"), allow(unused_variables))]
-fn record_ingest(accepted: u64, lsn: Lsn, durable: bool) {
+fn record_ingest(accepted: u64, rejected: u64, lsn: Lsn, durable: bool) {
     #[cfg(feature = "tracing")]
     {
         let span = tracing::Span::current();
         span.record("accepted", accepted);
+        span.record("rejected", rejected);
         span.record("lsn", lsn.get());
         span.record("durable", durable);
     }
@@ -150,6 +154,15 @@ pub struct Db {
     /// worker before the final seal. `None` unless `Ingest::Async` was configured.
     #[cfg(feature = "ingest")]
     ingest_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// The metric duplicate-timestamp policy (issue #27). Kept outside the `ingest` cfg because the
+    /// read side consults it too — a query-only build still has to know whether to collapse a
+    /// duplicated instant or fail the query.
+    duplicates: Duplicates,
+    /// The bounded guard backing [`Duplicates::Reject`]. Inert and unallocated under every other
+    /// policy. Read-only handles always get an inert guard: they never ingest, and their per-query
+    /// WAL-tail materialization must not accumulate state across queries.
+    #[cfg(feature = "ingest")]
+    dedup: dedup::DedupGuard,
     /// Read-only snapshot-refresh policy (ARCHITECTURE.md §5). `OnQuery` (default) rebuilds every
     /// query; `Ttl`/`Manual` reuse [`Self::reader_cache`]. Irrelevant for read-write handles.
     #[cfg(feature = "query")]
@@ -199,6 +212,7 @@ impl Db {
             promote: Promote::default(),
             allow_stale_reads: false,
             refresh: Refresh::default(),
+            duplicates: Duplicates::default(),
         }
     }
 
@@ -230,6 +244,7 @@ impl Db {
             promote: Promote::default(),
             allow_stale_reads: false,
             refresh: Refresh::default(),
+            duplicates: Duplicates::default(),
         }
     }
 
@@ -252,7 +267,7 @@ impl Db {
                 rows,
             })
             .await?;
-            return Ok(IngestReceipt::queued(accepted));
+            return Ok(IngestReceipt::queued(accepted, 0));
         }
         self.ingest_logs_inner(body, true)
     }
@@ -271,7 +286,7 @@ impl Db {
             level = "debug",
             name = "ingest.logs",
             skip_all,
-            fields(bytes = body.len(), sync_now, accepted = tracing::field::Empty, lsn = tracing::field::Empty, durable = tracing::field::Empty)
+            fields(bytes = body.len(), sync_now, accepted = tracing::field::Empty, rejected = tracing::field::Empty, lsn = tracing::field::Empty, durable = tracing::field::Empty)
         )
     )]
     #[cfg(feature = "ingest")]
@@ -284,11 +299,11 @@ impl Db {
                 raw: body.to_vec(),
                 rows,
             })?;
-            return Ok(IngestReceipt::queued(accepted));
+            return Ok(IngestReceipt::queued(accepted, 0));
         }
         let (lsn, durable) = self.storage.ingest(SIGNAL_LOGS, body, rows, sync_now)?;
-        record_ingest(accepted, lsn, durable);
-        Ok(IngestReceipt::synced(accepted, lsn, durable))
+        record_ingest(accepted, 0, lsn, durable);
+        Ok(IngestReceipt::synced(accepted, 0, lsn, durable))
     }
 
     /// Ingest a protobuf OTLP/traces export request body (ARCHITECTURE.md §10.5). Under `Ingest::Async`
@@ -304,7 +319,7 @@ impl Db {
                 rows,
             })
             .await?;
-            return Ok(IngestReceipt::queued(accepted));
+            return Ok(IngestReceipt::queued(accepted, 0));
         }
         self.ingest_traces_inner(body, true)
     }
@@ -321,7 +336,7 @@ impl Db {
             level = "debug",
             name = "ingest.traces",
             skip_all,
-            fields(bytes = body.len(), sync_now, accepted = tracing::field::Empty, lsn = tracing::field::Empty, durable = tracing::field::Empty)
+            fields(bytes = body.len(), sync_now, accepted = tracing::field::Empty, rejected = tracing::field::Empty, lsn = tracing::field::Empty, durable = tracing::field::Empty)
         )
     )]
     #[cfg(feature = "ingest")]
@@ -334,11 +349,11 @@ impl Db {
                 raw: body.to_vec(),
                 rows,
             })?;
-            return Ok(IngestReceipt::queued(accepted));
+            return Ok(IngestReceipt::queued(accepted, 0));
         }
         let (lsn, durable) = self.storage.ingest_traces(body, rows, sync_now)?;
-        record_ingest(accepted, lsn, durable);
-        Ok(IngestReceipt::synced(accepted, lsn, durable))
+        record_ingest(accepted, 0, lsn, durable);
+        Ok(IngestReceipt::synced(accepted, 0, lsn, durable))
     }
 
     /// Ingest a protobuf OTLP/metrics export request body (gauge + sum points; ARCHITECTURE.md §10.5).
@@ -348,9 +363,9 @@ impl Db {
     pub async fn ingest_otlp_metrics(&self, body: &[u8]) -> Result<IngestReceipt> {
         if let Some(ch) = &self.ingest {
             self.ensure_writable()?;
-            let (job, accepted) = decode_metrics_job(body)?;
+            let (job, accepted, rejected) = decode_metrics_job(body, &self.dedup)?;
             ch.send(job).await?;
-            return Ok(IngestReceipt::queued(accepted));
+            return Ok(IngestReceipt::queued(accepted, rejected));
         }
         self.ingest_metrics_inner(body, true)
     }
@@ -367,27 +382,28 @@ impl Db {
             level = "debug",
             name = "ingest.metrics",
             skip_all,
-            fields(bytes = body.len(), sync_now, accepted = tracing::field::Empty, lsn = tracing::field::Empty, durable = tracing::field::Empty)
+            fields(bytes = body.len(), sync_now, accepted = tracing::field::Empty, rejected = tracing::field::Empty, lsn = tracing::field::Empty, durable = tracing::field::Empty)
         )
     )]
     #[cfg(feature = "ingest")]
     fn ingest_metrics_inner(&self, body: &[u8], sync_now: bool) -> Result<IngestReceipt> {
         self.ensure_writable()?;
         if let Some(ch) = &self.ingest {
-            let (job, accepted) = decode_metrics_job(body)?;
+            let (job, accepted, rejected) = decode_metrics_job(body, &self.dedup)?;
             ch.try_send(job)?;
-            return Ok(IngestReceipt::queued(accepted));
+            return Ok(IngestReceipt::queued(accepted, rejected));
         }
-        // One OTLP request carries scalar (gauge/sum) + explicit-/exponential-histogram + summary
-        // points. Decode the protobuf **once**, then extract every row kind from the shared request
-        // (a single WAL frame / LSN covers them all).
-        let req = imbh_otlp::decode_metrics_request(body)?;
-        let rows = imbh_otlp::metrics_request_to_rows(&req);
-        let histograms = imbh_otlp::metrics_request_to_histogram_rows(&req);
-        let exp_histograms = imbh_otlp::metrics_request_to_exp_histogram_rows(&req);
-        let summaries = imbh_otlp::metrics_request_to_summary_rows(&req);
-        let accepted =
-            (rows.len() + histograms.len() + exp_histograms.len() + summaries.len()) as u64;
+        let decoded = decode_metrics(body, &self.dedup)?;
+        let DecodedMetrics {
+            rows,
+            histograms,
+            exp_histograms,
+            summaries,
+            accepted,
+            rejected,
+        } = decoded;
+        // `body` stays the raw, unfiltered bytes: the WAL frame is the wire bytes we received, and
+        // replay re-derives the rows through the same guard (see `decode_metrics`).
         let (lsn, durable) = self.storage.ingest_metrics(
             body,
             rows,
@@ -396,8 +412,14 @@ impl Db {
             summaries,
             sync_now,
         )?;
-        record_ingest(accepted, lsn, durable);
-        Ok(IngestReceipt::synced(accepted, lsn, durable))
+        record_ingest(accepted, rejected, lsn, durable);
+        Ok(IngestReceipt::synced(accepted, rejected, lsn, durable))
+    }
+
+    /// The configured metric duplicate-timestamp policy (issue #27), as the read side consults it to
+    /// decide whether a duplicated instant collapses or fails the query.
+    pub fn duplicates(&self) -> Duplicates {
+        self.duplicates
     }
 
     /// Highest LSN that is durable (fsync'd WAL or captured in a sealed segment), or `None` when
@@ -512,13 +534,15 @@ impl Db {
         // The async-ingest queue gauges are only meaningful in a build with the ingest engine; a
         // query-only consumer has no queue and reports zero.
         #[cfg(feature = "ingest")]
-        let (ingest_queue_depth, ingest_dropped, ingest_errors) = (
+        let (ingest_queue_depth, ingest_dropped, ingest_errors, ingest_rejected) = (
             self.ingest.as_ref().map_or(0, |c| c.depth()),
             self.ingest.as_ref().map_or(0, |c| c.dropped()),
             self.ingest.as_ref().map_or(0, |c| c.errors()),
+            self.dedup.rejected(),
         );
         #[cfg(not(feature = "ingest"))]
-        let (ingest_queue_depth, ingest_dropped, ingest_errors) = (0usize, 0u64, 0u64);
+        let (ingest_queue_depth, ingest_dropped, ingest_errors, ingest_rejected) =
+            (0usize, 0u64, 0u64, 0u64);
         Ok(DbStats {
             tables,
             buffer_bytes: storage.buffer_bytes(),
@@ -527,6 +551,7 @@ impl Db {
             ingest_queue_depth,
             ingest_dropped,
             ingest_errors,
+            ingest_rejected,
         })
     }
 
@@ -687,6 +712,9 @@ pub struct DbBuilder {
     /// Read-only opens only: how often the point-in-time snapshot is rebuilt (ARCHITECTURE.md §5).
     /// Default `OnQuery` (near-real-time). Ignored for read-write / in-memory opens.
     refresh: Refresh,
+    /// What to do about two metric points sharing a series and a timestamp (issue #27). Default
+    /// [`Duplicates::ErrorOnRead`] — accept at ingest, fail the PromQL query.
+    duplicates: Duplicates,
 }
 
 impl DbBuilder {
@@ -790,6 +818,19 @@ impl DbBuilder {
         self
     }
 
+    /// What to do about two metric points sharing a series **and** a timestamp (issue #27).
+    ///
+    /// [`Duplicates::ErrorOnRead`] (the default) accepts everything at ingest and fails a PromQL
+    /// query over an affected series. [`Duplicates::LastWins`] collapses the duplicated instant at
+    /// read time instead — the escape hatch for a database that already holds duplicates, since no
+    /// ingest-side policy can repair data already written. [`Duplicates::Reject`] drops the repeat at
+    /// ingest and reports it in [`IngestReceipt::rejected`], so the responsible producer sees it at
+    /// write time; it costs a fixed ~13 MB at the default lookback and nothing at all otherwise.
+    pub fn duplicates(mut self, duplicates: Duplicates) -> Self {
+        self.duplicates = duplicates;
+        self
+    }
+
     /// Open the DB (synchronous startup I/O: manifest load + WAL replay).
     pub fn open(self) -> Result<Arc<Db>> {
         // In-memory DBs are always writable; a read-only in-memory DB would have nothing to read.
@@ -798,6 +839,17 @@ impl DbBuilder {
         } else {
             self.access
         };
+        // The guard is built before the replay loop below, which borrows it, and moved into the `Db`
+        // afterwards. A read-only handle is always inert: it never ingests, and it re-materializes
+        // the WAL tail into a throwaway buffer on *every* query, so a live guard there would both
+        // accumulate unbounded state and start rejecting rows the writer had accepted. The *policy*
+        // is still carried through unchanged — the read side honors it on a reader too.
+        #[cfg(feature = "ingest")]
+        let dedup = dedup::DedupGuard::new(if access == Access::ReadOnly {
+            Duplicates::default()
+        } else {
+            self.duplicates
+        });
         let storage = if self.in_memory {
             Storage::in_memory(self.compression, self.memory_budget)
                 .with_promote(self.promote.clone())
@@ -839,7 +891,7 @@ impl DbBuilder {
                             {
                                 replayed += 1;
                             }
-                            replay_record(&storage, &rec)?;
+                            replay_record(&storage, &rec, &dedup)?;
                         }
                         #[cfg(feature = "tracing")]
                         tracing::debug!(records = replayed, "WAL replay complete");
@@ -872,6 +924,9 @@ impl DbBuilder {
             ingest: ingest_chan.clone(),
             #[cfg(feature = "ingest")]
             ingest_handle: Mutex::new(None),
+            duplicates: self.duplicates,
+            #[cfg(feature = "ingest")]
+            dedup,
             #[cfg(feature = "query")]
             refresh: self.refresh,
             #[cfg(feature = "query")]
@@ -1289,26 +1344,64 @@ async fn run_maintenance_async(weak: Weak<Db>, interval: std::time::Duration, fl
     }
 }
 
-/// Decode an OTLP/metrics request into an [`IngestJob::Metrics`] plus the accepted-point count, for
-/// the async-ingest path. The protobuf is decoded **once**; all four metric row kinds re-derive from
-/// the shared request (a single WAL frame / LSN covers them), matching `ingest_metrics_inner`.
+/// All four metric row kinds decoded from one OTLP request, after the duplicate guard has run.
 #[cfg(feature = "ingest")]
-fn decode_metrics_job(body: &[u8]) -> Result<(IngestJob, u64)> {
+pub(crate) struct DecodedMetrics {
+    pub(crate) rows: Vec<imbh_core::ScalarMetricRow>,
+    pub(crate) histograms: Vec<imbh_core::HistogramRow>,
+    pub(crate) exp_histograms: Vec<imbh_core::ExpHistogramRow>,
+    pub(crate) summaries: Vec<imbh_core::SummaryRow>,
+    /// Points that survived the guard — the four vector lengths summed.
+    pub(crate) accepted: u64,
+    /// Points the guard dropped as duplicate `(series, timestamp)` repeats. Always 0 unless
+    /// [`Duplicates::Reject`] is configured.
+    pub(crate) rejected: u64,
+}
+
+/// Decode an OTLP/metrics body **once** into all four row kinds and apply `guard`.
+///
+/// The single choke point shared by the inline path, the async decode, and WAL replay, so all three
+/// make the same accept/reject decision under the same rule. One OTLP request carries scalar
+/// (gauge/sum) + explicit-/exponential-histogram + summary points, and one WAL frame / LSN covers
+/// them all.
+#[cfg(feature = "ingest")]
+fn decode_metrics(body: &[u8], guard: &dedup::DedupGuard) -> Result<DecodedMetrics> {
     let req = imbh_otlp::decode_metrics_request(body)?;
-    let rows = imbh_otlp::metrics_request_to_rows(&req);
-    let histograms = imbh_otlp::metrics_request_to_histogram_rows(&req);
-    let exp_histograms = imbh_otlp::metrics_request_to_exp_histogram_rows(&req);
-    let summaries = imbh_otlp::metrics_request_to_summary_rows(&req);
-    let accepted = (rows.len() + histograms.len() + exp_histograms.len() + summaries.len()) as u64;
+    let mut decoded = DecodedMetrics {
+        rows: imbh_otlp::metrics_request_to_rows(&req),
+        histograms: imbh_otlp::metrics_request_to_histogram_rows(&req),
+        exp_histograms: imbh_otlp::metrics_request_to_exp_histogram_rows(&req),
+        summaries: imbh_otlp::metrics_request_to_summary_rows(&req),
+        accepted: 0,
+        rejected: 0,
+    };
+    decoded.rejected = guard.retain(&mut decoded);
+    decoded.accepted = (decoded.rows.len()
+        + decoded.histograms.len()
+        + decoded.exp_histograms.len()
+        + decoded.summaries.len()) as u64;
+    Ok(decoded)
+}
+
+/// Decode an OTLP/metrics request into an [`IngestJob::Metrics`] plus the accepted and rejected
+/// point counts, for the async-ingest path.
+///
+/// The guard runs here, on the caller's thread, rather than in the worker — the queued receipt is
+/// returned before the worker runs, so this is the only place the async path can report an exact
+/// rejection count. The job carries the *filtered* rows alongside the *unfiltered* `raw` body.
+#[cfg(feature = "ingest")]
+fn decode_metrics_job(body: &[u8], guard: &dedup::DedupGuard) -> Result<(IngestJob, u64, u64)> {
+    let decoded = decode_metrics(body, guard)?;
     Ok((
         IngestJob::Metrics {
             raw: body.to_vec(),
-            rows,
-            histograms,
-            exp_histograms,
-            summaries,
+            rows: decoded.rows,
+            histograms: decoded.histograms,
+            exp_histograms: decoded.exp_histograms,
+            summaries: decoded.summaries,
         },
-        accepted,
+        decoded.accepted,
+        decoded.rejected,
     ))
 }
 
@@ -1439,22 +1532,28 @@ fn encode_ipc_stream(
 /// payload, so it is compiled only when the OTLP decoder (`ingest`) is in the build; a query-only
 /// consumer has no decoder and reads sealed segments only (its reader paths skip the replay loop).
 #[cfg(feature = "ingest")]
-fn replay_record(storage: &Storage, rec: &imbh_storage::WalRecord) -> Result<()> {
+fn replay_record(
+    storage: &Storage,
+    rec: &imbh_storage::WalRecord,
+    guard: &dedup::DedupGuard,
+) -> Result<()> {
     match rec.signal {
         SIGNAL_LOGS => storage.replay(rec.lsn, imbh_otlp::decode_logs_to_rows(&rec.payload)?),
         SIGNAL_TRACES => {
             storage.replay_traces(rec.lsn, imbh_otlp::decode_traces_to_rows(&rec.payload)?)
         }
         SIGNAL_METRICS => {
-            // Decode the frame once; the same request yields all four metric row kinds.
-            let req = imbh_otlp::decode_metrics_request(&rec.payload)?;
-            storage.replay_metrics(rec.lsn, imbh_otlp::metrics_request_to_rows(&req));
-            storage.replay_histograms(rec.lsn, imbh_otlp::metrics_request_to_histogram_rows(&req));
-            storage.replay_exp_histograms(
-                rec.lsn,
-                imbh_otlp::metrics_request_to_exp_histogram_rows(&req),
-            );
-            storage.replay_summaries(rec.lsn, imbh_otlp::metrics_request_to_summary_rows(&req));
+            // The WAL frame holds the raw body, so a point the guard dropped at ingest is still here
+            // and must be re-decided by the same rule. The rejection count is deliberately discarded:
+            // a replay rejection is a re-decision of one already made, not a fresh producer error, so
+            // counting it would double-report the WAL tail in `stats().ingest_rejected`.
+            let decoded = decode_metrics(&rec.payload, guard)?;
+            // Same order as `Storage::ingest_metrics` pushes them, so replay and ingest agree on the
+            // within-record row ordering.
+            storage.replay_metrics(rec.lsn, decoded.rows);
+            storage.replay_histograms(rec.lsn, decoded.histograms);
+            storage.replay_exp_histograms(rec.lsn, decoded.exp_histograms);
+            storage.replay_summaries(rec.lsn, decoded.summaries);
         }
         other => return Err(Error::unsupported_wal_signal(rec.lsn, other)),
     }
@@ -1485,7 +1584,7 @@ fn reader_stats(inner: &Db) -> Result<Vec<TableStats>> {
     // consumer leaves the scratch empty and reports sealed-segment stats only.
     #[cfg(feature = "ingest")]
     for rec in &snap.pending {
-        replay_record(&scratch, rec)?;
+        replay_record(&scratch, rec, &inner.dedup)?;
     }
     let buffer_rows: std::collections::HashMap<Table, u64> = scratch
         .stats()
@@ -1587,7 +1686,7 @@ fn build_reader_tables(
     // consumer leaves the scratch empty and queries sealed segments only.
     #[cfg(feature = "ingest")]
     for rec in &snap.pending {
-        replay_record(&scratch, rec)?;
+        replay_record(&scratch, rec, &inner.dedup)?;
     }
     // Schemas are stateless — take them from the read-only storage; buffers from the scratch replay;
     // segments (+ their `.tidx` sidecars) from the snapshot's manifest, rooted at the DB dir.
@@ -1711,20 +1810,22 @@ impl IngestReceipt {
     }
 
     /// Receipt for the inline path: real `lsn`, `durable` per the fsync policy.
-    fn synced(accepted: u64, lsn: Lsn, durable: bool) -> Self {
+    fn synced(accepted: u64, rejected: u64, lsn: Lsn, durable: bool) -> Self {
         IngestReceipt {
             accepted,
-            rejected: 0,
+            rejected,
             lsn: Some(lsn),
             durable,
         }
     }
 
-    /// Receipt for the async path: records enqueued, write pending on the worker.
-    fn queued(accepted: u64) -> Self {
+    /// Receipt for the async path: records enqueued, write pending on the worker. `rejected` is
+    /// still exact — the duplicate guard runs at decode time, on the caller's thread, before the job
+    /// is enqueued.
+    fn queued(accepted: u64, rejected: u64) -> Self {
         IngestReceipt {
             accepted,
-            rejected: 0,
+            rejected,
             lsn: None,
             durable: false,
         }
@@ -1803,6 +1904,9 @@ pub struct DbStats {
     pub ingest_dropped: u64,
     /// Async-ingest worker failures since open (WAL/buffer errors with no caller to return to).
     pub ingest_errors: u64,
+    /// Metric points dropped since open by the duplicate-timestamp guard (0 unless
+    /// [`Duplicates::Reject`] is configured). The cumulative "is a producer republishing?" signal.
+    pub ingest_rejected: u64,
 }
 
 /// Result of [`Db::maintain`] (ARCHITECTURE.md §10.2).
@@ -6388,5 +6492,221 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(count1(b), 1, "json_get_str/regexp_like params");
+    }
+
+    // ── duplicate-timestamp ingest guard (issue #27) ────────────────────────────────────────────
+
+    /// A gauge with one point per `(time, value)`, so a caller can put two on the same instant.
+    fn otlp_gauge_points(service: &str, metric: &str, points: &[(u64, f64)]) -> Vec<u8> {
+        use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
+        use opentelemetry_proto::tonic::common::v1::{AnyValue as PbAny, KeyValue, any_value};
+        use opentelemetry_proto::tonic::metrics::v1::{
+            Gauge, Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics, metric,
+            number_data_point,
+        };
+        use opentelemetry_proto::tonic::resource::v1::Resource;
+        use prost::Message;
+
+        ExportMetricsServiceRequest {
+            resource_metrics: vec![ResourceMetrics {
+                resource: Some(Resource {
+                    attributes: vec![KeyValue {
+                        key: "service.name".to_owned(),
+                        value: Some(PbAny {
+                            value: Some(any_value::Value::StringValue(service.to_owned())),
+                        }),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+                scope_metrics: vec![ScopeMetrics {
+                    metrics: vec![Metric {
+                        name: metric.to_owned(),
+                        unit: "1".to_owned(),
+                        data: Some(metric::Data::Gauge(Gauge {
+                            data_points: points
+                                .iter()
+                                .map(|(t, v)| NumberDataPoint {
+                                    time_unix_nano: *t,
+                                    value: Some(number_data_point::Value::AsDouble(*v)),
+                                    ..Default::default()
+                                })
+                                .collect(),
+                        })),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        }
+        .encode_to_vec()
+    }
+
+    async fn gauge_rows(db: &Arc<Db>) -> i64 {
+        count(db, "SELECT count(*) AS c FROM metrics_gauge").await
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn duplicates_default_accepts_repeated_timestamps() {
+        // Locks "ingest rejection is opt-in": the default policy must behave exactly as it always
+        // has, taking every point and reporting nothing rejected.
+        let db = Db::in_memory().open().unwrap();
+        let body = otlp_gauge_points("cart", "m", &[(10, 1.0)]);
+        for _ in 0..2 {
+            let r = db.ingest_otlp_metrics(&body).await.unwrap();
+            assert_eq!((r.accepted, r.rejected), (1, 0));
+        }
+        assert_eq!(gauge_rows(&db).await, 2);
+        assert_eq!(db.stats().await.unwrap().ingest_rejected, 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn duplicates_reject_drops_the_repeat_within_and_across_exports() {
+        let db = Db::in_memory()
+            .duplicates(Duplicates::reject())
+            .open()
+            .unwrap();
+
+        // Within one export.
+        let r = db
+            .ingest_otlp_metrics(&otlp_gauge_points("cart", "m", &[(10, 1.0), (10, 5.0)]))
+            .await
+            .unwrap();
+        assert_eq!((r.accepted, r.rejected), (1, 1));
+
+        // Across exports — the case issue #27 actually hit, minutes of LSNs apart.
+        let r = db
+            .ingest_otlp_metrics(&otlp_gauge_points("cart", "m", &[(10, 1.0)]))
+            .await
+            .unwrap();
+        assert_eq!((r.accepted, r.rejected), (0, 1));
+
+        assert_eq!(gauge_rows(&db).await, 1);
+        assert_eq!(db.stats().await.unwrap().ingest_rejected, 2);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn duplicates_reject_keeps_distinct_timestamps_and_label_sets() {
+        let db = Db::in_memory()
+            .duplicates(Duplicates::reject())
+            .open()
+            .unwrap();
+        let r = db
+            .ingest_otlp_metrics(&otlp_gauge_points("cart", "m", &[(10, 1.0), (11, 1.0)]))
+            .await
+            .unwrap();
+        assert_eq!((r.accepted, r.rejected), (2, 0));
+        // Two label sets under one metric name and one timestamp: distinct series, both kept.
+        let r = db
+            .ingest_otlp_metrics(&otlp_gauge_labeled("cart", "n", "pod", &["a", "b"]))
+            .await
+            .unwrap();
+        assert_eq!((r.accepted, r.rejected), (2, 0));
+        assert_eq!(gauge_rows(&db).await, 4);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn duplicates_reject_accepts_out_of_order_points() {
+        // The boundary against a per-series `last_timestamp` rule: only an exact (series, timestamp)
+        // repeat is a duplicate, so backfill and multi-producer clock skew keep working.
+        let db = Db::in_memory()
+            .duplicates(Duplicates::reject())
+            .open()
+            .unwrap();
+        db.ingest_otlp_metrics(&otlp_gauge_points("cart", "m", &[(200, 1.0)]))
+            .await
+            .unwrap();
+        let r = db
+            .ingest_otlp_metrics(&otlp_gauge_points("cart", "m", &[(100, 1.0)]))
+            .await
+            .unwrap();
+        assert_eq!((r.accepted, r.rejected), (1, 0));
+        assert_eq!(gauge_rows(&db).await, 2);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn duplicates_reject_separates_the_gauge_and_sum_instrument_kinds() {
+        // A false rejection is silent data loss, so a legitimate sum point must never be dropped
+        // because a same-named gauge existed. The resulting PromQL duplicate is the read side's job.
+        let db = Db::in_memory()
+            .duplicates(Duplicates::reject())
+            .open()
+            .unwrap();
+        db.ingest_otlp_metrics(&otlp_gauge_points("cart", "m", &[(10, 1.0)]))
+            .await
+            .unwrap();
+        let r = db
+            .ingest_otlp_metrics(&otlp_sum("cart", "m", 2, &[(10, 9.0)]))
+            .await
+            .unwrap();
+        assert_eq!((r.accepted, r.rejected), (1, 0));
+        assert_eq!(gauge_rows(&db).await, 1);
+        assert_eq!(count(&db, "SELECT count(*) AS c FROM metrics_sum").await, 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn duplicates_reject_covers_every_metric_row_kind() {
+        let db = Db::in_memory()
+            .duplicates(Duplicates::reject())
+            .open()
+            .unwrap();
+        let bodies = [
+            (
+                "metrics_gauge",
+                otlp_gauge_points("cart", "g", &[(10, 1.0)]),
+            ),
+            ("metrics_sum", otlp_sum("cart", "s", 2, &[(10, 1.0)])),
+            (
+                "metrics_histogram",
+                otlp_histogram("cart", "h", 10, 3, 6.0, &[1.0, 2.0], &[1, 1, 1]),
+            ),
+            (
+                "metrics_exp_histogram",
+                otlp_exp_histogram("cart", "e", 10, 3, 0, 0, 0, &[1, 1, 1]),
+            ),
+            (
+                "metrics_summary",
+                otlp_summary("cart", "u", 10, 3, 6.0, &[(0.5, 2.0)]),
+            ),
+        ];
+        for (table, body) in &bodies {
+            let first = db.ingest_otlp_metrics(body).await.unwrap();
+            let second = db.ingest_otlp_metrics(body).await.unwrap();
+            assert_eq!((first.accepted, first.rejected), (1, 0), "{table} first");
+            assert_eq!((second.accepted, second.rejected), (0, 1), "{table} repeat");
+            assert_eq!(
+                count(&db, &format!("SELECT count(*) AS c FROM {table}")).await,
+                1,
+                "{table} kept exactly one point"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn duplicates_guard_is_bounded_and_eventually_forgets() {
+        // A `recent` of 8 means two generations of 4, so the earliest keys are evicted well before
+        // the twelfth point. Re-admitting an evicted key is the guard failing *permissive*, which is
+        // the safe direction.
+        let db = Db::in_memory()
+            .duplicates(Duplicates::Reject { recent: 8 })
+            .open()
+            .unwrap();
+        for ts in 0..12u64 {
+            let r = db
+                .ingest_otlp_metrics(&otlp_gauge_points("cart", "m", &[(ts, 1.0)]))
+                .await
+                .unwrap();
+            assert_eq!((r.accepted, r.rejected), (1, 0), "ts={ts}");
+        }
+        let r = db
+            .ingest_otlp_metrics(&otlp_gauge_points("cart", "m", &[(0, 1.0)]))
+            .await
+            .unwrap();
+        assert_eq!(
+            (r.accepted, r.rejected),
+            (1, 0),
+            "an evicted key is new again"
+        );
     }
 }

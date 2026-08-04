@@ -11,8 +11,8 @@ use imbh::arrow::array::{
 use imbh::arrow::datatypes::Int32Type;
 use imbh::arrow::record_batch::RecordBatch;
 use imbh::{
-    AnyValue, Attributes, Direction, LogQuery, LogStringField, LogsApi, MetricPointsQuery,
-    MetricsApi, StringPredicate, Timestamp, TraceQuery, TracesApi,
+    AnyValue, Attributes, Direction, Duplicates, LogQuery, LogStringField, LogsApi,
+    MetricPointsQuery, MetricsApi, StringPredicate, Timestamp, TraceQuery, TracesApi,
 };
 
 use crate::{
@@ -141,7 +141,14 @@ impl MetricsSemanticsExt for MetricsApi {
         limits: EvalLimits,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<PromSeries<'static>>, SemanticError>> + Send + 'a>>
     {
-        Box::pin(crate::execute_prom(self, expression, range, limits))
+        // Duplicate timestamps are resolved per the database's own policy (issue #27), not per query.
+        Box::pin(crate::execute_prom_with_duplicates(
+            self,
+            expression,
+            range,
+            limits,
+            self.duplicates(),
+        ))
     }
 
     fn execute_promql_batches<'a>(
@@ -151,7 +158,14 @@ impl MetricsSemanticsExt for MetricsApi {
         limits: EvalLimits,
     ) -> Pin<Box<dyn Future<Output = Result<RecordBatch, SemanticError>> + Send + 'a>> {
         Box::pin(async move {
-            let series = crate::execute_prom(self, expression, range, limits).await?;
+            let series = crate::execute_prom_with_duplicates(
+                self,
+                expression,
+                range,
+                limits,
+                self.duplicates(),
+            )
+            .await?;
             Ok(crate::batch::prom_series_to_batch(&series))
         })
     }
@@ -162,6 +176,7 @@ impl PromSeriesSource for MetricsApi {
         &'a self,
         request: &'a PromFetchRequest,
     ) -> Pin<Box<dyn Future<Output = Result<PromSeriesPack, SemanticError>> + Send + 'a>> {
+        let duplicates = self.duplicates();
         Box::pin(async move {
             // Level-2 read: raw Arrow (no `MetricPoint` materialization). The pack owns the batches;
             // grouped series' labels borrow their buffers, and histogram bucket lists are borrowed
@@ -183,7 +198,7 @@ impl PromSeriesSource for MetricsApi {
                 let batches = owner
                     .downcast_ref::<Vec<RecordBatch>>()
                     .expect("PromSeriesPack owner is Vec<RecordBatch>");
-                scalar_series(batches, request)
+                scalar_series(batches, request, duplicates)
             })
         })
     }
@@ -192,6 +207,7 @@ impl PromSeriesSource for MetricsApi {
         &'a self,
         request: &'a PromFetchRequest,
     ) -> Pin<Box<dyn Future<Output = Result<PromHistogramPack, SemanticError>> + Send + 'a>> {
+        let duplicates = self.duplicates();
         Box::pin(async move {
             let query = build_metric_point_queries(request)?
                 .into_iter()
@@ -211,7 +227,7 @@ impl PromSeriesSource for MetricsApi {
                 let batches = owner
                     .downcast_ref::<Vec<RecordBatch>>()
                     .expect("PromHistogramPack owner is Vec<RecordBatch>");
-                histogram_series(batches, request)
+                histogram_series(batches, request, duplicates)
             })
         })
     }
@@ -262,6 +278,7 @@ fn list_u64_slice(list: &ListArray, row: usize) -> Result<&[u64], SemanticError>
 fn scalar_series<'a>(
     batches: &'a [RecordBatch],
     request: &PromFetchRequest,
+    duplicates: Duplicates,
 ) -> Result<Vec<PromSeries<'a>>, SemanticError> {
     // Group with labels borrowed from the batch buffers: the N input rows collapse to M series with
     // no owned label set per row. Labels stay borrowed in the returned pack (whose owner is the
@@ -299,7 +316,16 @@ fn scalar_series<'a>(
     Ok(by_labels
         .into_iter()
         .map(|(labels, mut samples)| {
-            samples.sort_by_key(|sample| sample.timestamp_ns);
+            // `execute_prom` resolves duplicates again over the merged working set (they can also
+            // arise *between* packs), but a `PromSeriesPack` is public and read directly by Level-2
+            // callers, so it must not hand out a series that violates the invariant either. Under
+            // the erroring policies this is just the sort it always was; the error is raised once,
+            // in `execute_prom`, where the whole series is in hand.
+            if duplicates.collapses_at_read() {
+                crate::collapse_duplicate_samples(&mut samples);
+            } else {
+                samples.sort_by_key(|sample| sample.timestamp_ns);
+            }
             PromSeries { labels, samples }
         })
         .collect())
@@ -308,6 +334,7 @@ fn scalar_series<'a>(
 fn histogram_series<'a>(
     batches: &'a [RecordBatch],
     request: &PromFetchRequest,
+    duplicates: Duplicates,
 ) -> Result<Vec<PromHistogramSeries<'a>>, SemanticError> {
     let mut by_labels: BTreeMap<LabelSet<'a>, Vec<HistogramPoint<'a>>> = BTreeMap::new();
     for batch in batches {
@@ -342,7 +369,12 @@ fn histogram_series<'a>(
     Ok(by_labels
         .into_iter()
         .map(|(labels, mut points)| {
-            points.sort_by_key(|point| point.timestamp_ns);
+            // See `scalar_series`: the pack keeps the same invariant the working set does.
+            if duplicates.collapses_at_read() {
+                crate::collapse_duplicate_histogram_points(&mut points);
+            } else {
+                points.sort_by_key(|point| point.timestamp_ns);
+            }
             PromHistogramSeries { labels, points }
         })
         .collect())
@@ -1122,5 +1154,140 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(eq.len(), 1, "only the 500 trace matches .status = 500");
+    }
+
+    // ── duplicate timestamps against real stored data (issue #27) ───────────────────────────────
+
+    /// A bare instant selector on `metric`, built by hand so these tests do not also depend on the
+    /// translator's catalog kind resolution.
+    fn name_selector(metric: &str) -> PromExpr {
+        PromExpr::Selector {
+            matchers: vec![LabelMatcher {
+                name: "__name__".to_owned(),
+                op: MatchOp::Eq,
+                value: metric.to_owned(),
+            }],
+        }
+    }
+
+    async fn promql_at(
+        db: &std::sync::Arc<imbh::Db>,
+        metric: &str,
+        at: i64,
+    ) -> Result<Vec<PromSeries<'static>>, SemanticError> {
+        db.metrics()
+            .execute_promql(
+                &name_selector(metric),
+                EvalRange::instant(at),
+                EvalLimits::default(),
+            )
+            .await
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn promql_reports_duplicate_points_within_one_table() {
+        use imbh_test_support::otlp::otlp_sum;
+
+        // `otlp_sum` maps `(time, value)` one-to-one onto data points, so this is one export
+        // carrying two points at the same instant.
+        let body = otlp_sum("cart", "m", 2, &[(10, 1.0), (10, 5.0), (20, 7.0)]);
+
+        let db = imbh::Db::in_memory().open().unwrap();
+        db.ingest_otlp_metrics(&body).await.unwrap();
+        let error = promql_at(&db, "m", 20)
+            .await
+            .expect_err("the default policy errors");
+        let message = error.to_string();
+        assert!(
+            matches!(error, SemanticError::DuplicateTimestamp(_)),
+            "{error:?}"
+        );
+        assert!(message.contains("__name__=\"m\""), "{message}");
+        assert!(
+            message.contains("10"),
+            "the offending instant is named: {message}"
+        );
+
+        let db = imbh::Db::in_memory()
+            .duplicates(imbh::Duplicates::LastWins)
+            .open()
+            .unwrap();
+        db.ingest_otlp_metrics(&body).await.unwrap();
+        let series = promql_at(&db, "m", 20)
+            .await
+            .expect("last_wins resolves it");
+        assert_eq!(series.len(), 1);
+        assert_eq!(
+            series[0].samples.len(),
+            1,
+            "an instant selector reports one point"
+        );
+        assert!((series[0].samples[0].value - 7.0).abs() < 1e-12);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn promql_handles_a_metric_present_in_both_the_gauge_and_sum_tables() {
+        use imbh_test_support::otlp::{otlp_gauge_attrs, otlp_sum};
+
+        // Not a producer fault at all: an instant selector reads *both* tables and concatenates the
+        // batches, and the derived label set (service + __name__ + string attributes) does not
+        // distinguish them — so a name recorded as both instrument kinds is structurally duplicated.
+        let gauge = otlp_gauge_attrs("cart", "m", 10, &[]); // value 1.0
+        let sum = otlp_sum("cart", "m", 2, &[(10, 9.0)]);
+
+        let db = imbh::Db::in_memory().open().unwrap();
+        db.ingest_otlp_metrics(&gauge).await.unwrap();
+        db.ingest_otlp_metrics(&sum).await.unwrap();
+        let error = promql_at(&db, "m", 10)
+            .await
+            .expect_err("the default policy errors");
+        assert!(
+            matches!(error, SemanticError::DuplicateTimestamp(_)),
+            "{error:?}"
+        );
+
+        let db = imbh::Db::in_memory()
+            .duplicates(imbh::Duplicates::LastWins)
+            .open()
+            .unwrap();
+        db.ingest_otlp_metrics(&gauge).await.unwrap();
+        db.ingest_otlp_metrics(&sum).await.unwrap();
+        let series = promql_at(&db, "m", 10)
+            .await
+            .expect("last_wins resolves it");
+        assert_eq!(series.len(), 1);
+        assert_eq!(series[0].samples.len(), 1);
+        assert!(
+            (series[0].samples[0].value - 9.0).abs() < 1e-12,
+            "{:?}",
+            series[0].samples
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ingest_rejection_keeps_the_metric_queryable_across_exports() {
+        use imbh_test_support::otlp::otlp_sum;
+
+        // The reporter's shape: the same reading republished in a *later* export, minutes of LSNs
+        // apart from the first. With the guard on, the second export's point never lands, so the
+        // read side never sees a duplicate at all.
+        let db = imbh::Db::in_memory()
+            .duplicates(imbh::Duplicates::reject())
+            .open()
+            .unwrap();
+        let body = otlp_sum("cart", "m", 2, &[(10, 1.0)]);
+        let first = db.ingest_otlp_metrics(&body).await.unwrap();
+        let second = db.ingest_otlp_metrics(&body).await.unwrap();
+        assert_eq!((first.accepted, first.rejected), (1, 0));
+        assert_eq!((second.accepted, second.rejected), (0, 1));
+
+        db.ingest_otlp_metrics(&otlp_sum("cart", "m", 2, &[(20, 3.0)]))
+            .await
+            .unwrap();
+        let series = promql_at(&db, "m", 20)
+            .await
+            .expect("no duplicate reached storage");
+        assert_eq!(series.len(), 1);
+        assert!((series[0].samples[0].value - 3.0).abs() < 1e-12);
     }
 }

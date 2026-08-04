@@ -1,7 +1,8 @@
 //! DB configuration knobs (ARCHITECTURE.md §10.2). Honored today: [`MemoryBudget`] (query pool),
 //! [`Compression`] (segment codec), [`WalMode`] (fsync policy), [`Retention`]
 //! (age + disk-budget), [`Promote`] (attribute keys lifted to typed columns), [`Maintenance`] (who
-//! runs the scheduler) and [`FlushPolicy`] (when that scheduler seals the buffer).
+//! runs the scheduler), [`FlushPolicy`] (when that scheduler seals the buffer) and [`Duplicates`]
+//! (what happens to two metric points sharing a series and a timestamp).
 
 use std::fmt;
 use std::str::FromStr;
@@ -677,6 +678,162 @@ pub enum Overflow {
     DropOldest,
 }
 
+/// What to do about two metric datapoints that share a series **and** a timestamp (ARCHITECTURE.md
+/// §10.5, issue #27).
+///
+/// PromQL's series identity is `service` + `__name__` + the string attributes, so two points sharing
+/// all of those *and* an instant are ambiguous to every metrics reader — there is no PromQL meaning
+/// for two values at one timestamp. This knob picks which end of the pipeline says so.
+///
+/// [`Duplicates::ErrorOnRead`] (the default) keeps the historical behavior: ingest takes everything
+/// and a PromQL query over an affected series fails. [`Duplicates::LastWins`] instead resolves the
+/// ambiguity at read time, so one bad point degrades one instant rather than the whole metric — the
+/// escape hatch for a database that *already* holds duplicates, since no ingest-side policy can
+/// repair data that is already written. [`Duplicates::Reject`] catches the repeat at ingest, where
+/// the responsible producer can see it in `IngestReceipt::rejected`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Duplicates {
+    /// Accept every point at ingest; fail a PromQL query that materializes a series holding two
+    /// samples at one timestamp, naming the metric, the label set and the instant. The default, and
+    /// byte-for-byte the behavior imbh has always had.
+    #[default]
+    ErrorOnRead,
+    /// Accept every point at ingest; collapse a duplicated timestamp to a single point at read time
+    /// instead of failing the query.
+    ///
+    /// The surviving point is chosen by a total order on the *value*, never by scan order: metric
+    /// segments carry no ingest-sequence column and the read SQL orders by time alone, so "the last
+    /// one the scan emitted" would let two identical queries disagree after a flush or a compaction.
+    /// The collapse is therefore a pure function of the fetched samples.
+    LastWins,
+    /// Drop a metric point whose `(series, timestamp)` is already among the last `recent` accepted
+    /// points, and count it in `IngestReceipt::rejected`. Reads stay as strict as
+    /// [`Duplicates::ErrorOnRead`], since points written before this policy was enabled are still
+    /// there.
+    ///
+    /// `recent` bounds the guard's memory *and* its lookback: roughly `recent / points_per_second` of
+    /// history at ~25-50 bytes per remembered point. Size it at `>= 2 * peak_points_per_second *
+    /// flush_interval`, so a generation rotation cannot fall inside one WAL-replay window.
+    ///
+    /// The guard is process-local and never persisted: it starts empty at every open and is rebuilt
+    /// from the WAL tail during recovery. That is deliberate — an empty guard is strictly *more*
+    /// permissive, which is what makes replay unable to drop a point the writer accepted. It follows
+    /// that this is a best-effort producer-facing guard, not a storage-level uniqueness constraint.
+    /// In particular it does **not** reject out-of-order or late-arriving points (only an exact
+    /// `(series, timestamp)` repeat), does not see duplicates older than `recent` points, and always
+    /// accepts the first point per series after an open.
+    Reject {
+        /// How many recently accepted points to remember. Clamped to at least 2 so a generation
+        /// rotation is always possible.
+        recent: usize,
+    },
+}
+
+impl Duplicates {
+    /// The default lookback for [`Duplicates::Reject`]: 262 144 points, ~13 MB of fixed memory, and
+    /// ~26 s of history at 10 000 points/s (~4.4 min at 1 000/s).
+    pub const DEFAULT_RECENT: usize = 1 << 18;
+
+    /// [`Duplicates::Reject`] with [`Self::DEFAULT_RECENT`].
+    pub fn reject() -> Self {
+        Duplicates::Reject {
+            recent: Self::DEFAULT_RECENT,
+        }
+    }
+
+    /// The configured lookback, or `None` when duplicates are not rejected at ingest.
+    pub fn recent(self) -> Option<usize> {
+        match self {
+            Duplicates::Reject { recent } => Some(recent.max(2)),
+            _ => None,
+        }
+    }
+
+    /// Whether ingest drops duplicate points.
+    pub fn rejects_at_ingest(self) -> bool {
+        matches!(self, Duplicates::Reject { .. })
+    }
+
+    /// Whether a read collapses a duplicated timestamp instead of failing the query.
+    pub fn collapses_at_read(self) -> bool {
+        matches!(self, Duplicates::LastWins)
+    }
+}
+
+/// Parse a duplicate-policy spec: `error_on_read` (the default), `last_wins`, or
+/// `reject[,recent=N]`.
+///
+/// ```
+/// use imbh_core::Duplicates;
+/// assert_eq!("".parse::<Duplicates>().unwrap(), Duplicates::ErrorOnRead);
+/// assert_eq!("last_wins".parse::<Duplicates>().unwrap(), Duplicates::LastWins);
+/// assert_eq!("reject".parse::<Duplicates>().unwrap(), Duplicates::reject());
+/// assert_eq!(
+///     "reject,recent=1024".parse::<Duplicates>().unwrap(),
+///     Duplicates::Reject { recent: 1024 },
+/// );
+/// assert!("nonsense".parse::<Duplicates>().is_err());
+/// ```
+impl FromStr for Duplicates {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        let spec = s.trim();
+        if spec.is_empty() {
+            return Ok(Duplicates::default());
+        }
+        let mut fields = spec.split(',').map(str::trim).filter(|f| !f.is_empty());
+        let mode = fields.next().unwrap_or_default().to_ascii_lowercase();
+        let mut policy = match mode.as_str() {
+            "error_on_read" | "error" | "strict" => Duplicates::ErrorOnRead,
+            "last_wins" | "last-wins" | "collapse" => Duplicates::LastWins,
+            "reject" => Duplicates::reject(),
+            other => {
+                return Err(Error::config_msg(format!(
+                    "duplicates: unknown mode `{other}` (expected error_on_read, last_wins or reject)"
+                )));
+            }
+        };
+        for field in fields {
+            let (key, value) = field.split_once('=').ok_or_else(|| {
+                Error::config_msg(format!("duplicates: expected `key=value` in `{field}`"))
+            })?;
+            match key.trim().to_ascii_lowercase().as_str() {
+                "recent" => {
+                    // `recent` is meaningless unless ingest is guarding; rejecting the combination
+                    // beats silently ignoring a knob an operator deliberately set.
+                    let Duplicates::Reject { .. } = policy else {
+                        return Err(Error::config_msg(format!(
+                            "duplicates: `recent` applies only to `reject`, not `{mode}`"
+                        )));
+                    };
+                    let recent = parse_count(value.trim())?.min(usize::MAX as u64) as usize;
+                    policy = Duplicates::Reject {
+                        recent: recent.max(2),
+                    };
+                }
+                other => {
+                    return Err(Error::config_msg(format!(
+                        "duplicates: unknown key `{other}` (expected recent)"
+                    )));
+                }
+            }
+        }
+        Ok(policy)
+    }
+}
+
+/// Renders the spec syntax [`FromStr`] accepts, so a host can log the effective policy.
+impl fmt::Display for Duplicates {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Duplicates::ErrorOnRead => f.write_str("error_on_read"),
+            Duplicates::LastWins => f.write_str("last_wins"),
+            Duplicates::Reject { recent } => write!(f, "reject,recent={recent}"),
+        }
+    }
+}
+
 /// Read-only snapshot-refresh policy (ARCHITECTURE.md §5). A read-only handle answers each query from
 /// a point-in-time snapshot (manifest segments ∪ live WAL tail). Rebuilding that snapshot means
 /// re-reading the writer's newly appended WAL — cheap per byte (the reader tracks per-segment offsets
@@ -873,5 +1030,63 @@ mod tests {
         assert_eq!(parse_duration("250ms").unwrap(), Duration::from_millis(250));
         assert_eq!(parse_duration("2M").unwrap(), S(120)); // units are case-insensitive
         assert_eq!(parse_duration("1h").unwrap(), S(3600));
+    }
+
+    #[test]
+    fn duplicates_defaults_to_the_historical_read_time_error() {
+        let d = Duplicates::default();
+        assert_eq!(d, Duplicates::ErrorOnRead);
+        assert!(!d.rejects_at_ingest(), "ingest rejection must be opt-in");
+        assert!(!d.collapses_at_read(), "the default read stays strict");
+        assert_eq!(d.recent(), None);
+    }
+
+    #[test]
+    fn duplicates_spec_round_trips() {
+        for spec in [
+            "error_on_read",
+            "last_wins",
+            "reject,recent=262144",
+            "reject,recent=2",
+        ] {
+            let parsed: Duplicates = spec.parse().unwrap();
+            assert_eq!(parsed.to_string(), spec);
+            assert_eq!(spec.parse::<Duplicates>().unwrap(), parsed);
+        }
+        assert_eq!("".parse::<Duplicates>().unwrap(), Duplicates::ErrorOnRead);
+        assert_eq!(
+            "  REJECT ".parse::<Duplicates>().unwrap(),
+            Duplicates::reject()
+        );
+        assert_eq!(
+            "reject,recent=262_144".parse::<Duplicates>().unwrap(),
+            Duplicates::reject()
+        );
+    }
+
+    #[test]
+    fn duplicates_floors_recent_so_a_generation_can_always_rotate() {
+        assert_eq!(
+            "reject,recent=0".parse::<Duplicates>().unwrap(),
+            Duplicates::Reject { recent: 2 }
+        );
+        assert_eq!(Duplicates::Reject { recent: 1 }.recent(), Some(2));
+    }
+
+    #[test]
+    fn duplicates_rejects_malformed_specs() {
+        // A typo must never leave a deployment quietly accepting the duplicates it asked to reject.
+        for spec in [
+            "nonsense",
+            "reject,recent",
+            "reject,recent=x",
+            "reject,unknown=1",
+            "last_wins,recent=8", // `recent` without a guard to size
+        ] {
+            assert!(
+                spec.parse::<Duplicates>().is_err(),
+                "{spec} should not parse"
+            );
+        }
     }
 }

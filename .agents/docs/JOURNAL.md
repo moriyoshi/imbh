@@ -2579,3 +2579,78 @@ database — with Parquet segments and a Tantivy `.tidx` on the host mount. Then
 `registry:2` under all three tags and re-installed with `docker plugin install`. The one thing that
 could not be covered locally is `docker plugin push` to **GHCR** under `${{ github.token }}`; that is
 in TODO.md against the first `workflow_dispatch` rehearsal.
+
+## Duplicate metric timestamps: one policy, three answers (issue #27, 2026-08-04)
+
+A reporter's sampler polled `metrics.k8s.io` every 15s while metrics-server republished each kubelet
+scrape timestamp unchanged for 15-30s. Both polls exported the source's own timestamp, so the same
+`(series, timestamp)` landed twice — and `execute_prom` rejected any materialized series holding two
+samples at one instant. 1136 stored rows, every ingest receipt reporting success, and every PromQL
+query of that metric returning `400` for the whole retention period.
+
+Three separate defects, which is why the fix is not one change:
+
+1. **Nothing said no at write time.** `IngestReceipt::rejected` was declared-but-dead — both private
+   constructors hardcoded `0`, recorded as a Deviation in ARCHITECTURE.md §10.5.
+2. **The diagnostic was unactionable.** `SemanticError::Malformed` carries `&'static str`, so it
+   structurally could not name the offending series. From the operator's side it read as "the query
+   language is broken", and the natural next move — narrow the range — does not isolate it.
+3. **There was no recovery.** Nothing can delete the offending points, so the metric stayed
+   unqueryable until retention dropped it, whatever the producer did afterwards.
+
+### The latent bug underneath
+
+Duplicates are not only a producer fault. `build_metric_point_queries` issues **two** queries for an
+instant selector (`MetricPointsQuery::gauge` then `::sum`) and `MetricsApi::fetch` concatenates both
+result sets; `metric_labels_from_batch` derives labels from `service` + `__name__` + string attributes
+and nothing distinguishes the two tables. So a metric name recorded as **both** a gauge and a sum
+produced byte-identical label sets at one timestamp and `400`d a perfectly well-formed database. That
+is now a test (`promql_handles_a_metric_present_in_both_the_gauge_and_sum_tables`), and it failed
+before the change for exactly this reason.
+
+### One knob, because the issue asked the right question
+
+`Duplicates { ErrorOnRead (default) | LastWins | Reject { recent } }` in `imbh-core::config`, on
+`DbBuilder` and as `IMBH_DUPLICATES`. The default is byte-for-byte today's behavior apart from the
+message; `LastWins` is the only remedy for data already written; `Reject` is opt-in because dropping a
+producer's data must never happen by accident.
+
+### The two findings worth keeping
+
+**A per-series `last_timestamp` map is the obvious design and the wrong one.** It is what Prometheus
+does, and it is order-sensitive: X(ts=100) then Y(ts=50) accepts one point, Y then X accepts two. The
+WAL stores the *raw* body and replay re-derives the tail with a guard that starts empty, so `last_ts`
+could reject on replay a point the writer had accepted — silent data loss. A bounded `(series, ts)`
+**set** is order-commutative, which gives `G_replay ⊆ G_original` at every replayed record and hence
+"replay is strictly more permissive, and can never drop a row the writer kept". Commutativity is also
+what lets the guard sit at the *decode* site rather than under the `Storage` lock — which is the only
+place the async path can report an exact `rejected`, since the queued receipt returns before the
+worker runs. As a bonus, `Storage::ingest_metrics` kept its published signature.
+
+Scope was picked against a measurement, not a feeling: `imbhd` flushes on `interval=5s`, so anything
+scoped to "what is currently buffered" would have seen ~5s of history against a 15-30s duplicate
+window — i.e. would have closed the issue without fixing it. The guard is a `Db`-lifetime two-
+generation set instead, preallocated so it never rehashes: fixed ~13 MB at `recent = 262144`.
+
+**Resolving a duplicate by scan order is not deterministic here.** "Keep whichever the scan emitted
+last" reads as the obvious rule and matches Prometheus' phrasing, but metric segments carry no
+ingest-sequence column and the read SQL is `ORDER BY "time"` alone — so after a flush or a compaction
+two identical queries can disagree, and a range query redraws a chart differently on refresh. Silent
+nondeterminism is a worse failure than the `400` it replaces. The collapse is therefore a total order
+on the *value* (any real number outranks NaN — `f64::total_cmp` alone ranks NaN above `+INFINITY`, so
+a naive max would let one NaN row punch a hole in the chart), making the output a pure function of the
+fetched sample multiset. `collapse_is_independent_of_input_order` pins it.
+
+### Verified
+
+`fmt`/`build`/`clippy --all-features`/`test --workspace` clean (62 test binaries, 0 failures), plus
+`-p imbh-lgtm --features source` — which is **not** in the default workspace run, so the DB-backed
+lgtm tests only execute when asked for explicitly. `Cargo.lock` and every manifest are untouched: the
+guard is `std`-only, so the producer-only build (`--no-default-features --features ingest`, which has
+no DataFusion at all) gains nothing. `imbhd` was run by hand to confirm the banner prints the
+effective policy in the syntax `IMBH_DUPLICATES` accepts, and that a typo is fatal at startup rather
+than a silent fallback.
+
+Left open deliberately, now in TODO.md: the typed `MetricsApi::range`/`instant` path still `SUM`s
+duplicate points. It degrades a number rather than denying service, and a SQL dedup needs the same
+ingest-sequence column the log-driver `--tail 0` item wants. One column would close both.

@@ -209,3 +209,105 @@ fn sync_mode_is_inline_and_immediately_visible() {
         db.close().await.unwrap();
     });
 }
+
+/// The duplicate guard runs at *decode* time, on the caller's thread, before the job is enqueued —
+/// so a queued receipt still carries an exact `rejected` count even though nothing has been written
+/// yet (issue #27). Putting the guard in the worker instead would make this impossible: the receipt
+/// is returned before the worker ever runs.
+#[test]
+fn async_ingest_receipt_reports_rejected() {
+    use imbh::Duplicates;
+    use imbh_test_support::otlp::otlp_sum;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let rt = ct_rt();
+    let db: Arc<Db> = Db::builder(tmp.path())
+        .wal(WalMode::Always)
+        .duplicates(Duplicates::reject())
+        .ingest(Ingest::Async {
+            handle: rt.handle().clone(),
+            capacity: 8,
+            overflow: Overflow::Block,
+        })
+        .open()
+        .unwrap();
+
+    rt.block_on(async {
+        let body = otlp_sum("cart", "m", 2, &[(10, 1.0)]);
+        let first = db.ingest_otlp_metrics(&body).await.unwrap();
+        let second = db.ingest_otlp_metrics(&body).await.unwrap();
+        assert!(first.is_queued() && second.is_queued());
+        assert_eq!((first.accepted, first.rejected), (1, 0));
+        assert_eq!((second.accepted, second.rejected), (0, 1));
+        db.close().await.unwrap();
+    });
+    // Reopen to count: `close()` drains the worker and seals, but a closed handle still rejects
+    // queries — and still holds `writer.lock` until it is dropped.
+    drop(db);
+    let db: Arc<Db> = Db::builder(tmp.path()).open().unwrap();
+    assert_eq!(
+        rt.block_on(count(&db, "SELECT count(*) c FROM metrics_sum")),
+        1
+    );
+}
+
+/// Sync and async must make the same accept/reject decisions over the same input: both route
+/// through the one `decode_metrics` choke point.
+#[test]
+fn async_ingest_dedup_matches_sync() {
+    use imbh::Duplicates;
+    use imbh_test_support::otlp::otlp_sum;
+
+    let exports = || {
+        [
+            otlp_sum("cart", "m", 2, &[(10, 1.0), (10, 2.0)]),
+            otlp_sum("cart", "m", 2, &[(10, 3.0)]),
+            otlp_sum("cart", "m", 2, &[(20, 4.0)]),
+        ]
+    };
+    let rt = ct_rt();
+
+    let sync_tmp = tempfile::tempdir().unwrap();
+    let sync_db: Arc<Db> = Db::builder(sync_tmp.path())
+        .duplicates(Duplicates::reject())
+        .open()
+        .unwrap();
+    let async_tmp = tempfile::tempdir().unwrap();
+    let async_db: Arc<Db> = Db::builder(async_tmp.path())
+        .duplicates(Duplicates::reject())
+        .ingest(Ingest::Async {
+            handle: rt.handle().clone(),
+            capacity: 8,
+            overflow: Overflow::Block,
+        })
+        .open()
+        .unwrap();
+
+    rt.block_on(async {
+        let mut sync_receipts = Vec::new();
+        let mut async_receipts = Vec::new();
+        for body in exports() {
+            sync_receipts.push(sync_db.ingest_otlp_metrics(&body).await.unwrap());
+            async_receipts.push(async_db.ingest_otlp_metrics(&body).await.unwrap());
+        }
+        for (s, a) in sync_receipts.iter().zip(&async_receipts) {
+            assert_eq!((s.accepted, s.rejected), (a.accepted, a.rejected));
+        }
+        sync_db.close().await.unwrap();
+        async_db.close().await.unwrap();
+    });
+    // Drop both handles before reopening: the writer lock lives with the handle, not with `close()`.
+    drop(sync_db);
+    drop(async_db);
+
+    let sql = "SELECT count(*) c FROM metrics_sum";
+    let sync_db: Arc<Db> = Db::builder(sync_tmp.path()).open().unwrap();
+    let async_db: Arc<Db> = Db::builder(async_tmp.path()).open().unwrap();
+    let (sync_rows, async_rows) =
+        rt.block_on(async { (count(&sync_db, sql).await, count(&async_db, sql).await) });
+    assert_eq!(
+        sync_rows, async_rows,
+        "sync and async made the same decisions"
+    );
+    assert_eq!(sync_rows, 2);
+}

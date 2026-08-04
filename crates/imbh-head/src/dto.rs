@@ -234,6 +234,12 @@ pub struct Stats {
     pub ingest_queue_depth: u64,
     pub ingest_dropped: u64,
     pub ingest_errors: u64,
+    /// Metric points dropped by the duplicate-timestamp guard (issue #27); 0 unless the database was
+    /// opened with `Duplicates::Reject`. `#[serde(default)]` keeps the field wire-additive in both
+    /// directions — an older daemon's payload still deserializes here, and this field is simply
+    /// ignored by an older client.
+    #[serde(default)]
+    pub ingest_rejected: u64,
 }
 
 /// Per-table counts and time span. `table` is the physical table name (`logs`, `metrics_gauge`, …),
@@ -262,6 +268,12 @@ pub struct ErrorBody {
 
 /// [`ErrorBody::kind`] for a failure caused by an evaluation cap rather than by the query itself.
 pub const KIND_LIMIT_EXCEEDED: &str = "limit_exceeded";
+
+/// [`ErrorBody::kind`] for stored metric points that share a series and a timestamp (issue #27).
+/// Machine-readable because narrowing the time range — the natural next move on a `400` — does not
+/// isolate it: the fix is at the producer, or a `Duplicates::LastWins` database. The message names
+/// the metric, the label set and the instant.
+pub const KIND_DUPLICATE_TIMESTAMP: &str = "duplicate_timestamp";
 
 // ── float codec ─────────────────────────────────────────────────────────────────────────────────
 

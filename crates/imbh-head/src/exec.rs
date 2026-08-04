@@ -301,6 +301,7 @@ pub async fn stats(db: &Arc<Db>) -> Result<dto::Stats, HeadError> {
         ingest_queue_depth: stats.ingest_queue_depth as u64,
         ingest_dropped: stats.ingest_dropped,
         ingest_errors: stats.ingest_errors,
+        ingest_rejected: stats.ingest_rejected,
     })
 }
 

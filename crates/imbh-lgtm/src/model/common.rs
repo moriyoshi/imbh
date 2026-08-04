@@ -210,13 +210,72 @@ pub struct Annotation {
     pub message: String,
 }
 
+/// Marked `#[non_exhaustive]` so a future failure mode that needs its own payload can be added
+/// without another breaking change; match with a `_` arm.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SemanticError {
     InvalidRange,
     LimitExceeded(&'static str),
     Incompatible(&'static str),
     Malformed(&'static str),
     Source(String),
+    /// Two metric points share a series **and** a timestamp, which has no PromQL meaning.
+    ///
+    /// Its own variant, with an owned payload, because the other `Malformed` cases carry a
+    /// `&'static str` and this one has to *name* the offending series: without the metric, the label
+    /// set and the instant, the failure reads as "the query language is broken" and the natural next
+    /// move — narrowing the time range — does not isolate it (issue #27). Build it with
+    /// [`SemanticError::duplicate_timestamp`].
+    DuplicateTimestamp(String),
+}
+
+impl SemanticError {
+    /// Build a [`SemanticError::DuplicateTimestamp`] naming the series and the instant.
+    ///
+    /// `what` distinguishes the scalar and histogram cases. The rendered label set is capped, so a
+    /// wide series cannot turn a diagnostic into a pathological response body.
+    pub fn duplicate_timestamp(what: &str, labels: &LabelSet<'_>, timestamp_ns: i64) -> Self {
+        SemanticError::DuplicateTimestamp(format!(
+            "duplicate timestamps in one PromQL {what}: {} at {timestamp_ns}",
+            RenderLabels(labels)
+        ))
+    }
+}
+
+/// Renders a label set in PromQL's own `{k="v", …}` syntax for diagnostics, truncating both the
+/// number of labels and the length of any single value.
+struct RenderLabels<'a, 'b>(&'a LabelSet<'b>);
+
+impl fmt::Display for RenderLabels<'_, '_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        const MAX_LABELS: usize = 8;
+        const MAX_VALUE: usize = 64;
+        f.write_str("{")?;
+        let total = self.0.iter().count();
+        for (index, (key, value)) in self.0.iter().take(MAX_LABELS).enumerate() {
+            if index > 0 {
+                f.write_str(", ")?;
+            }
+            // Truncate on a char boundary; a label value is arbitrary UTF-8 from the producer.
+            let cut = value
+                .char_indices()
+                .map(|(i, _)| i)
+                .chain([value.len()])
+                .take_while(|i| *i <= MAX_VALUE)
+                .last()
+                .unwrap_or(0);
+            if cut < value.len() {
+                write!(f, "{key}=\"{}…\"", &value[..cut])?;
+            } else {
+                write!(f, "{key}=\"{value}\"")?;
+            }
+        }
+        if total > MAX_LABELS {
+            write!(f, ", …{} more", total - MAX_LABELS)?;
+        }
+        f.write_str("}")
+    }
 }
 
 impl fmt::Display for SemanticError {
@@ -227,6 +286,8 @@ impl fmt::Display for SemanticError {
             Self::Incompatible(what) => write!(f, "incompatible semantics: {what}"),
             Self::Malformed(what) => write!(f, "malformed semantic input: {what}"),
             Self::Source(what) => write!(f, "semantic data source error: {what}"),
+            // Already a complete sentence naming the series; no prefix to add.
+            Self::DuplicateTimestamp(what) => f.write_str(what),
         }
     }
 }

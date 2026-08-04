@@ -276,6 +276,14 @@ strategy — triggers that OR together, e.g. `interval=5s,buffer=16MiB,rows=5000
 `IMBH_MAINTENANCE_INTERVAL` (default `60s`) sets how often retention runs. Until a seal happens, rows
 live in the buffer + WAL, so this is what bounds `imbhd`'s memory and WAL growth.
 
+`IMBH_DUPLICATES` decides what happens to two metric datapoints sharing a series **and** a timestamp,
+which PromQL has no meaning for. The default `error_on_read` takes them at ingest and fails a PromQL
+query that finds them, naming the metric, the label set and the instant; `last_wins` collapses the
+duplicated instant at read time instead, so one bad point degrades one datapoint rather than the whole
+metric; `reject[,recent=N]` drops the repeat at ingest and reports it in the ingest response's
+`rejected` count (and in OTLP/gRPC `partial_success`), so the responsible producer sees it at write
+time. Rejecting is opt-in and costs a fixed ~13 MB at the default lookback.
+
 Connections are bounded: `IMBH_HEADER_TIMEOUT` (default `10s`) caps the request head *in total*, and
 `IMBH_BODY_TIMEOUT` (default `30s`) caps how long a single body read or response write may stall — so a
 slow-but-progressing upload is fine while an idle or stalled client gets a `408` instead of holding a
