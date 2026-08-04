@@ -13,6 +13,69 @@ release aborts if it is missing or duplicated.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-08-05
+
+### Added
+
+- **A duplicate-timestamp policy for metric ingest and PromQL reads: `Duplicates`.** Two metric
+  datapoints sharing a series **and** a timestamp have no PromQL meaning, and imbh said so at *read*
+  time — one duplicated point made every PromQL query of that metric fail, over every window, for as
+  long as the points stayed within retention, while ingest reported success. The diagnostic named no
+  metric, no labels and no timestamp, and nothing could delete the offending points.
+
+  One knob, on `DbBuilder::duplicates` and as `IMBH_DUPLICATES` on `imbhd`, with three answers.
+  `ErrorOnRead` (the default) keeps the historical behavior, but the new
+  `SemanticError::DuplicateTimestamp` names the metric, the label set and the instant, and reaches
+  clients as a `400` carrying `dto::KIND_DUPLICATE_TIMESTAMP` — so a head can say "fix the producer"
+  rather than suggest the shorter time range that will not isolate it. `LastWins` collapses the
+  duplicated instant at read time, degrading one datapoint instead of the whole metric; it is the
+  only remedy for points already written, since no ingest-side policy can repair stored data.
+  `Reject { recent }` drops the repeat at ingest and finally gives `IngestReceipt::rejected` a
+  non-zero value, reported through the HTTP ingest JSON, OTLP/gRPC
+  `partial_success.rejected_data_points`, `DbStats::ingest_rejected`, and one `tracing` warning per
+  rejecting export.
+
+  The ingest guard is a bounded two-generation `(series_hash_128, timestamp)` set rather than the
+  obvious per-series `last_timestamp` map. A `ts <= last_ts` rule is order-sensitive, and because the
+  WAL stores the raw OTLP body and replay re-derives the unsealed tail with a guard that starts
+  empty, it could reject on replay a point the writer had accepted — data loss. The set rule is
+  order-commutative, so the replay guard's key set is always a subset of the writer's and **replay is
+  strictly more permissive**: it can never drop a row the writer kept. That also lets the guard sit at
+  the decode site rather than under the storage lock, which is the only place the async ingest path
+  can report an exact rejection count, and leaves `Storage::ingest_metrics` unchanged. Out-of-order
+  and late-arriving points stay accepted, as the storage engine has always allowed. Nothing is
+  allocated unless `Reject` is configured; it then costs a fixed ~13 MB at the default lookback, with
+  no new dependency in any build (the guard is `std`-only, so the producer-only profile that has no
+  DataFusion gains nothing).
+
+- **The Docker log-driver plugin is published, per architecture:
+  `ghcr.io/moriyoshi/imbh-log-driver`.** A managed plugin cannot share a tag with an image — its
+  manifest points at an `application/vnd.docker.plugin.v1+json` config, so `docker pull` refuses a
+  plugin and `docker plugin install` refuses an image — so the plugin gets its own GHCR repository,
+  built and pushed by a new `plugin` job in `release.yml`. Managed plugins also have no manifest-list
+  support, so each architecture is its own tag (`X.Y.Z-amd64` / `X.Y.Z-arm64`, plus the floating
+  `X.Y-<arch>` and `latest-<arch>`); there is deliberately no bare `X.Y.Z`, which would be silently
+  wrong for half the users.
+
+### Fixed
+
+- **A metric recorded as both a gauge and a sum made PromQL fail on a well-formed database.** An
+  instant selector queries the gauge *and* sum tables and concatenates the results, and the derived
+  label set (`service` + `__name__` + the string attributes) does not distinguish the two — so one
+  metric name emitted as both instrument kinds produced byte-identical label sets at one timestamp
+  and tripped the duplicate-timestamp rejection. No bad producer was required.
+
+### Changed
+
+- **Breaking: `SemanticError` gains a `DuplicateTimestamp(String)` variant and is now
+  `#[non_exhaustive]`,** so a future failure mode needing its own payload is additive; match with a
+  `_` arm. The existing variants keep their `&'static str` payloads.
+- **Breaking: `DbStats` gains `ingest_rejected`,** alongside the existing `ingest_dropped` /
+  `ingest_errors` gauges. `imbh_head::dto::Stats` gains the same field as `#[serde(default)]`, which
+  keeps the head wire format additive in both directions.
+
+## [0.4.0] - 2026-08-02
+
 ### Added
 
 - **The terminal explorer can drive a running `imbhd`: `imbh-tui --url http://host:4318`.** Until now
@@ -433,6 +496,8 @@ release aborts if it is missing or duplicated.
   All 12 crates published to crates.io (`imbh-test-support` is dev-only and stays unpublished).
 
 <!-- next-url -->
+[0.5.0]: https://github.com/moriyoshi/imbh/releases/tag/v0.5.0
+[0.4.0]: https://github.com/moriyoshi/imbh/releases/tag/v0.4.0
 [0.3.0]: https://github.com/moriyoshi/imbh/commit/07b72dd7e05f2320afcf573e0ff4e4766b9f0ec0
 [0.2.0]: https://github.com/moriyoshi/imbh/releases/tag/v0.2.0
 [0.1.1]: https://github.com/moriyoshi/imbh/releases/tag/v0.1.1

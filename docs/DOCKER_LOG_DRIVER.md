@@ -43,7 +43,7 @@ It adds no crate to the dependency graph (the protobuf and OTLP message types ar
 The release publishes the plugin **per architecture**, and you name the one you want:
 
 ```sh
-docker plugin install --alias imbh --disable ghcr.io/moriyoshi/imbh-log-driver:0.4.0-amd64
+docker plugin install --alias imbh --disable ghcr.io/moriyoshi/imbh-log-driver:0.5.0-amd64
 docker plugin set     imbh data.source=/var/lib/imbh
 docker plugin enable  imbh
 ```
