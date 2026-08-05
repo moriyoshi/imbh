@@ -2654,3 +2654,201 @@ than a silent fallback.
 Left open deliberately, now in TODO.md: the typed `MetricsApi::range`/`instant` path still `SUM`s
 duplicate points. It degrades a number rather than denying service, and a SQL dedup needs the same
 ingest-sequence column the log-driver `--tail 0` item wants. One column would close both.
+
+## VRL log remapping for the Docker driver: what the dependency actually cost (2026-08-06)
+
+`imbh-server` gained `docker-remap` — a VRL (`vrl` 0.34) stage between the reassembled wire entry and
+the OTLP record, with a built-in script covering JSON, logfmt, klog/glog and `key=value`. It is the
+**first feature in this workspace that adds crates on purpose**; every other feature comment in
+`crates/imbh-server/Cargo.toml` ends in "adds no new crate". QUALITY_GATE.md says a footprint
+regression is justified here rather than merged silently, so:
+
+| axis | before | after | delta |
+|---|---|---|---|
+| `cargo tree -p imbh` (the gated axis) | 275 | **275** | **0** |
+| `cargo build --release -p imbh-server` (default features, what the gate measures) | unchanged | unchanged | **0** |
+| `cargo tree -p imbh-server --features docker,grpc,tracing` | 308 | **397** | **+89** |
+| release `imbhd --features docker,grpc,tracing` (glibc, fat LTO, stripped) | 35,973,464 B = 34.3 MiB | **39,997,776 B = 38.1 MiB** | **+3.8 MiB** |
+
+The shipped plugin binary is **40.0 MB against the §2 target of 42 MB** and a 55 MB hard limit — so
+the feature ships enabled (`release.yml`'s Linux legs, `docker-plugin/build.sh`) without moving a
+budget. On glibc; §2 is defined on musl, which runs higher, and the gate already annotates that.
+
+**The binary cost came in far under the estimate, and the reason is worth writing down.** Adding vrl
+at `compiler,stdlib-base` puts ~200 stdlib functions and their data tables (grok, the public-suffix
+list, ua-parser, a second regex engine) in the *dependency graph*, and a first measurement taken
+before any code called `compile()` showed only +1.4 MiB — because fat LTO had stripped essentially
+all of it. That number was meaningless and nearly got reported as the answer. The real figure, once
+`vrl::stdlib::all()` is referenced and every `Function` impl is therefore live, is +3.8 MiB. The
+lesson generalises: **a dependency's graph size and its linked size are different questions here**,
+and only the second one is measurable after the code that uses it exists.
+
+**The gate is blind to all of this.** `scripts/footprint-gate.sh` counts `cargo tree -p imbh` — the
+facade — and builds `imbh-server` with *default* features. The dependency direction is
+`imbh ← imbh-server`, so nothing this crate links can ever reach that number, and `docker-remap` is
+off by default so the binary axis does not see it either. Both axes reported "unchanged" while the
+shipped plugin grew by 3.8 MiB. The gate now prints an **informational, never-failing** plugin-build
+section (crate delta + binary size at `docker,docker-remap,grpc,tracing`) so the cost is visible on
+every run instead of at release time. Anything else that lands in `imbh-server` has the same blind
+spot.
+
+### Three policy statements this falsified
+
+- **`deny.toml`/`about.toml` licenses.** `borrow-or-share` is **MIT-0** and `quoted_printable` is
+  **0BSD**; neither was on the 12-entry allow-list, and `[graph] all-features = true` means the gate
+  walks vrl *whether or not the feature is on* — marking it default-off would not have helped. Both
+  added to both mirrored lists. `MIT-0` arrives via vrl's **non-optional** `jsonschema` dependency, so
+  it is unavoidable at every vrl feature level, `compiler`-only included.
+- **ARCHITECTURE.md §11 "C code allowed only for libzstd".** `stdlib-base` force-enables vrl's
+  `datadog` feature, which pulls `onig_sys` (vendored oniguruma) — the graph's second C library. Both
+  Linux release legs build natively, so no cross-compilation setup changes; the macOS legs never
+  enable the feature.
+- **ARCHITECTURE.md §11 "`lz4_flex` … is not a dependency".** It is now: vrl depends on it
+  non-optionally.
+
+vrl is also the graph's **first MPL-2.0 component** (`grep -c MPL-2.0 THIRD-PARTY-NOTICES.txt` was 0).
+MPL §3.3 permits the Larger Work under Apache-2.0, so this is fine, but every embedder inherits the
+story. Nine new duplicate-version crates, `prost 0.13` alongside our 0.14 the notable one;
+`cargo deny check bans` still passes (duplicates are `warn`).
+
+### Design notes worth keeping
+
+**The event is seeded with the record the driver would have stored anyway.** `Remapper::seed` fills
+in Docker's wire fields *and* the finished OTel record — body, attributes, resource, both timestamps,
+the stream's severity — so the identity script `.` is byte-for-byte today's behaviour
+(`an_identity_script_reproduces_the_unremapped_record` pins it) and the built-in script only ever
+*overrides*. It never re-derives `service.name`, `container.*` or `log.iostream`, which is what keeps
+the existing metadata mapping in exactly one place.
+
+**Three invariants are re-asserted after every script run**, because a script is operator input and
+the rest of the plugin depends on them: `container.id` on the resource is **overwritten**, not
+filled-in-if-absent (a *wrong* id would silently merge two containers' `docker logs` histories),
+`service.name` is restored only when absent or empty (a deliberate override is legitimate), and
+`log.iostream` is re-appended (it is what `readlogs::to_entry` restores the wire `source` from).
+
+**A parsed timestamp is only accepted within ±26h of Docker's capture time.** `readlogs.rs` orders,
+pages, applies `--since`/`--until` *and* computes its follow watermark from `row.time`; without the
+window a container with a skewed clock could make `docker logs -f` skip lines. This is a correctness
+constraint on the script, not a nicety — and it is why klog, which carries no year, keeps the capture
+time rather than the year VRL infers.
+
+**`docker logs` re-renders a structured body as logfmt** (`ts=… level=… ` then the body's fields)
+rather than the original line being stored a second time. A *string* body still goes out verbatim, so
+a `docker`-only build and every OTLP-ingested record are untouched. The RFC 3339 **formatter** this
+needed is hand-written next to the parser that was already there, for the same reason and because it
+must work without chrono in a `docker`-only build; `civil_from_days` is the exact inverse of the
+existing `days_from_civil`.
+
+**Prose must never be chopped into fields.** Every `key=value` tier is anchored on the line *starting*
+with `key=`, which alone rejects `starting server on port 8080` and `usage: foo --opt=bar`. Two
+further traps: `parse_logfmt` gives a bare word the **boolean** `true` while a real `flag=true` is the
+**string** `"true"`, so filtering booleans drops exactly the prose remnants; and the comma-delimited
+form has to be tried *before* the space-delimited one and only when the line has no whitespace at all
+— otherwise the space-delimited pass swallows `level=warn,msg=retrying` whole as one field named
+`level`, and *succeeds*, producing silent nonsense.
+
+**VRL's `??` is error-coalescing only** (`lhs.resolve().or_else(...)`), not null-coalescing; `||` is
+what falls through on null. And `exists()` needs a static path, so candidate-key search is an
+`if`/`else if` chain over literal paths rather than a loop over a list of names.
+
+### Verified
+
+`fmt` / `build --workspace` / `clippy --workspace --all-targets -D warnings` / `test --workspace`
+clean, plus both driver configurations explicitly: `-p imbh-server --features docker` (60 unit + 7
+e2e) and `--features docker,docker-remap` (87 unit + 13 e2e). The `docker`-only run matters as much as
+the other — the un-remapped path has to keep working, and the e2e suite now starts its mechanics
+tests with remapping *off* for exactly that reason. `cargo deny check licenses` passes after the two
+allow-list additions; `check bans` passes with the new duplicate warnings.
+
+## VRL remapping, part 2: finishing it, and what the rollout surfaced (2026-08-06)
+
+Companion to the entry above, which recorded the dependency cost while the work was mid-flight. This
+one closes it out: the final numbers, the surfaces that had to change beyond `remap.rs`, and three
+findings that only appeared once the feature was wired end to end.
+
+### Final footprint
+
+| axis | value | budget |
+|---|---|---|
+| `cargo tree -p imbh` (gated) | 275 | target 275, hard 300 |
+| release `imbhd`, default features (gated) | 34.9 MB / 33.3 MiB | target 42 MB, hard 55 MB |
+| `imbh-server --features docker,grpc,tracing` | 308 crates, 36.0 MB | not gated |
+| `imbh-server` + `docker-remap` (**the published plugin**) | 397 crates, **40.0 MB / 38.1 MiB** | vs the 42 MB target |
+
+Both gated axes are byte-for-byte what they were. RSS was **not** measured (the gate ran with
+`RSS_PROBE=0`); a per-FIFO-thread `Runtime` plus a cloned event object per line makes steady-state
+RSS the plausibly-affected number, and it is one thread per container rather than per line. Open.
+
+### A default-on feature silently rewrote an existing test suite
+
+`serve_plugin`'s default became `Source::Builtin`, so the moment the feature compiled, **six of the
+seven existing e2e tests failed** — not because anything broke, but because they assert on stored
+bodies and `docker logs` output, and both legitimately changed. The fix is the interesting part:
+those tests are about *driver mechanics* (framing, the FIFO reader, follow mode, the ingest drain),
+so `start_plugin()` now starts with remapping **off** and new tests opt in via
+`start_plugin_remapping()`. That keeps the un-remapped path — which is still what a `docker`-only
+build ships — genuinely covered rather than incidentally so.
+
+Generalisable: when an opt-in feature becomes on-by-default for a component, the existing suite stops
+testing what it was written to test. Re-pointing it at the old behaviour is usually better than
+re-baselining its expectations, because the old behaviour is still a shipping configuration.
+
+One test needed a second look rather than a fix. `the_default_script_turns_container_output_into_
+queryable_fields` failed on severity order, and the *test* was wrong: the JSON line's own timestamp
+had moved it 400s later, so `ORDER BY time` legitimately sorts it last. Ordering by `observed_time`
+(Docker's capture time) is what reads in the order the container printed. That the two orderings now
+differ is the feature working — it is the OTel event-time/observed-time distinction the driver could
+not express before — so the test asserts on both.
+
+### Additive API, because the crate is published
+
+`serve_plugin_with{,_until}` are `pub` on a released crate, so threading a remap default through them
+would have been a breaking change needing a semver bump. Instead `PluginConfig { ingest, remap }` plus
+one new `serve_plugin_with_config` entry point; the four existing functions keep their shapes and
+delegate. Cost is one `#[allow(clippy::needless_update)]` where `..Default::default()` is exhaustive
+without the feature — cheaper than either a breaking change or two `cfg`-duplicated call sites.
+
+### A measurement that could corrupt the thing it sits next to
+
+The informational plugin-size section added to `scripts/footprint-gate.sh` originally built into
+`target/release/imbhd` — **the same path the gated binary axis reuses when it already exists**. An
+interrupted run would have left the plugin build there, and the next gate would have measured it as
+if it were the default build, silently reporting ~40 MB against a budget that describes a different
+binary. It now builds into `target/footprint-plugin-probe/`. Caught only because a gate run mid-work
+printed the plugin's size on the *gated* line.
+
+### Two pre-existing gate defects, found while reading its output
+
+Neither is caused by this change (the only facade edit is a re-export; nothing was added to
+`cargo tree -p imbh`), both are now in TODO.md:
+
+- **`scripts/footprint-gate.sh`'s `datafusion: NO` assertion is vacuous.** It greps for `datafusion v`,
+  but the graph contains only the split crates (`datafusion-core`, `datafusion-common`, …) and no bare
+  `datafusion`. The check has been silently passing-by-printing-NO rather than guarding anything.
+- **`QUALITY_GATE.md`'s search-off number is wrong.** It documents 216 crates for
+  `imbh --no-default-features`; the gate measures **71**. The doc conflates "search off" with
+  "no default features" — the latter also drops `query`, and therefore the whole DataFusion subtree.
+
+### Surfaces changed beyond the driver
+
+`docs/DOCKER_LOG_DRIVER.md` gained a Remapping section (both event shapes, per-format behaviour, the
+`@PATH`/`off`/inline grammar, the `docker logs` rendering, the ±26h caveat) and its "what a line
+becomes" table now distinguishes `time` from `observed_time`. `docker-plugin/config.json` gained
+`IMBH_DOCKER_REMAP` and **no new mount** — a managed plugin's `type: none` mount requires its host
+source to exist before `docker plugin enable`, so adding one would have broken enable for every
+existing installation; the `data` mount already covers `@/var/lib/imbh/remap/*.vrl`. `release.yml`'s
+two Linux legs, `build.sh` and `ci.yml` all name the feature, and `ci.yml` runs **both** driver
+configurations because they are different code paths.
+
+`imbh`'s facade gained one re-export, `canonical_json_value` — the natural companion to the
+already-exported `parse_json`, needed by the logfmt renderer for nested body values. Additive, no new
+dependency, and it keeps `imbh-server` talking to the facade rather than reaching past it to
+`imbh-core`.
+
+### Verified
+
+`fmt` / `build --workspace` / `clippy --workspace --all-targets -D warnings` / `test --workspace`
+clean, plus `-p imbh-server` clippy **and** tests under `--features docker` and
+`--features docker,docker-remap` separately. `cargo deny check licenses` and `check bans` pass;
+`THIRD-PARTY-NOTICES.txt` regenerated (it now carries the graph's first MPL-2.0 entries, plus MIT-0
+and 0BSD). Footprint gate OK on both gated axes. Nothing committed.

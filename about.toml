@@ -19,8 +19,14 @@ accepted = [
     "Unicode-3.0",
     "Unicode-DFS-2016",
     "Zlib",
+    # vrl, via imbh-server's `docker-remap` feature — the graph's first copyleft component.
     "MPL-2.0",
     "CC0-1.0",
+    # Public-domain-equivalent, both reached only via vrl: MIT-0 (borrow-or-share, through vrl's
+    # non-optional jsonschema) and 0BSD (quoted_printable, through `stdlib-base`). See deny.toml for
+    # the full rationale — these two lists MUST stay in sync.
+    "MIT-0",
+    "0BSD",
 ]
 
 # Every target we publish a binary for, so target-specific dependencies (windows-sys, ntapi,

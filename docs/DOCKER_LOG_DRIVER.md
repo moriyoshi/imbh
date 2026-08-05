@@ -28,15 +28,19 @@ container stdout/stderr
 The feature is **off by default** in a source build:
 
 ```sh
-cargo build --release -p imbh-server --features docker
+cargo build --release -p imbh-server --features docker,docker-remap
 ```
 
-The published plugin and the prebuilt Linux binaries from a GitHub release both carry it
-(`--features docker,grpc,tracing`); the macOS builds omit it, since a plugin socket must be reachable
-by a *local* daemon and on macOS the daemon runs inside a VM.
+The published plugin and the prebuilt Linux binaries from a GitHub release both carry both features
+(`--features docker,docker-remap,grpc,tracing`); the macOS builds omit them, since a plugin socket
+must be reachable by a *local* daemon and on macOS the daemon runs inside a VM.
 
-It adds no crate to the dependency graph (the protobuf and OTLP message types are already there via
-`imbh-otlp`) and is **Unix only** — the module is `#[cfg(unix)]`.
+`docker` is the plugin itself: **Unix only** (the module is `#[cfg(unix)]`) and it adds no crate to
+the dependency graph, since the protobuf and OTLP message types are already there via `imbh-otlp`.
+`docker-remap` adds [remapping](#remapping) — parsing a container's JSON, logfmt, klog/glog or
+`key=value` output into queryable fields — and it *does* carry a dependency subtree (VRL, +89 crates
+and +3.8 MiB). Drop it for a smaller build; lines are then stored exactly as the container printed
+them.
 
 ## Install
 
@@ -129,9 +133,10 @@ conventions), so it survives compaction and is queryable with `json_get_str(reso
 
 | Field | Value |
 |-------|-------|
-| `time` | the container's capture time, nanosecond precision |
-| `body` | the line, with one trailing newline removed |
-| `severity_number` / `severity_text` | `9`/`INFO` for stdout, `17`/`ERROR` for stderr (configurable) |
+| `time` | the line's own timestamp when [remapping](#remapping) found one, else the container's capture time |
+| `observed_time` | the container's capture time, nanosecond precision |
+| `body` | the parsed fields when [remapping](#remapping) recognised the line, else the line with one trailing newline removed |
+| `severity_number` / `severity_text` | the line's own level when remapping found one, else `9`/`INFO` for stdout and `17`/`ERROR` for stderr (configurable) |
 | `service` | the `imbh-service` log-opt, else the container name, else its short id |
 | `scope` | `docker` — distinguishes driver output from an app's own OTLP |
 | `attributes` | `log.iostream` = `stdout` \| `stderr` |
@@ -151,6 +156,7 @@ Pass with `--log-opt key=value` on `docker run`, or set daemon-wide in `/etc/doc
 | `env=A,B` | copy those environment variables to `container.env.A`, … |
 | `imbh-stdout-severity=LEVEL` | severity for stdout lines. Default `INFO` |
 | `imbh-stderr-severity=LEVEL` | severity for stderr lines. Default `ERROR` |
+| `imbh-remap=SPEC` | the [remap script](#remapping) for this container. Default: the built-in one |
 
 `LEVEL` is an OTel severity name (`TRACE`, `DEBUG`, `INFO`, `WARN`, `ERROR`, `FATAL`) or a raw
 1–24 severity number. An unrecognized value falls back to the default rather than failing the
@@ -162,6 +168,134 @@ attributes instead).
 
 Labels and environment variables are copied **only** when named — a container's whole environment is
 never swept into the database, because it usually contains secrets.
+
+## Remapping
+
+Built with `docker-remap` (as the published plugin is), every line runs through a
+[VRL](https://vector.dev/docs/reference/vrl/) program that maps the Docker log-driver data model onto
+the [OpenTelemetry logs data model](https://opentelemetry.io/docs/specs/otel/logs/data-model/). The
+built-in script recognises **JSON**, **logfmt**, **klog/glog** and **`key=value`** with no
+configuration:
+
+```console
+$ docker run --rm --log-driver imbh --log-opt imbh-service=demo alpine sh -c '
+    echo "{\"level\":\"warn\",\"msg\":\"disk low\",\"disk\":\"/dev/sda\"}"
+    echo "level=info msg=\"ready\" port=8080"
+    echo "I0413 12:34:56.789012  123 main.go:45] leader elected"
+    echo "starting server on port 8080"'
+```
+
+```sql
+SELECT severity_text, json_get_str(body, 'msg'), json_get_str(body, 'disk')
+FROM logs WHERE service = 'demo' ORDER BY observed_time;
+-- WARN   disk low                       /dev/sda
+-- INFO   ready
+-- INFO   leader elected
+-- INFO   starting server on port 8080
+```
+
+A line the script cannot confidently classify is left alone: prose such as `starting server on port
+8080` becomes `{"msg": "starting server on port 8080"}`, never a pile of bogus fields. Every
+`key=value` tier is anchored on the line *starting* with `key=`, so `usage: foo --opt=bar` stays
+prose too.
+
+What the built-in script does, beyond parsing:
+
+- **One message key.** `message`, `log` and `event` are renamed to `msg` (klog and zerolog say
+  `message`; zap, logrus, slog and logfmt say `msg`), so `body->>'msg'` always works.
+- **Severity** comes from `level` / `severity` / `lvl` / `loglevel` / `levelname` / `log.level`, by
+  name or by number — bunyan/pino `10..60` and syslog `0..7` are both understood. `severity_text` is
+  normalised to the OTel band, so it stays a closed set across containers. An unrecognised level is
+  left in the body and the stream default applies.
+- **Timestamps** from `timestamp` / `ts` / `time` / `@timestamp` / `eventTime` / `asctime` become the
+  event `time`, while Docker's capture time stays as `observed_time`. RFC 3339, four common layouts,
+  and epoch seconds/millis/micros/nanos are all recognised — but **only within ±26h of the capture
+  time**. `docker logs` pages and follows on `time`, so a container with a skewed clock must not be
+  able to make `docker logs -f` skip lines.
+- **`trace_id` / `span_id`** (also `traceId`, `traceID`, `otelTraceID`, …) are lifted onto the
+  record, so a line joins the traces in the same database.
+
+Container identity is **not** the script's business: `service.name`, `container.*`,
+`container.label.*`, `container.env.*` and `log.iostream` are set by the driver before the script
+runs, and left alone by the built-in one.
+
+### `docker logs` on a remapped container
+
+Because the body is now structured, `docker logs` renders it back as a single logfmt line rather than
+the original being stored a second time:
+
+```console
+$ docker logs demo
+ts=2026-08-06T12:34:56Z level=WARN msg="disk low" disk=/dev/sda
+ts=2026-08-06T12:34:56Z level=INFO msg=ready port=8080
+```
+
+With `docker-remap` off — or `imbh-remap=off` — bodies are plain strings and `docker logs` is
+byte-identical to what the container printed, as before.
+
+### Your own script
+
+`imbh-remap` (per container) and `IMBH_DOCKER_REMAP` (daemon-wide) share one grammar:
+
+| Value | Meaning |
+|-------|---------|
+| unset, or `default` | the built-in script |
+| `off` (or `none`) | no remapping — store lines exactly as printed |
+| `@PATH` | read the script from `PATH` **inside the plugin**, e.g. `@/var/lib/imbh/remap/app.vrl` |
+| anything else | an inline VRL script |
+
+A per-container `--log-opt` always wins over the daemon-wide default.
+
+```sh
+# drop health-check noise before it is ever stored
+docker run --log-driver imbh \
+  --log-opt imbh-remap='if contains!(.line, "/healthz") { abort }' nginx
+
+# daemon-wide, from a file under the plugin's data mount (no rebuild needed)
+docker plugin set imbh IMBH_DOCKER_REMAP=@/var/lib/imbh/remap/app.vrl
+```
+
+`@PATH` resolves inside the plugin's own mount namespace, not the host's. The `data` mount is already
+bind-mounted at `/var/lib/imbh`, so putting scripts there is the path that works with no extra
+configuration.
+
+The script receives the Docker log-driver model **and** the OTel record the driver would have stored
+on its own, so a script that changes nothing behaves exactly like no script at all:
+
+```coffee
+# ── in: the Docker log-driver model ──
+.line                       # the line, one trailing newline removed
+.source                     # "stdout" | "stderr"
+.time_nano                  # Docker's capture time, unix nanoseconds
+.partial                    # was this line reassembled from split chunks
+.info.container_id          # ...container_name (no leading slash), container_image_name,
+.info.container_labels      #    container_image_id, daemon_name, log_path
+.info.container_env         # the full map, "K=V" pre-split
+.info.config                # the --log-opt map
+
+# ── in AND out: the OTel logs model, pre-filled with what the driver would store ──
+.timestamp                  # both seeded from .time_nano
+.observed_timestamp
+.severity_number            # the stdout/stderr default for this stream
+.severity_text
+.body                       # seeded with .line; any VRL value is accepted
+.attributes                 # { "log.iostream": ... }
+.resource                   # service.name, container.*, container.label.*, container.env.*
+.trace_id / .span_id        # 32 / 16 hex characters
+.trace_flags
+```
+
+`abort` drops the line. A script that fails at runtime never costs the line — it is stored the
+un-remapped way and a rate-limited warning goes to the daemon log. A script that fails to *compile*
+fails `docker run` with the VRL diagnostic, so you see the error where you typed the option.
+
+Three things a script cannot break, because `docker logs` depends on them: `container.id` on the
+resource is always restored (and cannot be changed to a different container's), `service.name` is
+restored if blanked, and `log.iostream` is restored if removed.
+
+The `env`, `system`, network and crypto VRL function groups are **not** compiled in — a remap script
+cannot read the host or make network calls. That is what makes it safe for `.info` to expose the
+container's full label and environment maps, which the `labels=`/`env=` log-opts deliberately do not.
 
 ## Networking
 
@@ -270,8 +404,10 @@ stopped container returns rather than hanging.
 
 Two caveats worth knowing:
 
-- The newline ingest stripped is restored on the way out, so output matches what the container
-  printed. A line that had no trailing newline gets one.
+- The newline ingest stripped is restored on the way out. Without remapping, output therefore
+  matches what the container printed exactly; with it, a structured body is re-rendered as one
+  logfmt line (see [Remapping](#docker-logs-on-a-remapped-container)). Either way a line that had no
+  trailing newline gets one.
 - Follow advances by record timestamp, which is when the container *emitted* the line -- ingest
   stores it up to one batch interval later. Follow accounts for that, except under `--tail 0`, whose
   "only new lines" semantic means a line emitted a moment before the follow started may not appear.

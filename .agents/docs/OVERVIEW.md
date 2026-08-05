@@ -89,6 +89,14 @@ indexes and Parquet files are mmapped, so file-backed pages are reclaimable page
 tuning surface (mutable buffers, DataFusion pool, Tantivy writer heap, Arrow batch sizes) is
 all capped by one `MemoryBudget` config.
 
+These budgets describe the **default-feature** build, which is what `scripts/footprint-gate.sh`
+enforces (`cargo tree -p imbh` plus a default-feature `imbhd`). An off-by-default `imbh-server`
+feature moves neither number, so the gate additionally prints — informationally, never as a failure
+— the shipped Docker log-driver plugin build (`docker,docker-remap,grpc,tracing`). That build is the
+only place `docker-remap`'s VRL subtree shows up: +89 crates and +3.8 MiB, landing the plugin binary
+at 40.0 MB against the 42 MB target (ARCHITECTURE.md §11, and the 2026-08-06 JOURNAL entry for the
+measurement).
+
 ## 3. Non-goals (v1)
 
 - Distribution, replication, HA, multi-node anything.

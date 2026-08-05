@@ -31,9 +31,13 @@ PLUGIN=${PLUGIN:-imbh/log-driver:latest}
 # `docker` is the plugin API. `grpc` matters more than it looks: OTLP/gRPC on 4317 is the *default*
 # transport for most OTel SDKs, so without it an app container pointed at this plugin fails until
 # someone works out that it has to say `http/protobuf`. `tracing` sends imbhd's own diagnostics to
-# stderr, which the Docker daemon log captures. None are on by default (ARCHITECTURE.md §11), so a
-# shipping build has to name them; this mirrors release.yml's Linux legs.
-FEATURES=${FEATURES:-docker,grpc,tracing}
+# stderr, which the Docker daemon log captures. `docker-remap` is what makes a container's JSON,
+# logfmt, klog/glog or key=value output land as queryable fields instead of an opaque string --
+# unlike the other three it adds a real dependency subtree (vrl; see the feature's comment in
+# ../Cargo.toml), so `FEATURES=docker,grpc,tracing ./build.sh` is the smaller build. None are on by
+# default (ARCHITECTURE.md §11), so a shipping build has to name them; this mirrors release.yml's
+# Linux legs.
+FEATURES=${FEATURES:-docker,docker-remap,grpc,tracing}
 # The rootfs base. Default matches what the release publishes; raise it when this host's glibc is
 # newer than the default's -- see the smoke test below, which is what tells you.
 BASE=${BASE:-debian:bookworm-slim}

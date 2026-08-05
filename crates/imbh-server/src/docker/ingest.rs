@@ -62,6 +62,10 @@ pub struct Container {
     resource: Resource,
     stdout_severity: (i32, &'static str),
     stderr_severity: (i32, &'static str),
+    /// The compiled remap binding, when this container has one. `None` — always, without the
+    /// `docker-remap` feature — is the pre-feature behaviour: [`Container::record`] and nothing else.
+    #[cfg(feature = "docker-remap")]
+    remap: Option<Arc<super::remap::Bound>>,
 }
 
 impl Container {
@@ -137,7 +141,61 @@ impl Container {
             },
             stdout_severity: severity(opt("imbh-stdout-severity")).unwrap_or((9, "INFO")),
             stderr_severity: severity(opt("imbh-stderr-severity")).unwrap_or((17, "ERROR")),
+            #[cfg(feature = "docker-remap")]
+            remap: None,
         }
+    }
+
+    /// Compile and attach the remap script this container asked for.
+    ///
+    /// Separate from [`Container::from_info`] on purpose. `from_info` cannot fail — an unparseable
+    /// log-opt falls back to a default rather than refusing to start the container — but a script
+    /// that does not compile *must* fail `StartLogging` loudly, because `docker run` is the only
+    /// place the operator will see the diagnostic.
+    ///
+    /// Precedence: the `imbh-remap` log-opt, then the daemon-wide default, then the built-in script.
+    #[cfg(feature = "docker-remap")]
+    pub fn bind_remap(
+        &mut self,
+        info: &ImbhValue,
+        default: &super::remap::Source,
+        cache: &super::remap::Cache,
+    ) -> Result<(), String> {
+        let opts = json::string_map(info, "Config");
+        let source = opts
+            .iter()
+            .find(|(k, _)| k == "imbh-remap")
+            .map(|(_, v)| super::remap::Source::parse(v))
+            .unwrap_or_else(|| default.clone());
+
+        let Some(source) = source.read()? else {
+            return Ok(()); // `off`
+        };
+        let script = cache.get(&source)?;
+        self.remap = Some(Arc::new(super::remap::Bound::new(script, self, info)));
+        Ok(())
+    }
+
+    /// A fresh per-thread remapper, or `None` when this container has no script. One is built per
+    /// FIFO reader thread, because a VRL `Runtime` needs `&mut` while `Container` is shared.
+    #[cfg(feature = "docker-remap")]
+    pub fn remapper(&self) -> Option<super::remap::Remapper> {
+        self.remap.clone().map(super::remap::Remapper::new)
+    }
+
+    /// The severity pair this container assigns to a stream. Pulled out of [`Container::record`] so
+    /// the remapper can seed its event with exactly what `record` would have produced.
+    pub(crate) fn severity_for(&self, stderr: bool) -> (i32, &'static str) {
+        match stderr {
+            true => self.stderr_severity,
+            false => self.stdout_severity,
+        }
+    }
+
+    /// This container's own resource, for the remapper's post-script invariant checks.
+    #[cfg(feature = "docker-remap")]
+    pub(crate) fn resource(&self) -> &Resource {
+        &self.resource
     }
 
     /// How to name this container in a log message: its name, falling back to its id.
@@ -155,10 +213,7 @@ impl Container {
     /// puts it back, so `docker logs` output is unchanged (`docs/DOCKER_LOG_DRIVER.md`).
     pub fn record(&self, entry: &LogEntry) -> LogRecord {
         let stderr = entry.source == "stderr";
-        let (severity_number, severity_text) = match stderr {
-            true => self.stderr_severity,
-            false => self.stdout_severity,
-        };
+        let (severity_number, severity_text) = self.severity_for(stderr);
         let time = entry.time_nano.max(0) as u64;
         LogRecord {
             time_unix_nano: time,
@@ -177,7 +232,7 @@ impl Container {
 }
 
 /// Strip one trailing line terminator (`\n` or `\r\n`).
-fn strip_newline(line: &[u8]) -> &[u8] {
+pub(crate) fn strip_newline(line: &[u8]) -> &[u8] {
     match line.strip_suffix(b"\n") {
         Some(rest) => rest.strip_suffix(b"\r").unwrap_or(rest),
         None => line,
@@ -226,7 +281,7 @@ fn name_for(n: i32) -> &'static str {
     }
 }
 
-fn kv(key: &str, value: &str) -> KeyValue {
+pub(crate) fn kv(key: &str, value: &str) -> KeyValue {
     KeyValue {
         key: key.to_owned(),
         value: Some(any_str(value)),
@@ -243,8 +298,34 @@ fn any_str(s: &str) -> AnyValue {
 /// One queued record and the container it belongs to.
 struct Item {
     container: Arc<Container>,
+    /// The resource a remap script produced for this line, when it differs from the container's own.
+    /// `None` — the only possibility without the `docker-remap` feature — means "use the
+    /// container's resource", which is the common case even with remapping on.
+    resource: Option<Arc<Resource>>,
     record: LogRecord,
 }
+
+/// Two overrides belong to one group when they are the same allocation — the usual case, because a
+/// container's `Remapper` interns the resource it produces — or, failing that, the same value, so a
+/// script that rebuilds an identical object every line still yields one `ResourceLogs`.
+fn same_resource(a: &Option<Arc<Resource>>, b: &Option<Arc<Resource>>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) => Arc::ptr_eq(a, b) || a == b,
+        _ => false,
+    }
+}
+
+/// Groups beyond which [`encode`] stops looking for an existing one and just opens another.
+///
+/// Without a cap, a pathological script emitting a distinct resource per line would make grouping
+/// quadratic in the batch size. Giving up costs a few extra `ResourceLogs` — which the wire format
+/// and the ingest path both handle fine — and is strictly better than a stalled reader thread.
+const MAX_GROUPS: usize = 64;
+
+/// One `ResourceLogs` under construction: the container, the resource override that distinguishes it
+/// from that container's other groups (`None` = the container's own), and the records so far.
+type Group = (Arc<Container>, Option<Arc<Resource>>, Vec<LogRecord>);
 
 /// What travels the queue between the FIFO readers and the worker. (Not `Message`: that name belongs
 /// to the prost trait this module encodes with.)
@@ -287,11 +368,20 @@ impl Ingestor {
     /// A full queue **blocks** the calling FIFO reader rather than dropping the line: back-pressure
     /// propagates into the container's stdout pipe, which is what an operator wants from a log
     /// driver — slow logging, not silently missing logs.
-    pub fn send(&self, container: Arc<Container>, record: LogRecord) -> bool {
+    pub fn send(
+        &self,
+        container: Arc<Container>,
+        resource: Option<Arc<Resource>>,
+        record: LogRecord,
+    ) -> bool {
         if self.closing.load(Ordering::Relaxed) {
             return false;
         }
-        match self.tx.try_send(Queued::Record(Item { container, record })) {
+        match self.tx.try_send(Queued::Record(Item {
+            container,
+            resource,
+            record,
+        })) {
             Ok(()) => true,
             Err(TrySendError::Full(item)) => self.tx.send(item).is_ok(),
             Err(TrySendError::Disconnected(_)) => false,
@@ -355,24 +445,34 @@ fn run(db: Arc<Db>, rx: Receiver<Queued>, config: IngestConfig) {
     }
 }
 
-/// Encode a batch as one OTLP request, one `ResourceLogs` per container. Records keep their arrival
-/// order within a container, which is the order Docker wrote them to the FIFO.
+/// Encode a batch as one OTLP request, one `ResourceLogs` per (container, resource). Records keep
+/// their arrival order within a group, which is the order Docker wrote them to the FIFO.
+///
+/// The container pointer alone was a sufficient key until a remap script could rewrite `.resource`
+/// per line; now both halves matter. With no override — always, without `docker-remap` — the extra
+/// test is one discriminant match on top of the pointer compare that was already here.
 fn encode(batch: Vec<Item>) -> Vec<u8> {
-    let mut groups: Vec<(Arc<Container>, Vec<LogRecord>)> = Vec::new();
+    let mut groups: Vec<Group> = Vec::new();
     for item in batch {
-        match groups
-            .iter_mut()
-            .find(|(c, _)| Arc::ptr_eq(c, &item.container))
-        {
-            Some((_, records)) => records.push(item.record),
-            None => groups.push((item.container, vec![item.record])),
+        let existing = match groups.len() < MAX_GROUPS {
+            true => groups.iter_mut().find(|(container, resource, _)| {
+                Arc::ptr_eq(container, &item.container) && same_resource(resource, &item.resource)
+            }),
+            false => None,
+        };
+        match existing {
+            Some((_, _, records)) => records.push(item.record),
+            None => groups.push((item.container, item.resource, vec![item.record])),
         }
     }
     ExportLogsServiceRequest {
         resource_logs: groups
             .into_iter()
-            .map(|(container, log_records)| ResourceLogs {
-                resource: Some(container.resource.clone()),
+            .map(|(container, resource, log_records)| ResourceLogs {
+                resource: Some(match resource {
+                    Some(overridden) => (*overridden).clone(),
+                    None => container.resource.clone(),
+                }),
                 scope_logs: vec![ScopeLogs {
                     scope: Some(InstrumentationScope {
                         name: SCOPE_NAME.to_owned(),
@@ -515,20 +615,7 @@ mod tests {
         let b = Arc::new(Container::from_info(&info(
             r#"{"ContainerID":"b","ContainerName":"/two"}"#,
         )));
-        let batch = vec![
-            Item {
-                container: a.clone(),
-                record: a.record(&entry("stdout", "a1\n")),
-            },
-            Item {
-                container: b.clone(),
-                record: b.record(&entry("stdout", "b1\n")),
-            },
-            Item {
-                container: a.clone(),
-                record: a.record(&entry("stdout", "a2\n")),
-            },
-        ];
+        let batch = vec![item(&a, "a1"), item(&b, "b1"), item(&a, "a2")];
 
         let decoded = ExportLogsServiceRequest::decode(&encode(batch)[..]).expect("decode");
         assert_eq!(decoded.resource_logs.len(), 2);
@@ -542,5 +629,95 @@ mod tests {
                 .name,
             SCOPE_NAME
         );
+    }
+
+    /// One un-remapped line of `container`.
+    fn item(container: &Arc<Container>, line: &str) -> Item {
+        Item {
+            container: container.clone(),
+            resource: None,
+            record: container.record(&entry("stdout", &format!("{line}\n"))),
+        }
+    }
+
+    fn resource_with(marker: &str) -> Arc<Resource> {
+        Arc::new(Resource {
+            attributes: vec![kv("deployment.environment", marker)],
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn one_container_splits_into_a_group_per_distinct_resource_override() {
+        let c = Arc::new(Container::from_info(&info(r#"{"ContainerID":"a"}"#)));
+        let prod = resource_with("prod");
+        let staging = resource_with("staging");
+
+        let with = |resource: Option<Arc<Resource>>, line: &str| Item {
+            container: c.clone(),
+            resource,
+            record: c.record(&entry("stdout", line)),
+        };
+        let batch = vec![
+            with(None, "plain-1\n"),
+            with(Some(prod.clone()), "prod-1\n"),
+            // The same allocation the interner would hand back: must join the group above.
+            with(Some(prod.clone()), "prod-2\n"),
+            // Equal by value but a different allocation: must ALSO join it, so a script that
+            // rebuilds an identical object every line does not fragment the batch.
+            with(Some(resource_with("prod")), "prod-3\n"),
+            with(Some(staging), "staging-1\n"),
+            with(None, "plain-2\n"),
+        ];
+
+        let decoded = ExportLogsServiceRequest::decode(&encode(batch)[..]).expect("decode");
+        let sizes: Vec<usize> = decoded
+            .resource_logs
+            .iter()
+            .map(|rl| rl.scope_logs[0].log_records.len())
+            .collect();
+        // container-default (2), prod (3), staging (1) — and `None` never merges with `Some`.
+        assert_eq!(sizes, vec![2, 3, 1]);
+        let env = |rl: &ResourceLogs| {
+            rl.resource
+                .as_ref()
+                .unwrap()
+                .attributes
+                .iter()
+                .find(|kv| kv.key == "deployment.environment")
+                .and_then(|kv| match &kv.value {
+                    Some(AnyValue {
+                        value: Some(any_value::Value::StringValue(s)),
+                    }) => Some(s.clone()),
+                    _ => None,
+                })
+        };
+        assert_eq!(env(&decoded.resource_logs[0]), None);
+        assert_eq!(env(&decoded.resource_logs[1]).as_deref(), Some("prod"));
+        assert_eq!(env(&decoded.resource_logs[2]).as_deref(), Some("staging"));
+    }
+
+    #[test]
+    fn a_pathological_script_cannot_make_grouping_quadratic() {
+        // 200 distinct resources in one batch: grouping stops searching at MAX_GROUPS and opens a
+        // new group per record after that, rather than scanning an ever-growing list.
+        let c = Arc::new(Container::from_info(&info(r#"{"ContainerID":"a"}"#)));
+        let batch: Vec<Item> = (0..200)
+            .map(|i| Item {
+                container: c.clone(),
+                resource: Some(resource_with(&format!("env-{i}"))),
+                record: c.record(&entry("stdout", "x\n")),
+            })
+            .collect();
+
+        let decoded = ExportLogsServiceRequest::decode(&encode(batch)[..]).expect("decode");
+        assert_eq!(decoded.resource_logs.len(), 200);
+        // Nothing is lost when the cap is hit — every record still reaches the request.
+        let total: usize = decoded
+            .resource_logs
+            .iter()
+            .map(|rl| rl.scope_logs[0].log_records.len())
+            .sum();
+        assert_eq!(total, 200);
     }
 }

@@ -153,6 +153,16 @@ fn main() -> Result<(), Box<dyn Error>> {
         .filter(|s| !s.as_os_str().is_empty())
     {
         let plugin_db = db.clone();
+        // `IMBH_DOCKER_REMAP` picks the daemon-wide remap script; `--log-opt imbh-remap` overrides it
+        // per container. Resolving here rather than inside the plugin keeps every environment knob in
+        // one place (see the module doc), and it cannot fail — a bad script is reported per container.
+        #[cfg_attr(not(feature = "docker-remap"), allow(unused_mut))]
+        let mut plugin_config = imbh_server::docker::PluginConfig::default();
+        #[cfg(feature = "docker-remap")]
+        {
+            plugin_config.remap =
+                imbh_server::docker_remap(std::env::var("IMBH_DOCKER_REMAP").ok())?;
+        }
         #[cfg(feature = "tracing")]
         tracing::info!(socket = %sock.display(), "docker log-driver plugin listening");
         #[cfg(not(feature = "tracing"))]
@@ -161,8 +171,13 @@ fn main() -> Result<(), Box<dyn Error>> {
         serve_on_thread("docker plugin", &stopped_tx, {
             let shutdown = shutdown.clone();
             move || {
-                imbh_server::docker::serve_plugin_until(plugin_db, &sock, shutdown)
-                    .map_err(|e| format!("docker plugin error on {}: {e}", sock.display()))
+                imbh_server::docker::serve_plugin_with_config(
+                    plugin_db,
+                    &sock,
+                    plugin_config,
+                    shutdown,
+                )
+                .map_err(|e| format!("docker plugin error on {}: {e}", sock.display()))
             }
         });
     }

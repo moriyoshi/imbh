@@ -218,6 +218,25 @@ pub fn duplicates(env: Option<String>) -> imbh::Result<imbh::Duplicates> {
     }
 }
 
+/// Resolve the daemon-wide Docker remap default from `IMBH_DOCKER_REMAP`
+/// (`docs/DOCKER_LOG_DRIVER.md`), falling back to the built-in script.
+///
+/// One grammar, shared with the per-container `--log-opt imbh-remap`, so the two are documented
+/// once: unset or `default` is the built-in JSON/logfmt/klog/key=value remapper, `off` (or `none`)
+/// disables remapping, `@PATH` reads a script from a path **inside the plugin's mount namespace**,
+/// and anything else is an inline VRL script.
+///
+/// Unlike [`flush_policy`], this cannot fail here. A script is arbitrary text until a compiler sees
+/// it, and both of the things that *can* go wrong — an unreadable `@PATH` and a script that does not
+/// compile — are diagnosed inside the plugin, where the failure can be reported per container to
+/// `docker run` rather than refusing to start the whole daemon. That matters most for a managed
+/// plugin: a typo in `docker plugin set` must not leave a plugin that will not enable and no way to
+/// see why.
+#[cfg(all(feature = "docker-remap", unix))]
+pub fn docker_remap(env: Option<String>) -> imbh::Result<docker::remap::Source> {
+    Ok(docker::remap::Source::parse(&env.unwrap_or_default()))
+}
+
 /// Resolve the retention cadence from `IMBH_MAINTENANCE_INTERVAL` (a duration such as `60s`, `5m`),
 /// falling back to [`DEFAULT_MAINTENANCE_INTERVAL`]. Empty means unset; a malformed value is an error.
 pub fn maintenance_interval(env: Option<String>) -> imbh::Result<Duration> {
