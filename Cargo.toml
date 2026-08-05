@@ -245,6 +245,33 @@ tracing-subscriber = { version = "0.3", default-features = false, features = [
     "fmt",
     "env-filter",
 ] }
+# Vector Remap Language: the log-transform DSL behind `imbh-server`'s optional `docker-remap`
+# feature, which turns the Docker log-driver data model into the OTel logs data model
+# (docs/DOCKER_LOG_DRIVER.md). MPL-2.0 — permitted by deny.toml's allow-list, and MPL §3.3 lets the
+# Larger Work stay Apache-2.0, but note it is the graph's FIRST copyleft-of-any-kind component.
+#
+# `default-features = false` is load-bearing. vrl's default set turns on `cli`, `enable_crypto_*`,
+# `enable_env_*`, `enable_system_*` and — the one that matters — `enable_network_functions`, which
+# pulls reqwest + rustls so a script can call `http_request`/`dns_lookup`. A log driver must not make
+# network calls on the ingest path, and dropping those groups is also what makes it safe to hand a
+# remap script the container's full label and environment maps: the script has no way to reach the
+# network or read the host.
+#
+# `stdlib-base` (not `stdlib`) is the smallest set that still has the parsers the built-in script
+# needs — `parse_json`, `parse_logfmt`, `parse_key_value`, `parse_klog`, `parse_glog`,
+# `parse_timestamp`. There is no finer lever: vrl's `src/lib.rs` gates `pub mod stdlib` on
+# `stdlib-base` as a whole, and `stdlib-base` in turn force-enables vrl's `datadog` feature. See the
+# `docker-remap` feature in crates/imbh-server/Cargo.toml for the measured cost.
+vrl = { version = "0.34", default-features = false, features = [
+    "compiler",
+    "stdlib-base",
+] }
+# Only to CONSTRUCT the `Value::Timestamp(DateTime<Utc>)` the remapper seeds `.timestamp` /
+# `.observed_timestamp` with — reading one back is an inherent method call that needs no direct edge.
+# Seeding a real timestamp rather than epoch nanos is what lets a remap script do timestamp
+# arithmetic (the default script's clock-skew window) without converting first. Pulled only by
+# `docker-remap`, and vrl and arrow both already require chrono 0.4, so this edge adds NO crate.
+chrono = { version = "0.4", default-features = false, features = ["std"] }
 
 # The "release-small" shipping profile from ARCHITECTURE.md §11 / Appendix C. This is what the
 # footprint gate builds. `cargo test` / `cargo build` (debug) use the dev profile and are

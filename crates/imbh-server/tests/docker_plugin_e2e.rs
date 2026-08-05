@@ -24,8 +24,9 @@ use std::time::{Duration, Instant};
 
 use imbh::Db;
 use imbh::arrow::array::{Array, StringArray, UInt8Array};
+use imbh_server::Shutdown;
 use imbh_server::docker::entry::{EntryReader, LogEntry, PartialLogEntryMetadata, write_entry};
-use imbh_server::docker::serve_plugin;
+use imbh_server::docker::{PluginConfig, serve_plugin_with_config};
 
 /// Longest a test waits for a line to travel FIFO → ingest worker → DB. The worker's default flush
 /// interval is 200 ms, so this is ~25 flushes of slack for a loaded CI box.
@@ -162,15 +163,53 @@ impl<R: std::io::BufRead> Read for ChunkedReader<R> {
     }
 }
 
-/// Start the plugin on a socket in a fresh temp dir; returns the DB it writes into.
+/// Start the plugin with remapping **off**, so the tests below exercise the driver mechanics —
+/// framing, the FIFO reader, follow mode, the ingest drain — against lines stored exactly as the
+/// container printed them. That is what they were written for, and it stays meaningful whether or
+/// not the crate is built with `docker-remap`.
 fn start_plugin() -> (Arc<Db>, PathBuf, tempfile::TempDir) {
+    start_plugin_with(PluginConfig::default_off())
+}
+
+/// Start the plugin with the built-in remap script active — the shipping configuration.
+#[cfg(feature = "docker-remap")]
+fn start_plugin_remapping() -> (Arc<Db>, PathBuf, tempfile::TempDir) {
+    start_plugin_with(PluginConfig {
+        remap: imbh_server::docker::remap::Source::Builtin,
+        ..Default::default()
+    })
+}
+
+/// Remapping off, spelled once. Without the feature there is nothing to turn off.
+trait RemapOff {
+    fn default_off() -> Self;
+}
+
+impl RemapOff for PluginConfig {
+    fn default_off() -> PluginConfig {
+        #[cfg(feature = "docker-remap")]
+        {
+            PluginConfig {
+                remap: imbh_server::docker::remap::Source::Off,
+                ..Default::default()
+            }
+        }
+        #[cfg(not(feature = "docker-remap"))]
+        {
+            PluginConfig::default()
+        }
+    }
+}
+
+/// Start the plugin on a socket in a fresh temp dir; returns the DB it writes into.
+fn start_plugin_with(config: PluginConfig) -> (Arc<Db>, PathBuf, tempfile::TempDir) {
     let tmp = tempfile::tempdir().expect("temp dir");
     let socket = tmp.path().join("imbh.sock");
     let db: Arc<Db> = Db::in_memory().open().expect("open in-memory db");
 
     let (plugin_db, plugin_socket) = (db.clone(), socket.clone());
     std::thread::spawn(move || {
-        let _ = serve_plugin(plugin_db, &plugin_socket);
+        let _ = serve_plugin_with_config(plugin_db, &plugin_socket, config, Shutdown::new());
     });
 
     // Poll until the accept loop answers the handshake.
@@ -249,6 +288,26 @@ fn wait_for_logs(db: &Arc<Db>, want: usize) -> Vec<(String, u8, String)> {
         }
         std::thread::sleep(Duration::from_millis(25));
     }
+}
+
+/// One column of a query, rendered as text — enough for asserting on remapped fields without a
+/// typed accessor per column type.
+#[cfg(feature = "docker-remap")]
+fn sql_column(db: &Arc<Db>, sql: &str) -> Vec<String> {
+    let batches = db.blocking().sql(sql).expect("query");
+    let mut out = Vec::new();
+    for batch in &batches {
+        let column = batch.column(0);
+        let formatter = imbh::arrow::util::display::ArrayFormatter::try_new(
+            column,
+            &imbh::arrow::util::display::FormatOptions::default(),
+        )
+        .expect("format column");
+        for i in 0..batch.num_rows() {
+            out.push(formatter.value(i).to_string());
+        }
+    }
+    out
 }
 
 /// The single `resource` JSON blob stored for the logs of `service`.
@@ -713,24 +772,30 @@ fn a_live_fifo_streams_into_the_database() {
 /// in the DB before `main` closes it.
 #[test]
 fn shutdown_drains_queued_container_lines_and_unlinks_the_socket() {
-    use imbh_server::Shutdown;
     use imbh_server::docker::ingest::IngestConfig;
-    use imbh_server::docker::serve_plugin_with_until;
 
     let tmp = tempfile::tempdir().expect("temp dir");
     let socket = tmp.path().join("imbh.sock");
     let db: Arc<Db> = Db::in_memory().open().expect("open in-memory db");
     let shutdown = Shutdown::with_drain_timeout(SETTLE);
 
-    let ingest = IngestConfig {
-        // Long enough that no batch closes on its own during this test.
-        flush_interval: Duration::from_secs(30),
-        ..IngestConfig::default()
+    // Remapping off for the same reason as `start_plugin`: this is about the drain, and comparing
+    // raw lines is what makes "nothing was stranded in the queue" legible.
+    // `PluginConfig` has a second field only under `docker-remap`, so without it this update is
+    // trivially exhaustive; spelling it out keeps one expression valid either way.
+    #[allow(clippy::needless_update)]
+    let config = PluginConfig {
+        ingest: IngestConfig {
+            // Long enough that no batch closes on its own during this test.
+            flush_interval: Duration::from_secs(30),
+            ..IngestConfig::default()
+        },
+        ..PluginConfig::default_off()
     };
     let server = {
         let (db, socket, shutdown) = (db.clone(), socket.clone(), shutdown.clone());
         std::thread::spawn(move || {
-            serve_plugin_with_until(db, &socket, ingest, shutdown).expect("serve the plugin")
+            serve_plugin_with_config(db, &socket, config, shutdown).expect("serve the plugin")
         })
     };
     let deadline = Instant::now() + SETTLE;
@@ -788,5 +853,357 @@ fn shutdown_drains_queued_container_lines_and_unlinks_the_socket() {
         !socket.exists(),
         "the plugin socket outlived the plugin: {}",
         socket.display()
+    );
+}
+
+// ── VRL remapping (the `docker-remap` feature) ────────────────────────────────────────────
+
+/// The end-to-end promise of the feature: a container's structured output becomes *queryable*
+/// fields, not an opaque string, and its own severity and timestamp are honoured — while a line
+/// with no structure is left alone.
+#[cfg(feature = "docker-remap")]
+#[test]
+fn the_default_script_turns_container_output_into_queryable_fields() {
+    let (db, socket, tmp) = start_plugin_remapping();
+
+    let stream_path = tmp.path().join("remap-stream");
+    let mut framed = Vec::new();
+    let base = 1_700_000_000_000_000_000i64;
+    for (i, (source, line)) in [
+        // JSON, with its own level and an in-line timestamp 400s after the capture time.
+        (
+            "stdout",
+            r#"{"level":"warn","msg":"disk low","disk":"/dev/sda","ts":"2023-11-14T22:20:00Z"}"#,
+        ),
+        // logfmt.
+        ("stdout", r#"level=error msg="upstream refused" port=8080"#),
+        // klog — note it names the message `message`, which normalises to `msg`.
+        (
+            "stderr",
+            "I0505 17:59:40.692994   28133 klog.go:70] leader elected",
+        ),
+        // Prose: must survive as one message, with the stream default severity.
+        ("stdout", "starting server on port 8080"),
+    ]
+    .iter()
+    .enumerate()
+    {
+        write_entry(
+            &mut framed,
+            &entry(source, &format!("{line}\n"), base + i as i64),
+        )
+        .expect("frame entry");
+    }
+    std::fs::write(&stream_path, &framed).expect("write the container stream");
+
+    let start = post(
+        &socket,
+        "/LogDriver.StartLogging",
+        &start_logging_body(&stream_path, "remap00", "app", ""),
+    );
+    assert_eq!(start.text(), r#"{"Err":""}"#);
+    wait_for_logs(&db, 4);
+
+    // Ordered by Docker's CAPTURE time, so these read in the order the container printed them.
+    // The event-time order is deliberately different now — see the timestamp assertions below.
+    const BY_ARRIVAL: &str = "ORDER BY observed_time";
+
+    // Severity now comes from each line's own level, except the prose line, which keeps the
+    // stdout default (INFO = 9).
+    let severities: Vec<u8> = sql_column(
+        &db,
+        &format!("SELECT severity_number FROM logs {BY_ARRIVAL}"),
+    )
+    .iter()
+    .map(|v| v.parse().expect("a severity number"))
+    .collect();
+    assert_eq!(severities, vec![13, 17, 9, 9], "per-line severities");
+
+    // The parsed fields are addressable as JSON in the body column — the whole point.
+    let msgs = sql_column(
+        &db,
+        &format!("SELECT json_get_str(body, 'msg') FROM logs {BY_ARRIVAL}"),
+    );
+    assert_eq!(
+        msgs,
+        vec![
+            "disk low",
+            "upstream refused",
+            // klog's `message` normalised onto `msg`.
+            "leader elected",
+            // Prose is wrapped whole rather than chopped into fields.
+            "starting server on port 8080",
+        ]
+    );
+    assert_eq!(
+        sql_column(
+            &db,
+            &format!("SELECT json_get_str(body, 'disk') FROM logs {BY_ARRIVAL}")
+        )[0],
+        "/dev/sda"
+    );
+    assert_eq!(
+        sql_column(
+            &db,
+            &format!("SELECT json_get_str(body, 'port') FROM logs {BY_ARRIVAL}")
+        )[1],
+        "8080"
+    );
+
+    // The JSON line's own timestamp became the event time while Docker's capture time stayed as
+    // the observed time — the OTel distinction the driver could not express before. It is also why
+    // the two orderings differ: by event time, that first-printed line now sorts last.
+    let times = sql_column(&db, &format!("SELECT time FROM logs {BY_ARRIVAL}"));
+    let observed = sql_column(&db, &format!("SELECT observed_time FROM logs {BY_ARRIVAL}"));
+    assert!(
+        times[0].contains("22:20:00"),
+        "the line's own timestamp should be the event time, got {}",
+        times[0]
+    );
+    assert!(
+        observed[0].contains("22:13:20"),
+        "Docker's capture time should survive as the observed time, got {}",
+        observed[0]
+    );
+    // klog carries no year, so the year VRL infers lands far outside the sanity window; the capture
+    // time stands rather than a wrong one being trusted.
+    assert_eq!(
+        times[2], observed[2],
+        "an out-of-window timestamp is refused"
+    );
+
+    // Container identity is untouched by remapping — the driver's mapping still applies.
+    let resource = resource_json(&db, "app");
+    assert!(
+        resource.contains("\"container.id\":\"remap00\""),
+        "{resource}"
+    );
+    assert!(
+        resource.contains("\"container.image.name\":\"nginx:1.27\""),
+        "{resource}"
+    );
+}
+
+/// `docker logs` on a remapped container: the structured body is re-rendered as one logfmt line,
+/// with the record's own `ts=`/`level=` in front. Nothing is stored twice to make this work.
+#[cfg(feature = "docker-remap")]
+#[test]
+fn read_logs_renders_a_remapped_body_back_as_logfmt() {
+    let (db, socket, tmp) = start_plugin_remapping();
+
+    let stream_path = tmp.path().join("logfmt-stream");
+    let mut framed = Vec::new();
+    write_entry(
+        &mut framed,
+        &entry(
+            "stderr",
+            "{\"level\":\"error\",\"msg\":\"boom\",\"code\":500}\n",
+            1_700_000_000_000_000_000,
+        ),
+    )
+    .expect("frame entry");
+    std::fs::write(&stream_path, &framed).expect("write the container stream");
+
+    post(
+        &socket,
+        "/LogDriver.StartLogging",
+        &start_logging_body(&stream_path, "logfmt00", "renderer", ""),
+    );
+    wait_for_logs(&db, 1);
+
+    let out = read_logs(
+        &socket,
+        r#"{"Info":{"ContainerID":"logfmt00"},"Config":{"Tail":-1}}"#,
+    );
+    assert_eq!(out.len(), 1);
+    assert_eq!(
+        String::from_utf8_lossy(&out[0].line),
+        "ts=2023-11-14T22:13:20Z level=ERROR msg=boom code=500\n"
+    );
+    // The stream still round-trips through `log.iostream`.
+    assert_eq!(out[0].source, "stderr");
+}
+
+/// `--log-opt imbh-remap=off` restores the pre-feature behaviour for one container, and an inline
+/// script overrides the daemon-wide default for another — both against the same running plugin.
+#[cfg(feature = "docker-remap")]
+#[test]
+fn the_remap_log_opt_selects_per_container_behaviour() {
+    let (db, socket, tmp) = start_plugin_remapping();
+
+    let write_stream = |name: &str, line: &str| {
+        let path = tmp.path().join(name);
+        let mut framed = Vec::new();
+        write_entry(
+            &mut framed,
+            &entry("stdout", line, 1_700_000_000_000_000_000),
+        )
+        .expect("frame entry");
+        std::fs::write(&path, &framed).expect("write the container stream");
+        path
+    };
+
+    // `off`: the raw line is stored, exactly as before this feature existed.
+    let plain = write_stream("opt-off", "{\"level\":\"warn\",\"msg\":\"untouched\"}\n");
+    post(
+        &socket,
+        "/LogDriver.StartLogging",
+        &start_logging_body(&plain, "optoff00", "plain", r#""imbh-remap":"off""#),
+    );
+
+    // An inline script overriding the daemon default.
+    let custom = write_stream("opt-inline", "anything\n");
+    post(
+        &socket,
+        "/LogDriver.StartLogging",
+        &start_logging_body(
+            &custom,
+            "optcust0",
+            "custom",
+            r#""imbh-remap":".severity_number = 21\n.body = \"rewritten\"""#,
+        ),
+    );
+
+    wait_for_logs(&db, 2);
+
+    let off = sql_column(&db, "SELECT body FROM logs WHERE service = 'plain'");
+    assert_eq!(
+        off[0], r#"{"level":"warn","msg":"untouched"}"#,
+        "`off` must store the line verbatim"
+    );
+
+    let custom_rows = sql_column(
+        &db,
+        "SELECT body || ' ' || CAST(severity_number AS VARCHAR) FROM logs WHERE service = 'custom'",
+    );
+    assert_eq!(custom_rows[0], "rewritten 21");
+}
+
+/// A script may rewrite the resource, but not out of `docker logs`: `container.id` is what the
+/// history query filters on, so the driver re-asserts it no matter what the script did.
+#[cfg(feature = "docker-remap")]
+#[test]
+fn read_logs_still_works_when_a_script_rewrote_the_resource() {
+    let (db, socket, tmp) = start_plugin_remapping();
+
+    let stream_path = tmp.path().join("resource-stream");
+    let mut framed = Vec::new();
+    for i in 0..3i64 {
+        write_entry(
+            &mut framed,
+            &entry(
+                "stdout",
+                &format!("line {i}\n"),
+                1_700_000_000_000_000_000 + i,
+            ),
+        )
+        .expect("frame entry");
+    }
+    std::fs::write(&stream_path, &framed).expect("write the container stream");
+
+    post(
+        &socket,
+        "/LogDriver.StartLogging",
+        &start_logging_body(
+            &stream_path,
+            "resrc000",
+            "rewriter",
+            // Add an attribute AND try to delete the one `ReadLogs` depends on.
+            r#""imbh-remap":".resource.\"deployment.environment\" = \"prod\"\ndel(.resource.\"container.id\")""#,
+        ),
+    );
+    wait_for_logs(&db, 3);
+
+    let resource = resource_json(&db, "rewriter");
+    assert!(
+        resource.contains("\"deployment.environment\":\"prod\""),
+        "the script's addition should be stored: {resource}"
+    );
+    assert!(
+        resource.contains("\"container.id\":\"resrc000\""),
+        "container.id must survive a script that deleted it: {resource}"
+    );
+
+    // ...and the consequence that actually matters: `docker logs` still finds every line.
+    let out = read_logs(
+        &socket,
+        r#"{"Info":{"ContainerID":"resrc000"},"Config":{"Tail":-1}}"#,
+    );
+    assert_eq!(
+        out.len(),
+        3,
+        "docker logs must still see the container's history"
+    );
+}
+
+/// `abort` drops only the lines the script names — the documented way to filter health-check spam.
+#[cfg(feature = "docker-remap")]
+#[test]
+fn a_script_that_aborts_drops_only_the_lines_it_names() {
+    let (db, socket, tmp) = start_plugin_remapping();
+
+    let stream_path = tmp.path().join("abort-stream");
+    let mut framed = Vec::new();
+    for (i, line) in ["GET /healthz", "GET /orders", "GET /healthz", "GET /users"]
+        .iter()
+        .enumerate()
+    {
+        write_entry(
+            &mut framed,
+            &entry(
+                "stdout",
+                &format!("{line}\n"),
+                1_700_000_000_000_000_000 + i as i64,
+            ),
+        )
+        .expect("frame entry");
+    }
+    std::fs::write(&stream_path, &framed).expect("write the container stream");
+
+    post(
+        &socket,
+        "/LogDriver.StartLogging",
+        &start_logging_body(
+            &stream_path,
+            "abort000",
+            "filtered",
+            r#""imbh-remap":"if contains!(.line, \"healthz\") { abort }\n.body = .line""#,
+        ),
+    );
+
+    let rows = wait_for_logs(&db, 2);
+    assert_eq!(
+        rows.iter().map(|(b, _, _)| b.as_str()).collect::<Vec<_>>(),
+        ["GET /orders", "GET /users"],
+        "only the health-check lines should have been dropped"
+    );
+}
+
+/// A script that does not compile fails the container's start with the VRL diagnostic, so
+/// `docker run` shows the operator what is wrong instead of silently logging nothing.
+#[cfg(feature = "docker-remap")]
+#[test]
+fn a_broken_script_fails_start_logging_with_a_diagnostic() {
+    let (_db, socket, tmp) = start_plugin_remapping();
+    let stream_path = tmp.path().join("broken-stream");
+    std::fs::write(&stream_path, b"").expect("write the container stream");
+
+    let reply = post(
+        &socket,
+        "/LogDriver.StartLogging",
+        &start_logging_body(
+            &stream_path,
+            "broken00",
+            "broken",
+            r#""imbh-remap":".body = to_int(\"5\")""#,
+        ),
+    );
+    // The plugin contract: HTTP 200 with the failure in `Err`.
+    assert_eq!(reply.status, 200);
+    let message = reply.text();
+    assert!(message.contains("error"), "{message}");
+    assert!(
+        message.contains("unhandled"),
+        "expected a VRL diagnostic, got {message}"
     );
 }

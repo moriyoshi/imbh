@@ -1107,6 +1107,29 @@ declared with prost's derive rather than generated, so it rides on the prost + o
 message types already present via `imbh-otlp`. All five endpoints are implemented
 (`Plugin.Activate`, `LogDriver.{StartLogging,StopLogging,Capabilities,ReadLogs}`).
 
+**Remapping** (`docker-remap`, also off by default, but enabled in the published plugin) inserts a
+VRL program between the reassembled wire entry and the OTLP record, with a built-in script covering
+JSON, logfmt, klog/glog and `key=value`. Unlike `docker`, it is **not** crate-free — it is the one
+feature in the workspace that adds a dependency subtree on purpose (vrl; +89 crates and +3.8 MiB on
+the plugin build, §11). Three things make it safe to bolt onto an ingest hot path:
+
+- **The event is pre-seeded with the record the driver would have stored anyway** — Docker's wire
+  fields *and* the finished OTel record (body, attributes, resource, both timestamps, the stream's
+  severity). The identity script `.` is therefore byte-for-byte the un-remapped behaviour, and the
+  built-in script only ever *overrides*; it never re-derives `service.name`, `container.*` or
+  `log.iostream`. A compiled `Program` is `Send + Sync` and lives on the `Arc<Container>`; a
+  `Runtime` needs `&mut`, so one is owned per FIFO reader thread and nothing is locked.
+- **Three invariants are re-asserted after every run**, because a script is operator input:
+  `container.id` on the resource is *overwritten* (`ReadLogs` filters history on it, and a wrong id
+  would merge two containers' histories), `service.name` is restored when absent or empty, and
+  `log.iostream` is re-appended. A runtime error stores the line the un-remapped way rather than
+  losing it; an explicit `abort` drops it, which is how a script filters health-check spam.
+- **`docker logs` re-renders a structured body as one logfmt line** (`ts=… level=… ` then the body's
+  fields) instead of the original being stored twice. A *string* body still goes out verbatim, so a
+  `docker`-only build and every OTLP-ingested record are unaffected. A script may move `.timestamp`,
+  but only within ±26h of Docker's capture time — `readlogs` pages and computes its follow watermark
+  from it, so a skewed container clock must not be able to make `docker logs -f` skip lines.
+
 `ReadLogs` is the one endpoint that streams: it emits length-prefixed frames for as long as the client
 wants them, and the generator (`readlogs::stream`) is blocking, generic over `io::Write`, and under
 `Follow` runs until the container stops. Rather than rewrite it as a `Stream`, it runs unchanged on a
@@ -1408,8 +1431,14 @@ Like the rest of `imbhd` it is unauthenticated, so a real deployment gates the p
 - **Profiles.** Shipped binaries use `opt-level = "s"`, `lto = "fat"`, `codegen-units = 1`,
   `strip = "symbols"`, `panic = "abort"`. Library crates never force `panic` settings on hosts.
 - **Dependency policy.** No openssl anywhere; C code allowed only for libzstd (shared by parquet
-  and tantivy, linked once). *Correction:* lz4 is Parquet's built-in `LZ4_RAW`, **not** the
-  pure-Rust `lz4_flex` (which is not a dependency). **Self-observability uses the `tracing` facade,
+  and tantivy, linked once) — **and, under `imbh-server`'s off-by-default `docker-remap` feature
+  only, `onig_sys`** (vendored oniguruma), which vrl's `stdlib-base` forces via its `datadog`
+  feature. That is the graph's second C library and the one exception to the libzstd rule; both
+  Linux release legs build natively, so no cross-compilation setup changes, and the macOS/Windows
+  legs never enable the feature. *Correction:* lz4 is Parquet's built-in `LZ4_RAW`, not the pure-Rust
+  `lz4_flex` — which **is** now a dependency, but only via vrl under `docker-remap`, and not for
+  compression (this sentence previously read "which is not a dependency"; see the 2026-08-06 JOURNAL
+  entry). **Self-observability uses the `tracing` facade,
   feature-gated (`tracing`, off by default), never `log`** (superseding the earlier `log`-not-`tracing`
   rule — see the 2026-07-19 JOURNAL entry): library crates emit spans/events through an optional
   `tracing` dependency that compiles away entirely when the feature is off, and the `tracing`
@@ -1422,9 +1451,16 @@ Like the rest of `imbhd` it is unauthenticated, so a real deployment gates the p
   the default facade build unchanged at 275. serde is present transitively but the default facade
   graph stays serde-free; the optional `serde` feature (§10.13) turns on DTO derives without adding a
   crate (serde is already compiled). `cargo-deny` gates licenses + duplicate-version creep (`deny.toml`); a `cargo tree`
-  count budget is enforced in the footprint gate.
+  count budget is enforced in the footprint gate. **`deny.toml` runs `all-features = true`**, so an
+  optional feature's subtree is license-checked whether or not it is on — `MIT-0` and `0BSD` are on
+  the allow-list because vrl reaches them, and default-off would not have avoided that.
 - **Measurement rig.** `scripts/footprint-gate.sh` checks binary size and crate count against the
-  §2 budgets (see [QUALITY_GATE.md](./QUALITY_GATE.md)); `cargo bloat` / RSS soak as needed.
+  §2 budgets (see [QUALITY_GATE.md](./QUALITY_GATE.md)); `cargo bloat` / RSS soak as needed. Note
+  what the gate can and cannot see: it counts `cargo tree -p imbh` (the **library** graph) and builds
+  `imbh-server` with **default** features, so nothing behind an off-by-default `imbh-server` feature
+  moves either number. The gate therefore also prints an **informational, never-failing** measurement
+  of the shipped plugin build (`docker,docker-remap,grpc,tracing`), which is the only place
+  `docker-remap`'s +89 crates and +3.8 MiB are visible.
 - **Allocator.** System allocator by default.
 
 ## 12. Workspace layout

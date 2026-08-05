@@ -51,6 +51,13 @@ jobs:
         run: cargo clippy -p imbh-server --all-targets --features docker -- -D warnings
       - name: Test (docker log-driver plugin)
         run: cargo test -p imbh-server --features docker
+      # `docker-remap` adds the VRL remapper (and its dependency subtree) on top. Both feature sets
+      # are lint-and-tested because they are genuinely different code paths: without it the driver
+      # stores lines verbatim, and that no-remap behaviour has to keep working.
+      - name: Clippy (docker log-driver + VRL remap)
+        run: cargo clippy -p imbh-server --all-targets --features docker,docker-remap -- -D warnings
+      - name: Test (docker log-driver + VRL remap)
+        run: cargo test -p imbh-server --features docker,docker-remap
 
   feature-matrix:
     name: Feature matrix (producer / consumer)

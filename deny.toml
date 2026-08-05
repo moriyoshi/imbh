@@ -35,8 +35,22 @@ allow = [
     "Unicode-3.0",
     "Unicode-DFS-2016",
     "Zlib",
+    # vrl itself, reached only through imbh-server's `docker-remap` feature. Weak, file-level
+    # copyleft: §3.3 explicitly permits distributing the Larger Work under other terms, so an
+    # Apache-2.0 imbh (and an embedder's own binary) is fine as long as vrl's own files keep their
+    # license. It is the graph's first copyleft component of any kind — do not treat a second one as
+    # routine just because this line exists.
     "MPL-2.0",
     "CC0-1.0",
+    # Public-domain-equivalent, OSI approved, both reached only via vrl (`docker-remap`):
+    #   MIT-0 — borrow-or-share, via vrl's NON-OPTIONAL jsonschema → referencing → fluent-uri, so it
+    #           is present at every vrl feature level, not just `stdlib-base`.
+    #   0BSD  — quoted_printable, via `stdlib-base`.
+    # Neither imposes an attribution obligation, so they add nothing to THIRD-PARTY-NOTICES.txt
+    # beyond being listed. Note `[graph] all-features = true` below: these are checked whether or not
+    # `docker-remap` is on, so marking the feature default-off would NOT have avoided this.
+    "MIT-0",
+    "0BSD",
 ]
 confidence-threshold = 0.9
 

@@ -1,0 +1,314 @@
+# imbh's built-in remap script for the Docker logging driver.
+#
+# In : the Docker log-driver data model — `.line`, `.source`, `.time_nano`, `.partial`, and the
+#      `StartLogging` `Info` object under `.info` — PLUS the OTel record the driver would have
+#      stored if no script existed (`.body`, `.attributes`, `.resource`, `.severity_*`,
+#      `.timestamp`, `.observed_timestamp`).
+# Out: the OpenTelemetry logs data model.
+#
+# Because the driver pre-seeds the output half, this script only ever *overrides*. It never
+# re-derives `service.name`, `container.*`, `container.label.*`, `container.env.*` or
+# `log.iostream` — those arrive already set and are left alone.
+#
+# Three rules the detection below is built around:
+#
+#   1. A line this script cannot CONFIDENTLY classify is left as it arrived. Prose such as
+#      "starting server on port 8080" must never be chopped into key/value fields — that is the
+#      failure mode a naive logfmt detector has, and every guard here exists to avoid it.
+#   2. Whatever is parsed becomes the BODY, as a map. `docker logs` re-renders it as a logfmt line,
+#      so nothing has to be stored twice to keep the original readable.
+#   3. Severity and timestamp are lifted OUT of the body onto the record, because `docker logs`
+#      prints them as its own `ts=` / `level=` prefix and would otherwise show them twice.
+
+line = string(.line) ?? ""
+trimmed = strip_whitespace(line)
+fields = null
+
+# ── 1. JSON ───────────────────────────────────────────────────────────────────────────────
+# Brace-guarded: `parse_json` accepts bare scalars too, and a line that is literally `null`, `12`
+# or `"hi"` is not a structured record.
+if starts_with(trimmed, "{") && ends_with(trimmed, "}") {
+    parsed = parse_json(trimmed) ?? null
+    if is_object(parsed) {
+        fields = object!(parsed)
+    }
+}
+
+# ── 2. klog / glog ────────────────────────────────────────────────────────────────────────
+#   klog: I0505 17:59:40.692994   28133 klog.go:70] hello        (MMDD)
+#   glog: I20260505 17:59:40.692994 28133 glog.cc:70] hello      (YYYYMMDD)
+# A severity letter followed by a fixed-width date and clock is distinctive enough to be
+# conclusive, and the two date widths are disjoint, so each gets one probe. Both parsers error on
+# a non-matching line, which is what makes them safe to try.
+if fields == null && match(trimmed, r'^[IWEF]\d{8} \d{2}:\d{2}:\d{2}\.\d{6}\s') {
+    parsed = parse_glog(trimmed) ?? null
+    if is_object(parsed) {
+        fields = object!(parsed)
+    }
+} else if fields == null && match(trimmed, r'^[IWEF]\d{4} \d{2}:\d{2}:\d{2}\.\d{6}\s') {
+    parsed = parse_klog(trimmed) ?? null
+    if is_object(parsed) {
+        fields = object!(parsed)
+    }
+}
+
+# ── 3. logfmt, then comma-separated key=value ─────────────────────────────────────────────
+# Every tier is anchored on the line STARTING with `key=`. That anchor alone rejects
+# "starting server on port 8080" and "usage: foo --opt=bar", which is most of the job.
+starts_kv = match(trimmed, r'^[A-Za-z_][A-Za-z0-9_.\-]*=')
+
+# Comma-separated `key=value,key=value`, which some runtimes emit instead of space-separated.
+# FIRST, and only when the line has no whitespace at all: with a space delimiter the strict pass
+# below would happily swallow `level=warn,msg=retrying` whole as one field named `level`, and
+# succeed — so the comma form has to be ruled in or out before it runs. Requiring no whitespace is
+# what keeps that decision unambiguous; a line with both separators is left to logfmt.
+if fields == null && starts_kv && contains(trimmed, ",") && !match(trimmed, r'\s') {
+    parsed = parse_key_value(
+        trimmed,
+        key_value_delimiter: "=",
+        field_delimiter: ",",
+        accept_standalone_key: false
+    ) ?? null
+    if is_object(parsed) {
+        fields = object!(parsed)
+    }
+}
+
+# Strict: standalone keys are DISABLED, so a single stray bare word fails the whole parse rather
+# than becoming a field. Exactly right for a well-formed logfmt line.
+if fields == null && starts_kv {
+    parsed = parse_key_value(trimmed, accept_standalone_key: false) ?? null
+    if is_object(parsed) {
+        fields = object!(parsed)
+    }
+}
+
+# Loose: recovers the very common `ts=… level=info msg=some unquoted prose` shape, which the
+# strict pass rejects on the trailing bare words. Quoted runs are masked first so a quoted message
+# does not read as several stray words; then at least two `key=` fields must be present and they
+# must account for at least half the tokens.
+if fields == null && starts_kv {
+    masked = replace(trimmed, r'"(?:[^"\\]|\\.)*"', "\"\"")
+    tokens = split(masked, r'\s+')
+    pairs = filter(tokens) -> |_index, token| {
+        match(string!(token), r'^[A-Za-z_][A-Za-z0-9_.\-]*=')
+    }
+    if length(pairs) >= 2 && length(pairs) * 2 >= length(tokens) {
+        parsed = parse_logfmt(trimmed) ?? null
+        if is_object(parsed) {
+            # `parse_logfmt` gives a bare word the BOOLEAN `true`, while a real `flag=true` is the
+            # STRING "true". Dropping booleans therefore removes exactly the prose remnants and
+            # keeps every genuine field.
+            fields = filter(object!(parsed)) -> |_key, value| { value != true }
+        }
+    }
+}
+
+# ── 4. nothing structural: the line is its own message ────────────────────────────────────
+# Wrapped rather than left as a string so EVERY remapped record has a map body, which is what lets
+# `docker logs` use one rendering path.
+if fields == null {
+    fields = { "msg": line }
+}
+
+# ── 5. one message key ────────────────────────────────────────────────────────────────────
+# klog/glog produce `message`; zap, logrus, slog, pino and logfmt produce `msg`; others use `log`
+# or `event`. Normalising means `SELECT body->>'msg'` always works instead of needing a COALESCE
+# over four spellings. Renamed, not duplicated — and never over a `msg` the line already had.
+if !exists(fields.msg) {
+    if exists(fields.message) {
+        fields.msg = del(fields.message)
+    } else if exists(fields.log) {
+        fields.msg = del(fields.log)
+    } else if exists(fields.event) {
+        fields.msg = del(fields.event)
+    }
+}
+
+# ── 6. severity ───────────────────────────────────────────────────────────────────────────
+# Lifted out of the body: `docker logs` renders it as its own `level=` field. When the line has no
+# level of its own, the stream default the driver already set (the `imbh-stdout-severity` /
+# `imbh-stderr-severity` log-opts) stands untouched.
+#
+# Read first and remove only on success, so an unrecognized level ("NOTICE_SPECIAL") stays visible
+# in the body instead of vanishing.
+level = null
+level_key = null
+if exists(fields.level) {
+    level = fields.level
+    level_key = "level"
+} else if exists(fields.severity) {
+    level = fields.severity
+    level_key = "severity"
+} else if exists(fields.lvl) {
+    level = fields.lvl
+    level_key = "lvl"
+} else if exists(fields.loglevel) {
+    level = fields.loglevel
+    level_key = "loglevel"
+} else if exists(fields.log_level) {
+    level = fields.log_level
+    level_key = "log_level"
+} else if exists(fields.levelname) {
+    level = fields.levelname
+    level_key = "levelname"
+} else if exists(fields."log.level") {
+    level = fields."log.level"
+    level_key = "log.level"
+}
+
+if level_key != null {
+    number = null
+    named = downcase(string(level) ?? "")
+
+    if named == "trace" || named == "trc" || named == "finest" {
+        number = 1
+    } else if named == "debug" || named == "dbg" || named == "verbose" || named == "fine" {
+        number = 5
+    } else if named == "info" || named == "inf" || named == "information" {
+        number = 9
+    } else if named == "notice" {
+        number = 10
+    } else if named == "warn" || named == "warning" || named == "wrn" {
+        number = 13
+    } else if named == "error" || named == "err" || named == "eror" || named == "severe" {
+        number = 17
+    } else if named == "critical" || named == "crit" {
+        number = 19
+    } else if named == "fatal" || named == "panic" || named == "alert" || named == "emerg" {
+        number = 21
+    }
+
+    if number == null {
+        # Numeric levels. bunyan/pino use 10/20/…/60 and syslog uses 0..7; the two ranges do not
+        # overlap, so one test each is unambiguous.
+        n = to_int(level) ?? -1
+        if n == 10 || n == 20 {
+            number = 5
+        } else if n == 30 {
+            number = 9
+        } else if n == 40 {
+            number = 13
+        } else if n == 50 {
+            number = 17
+        } else if n == 60 {
+            number = 21
+        } else if n == 0 || n == 1 {
+            number = 21
+        } else if n == 2 {
+            number = 19
+        } else if n == 3 {
+            number = 17
+        } else if n == 4 {
+            number = 13
+        } else if n == 5 {
+            number = 10
+        } else if n == 6 {
+            number = 9
+        } else if n == 7 {
+            number = 5
+        }
+    }
+
+    if number != null {
+        num = int!(number)
+        .severity_number = num
+        # The OTel severity BAND, so `severity_text` stays a closed set across every container no
+        # matter how the producer spelt it.
+        if num >= 21 {
+            .severity_text = "FATAL"
+        } else if num >= 17 {
+            .severity_text = "ERROR"
+        } else if num >= 13 {
+            .severity_text = "WARN"
+        } else if num >= 9 {
+            .severity_text = "INFO"
+        } else if num >= 5 {
+            .severity_text = "DEBUG"
+        } else {
+            .severity_text = "TRACE"
+        }
+        fields = remove!(fields, [string!(level_key)])
+    }
+}
+
+# ── 7. timestamp ──────────────────────────────────────────────────────────────────────────
+# The application's own time becomes `.timestamp`; Docker's capture time stays on
+# `.observed_timestamp`, which is exactly what OTel means by the two.
+raw_ts = null
+ts_key = null
+if exists(fields.timestamp) {
+    raw_ts = fields.timestamp
+    ts_key = "timestamp"
+} else if exists(fields.ts) {
+    raw_ts = fields.ts
+    ts_key = "ts"
+} else if exists(fields.time) {
+    raw_ts = fields.time
+    ts_key = "time"
+} else if exists(fields."@timestamp") {
+    raw_ts = fields."@timestamp"
+    ts_key = "@timestamp"
+} else if exists(fields.eventTime) {
+    raw_ts = fields.eventTime
+    ts_key = "eventTime"
+} else if exists(fields.asctime) {
+    raw_ts = fields.asctime
+    ts_key = "asctime"
+}
+
+if ts_key != null {
+    stamp = null
+    if is_timestamp(raw_ts) {
+        # klog/glog already produced a real timestamp.
+        stamp = raw_ts
+    } else if is_string(raw_ts) {
+        text = string!(raw_ts)
+        stamp = parse_timestamp(text, "%+") ??
+            parse_timestamp(text, "%Y-%m-%dT%H:%M:%S%.f") ??
+            parse_timestamp(text, "%Y-%m-%d %H:%M:%S%.f") ??
+            parse_timestamp(text, "%Y/%m/%d %H:%M:%S%.f") ??
+            parse_timestamp(text, "%d/%b/%Y:%H:%M:%S %z") ??
+            null
+    } else if is_integer(raw_ts) || is_float(raw_ts) {
+        # Epoch numbers, told apart by magnitude.
+        n = to_int(raw_ts) ?? 0
+        if n >= 1000000000000000000 {
+            stamp = from_unix_timestamp(n, unit: "nanoseconds") ?? null
+        } else if n >= 1000000000000000 {
+            stamp = from_unix_timestamp(n, unit: "microseconds") ?? null
+        } else if n >= 1000000000000 {
+            stamp = from_unix_timestamp(n, unit: "milliseconds") ?? null
+        } else if n >= 1000000000 {
+            stamp = from_unix_timestamp(n, unit: "seconds") ?? null
+        }
+    }
+
+    # SANITY WINDOW — a correctness requirement, not a nicety. `docker logs` orders, pages, applies
+    # `--since`/`--until` AND computes its follow watermark from this field, so a container with a
+    # skewed clock (or a line quoting last year's date) could make `docker logs -f` skip lines.
+    # ±26h covers every real timezone confusion and nothing else.
+    if is_timestamp(stamp) {
+        drift = abs(to_unix_timestamp(timestamp!(stamp)) - to_unix_timestamp(timestamp!(.observed_timestamp)))
+        if drift <= 93600 {
+            .timestamp = stamp
+            fields = remove!(fields, [string!(ts_key)])
+        }
+    }
+}
+
+# ── 8. trace context ──────────────────────────────────────────────────────────────────────
+# Hex strings. The driver decodes them to 16- and 8-byte ids and ignores anything of the wrong
+# length, so a malformed id costs the id, not the line. Left in the body as well: they are cheap,
+# and a correlation id is worth having in the text a human reads.
+trace = fields.trace_id || fields.traceId || fields.traceID || fields.otelTraceID
+if trace != null {
+    .trace_id = trace
+}
+span = fields.span_id || fields.spanId || fields.spanID || fields.otelSpanID
+if span != null {
+    .span_id = span
+}
+
+# ── 9. the parsed map IS the body ─────────────────────────────────────────────────────────
+.body = fields

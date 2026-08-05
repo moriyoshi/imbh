@@ -83,6 +83,11 @@ prost = { workspace = true, optional = true }
 # pulled only under the `tracing` feature, so the default footprint-gate build is unchanged (§12 keeps
 # the subscriber out of the graph).
 tracing = { workspace = true, optional = true }
+# The remap engine for the Docker log driver, pulled only by `docker-remap`. See that feature for the
+# measured crate/binary cost and the workspace manifest for the feature-trimming rationale (no
+# network/env/system/crypto function groups).
+vrl = { workspace = true, optional = true }
+chrono = { workspace = true, optional = true }
 
 # Graceful shutdown: `SIGINT`/`SIGTERM` handling for `imbhd` (`src/shutdown.rs`). std cannot catch a
 # signal, so `sigaction` + the self-pipe come from libc. Not optional — signal-driven shutdown is part
@@ -115,6 +120,17 @@ grpc = [
 # enable with `cargo build -p imbh-server --features docker`. Adds **no new crate** to the graph:
 # prost and opentelemetry-proto's message types are already in the default `imbh` tree via imbh-otlp.
 docker = ["dep:opentelemetry-proto", "dep:prost"]
+# VRL remapping for the Docker log driver (docs/DOCKER_LOG_DRIVER.md): every container line runs
+# through a compiled Vector Remap Language program that maps the Docker log-driver data model onto the
+# OTel logs data model, with a built-in script covering JSON, logfmt, klog/glog and key=value. Off by
+# default; the published plugin and the Linux release binaries enable it explicitly.
+#
+# THE ONE FEATURE IN THIS WORKSPACE THAT ADDS CRATES ON PURPOSE — every other feature comment here
+# ends in "adds no new crate", and this one cannot. Measured delta: see .agents/docs/JOURNAL.md.
+# `scripts/footprint-gate.sh` does NOT see it: the gate counts `cargo tree -p imbh` (the facade —
+# dependency direction is `imbh ← imbh-server`, so vrl never reaches it) and builds this crate with
+# DEFAULT features. The gate therefore prints an informational, non-failing plugin-build size instead.
+docker-remap = ["docker", "dep:vrl", "dep:chrono"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros"] }

@@ -142,6 +142,32 @@ git history); this file tracks only what is still open.
       ingest-sequence column the metric schemas do not have. Note the item above wants that same
       column for the log-driver tail race; one column would close both. — *source: issue #27*
 
+- [ ] **The footprint gate's `datafusion` assertion is vacuous.**
+      `scripts/footprint-gate.sh` greps `cargo tree -p imbh --edges normal` for `datafusion v`, but the
+      graph contains only the split crates (`datafusion-core`, `datafusion-common`,
+      `datafusion-physical-plan`, …) and no bare `datafusion`. It therefore prints `datafusion: NO` on
+      a perfectly healthy tree and would print the same thing if the engine really did vanish — so it
+      guards nothing. Fix is a one-liner (`grep -q 'datafusion[a-z-]* v'`, or assert on
+      `datafusion-core`), but pick the pattern deliberately: the point of the check is to catch a
+      feature-flag mistake that silently drops the query engine. Note the tantivy check on the next
+      line does work, which is why this went unnoticed. — *source: JOURNAL (2026-08-06, part 2)*
+
+- [ ] **`QUALITY_GATE.md`'s search-off crate count is wrong (216 vs the measured 71).** The doc says
+      "turning `search` off (`imbh --no-default-features`) drops the tantivy subtree to 216 crates";
+      the gate measures **71**. The two are not the same operation — `--no-default-features` drops
+      `ingest`, `query` *and* `search`, so it also takes the entire DataFusion subtree with it, which
+      is most of the difference. Either correct the number and say which knob it describes, or add a
+      genuine search-off-only measurement (`--no-default-features --features ingest,query`) if that is
+      the lever the doc meant to document. — *source: JOURNAL (2026-08-06, part 2)*
+
+- [ ] **RSS is unmeasured for the `docker-remap` build.** The footprint work for the VRL remapper ran
+      the gate with `RSS_PROBE=0`, so §2's idle (40 MB) and steady (200 MB) targets have not been
+      checked against a remapping plugin. Crate count and binary size were measured (+89 crates,
+      +3.8 MiB, plugin binary 40.0 MB against a 42 MB target). Steady-state is the plausibly-affected
+      axis: each container's FIFO thread owns a VRL `Runtime`, and each line clones a seed event
+      object — so the cost scales with container count, not line rate. `cargo run --release -p
+      rss-probe` plus a driver soak would close it. — *source: JOURNAL (2026-08-06)*
+
 ## Closed, awaiting the next sweep
 
 - [x] **MCP over stdio, hosted by `imbh-tui`.** *Closed 2026-08-01.* `imbhd` served MCP over HTTP

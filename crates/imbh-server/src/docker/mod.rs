@@ -47,6 +47,8 @@ pub mod entry;
 pub mod ingest;
 mod json;
 pub mod readlogs;
+#[cfg(feature = "docker-remap")]
+pub mod remap;
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -128,6 +130,35 @@ pub fn serve_plugin_until(
     serve_plugin_with_until(db, socket, IngestConfig::default(), shutdown)
 }
 
+/// Everything the plugin needs beyond the database and the socket.
+///
+/// A struct rather than more positional arguments, so a future knob is an added field rather than a
+/// breaking signature change — which is why the four `serve_plugin*` functions above keep the shapes
+/// they shipped with and delegate here.
+#[derive(Debug, Clone, Default)]
+pub struct PluginConfig {
+    /// Ingest batching.
+    pub ingest: IngestConfig,
+    /// The daemon-wide remap default, overridable per container by `--log-opt imbh-remap`.
+    #[cfg(feature = "docker-remap")]
+    pub remap: remap::Source,
+}
+
+/// [`serve_plugin_until`] with everything tunable — what `imbhd` runs on its plugin thread.
+pub fn serve_plugin_with_config(
+    db: Arc<Db>,
+    socket: impl AsRef<Path>,
+    config: PluginConfig,
+    shutdown: Arc<Shutdown>,
+) -> std::io::Result<()> {
+    // Multi-threaded for the same reason the HTTP listener is: `crate::offload*` needs
+    // `block_in_place`, and `ReadLogs` parks a blocking task per follow stream.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(serve_plugin_async(db, socket.as_ref(), config, shutdown))
+}
+
 /// [`serve_plugin_until`] with the ingest batching tuned — what `imbhd` runs on its plugin thread.
 ///
 /// The wind-down order is what makes container output survive a `docker stop` of the plugin:
@@ -145,12 +176,18 @@ pub fn serve_plugin_with_until(
     ingest: IngestConfig,
     shutdown: Arc<Shutdown>,
 ) -> std::io::Result<()> {
-    // Multi-threaded for the same reason the HTTP listener is: `crate::offload*` needs
-    // `block_in_place`, and `ReadLogs` parks a blocking task per follow stream.
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?;
-    runtime.block_on(serve_plugin_async(db, socket.as_ref(), ingest, shutdown))
+    // `PluginConfig` has a second field only under `docker-remap`, so without that feature the
+    // update is trivially exhaustive. Spelling it out keeps this one expression valid either way.
+    #[allow(clippy::needless_update)]
+    serve_plugin_with_config(
+        db,
+        socket,
+        PluginConfig {
+            ingest,
+            ..Default::default()
+        },
+        shutdown,
+    )
 }
 
 /// The plugin's accept loop. Binds first, so a bind failure still reaches the caller — which for
@@ -159,7 +196,7 @@ pub fn serve_plugin_with_until(
 async fn serve_plugin_async(
     db: Arc<Db>,
     socket: &Path,
-    ingest: IngestConfig,
+    config: PluginConfig,
     shutdown: Arc<Shutdown>,
 ) -> std::io::Result<()> {
     if let Some(parent) = socket.parent()
@@ -170,7 +207,7 @@ async fn serve_plugin_async(
     remove_stale_socket(socket)?;
 
     let listener = tokio::net::UnixListener::bind(socket)?;
-    let plugin = Arc::new(Plugin::new(db, ingest));
+    let plugin = Arc::new(Plugin::new(db, config));
     let app = plugin_app(Arc::clone(&plugin));
 
     let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
@@ -417,14 +454,24 @@ pub(crate) struct Plugin {
     ingest: Arc<Ingestor>,
     /// Keyed by the FIFO path, which is what `StopLogging` identifies a stream by.
     streams: Mutex<HashMap<String, Stream>>,
+    /// The daemon-wide remap default, used by any container that does not name its own.
+    #[cfg(feature = "docker-remap")]
+    remap: remap::Source,
+    /// Compiled scripts, so a restart storm of containers sharing one script compiles it once.
+    #[cfg(feature = "docker-remap")]
+    scripts: remap::Cache,
 }
 
 impl Plugin {
-    pub(crate) fn new(db: Arc<Db>, ingest: IngestConfig) -> Plugin {
+    pub(crate) fn new(db: Arc<Db>, config: PluginConfig) -> Plugin {
         Plugin {
-            ingest: Arc::new(Ingestor::start(db.clone(), ingest)),
+            ingest: Arc::new(Ingestor::start(db.clone(), config.ingest)),
             db,
             streams: Mutex::new(HashMap::new()),
+            #[cfg(feature = "docker-remap")]
+            remap: config.remap,
+            #[cfg(feature = "docker-remap")]
+            scripts: remap::Cache::default(),
         }
     }
 
@@ -488,7 +535,14 @@ impl Plugin {
         let info = json::field(&root, "Info")
             .cloned()
             .unwrap_or(imbh::AnyValue::Map(Vec::new()));
-        let container = Arc::new(Container::from_info(&info));
+        #[cfg_attr(not(feature = "docker-remap"), allow(unused_mut))]
+        let mut container = Container::from_info(&info);
+        // Compile the remap script *before* anything is claimed or spawned, so a script that does
+        // not compile fails this request with a VRL diagnostic and leaves nothing to release. The
+        // daemon posts the message straight to `docker run`, which is where the operator is looking.
+        #[cfg(feature = "docker-remap")]
+        container.bind_remap(&info, &self.remap, &self.scripts)?;
+        let container = Arc::new(container);
 
         let stop = Arc::new(AtomicBool::new(false));
         let container_id = container.id.clone();
@@ -592,14 +646,44 @@ fn pump(
 
     let mut reader = EntryReader::new(BufReader::new(fifo));
     let mut assembler = PartialAssembler::default();
+    // One remapper per FIFO thread: a VRL `Runtime` needs `&mut`, while the `Container` it belongs
+    // to is shared by `Arc`. `None` when this container has no script, and always without the
+    // feature.
+    #[cfg(feature = "docker-remap")]
+    let mut remapper = container.remapper();
+
+    // One place decides what a completed line becomes, so the drain below cannot drift from the
+    // read loop above. Returns false when the ingest worker is gone and the reader should stop.
+    // Only the remap branch below captures anything mutably, so without that feature the binding is
+    // genuinely immutable — but writing it twice under a `cfg` would duplicate the fallback path
+    // this closure exists to keep in one place.
+    #[cfg_attr(not(feature = "docker-remap"), allow(unused_mut))]
+    let mut emit = |line: &entry::LogEntry| -> bool {
+        #[cfg(feature = "docker-remap")]
+        if let Some(remapper) = remapper.as_mut() {
+            return match remapper.apply(&container, line) {
+                // The script called `abort`: it asked for this line to be dropped.
+                remap::Outcome::Drop => true,
+                remap::Outcome::Record(record, resource) => {
+                    ingest.send(container.clone(), resource, record)
+                }
+                // A script that failed at runtime must not cost the line — store it the way the
+                // driver did before remapping existed.
+                remap::Outcome::Failed => {
+                    ingest.send(container.clone(), None, container.record(line))
+                }
+            };
+        }
+        ingest.send(container.clone(), None, container.record(line))
+    };
+
     while !stop.load(Ordering::Relaxed) {
         match reader.next_entry() {
             Ok(Some(wire)) => {
-                if let Some(line) = assembler.push(wire) {
-                    let record = container.record(&line);
-                    if !ingest.send(container.clone(), record) {
-                        return; // the ingest worker is gone; the DB is closing
-                    }
+                if let Some(line) = assembler.push(wire)
+                    && !emit(&line)
+                {
+                    return; // the ingest worker is gone; the DB is closing
                 }
             }
             Ok(None) => break, // the container closed its output
@@ -613,8 +697,7 @@ fn pump(
     // A line that was still being reassembled when the container exited is worth more in the DB
     // than in a dropped buffer.
     for line in assembler.drain() {
-        let record = container.record(&line);
-        if !ingest.send(container.clone(), record) {
+        if !emit(&line) {
             return;
         }
     }
@@ -631,7 +714,7 @@ mod tests {
 
     fn plugin() -> Plugin {
         let db = Db::in_memory().open().expect("open in-memory db");
-        Plugin::new(db, IngestConfig::default())
+        Plugin::new(db, PluginConfig::default())
     }
 
     fn body(resp: &Response) -> String {
@@ -663,6 +746,72 @@ mod tests {
         // The plugin contract: HTTP 200, the failure in `Err`.
         assert_eq!(resp.status, 200);
         assert!(body(&resp).contains("no File"), "got {}", body(&resp));
+    }
+
+    /// A broken script must fail `StartLogging` *and leave nothing behind*: the diagnostic goes to
+    /// `docker run`, and the FIFO path stays unclaimed so a corrected retry can take it.
+    #[cfg(feature = "docker-remap")]
+    #[test]
+    fn start_logging_rejects_a_script_that_does_not_compile_without_leaking_the_claim() {
+        let p = plugin();
+        let resp = p.route(
+            "/LogDriver.StartLogging",
+            br#"{"File":"/nonexistent/imbh/fifo","Info":{"ContainerID":"abc",
+                 "Config":{"imbh-remap":".body = to_int(\"5\")"}}}"#,
+        );
+        assert_eq!(resp.status, 200);
+        let message = body(&resp);
+        // The full VRL diagnostic, not a summary — the caret is what makes it actionable.
+        assert!(
+            message.contains('^'),
+            "expected a diagnostic, got {message}"
+        );
+        // The script is rejected before the FIFO is even opened, so this must NOT be the
+        // open failure that a valid script against the same bogus path would produce.
+        assert!(
+            !message.contains("cannot open log stream"),
+            "the script must be rejected before the FIFO is touched, got {message}"
+        );
+        assert!(!p.is_active("abc"), "a rejected start must claim nothing");
+    }
+
+    /// `off` at the container level wins over a daemon-wide default, and vice versa the default
+    /// applies when the container says nothing.
+    #[cfg(feature = "docker-remap")]
+    #[test]
+    fn the_remap_log_opt_overrides_the_daemon_wide_default() {
+        let broken = remap::Source::Inline(".body = to_int(\"5\")".to_owned());
+        let with_default = |remap: remap::Source| {
+            let db = Db::in_memory().open().expect("open in-memory db");
+            Plugin::new(
+                db,
+                PluginConfig {
+                    remap,
+                    ..Default::default()
+                },
+            )
+        };
+
+        // A container that says nothing inherits the daemon default — here, a broken one.
+        let p = with_default(broken.clone());
+        let resp = p.route(
+            "/LogDriver.StartLogging",
+            br#"{"File":"/nonexistent/imbh/fifo","Info":{"ContainerID":"abc"}}"#,
+        );
+        assert!(body(&resp).contains('^'), "got {}", body(&resp));
+
+        // ...and one that asks for `off` is unaffected by it, so it gets as far as the FIFO.
+        let p = with_default(broken);
+        let resp = p.route(
+            "/LogDriver.StartLogging",
+            br#"{"File":"/nonexistent/imbh/fifo","Info":{"ContainerID":"abc",
+                 "Config":{"imbh-remap":"off"}}}"#,
+        );
+        assert!(
+            body(&resp).contains("cannot open log stream"),
+            "`off` must bypass the broken default, got {}",
+            body(&resp)
+        );
     }
 
     #[test]

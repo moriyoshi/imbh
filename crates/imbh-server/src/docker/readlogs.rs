@@ -238,10 +238,18 @@ fn write_rows<W: Write>(out: &mut W, rows: &[LogRow]) -> std::io::Result<Option<
 }
 
 /// Rebuild the wire entry from a stored row. `log.iostream` restores the original stream, and the
-/// trailing newline that ingest stripped goes back on, so `docker logs` prints what the container
-/// printed.
+/// trailing newline that ingest stripped goes back on.
+///
+/// Two body shapes reach here. A **string** body is what the driver stores without remapping (and
+/// what OTLP ingest stores for an unstructured record): it goes out verbatim, so `docker logs` is
+/// byte-identical to what the container printed. A **map** body is what a remap script produces
+/// (`docker-remap`); since the original line was not kept a second time, it is re-rendered as a
+/// logfmt line — `ts=… level=… ` then its own fields.
 fn to_entry(row: &LogRow) -> LogEntry {
-    let mut line = row.body.clone().into_bytes();
+    let mut line = match structured(&row.body) {
+        Some(fields) => logfmt(row, &fields).into_bytes(),
+        None => row.body.clone().into_bytes(),
+    };
     line.push(b'\n');
     LogEntry {
         source: row
@@ -254,6 +262,145 @@ fn to_entry(row: &LogRow) -> LogEntry {
         partial: false,
         partial_log_metadata: None,
     }
+}
+
+/// The body's fields when it is a structured (map) body, `None` when it is plain text.
+///
+/// `imbh-otlp` stores a map body as canonical JSON, so the cheap pre-test is the leading brace —
+/// only a body that could be an object is handed to the parser.
+fn structured(body: &str) -> Option<Vec<(String, imbh::AnyValue)>> {
+    if !body.starts_with('{') {
+        return None;
+    }
+    match imbh::parse_json(body)? {
+        imbh::AnyValue::Map(pairs) => Some(pairs),
+        _ => None,
+    }
+}
+
+/// Render a stored record as a logfmt line.
+///
+/// `ts=` and `level=` come first because the default remap script *lifts* them out of the body onto
+/// the record — printing them here is what keeps that lossless, and doing it in a fixed order keeps
+/// `docker logs` output scannable. `msg` leads the body's own fields for the same reason: it is what
+/// a human reads first. (`message` is the fallback for records this driver did not produce.)
+fn logfmt(row: &LogRow, fields: &[(String, imbh::AnyValue)]) -> String {
+    let mut out = String::with_capacity(row.body.len() + 48);
+    out.push_str("ts=");
+    out.push_str(&rfc3339(row.time));
+    out.push_str(" level=");
+    out.push_str(
+        row.severity_text
+            .as_deref()
+            .unwrap_or_else(|| band(row.severity_number.0)),
+    );
+
+    let ordered = fields
+        .iter()
+        .filter(|(key, _)| key == "msg")
+        .chain(fields.iter().filter(|(key, _)| key == "message"))
+        .chain(
+            fields
+                .iter()
+                .filter(|(key, _)| key != "msg" && key != "message"),
+        );
+    for (key, value) in ordered {
+        out.push(' ');
+        out.push_str(key);
+        out.push('=');
+        out.push_str(&quoted(&render(value)));
+    }
+    out
+}
+
+/// The OTel severity band for a number, for a record stored without a `severity_text`.
+fn band(number: u8) -> &'static str {
+    match number {
+        1..=4 => "TRACE",
+        5..=8 => "DEBUG",
+        9..=12 => "INFO",
+        13..=16 => "WARN",
+        17..=20 => "ERROR",
+        21..=24 => "FATAL",
+        _ => "UNSPECIFIED",
+    }
+}
+
+/// One attribute value as logfmt text. Scalars render bare; a nested map or array renders as its
+/// canonical JSON, which [`quoted`] then wraps — logfmt has no nesting, and the JSON is at least
+/// exact and re-parseable.
+fn render(value: &imbh::AnyValue) -> String {
+    match value {
+        imbh::AnyValue::Str(s) => s.clone(),
+        imbh::AnyValue::Int(i) => i.to_string(),
+        imbh::AnyValue::Double(d) => d.to_string(),
+        imbh::AnyValue::Bool(b) => b.to_string(),
+        imbh::AnyValue::Null => String::new(),
+        other => imbh::canonical_json_value(other),
+    }
+}
+
+/// Quote a logfmt value when it needs it.
+///
+/// Bare whenever the value is safe to read back — no whitespace, quote, backslash, `=` or control
+/// character — and an empty value always quotes, because `k=` on its own reads as a flag rather than
+/// as an empty string.
+fn quoted(value: &str) -> String {
+    let plain = !value.is_empty()
+        && !value
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control() || matches!(c, '"' | '\\' | '='));
+    if plain {
+        return value.to_owned();
+    }
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for c in value.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            _ => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Format epoch nanoseconds as RFC 3339 UTC — the inverse of [`timestamp`].
+///
+/// Hand-written for the same reason the parser is: a date-time crate is not worth carrying in a
+/// footprint-gated graph for one field. It must also work in a `docker`-only build, which has no
+/// chrono at all (that arrives with `docker-remap`).
+fn rfc3339(time: Timestamp) -> String {
+    let nanos = time.unix_nanos();
+    // Floor-divide so pre-epoch instants land on the right second rather than one too late.
+    let secs = nanos.div_euclid(1_000_000_000);
+    let frac = nanos.rem_euclid(1_000_000_000);
+    let (year, month, day) = civil_from_days(secs.div_euclid(86_400));
+    let tod = secs.rem_euclid(86_400);
+    let (hour, minute, second) = (tod / 3600, (tod / 60) % 60, tod % 60);
+    match frac {
+        0 => format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z"),
+        _ => format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{frac:09}Z"),
+    }
+}
+
+/// The proleptic-Gregorian civil date `days` after 1970-01-01 (Howard Hinnant's `civil_from_days`,
+/// the exact inverse of [`days_from_civil`]).
+fn civil_from_days(days: i64) -> (i64, i64, i64) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
 /// Parse an RFC 3339 timestamp into epoch nanoseconds.
@@ -420,5 +567,144 @@ mod tests {
             ..row
         };
         assert_eq!(to_entry(&plain).source, "stdout");
+    }
+
+    /// A row as the ingest path stores one, with `body` in whatever shape is under test.
+    fn row_with(body: &str, severity: u8, text: Option<&str>, nanos: i64) -> LogRow {
+        LogRow {
+            time: Timestamp::from_unix_nanos(nanos),
+            observed_time: None,
+            severity_number: imbh::SeverityNumber(severity),
+            severity_text: text.map(str::to_owned),
+            service: Some("web".to_owned()),
+            body: body.to_owned(),
+            attributes: imbh::Attributes::new(),
+            resource: imbh::Attributes::new(),
+            scope: imbh::Attributes::new(),
+            trace_id: None,
+            span_id: None,
+            flags: 0,
+        }
+    }
+
+    fn rendered(body: &str, severity: u8, text: Option<&str>, nanos: i64) -> String {
+        let entry = to_entry(&row_with(body, severity, text, nanos));
+        String::from_utf8(entry.line).expect("utf-8 line")
+    }
+
+    /// The un-remapped path — and every OTLP-ingested record — must be untouched by the renderer.
+    #[test]
+    fn a_plain_text_body_goes_out_verbatim() {
+        assert_eq!(
+            rendered("starting server", 9, Some("INFO"), 0),
+            "starting server\n"
+        );
+        // Text that merely starts with a brace but is not an object is still text.
+        assert_eq!(rendered("{not json", 9, Some("INFO"), 0), "{not json\n");
+        assert_eq!(rendered("", 9, Some("INFO"), 0), "\n");
+    }
+
+    #[test]
+    fn a_structured_body_renders_as_logfmt_with_the_record_fields_first() {
+        let line = rendered(
+            r#"{"disk":"/dev/sda","msg":"disk low"}"#,
+            13,
+            Some("WARN"),
+            1_700_000_000_000_000_000,
+        );
+        // `ts=` and `level=` lead because the remap script lifted them OUT of the body; `msg`
+        // leads the body's own fields.
+        assert_eq!(
+            line,
+            "ts=2023-11-14T22:13:20Z level=WARN msg=\"disk low\" disk=/dev/sda\n"
+        );
+    }
+
+    #[test]
+    fn a_record_without_severity_text_falls_back_to_the_otel_band() {
+        let line = rendered(r#"{"msg":"x"}"#, 17, None, 0);
+        assert!(
+            line.starts_with("ts=1970-01-01T00:00:00Z level=ERROR "),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn logfmt_values_are_quoted_only_when_they_need_it() {
+        let line = rendered(
+            r#"{"bare":"plain","spaced":"two words","quote":"a\"b","equals":"k=v","empty":"","nl":"a\nb"}"#,
+            9,
+            Some("INFO"),
+            0,
+        );
+        assert!(line.contains(" bare=plain "), "{line}");
+        assert!(line.contains(r#" spaced="two words" "#), "{line}");
+        assert!(line.contains(r#" quote="a\"b" "#), "{line}");
+        // `=` must quote, or the value would read as a second field.
+        assert!(line.contains(r#" equals="k=v" "#), "{line}");
+        // An empty value quotes, so it does not read as a bare flag.
+        assert!(line.contains(r#" empty="" "#), "{line}");
+        assert!(line.contains(r#" nl="a\nb""#), "{line}");
+    }
+
+    #[test]
+    fn non_string_and_nested_values_render_usefully() {
+        let line = rendered(
+            r#"{"n":42,"f":1.5,"b":true,"nested":{"a":1},"list":[1,2]}"#,
+            9,
+            Some("INFO"),
+            0,
+        );
+        assert!(line.contains(" n=42 "), "{line}");
+        assert!(line.contains(" f=1.5 "), "{line}");
+        assert!(line.contains(" b=true "), "{line}");
+        // logfmt has no nesting, so a nested value renders as exact, re-parseable JSON. Quoting is
+        // driven by the characters present, not by the value's shape: an object needs it (the JSON
+        // carries `"`), a flat array does not.
+        assert!(line.contains(r#" nested="{\"a\":1}" "#), "{line}");
+        assert!(line.contains(" list=[1,2]"), "{line}");
+    }
+
+    #[test]
+    fn message_is_the_fallback_lead_field_for_records_this_driver_did_not_produce() {
+        let line = rendered(r#"{"z":"1","message":"hello"}"#, 9, Some("INFO"), 0);
+        assert!(line.contains("level=INFO message=hello z=1"), "{line}");
+    }
+
+    /// The formatter is the exact inverse of the parser this module already had, so anything
+    /// `docker logs` prints can be fed back to `--since`.
+    #[test]
+    fn the_rfc3339_formatter_round_trips_against_the_parser() {
+        for nanos in [
+            0i64,
+            1,
+            1_000_000_000,
+            123_456_789,
+            1_700_000_000_000_000_000,
+            1_700_000_000_123_456_789,
+            // Pre-epoch: floor division must land on the right second, not one too late.
+            -1_000_000_000,
+            -86_400_000_000_000,
+        ] {
+            let text = rfc3339(Timestamp::from_unix_nanos(nanos));
+            assert_eq!(
+                timestamp(&text).map(|t| t.unix_nanos()),
+                Some(nanos),
+                "{nanos} rendered as {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn civil_from_days_inverts_days_from_civil() {
+        for (y, m, d) in [
+            (1970, 1, 1),
+            (1969, 12, 31),
+            (2000, 2, 29),
+            (2026, 8, 6),
+            (2400, 12, 31),
+        ] {
+            assert_eq!(civil_from_days(days_from_civil(y, m, d)), (y, m, d));
+        }
     }
 }

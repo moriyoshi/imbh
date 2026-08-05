@@ -172,18 +172,23 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Linux legs build NATIVELY on 22.04 runners rather than cross-compiling: the only C
-          # dependency in the graph is zstd-sys (vendored libzstd, built by cc via parquet), and a
-          # native toolchain is the one configuration that needs no cross C setup at all. 22.04 and
+          # Linux legs build NATIVELY on 22.04 runners rather than cross-compiling: the C
+          # dependencies in the graph are zstd-sys (vendored libzstd, built by cc via parquet) and —
+          # under `docker-remap` — onig_sys (vendored oniguruma, via vrl's stdlib), and a native
+          # toolchain is the one configuration that needs no cross C setup for either. 22.04 and
           # not 24.04 because it pins the glibc floor at 2.35 — the release binaries then also run on
           # the debian:bookworm-slim base of docker/Dockerfile (glibc 2.36). arm64 GitHub-hosted
           # runners are free for public repositories.
+          #
+          # `docker-remap` is the one feature in the workspace that adds crates on purpose (vrl); it
+          # is what makes the published plugin parse a container's JSON/logfmt/klog output into
+          # queryable fields out of the box. See crates/imbh-server/Cargo.toml for the measured cost.
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-22.04
-            features: docker,grpc,tracing
+            features: docker,docker-remap,grpc,tracing
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-22.04-arm
-            features: docker,grpc,tracing
+            features: docker,docker-remap,grpc,tracing
           # macOS omits `docker`: a logging-driver plugin is served over a Unix socket to a *local*
           # Docker daemon, and on macOS the daemon runs inside a VM, so the feature could not be used
           # even though it compiles. Dropping it keeps an unverifiable code path off the release path.

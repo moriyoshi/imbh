@@ -32,6 +32,12 @@
       "settable": ["value"]
     },
     {
+      "name": "IMBH_DOCKER_REMAP",
+      "description": "VRL script applied to every container line before it is stored, mapping the Docker log-driver data model onto the OpenTelemetry logs data model. `default` is the built-in remapper (JSON, logfmt, klog/glog, key=value); `off` stores lines exactly as the container printed them; `@PATH` reads a script from a path inside the plugin -- the `data` mount is already there, so @/var/lib/imbh/remap/app.vrl works with no extra configuration; anything else is treated as an inline script. Override per container with --log-opt imbh-remap=...",
+      "value": "default",
+      "settable": ["value"]
+    },
+    {
       "name": "IMBH_MAINTENANCE_INTERVAL",
       "description": "How often the retention policy is applied.",
       "value": "60s",

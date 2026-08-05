@@ -48,6 +48,40 @@ elif [ "$bytes" -gt "$target_bytes" ]; then
   echo "  WARN: over target (under hard limit) — expected on glibc; confirm on musl"
 fi
 
+echo "== shipped plugin build (informational — never fails the gate) =="
+# The two axes above measure the LIBRARY graph (`cargo tree -p imbh`) and a DEFAULT-feature imbhd.
+# The published Docker log-driver plugin is neither: it is imbh-server with
+# `docker,docker-remap,grpc,tracing`, and `docker-remap` pulls vrl — the one feature in the workspace
+# that adds crates on purpose. Nothing else in this script can see that, so print it here rather than
+# let it surface at release time. Informational ONLY: the §2 budgets are written against the default
+# build, and turning the plugin's size into a hard gate would be a new policy, not a measurement.
+# Skip with PLUGIN_PROBE=0 (it is a fat-LTO build, so it is not cheap).
+if [ "${PLUGIN_PROBE:-1}" = "0" ]; then
+  echo "  skipped (PLUGIN_PROBE=0)"
+else
+  count_crates() {
+    cargo tree -p imbh-server --edges normal --prefix none --features "$1" 2>/dev/null \
+      | sed 's/ (\*)//; s/ v[0-9].*//' | awk 'NF' | sort -u | wc -l
+  }
+  base_crates=$(count_crates docker,grpc,tracing)
+  remap_crates=$(count_crates docker,docker-remap,grpc,tracing)
+  echo "  imbh-server crates: $base_crates (docker,grpc,tracing) -> $remap_crates (+docker-remap) = +$((remap_crates - base_crates))"
+  echo "  building plugin feature set (release, fat LTO) ..."
+  # Its OWN target dir, deliberately: the gated binary axis above reuses `target/release/imbhd` when
+  # it already exists, so building a different feature set into that path would silently make the
+  # next gate run measure the plugin build as if it were the default one. Costs disk and a cold
+  # build; buys a measurement that cannot corrupt the thing it sits next to.
+  probe_dir=target/footprint-plugin-probe
+  if cargo build --release -p imbh-server --features docker,docker-remap,grpc,tracing \
+       --target-dir "$probe_dir" >/dev/null 2>&1; then
+    pbytes=$(stat -c%s "$probe_dir/release/imbhd")
+    pmib=$(awk "BEGIN{printf \"%.1f\", $pbytes/1048576}")
+    echo "  imbhd (plugin feature set): $pbytes bytes = ${pmib} MiB"
+  else
+    echo "  WARN: the plugin feature set did not build"
+  fi
+fi
+
 echo "== engine deps present? =="
 tree=$(cargo tree -p imbh --edges normal 2>/dev/null)
 printf '%s\n' "$tree" | grep -q 'tantivy v' && echo "  tantivy: yes" || echo "  tantivy: NO"

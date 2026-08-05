@@ -96,7 +96,7 @@ pub use imbh_core::{
     Access, AnyValue, Attributes, Compression, Direction, Duplicates, DurationNs, Error,
     FlushPolicy, FlushSize, Ingest, LogRow, Lsn, Maintenance, MemoryBudget, Overflow, Promote,
     Refresh, Result, Retention, SegmentRef, SeverityNumber, SpanId, Table, TimeRange, Timestamp,
-    TraceId, WalMode, parse_bytes, parse_duration, parse_json,
+    TraceId, WalMode, canonical_json_value, parse_bytes, parse_duration, parse_json,
 };
 
 pub use imbh_storage::{CompactionReport, FlushGauges, SnapshotInfo, TableStats};
