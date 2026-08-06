@@ -6,9 +6,10 @@
 //! bridge), and materializes the result batches into owned [`LogEntry`] DTOs.
 //!
 //! Scope: `service`/`severity_at_least`/`matches`/`attr_eq`/`attr_exists`/`attr_matches`/`attr_in`/
-//! `attr_not_in`/`attr_gt`/`attr_ge`/`attr_lt`/`attr_le`/`attr_regex`/`range`/`since`/`limit`/
-//! `direction`, `query`, `count`, `volume`, attribute discovery, and OFFSET-based cursor paging
-//! (`after`). The `MatchOp` vocabulary is complete; `tail` (live follow) is a later chunk.
+//! `attr_not_in`/`attr_gt`/`attr_ge`/`attr_lt`/`attr_le`/`attr_regex`/`range`/`since`/
+//! `observed_after`/`order_by`/`limit`/`direction`, `query`, `count`, `volume`, attribute discovery,
+//! and OFFSET-based cursor paging (`after`). The `MatchOp` vocabulary is complete; `tail` (live
+//! follow) is a later chunk.
 
 use std::time::{Duration, Instant};
 
@@ -43,19 +44,17 @@ impl LogsApi {
         let mut params = SqlParams::with_promote(self.db.storage.promote().keys());
         // `SELECT *` (not the fixed 12-column projection) so any promoted attribute columns are
         // present in the batch — that is what lets the reader take the zero-copy dictionary path
-        // instead of parsing the JSON blob.
-        let dir = match q.direction {
-            Direction::Backward => "DESC",
-            Direction::Forward => "ASC",
-        };
+        // instead of parsing the JSON blob. The leading columns are still the canonical schema
+        // order, which `imbh-lgtm` reads by position; see `projection_order_is_a_wire_contract`.
         let offset = if q.offset > 0 {
             format!(" OFFSET {}", q.offset)
         } else {
             String::new()
         };
         let sql = format!(
-            "SELECT * FROM logs{} ORDER BY \"time\" {dir} LIMIT {}{offset}",
+            "SELECT * FROM logs{} ORDER BY {} LIMIT {}{offset}",
             q.where_sql(&mut params),
+            q.order_sql(),
             q.limit
         );
         self.db
@@ -224,6 +223,30 @@ impl NumOp {
         }
     }
 }
+/// The time axis a [`LogQuery`] orders by (`ORDER BY`), independent of its
+/// [`direction`](LogQuery::direction).
+///
+/// A record carries two instants (OTel logs data model): `time` is when the *event happened* — for
+/// the Docker driver, when the container emitted the line — and `observed_time` is when the
+/// collector *received* it. They differ whenever a record's own timestamp is trusted (a VRL remap
+/// lifting an in-line `ts=`), and they differ by up to one batch interval always, because ingest
+/// lands a line after it was emitted.
+///
+/// Ordering by [`ObservedTime`](Self::ObservedTime) is what a *tailer* wants: arrival order is
+/// monotonic in the order rows became visible, so a watermark over it cannot be overtaken by a
+/// late-arriving record with an older event time. Rows with a NULL `observed_time` (the column is
+/// nullable — an OTLP producer need not send one) sort **last** in either direction, so they never
+/// occupy the head of a backwards "newest arrival" probe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum LogOrder {
+    /// Order by event time (the `time` column). The default, and what `docker logs` prints.
+    #[default]
+    Time,
+    /// Order by arrival time (the `observed_time` column), NULLs last.
+    ObservedTime,
+}
+
 /// A string-bearing field addressable by the native log query model.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -283,6 +306,12 @@ pub struct LogQuery {
     match_none: bool,
     range_end_inclusive: bool,
     range: Option<TimeRange>,
+    /// Strict lower bound on `observed_time` (arrival), independent of `range` (event time).
+    #[cfg_attr(feature = "serde", serde(default))]
+    observed_after: Option<Timestamp>,
+    /// Which time column `ORDER BY` uses.
+    #[cfg_attr(feature = "serde", serde(default))]
+    order: LogOrder,
     limit: usize,
     direction: Direction,
     offset: usize,
@@ -307,6 +336,8 @@ impl Default for LogQuery {
             match_none: false,
             range_end_inclusive: false,
             range: None,
+            observed_after: None,
+            order: LogOrder::Time,
             limit: 100,
             direction: Direction::Backward,
             offset: 0,
@@ -458,6 +489,29 @@ impl LogQuery {
         self
     }
 
+    /// Keep only records whose **arrival** time is strictly after `t` (`observed_time > t`), a
+    /// filter on the ingest clock rather than the event clock. Orthogonal to
+    /// [`range`](Self::range)/[`since`](Self::since), which bound event time; combine them freely.
+    /// Repeated calls keep the last.
+    ///
+    /// Rows with a NULL `observed_time` never match (SQL `NULL > t` is unknown). That is the point
+    /// for a tailer: a record with no recorded arrival instant cannot be placed relative to a
+    /// watermark, so it is left out rather than replayed on every poll.
+    ///
+    /// Pair with [`order_by`](Self::order_by)`(`[`LogOrder::ObservedTime`]`)` to page forward through
+    /// arrivals: the newest `observed_time` written becomes the next call's bound.
+    pub fn observed_after(mut self, t: Timestamp) -> Self {
+        self.observed_after = Some(t);
+        self
+    }
+
+    /// Choose the time axis `ORDER BY` uses (see [`LogOrder`]). Defaults to
+    /// [`LogOrder::Time`] — event time, which is the order log readers expect to see records in.
+    pub fn order_by(mut self, order: LogOrder) -> Self {
+        self.order = order;
+        self
+    }
+
     pub fn since(mut self, d: Duration) -> Self {
         self.range = Some(TimeRange::since(d));
         self.range_end_inclusive = false;
@@ -502,6 +556,11 @@ impl LogQuery {
                     p.i64(r.end.0)
                 ));
             }
+        }
+        // Arrival bound: a separate axis from `range`, and NULL-excluding by construction (a row
+        // with no `observed_time` is not comparable to an arrival watermark).
+        if let Some(t) = self.observed_after {
+            conds.push(format!("CAST(observed_time AS BIGINT) > {}", p.i64(t.0)));
         }
         if let Some(s) = &self.service {
             conds.push(format!("service = {}", p.str(s)));
@@ -606,21 +665,37 @@ impl LogQuery {
         }
     }
 
-    fn to_sql(&self, p: &mut SqlParams) -> String {
+    /// The `ORDER BY` key for this query: the selected time column plus the direction. Shared by
+    /// [`to_sql`](Self::to_sql) and [`LogsApi::query_batches`], so both entry points agree on the
+    /// ordering axis. `observed_time` is nullable, so it pins NULLs last in **both** directions —
+    /// a `DESC` "newest arrival" probe must not hand back a row that has no arrival instant.
+    pub(crate) fn order_sql(&self) -> String {
         let dir = match self.direction {
             Direction::Backward => "DESC",
             Direction::Forward => "ASC",
         };
+        match self.order {
+            LogOrder::Time => format!("\"time\" {dir}"),
+            LogOrder::ObservedTime => format!("observed_time {dir} NULLS LAST"),
+        }
+    }
+
+    fn to_sql(&self, p: &mut SqlParams) -> String {
         let offset = if self.offset > 0 {
             format!(" OFFSET {}", self.offset)
         } else {
             String::new()
         };
+        // INVARIANT: the projection list below is a **wire contract**. Readers materialize columns
+        // by position (`materialize` here, and `imbh-lgtm`'s log/metric batch readers), so a column
+        // appended, removed, or reordered silently mis-decodes every row. `projection_order_is_a_wire_contract`
+        // pins it. Change it only together with every positional reader.
         format!(
             "SELECT \"time\", observed_time, service, severity_number, severity_text, body, \
              attributes, resource, scope, trace_id, span_id, flags \
-             FROM logs{} ORDER BY \"time\" {dir} LIMIT {}{offset}",
+             FROM logs{} ORDER BY {} LIMIT {}{offset}",
             self.where_sql(p),
+            self.order_sql(),
             self.limit
         )
     }
@@ -809,6 +884,121 @@ mod native_query_tests {
                 ScalarValue::Utf8(Some(pattern.to_owned())),
             ]
         );
+    }
+
+    /// The `logs` **projection is a wire contract**, not an implementation detail.
+    ///
+    /// `materialize` here, `imbh-lgtm`'s log-batch reader, and the FFI/Arrow bindings all decode
+    /// columns **by position**. A column appended, removed, or reordered therefore does not fail to
+    /// compile anywhere — it silently mis-decodes every row (a body read as a resource blob, a
+    /// severity read as a flag word). Pin the list so that change has to be deliberate.
+    ///
+    /// The `SELECT *` twin (`query_batches`, which `imbh-lgtm` actually drives) inherits its layout
+    /// from the storage schema instead, so the same order is pinned against `logs_schema` — the two
+    /// must not drift apart either.
+    #[test]
+    fn projection_order_is_a_wire_contract() {
+        const PROJECTION: [&str; 12] = [
+            "time",
+            "observed_time",
+            "service",
+            "severity_number",
+            "severity_text",
+            "body",
+            "attributes",
+            "resource",
+            "scope",
+            "trace_id",
+            "span_id",
+            "flags",
+        ];
+
+        let mut params = SqlParams::with_promote(&[]);
+        let sql = LogQuery::new().to_sql(&mut params);
+        let select = sql
+            .strip_prefix("SELECT ")
+            .and_then(|s| s.split_once(" FROM logs"))
+            .expect("the query selects an explicit column list from `logs`")
+            .0;
+        let columns: Vec<String> = select
+            .split(',')
+            .map(|c| c.trim().trim_matches('"').to_owned())
+            .collect();
+        assert_eq!(
+            columns, PROJECTION,
+            "the logs projection changed; every positional reader (imbh::logs::materialize, \
+             imbh-lgtm's source.rs, the Arrow/FFI bindings) decodes by index and would mis-read \
+             every row"
+        );
+
+        // `SELECT *` must agree with it, column for column, in the same order.
+        let schema = imbh_storage::logs_schema(&[]);
+        let fields: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+        assert_eq!(
+            fields, PROJECTION,
+            "the storage schema and the explicit projection disagree; `query_batches` uses \
+             `SELECT *`, so the two orders must stay identical"
+        );
+
+        // Promoted attribute columns append *after* the fixed twelve — `imbh-lgtm` treats any
+        // index >= 12 as a promoted label column.
+        let promoted = imbh_storage::logs_schema(&["region".to_owned()]);
+        assert_eq!(promoted.fields().len(), 13);
+        assert_eq!(promoted.field(12).name(), "region");
+    }
+
+    /// The observed-time axis is a *filter and an order key*, not a projection change: adding it
+    /// must leave the selected columns alone.
+    #[test]
+    fn the_observed_time_axis_filters_and_orders_without_touching_the_projection() {
+        let mut params = SqlParams::with_promote(&[]);
+        let plain = LogQuery::new().to_sql(&mut params);
+
+        let mut params = SqlParams::with_promote(&[]);
+        let sql = LogQuery::new()
+            .observed_after(Timestamp::from_unix_nanos(1_700_000_000_000_000_000))
+            .order_by(LogOrder::ObservedTime)
+            .direction(Direction::Backward)
+            .limit(1)
+            .to_sql(&mut params);
+
+        assert!(sql.contains("CAST(observed_time AS BIGINT) > $1"), "{sql}");
+        // NULLs last in *both* directions: a backwards "newest arrival" probe must not return a row
+        // that has no arrival instant.
+        assert!(
+            sql.contains("ORDER BY observed_time DESC NULLS LAST"),
+            "{sql}"
+        );
+        assert!(!sql.contains("ORDER BY \"time\""), "{sql}");
+        assert_eq!(
+            params.into_values(),
+            vec![ScalarValue::Int64(Some(1_700_000_000_000_000_000))],
+            "the bound is a bind parameter, not interpolated text"
+        );
+
+        // Same projection, both ways.
+        let columns = |s: &str| {
+            s.split_once(" FROM logs")
+                .expect("a FROM clause")
+                .0
+                .to_owned()
+        };
+        assert_eq!(columns(&plain), columns(&sql));
+
+        // Forward is the paging direction a tailer uses.
+        let mut params = SqlParams::with_promote(&[]);
+        let forward = LogQuery::new()
+            .order_by(LogOrder::ObservedTime)
+            .direction(Direction::Forward)
+            .to_sql(&mut params);
+        assert!(
+            forward.contains("ORDER BY observed_time ASC NULLS LAST"),
+            "{forward}"
+        );
+
+        // And the default is untouched: event time, no arrival predicate.
+        assert!(plain.contains("ORDER BY \"time\" DESC"), "{plain}");
+        assert!(!plain.contains("observed_time AS BIGINT"), "{plain}");
     }
 
     #[test]
