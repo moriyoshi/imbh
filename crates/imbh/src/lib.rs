@@ -54,8 +54,8 @@ mod traces;
 pub use attrs::AttrsApi;
 #[cfg(feature = "query")]
 pub use logs::{
-    LogEntry, LogPage, LogQuery, LogStringField, LogsApi, PageCursor, QueryStats, StringPredicate,
-    VolumeBucket,
+    LogEntry, LogOrder, LogPage, LogQuery, LogStringField, LogsApi, PageCursor, QueryStats,
+    StringPredicate, VolumeBucket,
 };
 #[cfg(feature = "query")]
 pub use metrics::{

@@ -1,0 +1,85 @@
+# Dependabot keeps the SHA-pinned action references in .github/workflows/ moving.
+#
+# Every `uses:` in ci.yml, release.yml and soak.yml is pinned to a full-length commit SHA with the
+# human-readable tag in a trailing comment (`actions/checkout@3d3c42e5... # v7.0.1`). That pinning
+# is deliberate and stays — a SHA is the only immutable way to reference an action, and release.yml
+# is the workflow that holds the crates.io token and the registry login. But pinning has a cost:
+# GitHub does not raise Dependabot *alerts* for actions pinned to a SHA (alerts fire only on semver
+# refs), so a compromised or patched action is invisible to this repo. Scheduled version updates
+# are therefore not a convenience here; they are the only automated path by which a fix upstream in
+# an action ever reaches these workflows.
+#
+# The pins survive the update. For a SHA-pinned action Dependabot rewrites the SHA in place and
+# bumps the version in the trailing comment to match — it does not demote the pin back to a tag.
+# That is the github-actions ecosystem's own behaviour, not something configured below: there is no
+# "stay pinned" option to set, and so nothing here to keep in sync if the rest of this file changes.
+#
+# One thing to watch when reviewing these PRs: `dtolnay/rust-toolchain` is pinned to a commit on its
+# `stable` branch rather than to a release tag (hence `# stable` instead of `# vX.Y.Z`). With no tag
+# behind the pin, Dependabot follows branch HEAD, so read that diff as "some new upstream commit"
+# and check what actually changed — the comment carries no version to sanity-check it against.
+
+version: 2
+
+updates:
+  - package-ecosystem: "github-actions"
+    # "/" is the whole github-actions surface of this repo, not just its root: Dependabot reads
+    # /.github/workflows plus a root action.yml. There are no composite actions in the tree today,
+    # so this single entry covers ci.yml, release.yml and soak.yml. A composite action added later
+    # under .github/actions/<name>/ would need its own entry — "/" does not reach into it.
+    directory: "/"
+    schedule:
+      # Weekly rather than daily. The ten actions used here cut releases on the order of monthly, so
+      # a daily check would mostly re-confirm unchanged pins, and every PR costs a full CI run (the
+      # ubuntu gate + E2E, the feature matrix, the Windows portability job, the footprint gate).
+      # Monday morning lands the batch at the start of a working week rather than before a weekend.
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "Asia/Tokyo"
+    # Conventional-commit `ci:` prefix, matching how workflow changes are already titled in history.
+    commit-message:
+      prefix: "ci"
+    groups:
+      # Patch and minor bumps arrive as one pull request, so a single CI run clears the whole batch.
+      # Majors are deliberately left out of the group: an action major usually means renamed inputs
+      # or a new runner/Node runtime, which is a real change to the workflow and deserves to be
+      # reviewed — and to fail — on its own rather than buried in a batch of routine bumps.
+      actions:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
+
+  # Cargo, deliberately narrowed to SECURITY updates only.
+  #
+  # The reason it is not a normal version-update entry: CI enforces hard footprint budgets (crate
+  # count and release binary size, via scripts/footprint-gate.sh; see OVERVIEW.md §2 and
+  # ARCHITECTURE.md §11), and a routine dependency bump can widen the tree enough to trip them — or,
+  # worse, quietly consume headroom without tripping anything. The margin is genuinely thin: the
+  # v0.5.0 x86_64-linux `imbhd` measured 41.1 MB against a 42 MB target (ARCHITECTURE.md Appendix C).
+  # Several subtrees are also held to hand-trimmed `default-features = false` sets, a property
+  # Dependabot cannot reason about and would not preserve when proposing a version. So routine Rust
+  # version churn stays a measured, deliberate act — `cargo update` by hand, with the gate re-run.
+  #
+  # What is NOT deliberate is having no automated path for an *advisory*. `cargo-deny` (deny.toml)
+  # fails CI on a RUSTSEC advisory, but failing is not fixing: it tells you a vulnerable crate is in
+  # the tree and then waits for a human. This entry closes that gap and nothing else.
+  #
+  # `open-pull-requests-limit: 0` is the documented way to disable *version* updates for an ecosystem
+  # while leaving security updates on — security PRs are not counted against the limit and are raised
+  # regardless of it. That is the whole mechanism here; there is no separate "security only" switch.
+  - package-ecosystem: "cargo"
+    # The workspace root. One manifest tree, one lockfile, so a single entry covers all 15 crates.
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "Asia/Tokyo"
+    commit-message:
+      prefix: "deps"
+    # Disables routine version-update PRs. Security updates still arrive. Raise this above 0 only
+    # together with a decision about who re-runs the footprint gate on each bump.
+    open-pull-requests-limit: 0

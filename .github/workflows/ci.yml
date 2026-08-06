@@ -111,6 +111,11 @@ jobs:
     # the workspace, then run the two suites that actually touch the filesystem — `imbh-storage`
     # (WAL segment create/rotate, manifest `CURRENT` swap, seal → rename) and the facade's
     # open → seal → reopen → compact lifecycle. Not a substitute for the ubuntu gate above.
+    #
+    # Both suites also cover the second Unix-shaped assumption found here: reclaiming segment files
+    # that a reader still holds open or memory-mapped, during retention and compaction. POSIX unlinks
+    # those unconditionally; Windows refuses to delete a file with a live mapping, which a Tantivy
+    # searcher over a `.tidx` sidecar always has. Keep those tests on this leg.
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable

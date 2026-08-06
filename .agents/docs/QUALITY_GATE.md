@@ -51,6 +51,14 @@ Notes:
 - Prezto shell pitfalls when scripting: `cp` is aliased to `cp -i` (`rm -f dst` first), `rm` to
   `rm -i` (use `rm -f`), and `NO_CLOBBER` makes `>` / heredocs fail on an existing file
   (`rm -f` first or use `tee`).
+- **`producer | grep -q pattern` is a race under `set -o pipefail`** — and every gate script here
+  sets it. `grep -q` exits the moment it matches, so the producer gets a broken pipe and the pipeline
+  reports *its* SIGPIPE (141) even though grep matched. The earlier the match, the more input is left
+  unwritten and the likelier the false negative: measured on `scripts/footprint-gate.sh`'s dependency
+  tree, `printf '%s\n' "$tree" | grep -q 'datafusion v'` reported "not present" in **63 of 400** runs
+  on a perfectly healthy graph. Feed `grep -q` from a here-string instead (`grep -q pat <<<"$var"`,
+  capturing command output into the variable first) — no upstream process, no race, 0/400. Pipelines
+  whose stages all read to EOF (`… | sed | awk | sort -u | wc -l`) are unaffected.
 
 ## 2. Footprint gate (dependency / feature changes)
 
@@ -64,14 +72,42 @@ exits non-zero over a hard limit:
 cargo bloat --release --crates       # where binary size goes (if cargo-bloat installed)
 ```
 
-The gate also verifies the `search` feature lever (§11): it fails if `imbh --no-default-features`
-still links tantivy or no longer compiles, so the footprint knob can't silently break.
+The gate also verifies the `search` feature lever (§11): it fails if tantivy is still linked with
+search off — checked both with `--no-default-features` and with `--no-default-features --features
+ingest,query`, since it can leak back into either — or if `imbh --no-default-features` no longer
+compiles, so the footprint knob can't silently break. It fails symmetrically in the other direction
+too: both engines must be present in the *default* graph, so a feature-flag edit that silently drops
+tantivy or the whole DataFusion crate family fails the gate instead of printing a note nobody reads.
+The DataFusion check matches the whole crate family (`datafusion`, `datafusion-core`,
+`datafusion-physical-plan`, …) rather than the bare facade, so it keeps working as DataFusion
+continues splitting itself into sub-crates. All four presence checks are fed from here-strings, not
+pipes — see the `grep -q` / `pipefail` pitfall in §1; it made the DataFusion check falsely report a
+missing query engine on ~16% of runs.
 
 Latest measured (2026-07-18, aarch64-glibc, release-small profile): **275** unique crates (≤ 275
 target, ≤ 300 hard) and **31.2 MiB** for the `imbhd` binary (≤ 42 MB musl target — a glibc floor,
 not the musl number). Both are within budget; the v0.1 footprint exit criterion is met on this
-axis. Turning `search` off (`imbh --no-default-features`) drops the tantivy subtree to **216**
-crates. Idle/steady RSS now has an opt-in soak gate (`crates/imbh/tests/soak_rss.rs`, Linux,
+axis.
+
+Two different §11 levers get conflated here, so record both (re-measured 2026-08-06, aarch64-glibc,
+`cargo tree -p imbh --edges normal`, unique crates):
+
+| Feature set | Crates | What it drops |
+| --- | --- | --- |
+| default (`ingest,query,search`) | **275** | — |
+| `--no-default-features --features ingest,query` | **217** (-58) | the tantivy subtree only — this is the *search* lever |
+| `--no-default-features` | **71** (-204) | `ingest` **and** `query` **and** `search`, so the OTLP-decode and the whole DataFusion subtree go too |
+
+The gate's `search-off footprint lever` section prints all three rows with those labels; the config
+it actually compiles is the bare `--no-default-features` build (**71**). Do not read that number as
+the cost of search — search on its own is worth 58 crates. Of the further 146 that
+`--no-default-features` removes, `query` (DataFusion + sqlparser) accounts for 139 and `ingest`
+(OTLP decode) for 24, the two overlapping by 17 (measured as `--no-default-features --features query`
+= 210 and `--no-default-features --features ingest` = 95). An earlier revision of this file quoted
+**216** against `--no-default-features`, which is the *search* lever's number attached to the wrong
+knob; don't reintroduce it.
+
+Idle/steady RSS now has an opt-in soak gate (`crates/imbh/tests/soak_rss.rs`, Linux,
 `#[ignore]`): a sustained ingest→seal→query loop asserts steady `VmRSS` stays under a runaway
 sentinel (a recent run: idle ~14 MiB, steady ~172 MiB over 20k rows, budget 512 MiB). Run it with
 `cargo test -p imbh --test soak_rss -- --ignored --nocapture`. Peak RSS (VmHWM) is still only

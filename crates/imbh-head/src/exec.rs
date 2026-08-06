@@ -282,27 +282,7 @@ pub async fn attribute_values(
 /// Database statistics: the per-table breakdown plus the engine-wide gauges.
 pub async fn stats(db: &Arc<Db>) -> Result<dto::Stats, HeadError> {
     let stats = db.stats().await.map_err(HeadError::from_db)?;
-    Ok(dto::Stats {
-        tables: stats
-            .tables
-            .into_iter()
-            .map(|table| dto::TableStats {
-                table: table.table.as_str().to_owned(),
-                segment_count: table.segment_count,
-                segment_rows: table.segment_rows,
-                buffer_rows: table.buffer_rows,
-                min_time_unix_nano: table.min_time_unix_nano,
-                max_time_unix_nano: table.max_time_unix_nano,
-            })
-            .collect(),
-        buffer_bytes: stats.buffer_bytes as u64,
-        wal_bytes: stats.wal_bytes,
-        durable_lsn: stats.durable_lsn.map(|lsn| lsn.get()),
-        ingest_queue_depth: stats.ingest_queue_depth as u64,
-        ingest_dropped: stats.ingest_dropped,
-        ingest_errors: stats.ingest_errors,
-        ingest_rejected: stats.ingest_rejected,
-    })
+    Ok(dto::Stats::from(&stats))
 }
 
 /// The physical table a [`dto::TableStats::table`] name refers to, or `None` for a name this build

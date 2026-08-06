@@ -9,7 +9,12 @@ git history); this file tracks only what is still open.
 
 ## Open Items
 
-- [ ] **The head API needs a semver bump before release (`imbh-head` is a new published crate).** The
+- [x] **The head API needs a semver bump before release (`imbh-head` is a new published crate).**
+      *(closed 2026-08-06 — stale.)* Shipped: the workspace is at `0.5.0`, `v0.4.0` and `v0.5.0` are
+      tagged and released, and `imbh-head` is a workspace member inheriting `version.workspace` /
+      `publish.workspace` as the item predicted. Original text below for the record.
+
+      The
       TUI-as-a-head work (ARCHITECTURE.md §10.19, JOURNAL 2026-08-01) added a 15th shipping crate,
       `imbh-head`, and made one **breaking** change to `imbh-tui`'s published surface:
       `cli::Mode::Tui { path: PathBuf, .. }` is now `cli::Mode::Tui { source: Source, .. }`, since the
@@ -19,15 +24,34 @@ git history); this file tracks only what is still open.
       `version.workspace` and `publish = true`, so it should be picked up automatically — worth
       confirming on the dry run). Not done here: releases are cut only when explicitly asked.
 
-- [ ] **`GET /stats` still cannot be parsed back into a typed value, and omits the ingest gauges.** The
-      head API answers `GET /api/head/stats` with a complete, serde-round-trippable `Stats` instead of
-      widening `/stats`, whose hand-written JSON (`imbh_mcp::stats_json`, shared with the `db_stats`
-      tool) is an existing public contract reporting neither `ingest_queue_depth` nor `ingest_dropped`
-      nor `ingest_errors`, and spelling a `None` durable LSN as `0`. Adding the three gauges is purely
-      additive and would let the two converge on one serializer; the `durable_lsn` spelling is the part
-      that would actually change what a current consumer sees.
+- [x] **`GET /stats` still cannot be parsed back into a typed value, and omits the ingest gauges.**
+      *(closed 2026-08-06.)* Resolved by **converging on one serializer** rather than widening the
+      hand-written writer: `imbh_mcp::stats_json` is now
+      `serde_json::to_string(&imbh_head::dto::Stats::from(stats))`, and `imbh_head::exec::stats()`
+      defers to the same `From<&imbh::DbStats>` conversion instead of a hand-rolled mapping. Two
+      corrections to the item's premise: there are **four** gauges, not three (`ingest_rejected`
+      arrived in 0.5.0 with the duplicate-timestamp policy), and the `db_stats` call site parsed into
+      `serde_json::Value`, so it constrained nothing beyond "valid JSON" — the real constraint was
+      `dto::Stats`. Two **breaking** spelling changes, both in `CHANGELOG.md` under `[Unreleased]`:
+      a `None` durable LSN is now `null` rather than `0` (the change the item flagged, approved by
+      the user), and — forced by the convergence — `dto::Stats` / `dto::TableStats` dropped
+      `skip_serializing_if`, so their `None` optionals serialize as explicit `null` instead of being
+      omitted, which changes what a `GET /api/head/stats` consumer sees. Both are
+      deserialization-compatible in each direction via `#[serde(default)]`. `/stats` key order also
+      changed (`tables` moved first); no field was removed or renamed. Cost: `imbh-mcp` gained an
+      `imbh-head` dependency (`dto` feature only), +1 workspace crate and +0 third-party. Covered by
+      three `imbh-mcp` render tests, one `imbh-head` dto test, and widened assertions in
+      `imbh-server`'s `health_ingest_query`.
 
-- [ ] **Decide whether to restore the `v0.3.0` git tag on the remote.** It was deleted while trying to
+- [x] **Decide whether to restore the `v0.3.0` git tag on the remote.** *(closed 2026-08-06 — won't
+      do.)* Decided by the user: **this repository's releases are immutable, so there is nothing
+      further to be done here.** The tag name stays permanently reserved by the deleted Release, which
+      is precisely why re-pushing could only ever produce a red run; 0.3.0 remains traceable through
+      the `CHANGELOG.md` commit link, and crates.io and GHCR are both published (`ghcr.io/moriyoshi/imbh`
+      still carries the `0.3.0` and `0.3` tags). Not a deferral — the option the item was weighing does
+      not exist. Original text below.
+
+      It was deleted while trying to
       retry the failed CD run, and only the local signed tag at `07b72dd` survives, so nothing on the
       remote marks the commit that produced crates.io 0.3.0 (`CHANGELOG.md` links the commit instead).
       Re-pushing the tag is allowed by the `Version tags` ruleset (signed, no deletion involved), but
@@ -61,6 +85,9 @@ git history); this file tracks only what is still open.
       read) and the endpoint is unauthenticated. If this matters for a deployment, the fix is a
       per-call deadline around `tools::call` plus a scanned-bytes ceiling from `QueryStats`. —
       *source: JOURNAL (MCP endpoint, 2026-08-01)*
+      **Reviewed 2026-08-06 and deliberately left open** (user decision), so a future sweep need not
+      re-ask. The "if this matters for a deployment" framing still holds; the fix is described above
+      and nothing about it has gone stale.
 
 - [ ] **No write-side deadline on buffered HTTP responses.** `IMBH_BODY_TIMEOUT` used to bound the
       response write as well as body reads, via `set_write_timeout` on the socket; hyper exposes no
@@ -70,20 +97,61 @@ git history); this file tracks only what is still open.
       after `STREAM_STALL` (30s), because its channel sink can see the backpressure. If the buffered
       case matters, the fix is a `tower` timeout layer around the response future or a connection-level
       deadline. — *source: JOURNAL (axum migration, 2026-08-01)*
+      **Reviewed 2026-08-06 and deliberately left open** (user decision). The dependency a `tower`
+      timeout layer would add is itself a footprint question, which is part of why this stays a
+      conditional item rather than a pending fix.
+
+- [ ] **The PromQL-agreement test compares against a transcription, not the real function.**
+      `range_dedup_agrees_with_the_promql_collapse` (`crates/imbh/src/metrics.rs`) verifies that the
+      typed metrics dedup resolves duplicates the same way PromQL does — but it carries a **verbatim
+      copy** of `duplicate_value_cmp` / `collapse_duplicate_samples` rather than calling them, because
+      `imbh-lgtm` depends on `imbh` and importing them into an `imbh` test would be a dev-dependency
+      cycle. So it verifies agreement with a *copy* of the rule: drift in
+      `crates/imbh-lgtm/src/model/promql.rs` would not trip it, which is precisely the failure the test
+      exists to catch. The honest fix is to move that one test into `imbh-lgtm`, where both sides are
+      in scope. Left in place only because the crate boundary was outside the change's remit.
+      — *source: JOURNAL 2026-08-06 part 7*
 
 - [ ] **Optional upstream differential runner.** Automate the versioned in-process fixture corpus
       against pinned Prometheus/Loki/Tempo daemons behind an opt-in test or script. Default
       workspace tests must remain daemon-free and offline. Deferred by explicit user request. —
       *source: JOURNAL (LGTM differential-testing follow-up)*
 
-- [ ] **Dependabot for the SHA-pinned GitHub Actions.** Now **nine** actions across
+- [x] **Dependabot for the SHA-pinned GitHub Actions.** *(closed 2026-08-06.)* `.github/dependabot.yml`
+      added with a single `package-ecosystem: github-actions` entry at `directory: "/"` (verified
+      complete: there are no composite actions anywhere in the tree, so `/` — which covers
+      `.github/workflows` plus a root `action.yml` — reaches everything). Weekly, Monday 09:00
+      Asia/Tokyo, `ci:` commit prefix, minor+patch grouped into one PR so a single CI run clears the
+      batch while majors stay ungrouped. Two corrections to the item: there are **ten** distinct
+      actions, not nine (`taiki-e/install-action` was missed), and more importantly — per GitHub's
+      Secure use reference, **Dependabot raises security *alerts* only for actions pinned to semver,
+      never for SHA pins**, so the pinning had silently opted this repo out of action alerts
+      altogether. This config is therefore not a convenience but the only automated channel by which
+      an upstream action fix reaches `release.yml`, which holds the crates.io token and the registry
+      login. Field names and enum values were validated against the current
+      `dependabot-options-reference` from `github/docs@main`; SHA pins are preserved on update (the
+      github-actions manager bumps the SHA and rewrites the trailing version comment — unconditional
+      behaviour, no option to set). Watch item recorded in the file: `dtolnay/rust-toolchain` is
+      pinned to a commit on its `stable` *branch*, not a tag, so its PRs carry no version to
+      sanity-check the diff against. No `cargo` ecosystem entry — see the new open item below.
+
+      Original text: Now **nine** actions across
       `.github/workflows/{ci,release,soak}.yml` are pinned to commit SHAs (the CD work added
       `actions/download-artifact` plus the four `docker/*` actions), so patch/security updates no
       longer arrive on their own. Add `.github/dependabot.yml` with a
       `package-ecosystem: github-actions` entry so the pins are refreshed by PR. Offered to the
       user, not yet added. — *source: JOURNAL (Actions SHA-pinning, 2026-07-24; CD, 2026-07-30)*
 
-- [ ] **The CD pipeline has never run.** `release.yml`'s `build`/`publish`/`image`/`plugin` jobs were
+- [x] **The CD pipeline has never run.** *(closed 2026-08-06 — stale.)* It has run, successfully and
+      repeatedly: full five-platform runs for `v0.2.0` (41m), `v0.4.0` (39m) and `v0.5.0` (39m), plus a
+      successful `workflow_dispatch` on 2026-08-03. The specific unknowns the item listed
+      (`x86_64-apple-darwin` cross-compile, `zstd-sys` under MSVC, the `ubuntu-22.04-arm` label, and
+      the GHCR plugin push) are all answered by those green runs. The one thing still worth a manual
+      look is the item's last point — the visibility of the `imbh-log-driver` GHCR package created by
+      `GITHUB_TOKEN`, since a private one breaks `docker plugin install` for everyone else. Original
+      text below.
+
+      `release.yml`'s `build`/`publish`/`image`/`plugin` jobs were
       written and verified as far as a single host allows (the Dockerfile was built for both arches and
       the image run; the glibc guard, the smoke assertions, and the `docker,grpc,tracing` build were all
       checked locally), but no five-platform run has happened. Before the next release, do a
@@ -101,7 +169,72 @@ git history); this file tracks only what is still open.
       makes `docker plugin install` fail for everyone else. — *source: JOURNAL (CD, 2026-07-30; plugin
       publishing, 2026-08-03)*
 
-- [ ] **Measure the footprint budgets on the published targets.** `scripts/footprint-gate.sh` still
+- [x] **Measure the footprint budgets on the published targets.** *(closed 2026-08-06.)* Numbers
+      harvested from run `31004270880` (tag `v0.5.0`, commit `5ae4259`) and folded into
+      `ARCHITECTURE.md` Appendix C as a new subsection. Method matters: the `$GITHUB_STEP_SUMMARY`
+      table the item expected to read is **not reachable through the REST API** at all (no summary
+      endpoint; the check-run `output.summary` is `null` — it renders only in the web UI), so the five
+      `dist-*` artifacts were downloaded, unpacked and sized directly, and their SHA-256 sums verified
+      against the published Release's `SHA256SUMS` asset. Those are the shipped bytes, not an estimate,
+      and not the artifact-zip sizes (which would have been a compressed zip of a compressed tarball).
+      All five matrix targets are built *and* archived — nothing is built-but-unshipped. Two findings
+      worth more than the item: **x86_64-linux `imbhd` is 41.1 MB against §2's 42 MB target — about
+      888 KB of margin**, and the x86_64/aarch64 gap is 5.1 MB, so the aarch64 host figure the gate
+      normally prints is the optimistic end of the range rather than a representative one. Also
+      cross-validated: the aarch64-linux number is byte-identical to the pre-`docker-remap` baseline in
+      the 2026-08-06 JOURNAL entry. Follow-ups split out below. — *source: JOURNAL (CD, 2026-07-30)*
+
+- [x] **Retarget `OVERVIEW.md` §2's `imbhd` budget from musl to glibc x86_64.** *(closed 2026-08-06.)*
+      The `imbhd` row now names `x86_64-unknown-linux-gnu` — the largest target the release archives
+      actually ship — and carries the measured **41.1 MB** at v0.5.0 beside it. The old row named
+      `x86_64-unknown-linux-musl`, which CD builds nowhere, so the budget named a binary nobody could
+      measure and was in practice checked against whatever host ran the gate. The musl recommendation
+      stands and was not implemented: no musl archive, because a sixth fat-LTO leg needs
+      `cross`/`zigbuild` or a container (no native musl runner; `zstd-sys`/`onig_sys` build vendored C),
+      and the Alpine/`scratch` case is already served by the `bookworm-slim` image plus the CI-asserted
+      glibc ≤ 2.36 floor. §2's closing paragraph also gained the projection described in the item
+      below. Original text below.
+
+      Falls out of the
+      Appendix C harvest above, and supersedes the old item's "decide whether a musl archive is worth
+      adding". Recommendation from that work, for review rather than already applied: **do not add a
+      musl archive** — `x86_64-unknown-linux-musl` is built nowhere in CD (it survives only in
+      `about.toml`/`deny.toml` for license coverage), a sixth fat-LTO leg would need `cross`/`zigbuild`
+      or a container because there is no native musl runner and `zstd-sys`/`onig_sys` build vendored C,
+      and the Alpine/`scratch` demand is already served by the `bookworm-slim` image plus the
+      CI-asserted glibc ≤ 2.36 floor. Instead restate §2's `imbhd` row as glibc x86_64 with the
+      measured 41.1 MB beside it, so the budget names a target that actually ships and can therefore be
+      checked. Deliberately not done as part of the harvest, which was scoped to Appendix C.
+      — *source: TODO sweep 2026-08-06*
+
+- [ ] **The next release's x86_64 `imbhd` is projected ~3 MB OVER the §2 target, and the local gate
+      cannot see it.** *(quantified 2026-08-06; needs a CD dry run to confirm, then a decision.)* The
+      `docker-remap` delta is now measured **exactly** rather than estimated: two local aarch64 release
+      builds differing only in the feature, 35,973,488 → 39,997,800 bytes = **+4,024,312 B (+3.84 MiB)**.
+      The local baseline lands within **24 bytes** of CD's v0.5.0 aarch64 archive (35,973,464 B), so the
+      delta is trustworthy. Applying it to CD's x86_64-linux baseline of 41,112,104 B projects
+      **≈ 45.1 MB against a 42 MB target** — over by ~3 MB, still well under the 55 MB hard limit.
+      Two reasons this is live rather than theoretical: `release.yml`'s Linux legs carry
+      `docker,docker-remap,grpc,tracing` as of `fc70cf8` while v0.5.0 shipped `docker,grpc,tracing`, so
+      **the next release is the first whose x86_64 archive contains the VRL subtree at all**; and the
+      footprint gate on an aarch64 host reads 40.0 MB and **passes**, because the same binary is 5.1 MB
+      smaller there. The projection is conservative in the wrong direction — the delta was measured on
+      aarch64, and x86_64 codegen is demonstrably fatter, so the real number is more likely above 45.1
+      MB than below. Next step is a `workflow_dispatch` dry run (builds and smoke-tests all five
+      archives, publishes nothing) to replace the projection with a measurement; then the decision is
+      raise the target, trim the VRL subtree, or ship `docker-remap` only on a separate artifact. No
+      local confirmation is possible on this host — there is no x86_64 cross linker.
+      — *source: TODO sweep 2026-08-06*
+
+      Original framing: `v0.5.0` was built with
+      `docker,grpc,tracing`; `docker-remap` arrived later in `fc70cf8` on the current branch, and
+      `release.yml`'s Linux legs now carry it. So every per-target number in Appendix C predates the
+      VRL remapper, and the +3.8 MiB the JOURNAL measured locally has never been seen on the thin
+      x86_64-linux margin (888 KB). Worth a `workflow_dispatch` dry run before the next release rather
+      than discovering it during one. Pairs with the unmeasured-RSS item below.
+      — *source: TODO sweep 2026-08-06*
+
+      Original text: `scripts/footprint-gate.sh` still
       measures only the CI host, and `OVERVIEW.md` §2's budgets are musl numbers that nothing has ever
       verified (`x86_64-unknown-linux-musl` is in `about.toml`/`deny.toml` but is not a release-archive
       target). CD's `Package` step now writes per-target binary sizes into the run summary, so the
@@ -109,21 +242,52 @@ git history); this file tracks only what is still open.
       and decide whether a musl archive is worth adding alongside the glibc ones. — *source: JOURNAL
       (CD, 2026-07-30)*
 
-- [ ] **Windows portability beyond the directory fsync (issue #3 follow-up).** The `windows-latest`
+- [x] **Windows portability beyond the directory fsync (issue #3 follow-up).** *(closed 2026-08-06 —
+      stale.)* The job has run and is green on every recent CI run, including `main`. What it covers is
+      deliberately narrow (build the workspace, then `cargo test -p imbh-storage` and
+      `cargo test -p imbh --test lifecycle`), so the item's speculative next candidates — deletion and
+      rename of open or memory-mapped files during **compaction and retention** — are only partly
+      exercised by the lifecycle suite's compact step and not at all for retention. That residue is a
+      coverage question for a future test, not an unwatched first run. Original text below.
+
+      The `windows-latest`
       job added to `ci.yml` has never run — it was written without a Windows host to verify against
       (cross-compiling locally is blocked by `zstd-sys` needing mingw). It may surface further
       Windows-specific issues; deletion/rename of open or memory-mapped files during compaction and
       retention are the plausible next candidates. Watch the first run and fix what it finds. —
       *source: JOURNAL (issue #3, 2026-07-28)*
 
-- [ ] **Release carrying the Windows fix.** `imbh-storage` 0.1.0 on crates.io cannot open an on-disk
+- [x] **Release carrying the Windows fix.** *(closed 2026-08-06 — stale.)* `v0.1.1` is tagged on the
+      remote and published; four releases have shipped since (the workspace is at `0.5.0`). Original
+      text below.
+
+      `imbh-storage` 0.1.0 on crates.io cannot open an on-disk
       DB on Windows at all. The fix and the shared-version bump to **0.1.1** are on
       `fix/windows-dir-fsync` (PR #4), with the changelog entry staged under `## [Unreleased]`.
       Because the tree already carries 0.1.1, the release run is `cargo release` with **no** level
       argument (`cargo release patch` would bump again, to 0.1.2). Cutting it is the user's call
       (see `README.md` "Releasing"). — *source: JOURNAL (issue #3, 2026-07-28)*
 
-- [ ] **Docker log driver: `--tail 0 -f` has an inherent event-time race.** With `--tail 0` the
+- [x] **Docker log driver: `--tail 0 -f` has an inherent event-time race.** *(closed 2026-08-06 — and
+      **without** the ingest-sequence column the item asked for.)* `observed_time` already existed on
+      the logs schema (`schema.rs:110`, nullable, reserved at `:53`), was already on `LogEntry`, and the
+      Docker driver already set it from dockerd's capture stamp (`ingest.rs:216-219`) and deliberately
+      preserved it through VRL remap (`remap.rs:432-433`, test at `:830`). It was simply never exposed
+      as a query axis. Added `LogOrder { Time, ObservedTime }` and `LogQuery::observed_after`
+      (additive; both fields `#[serde(default)]` so old serialized queries still deserialize), then
+      moved the driver's watermark and follow loop onto the arrival clock while leaving `--tail N` and
+      full history ordered by **event** time, which is what `docker logs` prints. Only the cursor moved.
+      A subtlety worth keeping: neither clock is monotone in the other, so paged watermarks merge by
+      **max on each clock independently**, not by last-seen. The race test was confirmed non-vacuous —
+      reverting the three behavioural hunks fails 3 of 19 e2e tests with a read timeout. Also added the
+      projection-order pin (`projection_order_is_a_wire_contract`) that never existed, guarding
+      `imbh-lgtm`'s positional column reads. Three residues are documented in
+      `docs/DOCKER_LOG_DRIVER.md` rather than softened: a VRL script can overwrite
+      `.observed_timestamp`; an exact nanosecond tie is still broken once by the strict `>`; and
+      `--tail 0` has no uniquely correct answer, because json-file's semantic is defined by what is
+      durably recorded while imbh batches. Original text below.
+
+      With `--tail 0` the
       follow watermark deliberately jumps to `Timestamp::now()`, because "only new lines" is that
       flag's defined semantic. But a record's timestamp is when the container emitted the line while
       ingest lands it up to one batch interval later, so a line emitted just before the follow starts
@@ -132,7 +296,31 @@ git history); this file tracks only what is still open.
       accepting it, or tracking an ingest-time column alongside event time so the tail can watermark
       on arrival order. — *source: JOURNAL (E2E against a real dockerd, 2026-07-30)*
 
-- [ ] **Typed `MetricsApi` still counts duplicate metric points.** Issue #27 gave PromQL a
+- [x] **Typed `MetricsApi` still counts duplicate metric points.** *(closed 2026-08-06 — and the
+      item's own proposed fix was the wrong one.)* The item said a window dedup "would need the
+      ingest-sequence column the metric schemas do not have". It does not: `ARCHITECTURE.md` §10.5.1
+      and line 1311 already require duplicates to be resolved **by value, never by scan order**,
+      precisely so two identical queries cannot disagree after a flush or compaction. Ordering by an
+      ingest sequence would have made the typed API and PromQL resolve the same duplicate differently.
+      Implemented as `ROW_NUMBER() OVER (PARTITION BY "time", metric, service, resource, scope,
+      attributes ORDER BY isnan(value) ASC, value DESC)` keeping rank 1, gated on
+      `Duplicates::LastWins`; under every other policy the SQL is byte-identical to before, and the
+      `WHERE` stays on the inner scan so the §9.2 pushdown contract is untouched. `instant` and
+      `range_batches` inherit it free. Two findings that changed the plan mid-flight: **`value = value`
+      does not detect NaN** — DataFusion 54 orders floats by a total order, not IEEE, so that idiom and
+      every comparison variant return *true* for NaN and a NaN would have silently won every duplicate;
+      and **`isnan` is available anyway** despite the `default-features = false` pin, because
+      DataFusion declares `datafusion-functions` non-optional with default features on, at zero crate
+      cost (verified: count unchanged at 275). Both anti-regression tests were **mutation-checked** —
+      dropping `resource, scope` from the partition key, or dropping `isnan`, makes them fail.
+      Deferred deliberately, with reasons recorded in §10.5.1: `ErrorOnRead` parity, which would cost a
+      detection scan on every typed range query for every user and turn today's numbers into errors on
+      published crates. One known weakness: the PromQL-agreement test compares against an **inline
+      mirror** of `collapse_duplicate_samples`, not the real function, because `imbh-lgtm` depends on
+      `imbh` and importing it would be a dev-dependency cycle; a true cross-crate check would have to
+      live in `imbh-lgtm`. Original text below.
+
+      Issue #27 gave PromQL a
       `Duplicates` policy (ARCHITECTURE.md §10.5.1), but `MetricsApi::range`/`instant`
       (`crates/imbh/src/metrics.rs`) still `SUM`/`COUNT` two points sharing a series and a timestamp,
       so `sum`/`count` inflate and `avg` skews (`RateMode::Counter`'s `max - min` is immune). A known
@@ -142,17 +330,46 @@ git history); this file tracks only what is still open.
       ingest-sequence column the metric schemas do not have. Note the item above wants that same
       column for the log-driver tail race; one column would close both. — *source: issue #27*
 
-- [ ] **The footprint gate's `datafusion` assertion is vacuous.**
-      `scripts/footprint-gate.sh` greps `cargo tree -p imbh --edges normal` for `datafusion v`, but the
-      graph contains only the split crates (`datafusion-core`, `datafusion-common`,
-      `datafusion-physical-plan`, …) and no bare `datafusion`. It therefore prints `datafusion: NO` on
-      a perfectly healthy tree and would print the same thing if the engine really did vanish — so it
-      guards nothing. Fix is a one-liner (`grep -q 'datafusion[a-z-]* v'`, or assert on
-      `datafusion-core`), but pick the pattern deliberately: the point of the check is to catch a
-      feature-flag mistake that silently drops the query engine. Note the tantivy check on the next
-      line does work, which is why this went unnoticed. — *source: JOURNAL (2026-08-06, part 2)*
+- [x] **The footprint gate's `datafusion` assertion is vacuous.** *(closed 2026-08-06, with the
+      diagnosis corrected.)* **The premise was wrong**: the bare `datafusion v54.1.0` crate *is* in
+      `imbh`'s graph (2 matching lines; line 185 of 999, alongside 30 split crates), so the pattern
+      matched fine and the check was not vacuous in the way stated. The check was still weak for a
+      different reason, and was fixed on three axes:
+      1. **It printed `yes`/`NO` and exited 0.** A `NO` that does not fail guards nothing regardless of
+         the pattern. Both engine checks now set `fail=1`, matching the search-lever guard below them.
+         `search` and `query` are on by default, so absence is never a deliberate trim.
+      2. **The pattern was pinned to the bare facade.** Now `datafusion(-[a-z-]+)? v` — the crate
+         *family* — so it will not false-alarm the day `imbh-query` depends on `datafusion-core`
+         instead of the facade.
+      3. **`grep -q` under `set -o pipefail`.** All four `grep -q` sites now read from here-strings
+         rather than a pipe. `grep -q` exits on first match, which can leave the upstream writer with
+         a broken pipe and make the pipeline report SIGPIPE (141) despite the match. **Caveat on the
+         numbers**: the subagent reported measuring 63 false negatives in 400 runs, but that did not
+         reproduce on re-check (0 in 900) and the mechanism cannot fire at the current size — the tree
+         is ~55 KiB, under the 64 KiB pipe buffer, so the writer never blocks. Treat the here-strings
+         as cheap insurance against a future larger tree, not as a fix for a measured flake. The
+         likelier cause of whatever was observed is `cargo tree` failing under concurrent-cargo lock
+         contention (three agents were running at the time) with its stderr swallowed by `2>/dev/null`.
+      4. **A regression introduced by (1), caught in review and fixed**: because the checks now fail
+         hard, an empty `$tree` from a failed `cargo tree` turned a transient infrastructure hiccup
+         into a red gate claiming both engines had vanished. The capture is now guarded and reports
+         "could not run" once, distinctly, with cargo's own error. — *source: JOURNAL (2026-08-06,
+         part 2)*
 
-- [ ] **`QUALITY_GATE.md`'s search-off crate count is wrong (216 vs the measured 71).** The doc says
+- [x] **`QUALITY_GATE.md`'s search-off crate count is wrong (216 vs the measured 71).** *(closed
+      2026-08-06.)* Took option (b) — the doc meant the search-only lever, so the genuine measurement
+      was added rather than just correcting a digit. Measured on aarch64-glibc with
+      `cargo tree -p imbh --edges normal` (unique): default `ingest,query,search` = **275**;
+      `--no-default-features --features ingest,query` = **217** (-58, the tantivy subtree — the *real*
+      cost of turning search off); `--no-default-features` = **71** (-204, which also drops OTLP decode
+      and the whole DataFusion subtree). The doc's 216 was the search lever's number attached to the
+      wrong knob. The gate itself was the origin of the confusion — its old
+      `tantivy dropped: yes (-204 crates)` line attributed the entire `--no-default-features` delta to
+      tantivy — so it now prints all three numbers, labelled, and additionally checks the precise
+      `ingest,query` lever for tantivy leakage, not just the bare build. Also added a §1
+      scripting-pitfall note. — *source: JOURNAL (2026-08-06, part 2)*
+
+      Original text: The doc says
       "turning `search` off (`imbh --no-default-features`) drops the tantivy subtree to 216 crates";
       the gate measures **71**. The two are not the same operation — `--no-default-features` drops
       `ingest`, `query` *and* `search`, so it also takes the entire DataFusion subtree with it, which
@@ -160,13 +377,98 @@ git history); this file tracks only what is still open.
       genuine search-off-only measurement (`--no-default-features --features ingest,query`) if that is
       the lever the doc meant to document. — *source: JOURNAL (2026-08-06, part 2)*
 
-- [ ] **RSS is unmeasured for the `docker-remap` build.** The footprint work for the VRL remapper ran
+- [x] **RSS is unmeasured for the `docker-remap` build.** *(closed 2026-08-06 — measured on both
+      axes; nothing is blown.)* Two separate measurements, because the first one is not the one the
+      item was about. **Database** (`RSS_PROBE=1`, `examples/rss-probe`, aarch64 glibc VmRSS): idle
+      **15.0 MB**, steady **104.8 MB**, against §2's 40 / 200 MB targets — but `rss-probe` is not even
+      built with `docker-remap`, so it is only the baseline. **Driver** (new opt-in soak,
+      `crates/imbh-server/tests/soak_docker_rss.rs`, release): the item's actual concern. Idle
+      **12 MiB**, worst steady across the whole matrix **93 MiB** (peak 100), and a remapping plugin at
+      **100 concurrently-logging containers sits at 67 MiB** — comfortably inside the 200 MB steady
+      target. The item's central claim is **confirmed, not assumed**: the remap differential decomposes
+      as **4.0 MiB fixed + 0.165 MiB per container**, and holding containers fixed while varying line
+      count over a 100× range moves it by +1.0 / +2.3 / +1.4 MiB, i.e. noise. Idle is *identical* with
+      and without remapping (12 MiB), because the `Runtime` is built at `StartLogging`.
+      Method note worth keeping: the soak measures three columns, not two — plain `docker`,
+      `docker-remap` with the **identity script `.`**, and `docker-remap` with the built-in script. The
+      identity control is what makes the line-rate number interpretable: it provably yields
+      byte-identical records to no script yet still clones a seed per line, so `identity − off` isolates
+      the remapper machinery, while `builtin − identity` turns out to be payload growth (a parsed
+      kvlist body is simply bigger) rather than remapper state. Also corrected while measuring: the
+      seed clone at `remap.rs:385` is allocation **churn, not retained memory**, and the doc comment at
+      `remap.rs:319` overstates it by claiming the event object's allocation is recycled — the
+      `TargetValue` is reused but the whole `Value` is replaced. Gated `#[ignore]` plus
+      `cfg(all(feature = "docker", unix, target_os = "linux"))`, verified to build **0 tests** on the
+      default path. Original text below.
+
+      The footprint work for the VRL remapper ran
       the gate with `RSS_PROBE=0`, so §2's idle (40 MB) and steady (200 MB) targets have not been
       checked against a remapping plugin. Crate count and binary size were measured (+89 crates,
       +3.8 MiB, plugin binary 40.0 MB against a 42 MB target). Steady-state is the plausibly-affected
       axis: each container's FIFO thread owns a VRL `Runtime`, and each line clones a seed event
       object — so the cost scales with container count, not line rate. `cargo run --release -p
       rss-probe` plus a driver soak would close it. — *source: JOURNAL (2026-08-06)*
+
+- [x] **Check the `imbh-log-driver` GHCR package's visibility.** *(closed 2026-08-06 — both packages
+      are public.)* Verified by the property that actually matters rather than by reading a settings
+      page: an **anonymous** pull token from `ghcr.io/token` followed by `GET /v2/<pkg>/tags/list`
+      returns `200` for both `moriyoshi/imbh` (tags `0.2.0` … `0.5.0`, `latest`) and
+      `moriyoshi/imbh-log-driver` (`0.5.0-amd64` / `0.5.0-arm64` / `0.5-*` / `latest-*`). That is
+      exactly the access `docker plugin install` needs from a stranger, so nothing is blocked. The
+      plugin carries v0.5.0 tags only, which is consistent — plugin publishing was added 2026-08-03.
+      Note for whoever repeats this: `gh api user/packages` needs the `read:packages` scope, which the
+      local token does not have; the anonymous registry check needs no scope at all and tests the real
+      property. — *source: TODO sweep 2026-08-06*
+
+- [x] **Decide whether Dependabot should also watch `cargo`.** *(closed 2026-08-06 — security updates
+      only.)* A `cargo` entry was added at `directory: "/"` with **`open-pull-requests-limit: 0`**,
+      which is the documented way to run an ecosystem for security updates alone: per GitHub's options
+      reference, "you can temporarily disable version updates for a package manager by setting this
+      option to zero", and "security update pull requests are not subject to this limit and do not
+      count toward it". There is no separate "security only" switch; this is the mechanism. Rationale
+      recorded in the file — routine version churn stays a deliberate `cargo update` with the footprint
+      gate re-run (the margin is thin: v0.5.0 x86_64-linux `imbhd` measured 41.1 MB against a 42 MB
+      target), but an *advisory* had no automated path at all, since `cargo-deny` fails CI on RUSTSEC
+      without fixing anything. Raise the limit above 0 only alongside a decision about who re-runs the
+      gate per bump. Original text below.
+
+      Deliberately left out of
+      `.github/dependabot.yml` (the item asked only for github-actions), and it is a real tradeoff
+      rather than an oversight. *For*: 15 workspace crates and a large graph, where transitive security
+      fixes currently arrive only when someone runs `cargo update` by hand — `cargo-deny` catches
+      advisories in CI, but catching is not fixing. *Against*: the footprint budgets are load-bearing,
+      not advisory (`scripts/footprint-gate.sh` gates crate count at 275/300 and binary size), a patch
+      bump can eat gate headroom without tripping it, and Dependabot has no notion of the hand-trimmed
+      `default-features = false` sets the project depends on — plus a graph this size on `weekly` means
+      steady PR traffic, each PR costing a full multi-job CI run. Middle path if wanted: a `cargo`
+      entry restricted to security updates via `allow`, or patch-only grouped with a low
+      `open-pull-requests-limit`. — *source: TODO sweep 2026-08-06*
+
+- [x] **Windows coverage stops short of compaction and retention.** *(closed 2026-08-06 — and it was
+      hiding a real defect, not just a test gap.)* Filed as a coverage item; investigating it found the
+      bug the coverage would have caught. `Storage::retain` and `Storage::compact` propagated the
+      post-manifest unlink error with `?`. On POSIX an unlink always succeeds regardless of open
+      handles or mappings, so this was silently fine; **on Windows a file with a live memory mapping
+      cannot be deleted at all**, whatever share flags its opener passed — and `imbh-index`'s
+      `search_body` / `search_attr_eq` hold exactly such mappings via Tantivy's `MmapDirectory` on the
+      `.tidx` sidecars, while queries run on the tokio runtime concurrently with the background
+      `maintain()` / `retain()` pass. So one concurrent `matches()` pushdown racing maintenance would
+      turn a pass that had **already succeeded** (the manifest was durable without those segments) into
+      a hard `Err`, and abandon the rest of the batch mid-loop. **This is a code-reading conclusion,
+      not an observed failure** — the work was done on Linux, where the bad ordering succeeds silently,
+      and no Windows host was available to reproduce it. Fixed by a `reclaim_segments` helper
+      (`crates/imbh-storage/src/lib.rs:2601`) making the unlink best-effort with a `tracing` warning:
+      not a new failure mode, since a crash in the same window already left orphans and
+      `cleanup_orphans` sweeps them on the next open. No public API change, so no semver impact.
+      Three tests in `imbh-storage` and one in `imbh --test lifecycle` — both targets the Windows leg
+      already runs, so **no CI widening was needed**; the job's comment was extended to name the new
+      coverage. The tolerance test pins segments with a live `memmap2::Mmap` and was confirmed
+      non-vacuous by temporarily panicking inside `reclaim_segments` (it was the only test in the suite
+      to trip that branch). `memmap2` was added as a **dev-dependency only** and already reaches the
+      graph via tantivy, so the footprint gate is unaffected — verified at 275/275 crates.
+      Not done deliberately: a persistent retry queue so a refused unlink retries on the next pass
+      rather than waiting for a reopen — invasive new durable state, and the orphan sweep already
+      bounds the leak. — *source: TODO sweep 2026-08-06*
 
 ## Closed, awaiting the next sweep
 

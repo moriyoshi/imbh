@@ -2565,6 +2565,7 @@ version = "0.5.0"
 dependencies = [
  "base64",
  "imbh",
+ "imbh-head",
  "imbh-test-support",
  "serde_json",
  "tempfile",
@@ -2654,6 +2655,7 @@ dependencies = [
  "fs4",
  "imbh-core",
  "imbh-index",
+ "memmap2",
  "parquet",
  "tempfile",
  "tracing",

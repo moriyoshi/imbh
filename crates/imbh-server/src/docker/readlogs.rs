@@ -7,14 +7,30 @@
 //!
 //! History comes from a typed [`LogQuery`] on the `container.id` resource attribute — the query
 //! surface an embedder would use (ARCHITECTURE.md §10.6), not a hand-written SQL string. Follow mode
-//! then polls for records newer than the last one written.
+//! then polls for records that **arrived** after the last one written.
+//!
+//! # Two clocks
+//!
+//! Every record carries both OTel instants: `time` is when the container emitted the line, and
+//! `observed_time` is when the driver captured it off the stream. They are not interchangeable, and
+//! each drives exactly one thing here:
+//!
+//! * **Output order is event time.** `docker logs` prints lines in the order the container printed
+//!   them, so the `--tail N` and full-history pages are ordered by `time` — including when a remap
+//!   script lifted a line's own timestamp onto the record.
+//! * **The follow watermark is arrival time.** Event time cannot be a watermark: ingest batches, so
+//!   a line emitted *before* the follow opened can be stored *after* it, and a `time > last` filter
+//!   would step straight over it. `observed_time` is monotonic in the order rows become visible, so
+//!   `observed_time > last_observed` cannot skip one. See `docs/DOCKER_LOG_DRIVER.md` ("Follow mode
+//!   and the two clocks") for the residual cases this does *not* fix.
 
 use std::io::Write;
 use std::sync::Arc;
 use std::time::Duration;
 
 use imbh::{
-    Db, Direction, LogEntry as LogRow, LogQuery, LogStringField, StringPredicate, Timestamp,
+    Db, Direction, LogEntry as LogRow, LogOrder, LogQuery, LogStringField, StringPredicate,
+    Timestamp,
 };
 
 use super::entry::{LogEntry, write_entry};
@@ -82,6 +98,43 @@ impl ReadRequest {
     }
 }
 
+/// How far a response has got, on both clocks (see the module header).
+///
+/// `observed` is what follow mode resumes from — the newest **arrival** written. `time` is the
+/// newest **event** time written, and is used for one thing only: deciding that a `--until`-bounded
+/// follow has delivered everything it was asked for. Both are `None` until a row is written.
+#[derive(Clone, Copy, Default)]
+struct Watermark {
+    observed: Option<Timestamp>,
+    time: Option<Timestamp>,
+}
+
+impl Watermark {
+    /// Fold a row's instants in, keeping the maximum on each clock.
+    fn absorb(&mut self, row: &LogRow) {
+        self.merge(Watermark {
+            observed: row.observed_time,
+            time: Some(row.time),
+        });
+    }
+
+    /// Fold another watermark in, keeping the maximum on each clock. Neither clock is monotonic
+    /// with respect to the other — a page ordered by one is unordered in the other — so this takes
+    /// the maximum rather than the last value seen.
+    fn merge(&mut self, other: Watermark) {
+        if let Some(observed) = other.observed
+            && self.observed.is_none_or(|o| observed > o)
+        {
+            self.observed = Some(observed);
+        }
+        if let Some(time) = other.time
+            && self.time.is_none_or(|t| time > t)
+        {
+            self.time = Some(time);
+        }
+    }
+}
+
 /// Serve one `ReadLogs` request, streaming frames into `out` until the history (and, under
 /// `Follow`, the live tail) is exhausted or the client goes away.
 ///
@@ -108,15 +161,26 @@ pub fn stream<W: Write>(
     // `Until` also bounds the history page, so forward paging cannot be shifted by rows arriving
     // mid-scan: the window is fixed before the first query runs.
     let history_end = req.until.unwrap_or_else(Timestamp::now);
-    // `None` means "nothing written yet", which is *not* the same as "caught up to now" — see the
-    // watermark note below.
-    let mut last: Option<Timestamp> = match req.tail {
-        // `--tail 0` asks for no history, so skipping straight to the present is its defined
-        // semantic, not a race.
-        0 => Some(history_end),
+    let mut mark = match req.tail {
+        // `--tail 0` asks for no history at all, so nothing is written and the cut has to come from
+        // a probe instead: the newest row this container has already *recorded*. That instant, not
+        // the wall clock, is the watermark — a line the container emitted a moment ago but that
+        // ingest has not stored yet still arrives after it, so follow mode picks it up.
+        //
+        // `None` (the container has nothing recorded) is the right answer, not a fallback: there is
+        // no history to skip, so the follow starts from the beginning of arrival time and every row
+        // that lands from here on is new.
+        0 => Watermark {
+            observed: newest_recorded_arrival(&rt, db, &req),
+            // Nothing was written, so there is no event-time progress to report. The request's own
+            // upper bound stands in, because this field feeds *only* the `--until` stop check
+            // below: `--tail 0 --until <past>` has nothing to wait for and must return at once.
+            time: Some(history_end),
+        },
         n if n > 0 => {
             // The last N: read backwards (the `logs` table's natural direction), then emit oldest
-            // first, which is the order `docker logs` prints.
+            // first, which is the order `docker logs` prints. Ordering stays on **event** time —
+            // this is history, and history reads in the order the container printed it.
             let q = req
                 .query(req.since, Some(history_end))
                 .direction(Direction::Backward)
@@ -136,54 +200,87 @@ pub fn stream<W: Write>(
     loop {
         std::thread::sleep(POLL_INTERVAL);
         if let Some(until) = req.until
-            && last.is_some_and(|l| l >= until)
+            && mark.time.is_some_and(|t| t >= until)
         {
             return Ok(());
         }
-        // The follow watermark is the last record *written*, not the wall clock. When history came
-        // back empty the watermark stays at the request's lower bound, because a record's timestamp
+        // Resume from the newest **arrival** written, never from the wall clock. A record's `time`
         // is when the container emitted the line while ingest lands it up to one batch interval
-        // later: advancing to "now" on an empty history would permanently skip every line already
-        // emitted but not yet stored. `docker logs -f` on a container that just started is exactly
-        // that case — it cost the first line of every follow before this was fixed.
-        let after = match last {
-            Some(t) => Timestamp::from_unix_nanos(t.unix_nanos().saturating_add(1)),
-            None => req.since.unwrap_or(Timestamp::from_unix_nanos(i64::MIN)),
-        };
+        // later, so an event-time watermark steps over any line that was emitted before the follow
+        // began and stored after it — in practice the first line of every `docker logs -f` on a
+        // container that just started, and any line a remap script back-dated.
+        //
+        // An empty watermark means "replay everything that has an arrival instant". Rows with a
+        // NULL `observed_time` (nothing this driver writes — an OTLP producer may) never match
+        // `observed_after` and so are never followed; they cannot be placed against a watermark, and
+        // replaying them on every poll would be worse than omitting them.
+        let after = mark
+            .observed
+            .unwrap_or_else(|| Timestamp::from_unix_nanos(i64::MIN));
+        // `--since`/`--until` still bound **event** time, because that is what they mean to
+        // `docker logs`. Only the cursor moved to the arrival clock — and the ordering with it, so
+        // that `LIMIT PAGE` cuts the page on the same axis the watermark advances along.
         let q = req
-            .query(Some(after), req.until)
+            .query(req.since, req.until)
+            .observed_after(after)
+            .order_by(LogOrder::ObservedTime)
             .direction(Direction::Forward)
             .limit(PAGE);
         let rows = rt.block_on(query(db, q));
-        match write_rows(out, &rows)? {
-            Some(newest) => {
-                last = Some(newest);
-                idle = 0;
-            }
+        let page = write_rows(out, &rows)?;
+        if rows.is_empty() {
             // Nothing new. Keep waiting while the container is still logging; once its stream is
             // gone and the tail has stayed quiet, `docker logs -f` should return like it does for
             // any other driver.
-            None => {
-                idle += 1;
-                if !active(&req.container_id) && idle >= IDLE_POLLS_BEFORE_EXIT {
-                    return Ok(());
-                }
+            idle += 1;
+            if !active(&req.container_id) && idle >= IDLE_POLLS_BEFORE_EXIT {
+                return Ok(());
             }
+        } else {
+            // Every row on this page passed `observed_after`, so its arrival is Some and strictly
+            // ahead of the old mark. The event-time mark only moves forwards: a page ordered by
+            // arrival may well carry an older event time than one already written.
+            mark.merge(page);
+            idle = 0;
         }
     }
 }
 
-/// Stream the whole history in `PAGE`-sized pages, oldest first. Returns the newest timestamp
-/// written, if any.
+/// The arrival instant of the newest row this container has already recorded — the `--tail 0` cut.
+///
+/// One backwards page of size 1 ordered by `observed_time`; `LogOrder::ObservedTime` sorts NULLs
+/// last, so a row with no arrival instant can never be picked as the cut. `None` when the container
+/// has recorded nothing (or nothing with an arrival instant), which follow mode reads as "start from
+/// the beginning of arrival time".
+fn newest_recorded_arrival(
+    rt: &tokio::runtime::Runtime,
+    db: &Arc<Db>,
+    req: &ReadRequest,
+) -> Option<Timestamp> {
+    // Deliberately unbounded on event time: `--since`/`--until` select which lines get *printed*,
+    // while this asks the different question of what is already on disk. A line stored under an
+    // out-of-window timestamp is still not new.
+    let q = req
+        .query(None, None)
+        .order_by(LogOrder::ObservedTime)
+        .direction(Direction::Backward)
+        .limit(1);
+    rt.block_on(query(db, q))
+        .first()
+        .and_then(|row| row.observed_time)
+}
+
+/// Stream the whole history in `PAGE`-sized pages, oldest first **by event time** — the order
+/// `docker logs` prints. Returns the high-water mark of everything written.
 fn write_history<W: Write>(
     rt: &tokio::runtime::Runtime,
     db: &Arc<Db>,
     req: &ReadRequest,
     end: Timestamp,
     out: &mut W,
-) -> std::io::Result<Option<Timestamp>> {
+) -> std::io::Result<Watermark> {
     let mut cursor = None;
-    let mut newest = None;
+    let mut mark = Watermark::default();
     loop {
         let mut q = req
             .query(req.since, Some(end))
@@ -196,15 +293,13 @@ fn write_history<W: Write>(
             Ok(p) => p,
             Err(e) => {
                 super::warn(&format!("ReadLogs query failed: {e}"));
-                return Ok(newest);
+                return Ok(mark);
             }
         };
-        if let Some(ts) = write_rows(out, &page.entries)? {
-            newest = Some(ts);
-        }
+        mark.merge(write_rows(out, &page.entries)?);
         match page.next {
             Some(next) => cursor = Some(next),
-            None => return Ok(newest),
+            None => return Ok(mark),
         }
     }
 }
@@ -221,20 +316,21 @@ async fn query(db: &Arc<Db>, q: LogQuery) -> Vec<LogRow> {
     }
 }
 
-/// Write rows as frames, returning the newest timestamp written (`None` when `rows` is empty).
-fn write_rows<W: Write>(out: &mut W, rows: &[LogRow]) -> std::io::Result<Option<Timestamp>> {
-    let mut newest = None;
+/// Write rows as frames, returning the high-water mark of what was written on **both** clocks (an
+/// all-`None` [`Watermark`] when `rows` is empty).
+///
+/// Both are needed: the `--tail N` and full-history paths order by event time but hand follow mode
+/// an *arrival* watermark, and those are two different rows in general.
+fn write_rows<W: Write>(out: &mut W, rows: &[LogRow]) -> std::io::Result<Watermark> {
+    let mut mark = Watermark::default();
     for row in rows {
         write_entry(out, &to_entry(row))?;
-        newest = Some(match newest {
-            Some(t) if t > row.time => t,
-            _ => row.time,
-        });
+        mark.absorb(row);
     }
-    if newest.is_some() {
+    if !rows.is_empty() {
         out.flush()?;
     }
-    Ok(newest)
+    Ok(mark)
 }
 
 /// Rebuild the wire entry from a stored row. `log.iostream` restores the original stream, and the

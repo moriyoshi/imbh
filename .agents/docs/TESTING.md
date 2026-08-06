@@ -90,6 +90,16 @@ crate, so the footprint graph is unchanged). Unless noted, these run in the defa
 - **RSS soak (opt-in)** — `crates/imbh/tests/soak_rss.rs` (`#[ignore]`, Linux only): a sustained
   ingest→seal→query loop asserts steady-state `VmRSS` stays under a runaway sentinel (closes the
   QUALITY_GATE §2 unmeasured-RSS gap). Run: `cargo test -p imbh --test soak_rss -- --ignored --nocapture`.
+- **Docker log-driver RSS soak (opt-in)** — `crates/imbh-server/tests/soak_docker_rss.rs`
+  (`#[ignore]` **and** `#[cfg(feature = "docker")]`, Linux only): the same RSS question for the
+  *plugin* rather than the database, scaled by the axis the VRL remapper's cost rides on. Each cell
+  re-executes the test binary as a fresh process running `serve_plugin_with_config` over real FIFOs
+  whose writers stay open, so every container's reader thread — and its VRL `Runtime` — is alive when
+  `VmRSS` is sampled. Columns are `off` / identity `.` / built-in script, which separates remapper
+  machinery from the fatter structured record it produces. Run both ways for the full differential:
+  `cargo test --release -p imbh-server --features docker-remap --test soak_docker_rss -- --ignored --nocapture`
+  and the same with `--features docker`. Release only — a debug RSS figure is not comparable to
+  OVERVIEW.md §2.
 
 ## Conventions
 

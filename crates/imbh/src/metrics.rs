@@ -116,7 +116,7 @@ impl MetricsApi {
     /// A range query → a [`Matrix`] of series over `step` buckets.
     pub async fn range(&self, q: MetricQuery) -> Result<Matrix> {
         let mut params = SqlParams::with_promote(self.db.storage.promote().keys());
-        let sql = q.range_sql(&mut params);
+        let sql = q.range_sql(&mut params, self.db.duplicates().collapses_at_read());
         let batches = self
             .db
             .sql_with_params(sql, params.into_values())
@@ -136,7 +136,7 @@ impl MetricsApi {
         q: MetricQuery,
     ) -> Result<(Vec<arrow::record_batch::RecordBatch>, crate::QueryStats)> {
         let mut params = SqlParams::with_promote(self.db.storage.promote().keys());
-        let sql = q.range_sql(&mut params);
+        let sql = q.range_sql(&mut params, self.db.duplicates().collapses_at_read());
         let started = std::time::Instant::now();
         let (_schema, batches, scan) = self
             .db
@@ -437,7 +437,9 @@ impl MetricQuery {
         self
     }
 
-    fn range_sql(&self, p: &mut SqlParams) -> String {
+    /// `collapse_duplicates` is [`imbh_core::Duplicates::collapses_at_read`] — see
+    /// [`DUP_PARTITION_KEYS`] and the dedup subquery below.
+    fn range_sql(&self, p: &mut SqlParams, collapse_duplicates: bool) -> String {
         let step_ns = step_nanos(self.step);
         let mut select = vec![format!(
             "(CAST(\"time\" AS BIGINT) / {step_ns}) * {step_ns} AS bucket"
@@ -474,15 +476,55 @@ impl MetricQuery {
             conds.push(label_cond(k, *op, v, p));
         }
 
+        // The `WHERE` stays on the *inner* scan in both shapes, so the `TableProvider` pushdown
+        // contract (ARCHITECTURE.md §9.2) and the `matches()`/bloom paths are untouched by the dedup wrapper.
+        let scan = format!("{} WHERE {}", self.table.as_str(), conds.join(" AND "));
+        let from = if collapse_duplicates {
+            format!(
+                "(SELECT *, ROW_NUMBER() OVER (PARTITION BY {DUP_PARTITION_KEYS} ORDER BY {DUP_VALUE_ORDER}) \
+                 AS __dup_rank FROM {scan}) AS deduped WHERE __dup_rank = 1"
+            )
+        } else {
+            scan
+        };
+
         format!(
-            "SELECT {} FROM {} WHERE {} GROUP BY {} ORDER BY bucket",
+            "SELECT {} FROM {from} GROUP BY {} ORDER BY bucket",
             select.join(", "),
-            self.table.as_str(),
-            conds.join(" AND "),
             group.join(", ")
         )
     }
 }
+
+/// The columns that make two scalar-metric rows **the same data point** for duplicate collapsing
+/// under [`imbh_core::Duplicates::LastWins`] (ARCHITECTURE.md §10.5.1).
+///
+/// This is **row identity, not PromQL label-set identity**, and that distinction is load-bearing:
+/// `resource` and `scope` MUST be in the key. Resource-level dimensions such as `k8s.pod.name` and
+/// `host.name` live in `resource`, so five replicas emitting the same counter at the same instant
+/// differ in *nothing else* — same `time`, `metric`, `service` and datapoint `attributes`.
+/// Partitioning on `(time, metric, service, attributes)` alone would collapse a legitimate 5-way
+/// `sum` to a single point, turning a modest over-count into a large **under**-count on exactly the
+/// counters people alert on. Only byte-identical-identity rows are duplicates.
+///
+/// Promoted attribute columns are deliberately absent: they are projections of the `attributes`
+/// JSON, which is stored verbatim, so `attributes` already discriminates them.
+const DUP_PARTITION_KEYS: &str = "\"time\", metric, service, resource, scope, attributes";
+
+/// The tie-break that picks the survivor of a duplicated instant. It must be a total order on the
+/// **value** so the result is a pure function of the scanned multiset — metric segments carry no
+/// ingest-sequence column, so a positional ("last row the scan emitted") rule would let two
+/// identical queries disagree after a flush or a compaction (ARCHITECTURE.md §10.5.1, issue #27).
+///
+/// This mirrors `imbh-lgtm`'s `duplicate_value_cmp` exactly: a real number always outranks NaN,
+/// then the greater value wins. DataFusion's float ordering is the same total order as
+/// `f64::total_cmp` (NaN sorts *above* `+INFINITY`), which is why the explicit `isnan` demotion is
+/// required rather than implied — without it one NaN row would punch a hole in a good series.
+/// `isnan` is a DataFusion built-in that is always registered: `datafusion` depends on
+/// `datafusion-functions` with default features (hence `math_expressions`) as a non-optional
+/// dependency, so the workspace's `default-features = false` pin does not remove it. The
+/// `range_dedup_orders_nan_below_real_values` test is the canary if that ever changes.
+const DUP_VALUE_ORDER: &str = "isnan(value) ASC, value DESC";
 
 /// A typed histogram-quantile query over the `metrics_histogram` table (ARCHITECTURE.md §10.8). Computes
 /// the `phi`-quantile of **each** explicit-bucket data point via the `histogram_quantile` UDF and
@@ -1514,5 +1556,417 @@ mod native_point_query_tests {
                 ScalarValue::Utf8(Some(pattern.to_owned())),
             ]
         );
+    }
+}
+
+/// Duplicate-timestamp collapsing in the typed range/instant path (ARCHITECTURE.md §10.5.1, issue #27).
+#[cfg(all(test, feature = "ingest", feature = "query"))]
+mod duplicate_collapse_tests {
+    use super::*;
+    use crate::Db;
+    use imbh_core::Duplicates;
+    use std::cmp::Ordering;
+    use std::sync::Arc;
+
+    /// One gauge data point to ingest: `(time_unix_nano, value, datapoint attributes)`.
+    type Point<'a> = (u64, f64, &'a [(&'a str, &'a str)]);
+
+    /// One OTLP `ResourceMetrics` block: the resource identity (`service.name` plus any extra
+    /// resource attributes) and its gauge data points.
+    struct Block<'a> {
+        service: &'a str,
+        resource_attrs: &'a [(&'a str, &'a str)],
+        points: &'a [Point<'a>],
+    }
+
+    impl<'a> Block<'a> {
+        fn new(points: &'a [Point<'a>]) -> Self {
+            Block {
+                service: "svc",
+                resource_attrs: &[],
+                points,
+            }
+        }
+    }
+
+    fn otlp_gauge(metric: &str, blocks: &[Block<'_>]) -> Vec<u8> {
+        use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
+        use opentelemetry_proto::tonic::common::v1::{AnyValue as PbAny, KeyValue, any_value};
+        use opentelemetry_proto::tonic::metrics::v1::{
+            Gauge, Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics, metric,
+            number_data_point,
+        };
+        use opentelemetry_proto::tonic::resource::v1::Resource;
+        use prost::Message;
+
+        let kv = |k: &str, v: &str| KeyValue {
+            key: k.to_owned(),
+            value: Some(PbAny {
+                value: Some(any_value::Value::StringValue(v.to_owned())),
+            }),
+            ..Default::default()
+        };
+        let resource_metrics = blocks
+            .iter()
+            .map(|b| {
+                let mut attrs = vec![kv("service.name", b.service)];
+                attrs.extend(b.resource_attrs.iter().map(|(k, v)| kv(k, v)));
+                ResourceMetrics {
+                    resource: Some(Resource {
+                        attributes: attrs,
+                        ..Default::default()
+                    }),
+                    scope_metrics: vec![ScopeMetrics {
+                        metrics: vec![Metric {
+                            name: metric.to_owned(),
+                            unit: "1".to_owned(),
+                            data: Some(metric::Data::Gauge(Gauge {
+                                data_points: b
+                                    .points
+                                    .iter()
+                                    .map(|(t, v, a)| NumberDataPoint {
+                                        time_unix_nano: *t,
+                                        value: Some(number_data_point::Value::AsDouble(*v)),
+                                        attributes: a.iter().map(|(k, val)| kv(k, val)).collect(),
+                                        ..Default::default()
+                                    })
+                                    .collect(),
+                            })),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }
+            })
+            .collect();
+        ExportMetricsServiceRequest { resource_metrics }.encode_to_vec()
+    }
+
+    fn db_with(duplicates: Duplicates) -> Arc<Db> {
+        Db::in_memory().duplicates(duplicates).open().unwrap()
+    }
+
+    /// The single-bucket value of a range query over the whole (tiny) time domain.
+    async fn one_value(db: &Arc<Db>, q: MetricQuery) -> f64 {
+        let m = db.metrics().range(q).await.unwrap();
+        assert_eq!(m.0.len(), 1, "expected exactly one series: {m:?}");
+        assert_eq!(m.0[0].samples.len(), 1, "expected exactly one bucket");
+        m.0[0].samples[0].value
+    }
+
+    fn step() -> Duration {
+        Duration::from_secs(3600)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn range_collapses_two_identical_points_at_one_instant() {
+        let db = db_with(Duplicates::LastWins);
+        db.ingest_otlp_metrics(&otlp_gauge(
+            "cpu",
+            &[Block::new(&[(10, 7.0, &[]), (10, 7.0, &[])])],
+        ))
+        .await
+        .unwrap();
+
+        let sum = one_value(
+            &db,
+            MetricQuery::gauge("cpu")
+                .aggregation(Aggregation::Sum)
+                .step(step()),
+        )
+        .await;
+        assert_eq!(sum, 7.0, "the duplicate must not inflate sum");
+
+        let count = one_value(
+            &db,
+            MetricQuery::gauge("cpu")
+                .aggregation(Aggregation::Count)
+                .step(step()),
+        )
+        .await;
+        assert_eq!(count, 1.0, "the duplicated instant is one point");
+
+        let avg = one_value(&db, MetricQuery::gauge("cpu").step(step())).await;
+        assert_eq!(avg, 7.0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn range_dedup_keeps_the_greater_of_two_differing_values() {
+        let db = db_with(Duplicates::LastWins);
+        db.ingest_otlp_metrics(&otlp_gauge(
+            "cpu",
+            &[Block::new(&[(10, 2.0, &[]), (10, 9.0, &[])])],
+        ))
+        .await
+        .unwrap();
+
+        // `duplicate_value_cmp`: neither is NaN, so `f64::total_cmp` decides — 9.0 wins.
+        let sum = one_value(
+            &db,
+            MetricQuery::gauge("cpu")
+                .aggregation(Aggregation::Sum)
+                .step(step()),
+        )
+        .await;
+        assert_eq!(sum, 9.0);
+        let min = one_value(
+            &db,
+            MetricQuery::gauge("cpu")
+                .aggregation(Aggregation::Min)
+                .step(step()),
+        )
+        .await;
+        assert_eq!(min, 9.0, "the 2.0 row is gone, so even min() sees only 9.0");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn range_dedup_orders_nan_below_real_values() {
+        // Canary for `DUP_VALUE_ORDER`: DataFusion's float sort ranks NaN *above* +INFINITY, so
+        // without the explicit `isnan` demotion a NaN row would win and poison the series.
+        let db = db_with(Duplicates::LastWins);
+        db.ingest_otlp_metrics(&otlp_gauge(
+            "cpu",
+            &[Block::new(&[(10, f64::NAN, &[]), (10, 4.0, &[])])],
+        ))
+        .await
+        .unwrap();
+
+        let sum = one_value(
+            &db,
+            MetricQuery::gauge("cpu")
+                .aggregation(Aggregation::Sum)
+                .step(step()),
+        )
+        .await;
+        assert_eq!(sum, 4.0, "a real number always outranks NaN");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn range_dedup_preserves_rows_differing_only_in_resource() {
+        // THE anti-regression for the partition key. Five replicas emit the same counter, at the
+        // same instant, with the same service and the same datapoint attributes: they differ ONLY
+        // in `resource` (`k8s.pod.name`). Dropping `resource` from `DUP_PARTITION_KEYS` would
+        // collapse a legitimate 5-way sum to 1.
+        let db = db_with(Duplicates::LastWins);
+        let points: [Point<'_>; 1] = [(10, 2.0, &[])];
+        let pod_attrs: Vec<[(&str, &str); 1]> = ["pod-a", "pod-b", "pod-c", "pod-d", "pod-e"]
+            .iter()
+            .map(|p| [("k8s.pod.name", *p)])
+            .collect();
+        let blocks: Vec<Block<'_>> = pod_attrs
+            .iter()
+            .map(|a| Block {
+                service: "svc",
+                resource_attrs: a.as_slice(),
+                points: &points,
+            })
+            .collect();
+        db.ingest_otlp_metrics(&otlp_gauge("cpu", &blocks))
+            .await
+            .unwrap();
+
+        let sum = one_value(
+            &db,
+            MetricQuery::gauge("cpu")
+                .aggregation(Aggregation::Sum)
+                .step(step()),
+        )
+        .await;
+        assert_eq!(sum, 10.0, "all five replicas must survive the dedup");
+        let count = one_value(
+            &db,
+            MetricQuery::gauge("cpu")
+                .aggregation(Aggregation::Count)
+                .step(step()),
+        )
+        .await;
+        assert_eq!(count, 5.0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn range_dedup_preserves_rows_differing_only_in_datapoint_attributes() {
+        // The `attributes` half of the same trap: same resource/service/instant, different labels.
+        let db = db_with(Duplicates::LastWins);
+        db.ingest_otlp_metrics(&otlp_gauge(
+            "cpu",
+            &[Block::new(&[
+                (10, 2.0, &[("core", "0")]),
+                (10, 2.0, &[("core", "1")]),
+            ])],
+        ))
+        .await
+        .unwrap();
+
+        let sum = one_value(
+            &db,
+            MetricQuery::gauge("cpu")
+                .aggregation(Aggregation::Sum)
+                .step(step()),
+        )
+        .await;
+        assert_eq!(sum, 4.0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn rate_counter_is_unchanged_by_the_dedup_wrapper() {
+        // `(max - min)` was already immune to a duplicated point; assert the wrapper keeps it so.
+        for policy in [Duplicates::ErrorOnRead, Duplicates::LastWins] {
+            let db = db_with(policy);
+            db.ingest_otlp_metrics(&otlp_gauge(
+                "bytes_total",
+                &[Block::new(&[
+                    (0, 10.0, &[]),
+                    (1_000_000_000, 13.0, &[]),
+                    (1_000_000_000, 13.0, &[]),
+                    (2_000_000_000, 16.0, &[]),
+                ])],
+            ))
+            .await
+            .unwrap();
+
+            let v = one_value(
+                &db,
+                MetricQuery::gauge("bytes_total")
+                    .rate_counter()
+                    .step(Duration::from_secs(3)),
+            )
+            .await;
+            assert!((v - 2.0).abs() < 1e-9, "{policy}: (16-10)/3 = 2.0, got {v}");
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn error_on_read_default_does_not_collapse() {
+        // Shipping decision: only `LastWins` collapses. The default keeps the historical (inflating)
+        // numbers rather than changing behaviour under existing deployments.
+        let db = db_with(Duplicates::default());
+        assert!(!db.duplicates().collapses_at_read());
+        db.ingest_otlp_metrics(&otlp_gauge(
+            "cpu",
+            &[Block::new(&[(10, 7.0, &[]), (10, 7.0, &[])])],
+        ))
+        .await
+        .unwrap();
+
+        let sum = one_value(
+            &db,
+            MetricQuery::gauge("cpu")
+                .aggregation(Aggregation::Sum)
+                .step(step()),
+        )
+        .await;
+        assert_eq!(sum, 14.0, "the default policy is unchanged");
+        let count = one_value(
+            &db,
+            MetricQuery::gauge("cpu")
+                .aggregation(Aggregation::Count)
+                .step(step()),
+        )
+        .await;
+        assert_eq!(count, 2.0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn instant_query_inherits_the_collapse() {
+        let db = db_with(Duplicates::LastWins);
+        db.ingest_otlp_metrics(&otlp_gauge(
+            "cpu",
+            &[Block::new(&[(10, 2.0, &[]), (10, 9.0, &[])])],
+        ))
+        .await
+        .unwrap();
+        let v = db
+            .metrics()
+            .instant(
+                MetricQuery::gauge("cpu")
+                    .aggregation(Aggregation::Sum)
+                    .step(step()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(v.0.len(), 1);
+        assert_eq!(v.0[0].sample.value, 9.0);
+    }
+
+    // --- Agreement with the PromQL collapse (`imbh-lgtm`'s `collapse_duplicate_samples`) ---------
+    //
+    // `imbh-lgtm` depends on `imbh`, so importing it here would be a dev-dependency cycle. The two
+    // functions below are a verbatim mirror of `crates/imbh-lgtm/src/model/promql.rs`
+    // (`duplicate_value_cmp` / `collapse_duplicate_samples`); the test asserts the SQL path agrees
+    // with them over the same multiset. Keep them in sync if that file changes.
+
+    fn duplicate_value_cmp(left: f64, right: f64) -> Ordering {
+        left.is_nan()
+            .cmp(&right.is_nan())
+            .reverse()
+            .then_with(|| left.total_cmp(&right))
+    }
+
+    fn collapse_duplicate_samples(samples: &mut Vec<(i64, f64)>) {
+        samples.sort_unstable_by(|left, right| {
+            left.0
+                .cmp(&right.0)
+                .then_with(|| duplicate_value_cmp(left.1, right.1).reverse())
+        });
+        samples.dedup_by(|later, kept| later.0 == kept.0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn range_dedup_agrees_with_the_promql_collapse() {
+        // One series (one resource, one service, no datapoint attributes) with duplicated instants
+        // covering every branch of `duplicate_value_cmp`: plain ties, a strict ordering, NaN vs a
+        // real number, NaN vs +INFINITY, and negative values.
+        let raw: &[(u64, f64)] = &[
+            (10, 7.0),
+            (10, 7.0),
+            (20, 2.0),
+            (20, 9.0),
+            (20, -1.0),
+            (30, f64::NAN),
+            (30, 4.0),
+            (40, f64::NAN),
+            (40, f64::INFINITY),
+            (50, f64::NAN),
+            (50, f64::NAN),
+            (60, -5.0),
+            (60, -2.0),
+            (70, 1.0),
+        ];
+        let points: Vec<Point<'_>> = raw.iter().map(|(t, v)| (*t, *v, &[][..])).collect();
+
+        let db = db_with(Duplicates::LastWins);
+        db.ingest_otlp_metrics(&otlp_gauge("cpu", &[Block::new(&points)]))
+            .await
+            .unwrap();
+
+        // One bucket per nanosecond → the SQL bucket key is the raw timestamp, so `max(value)` per
+        // bucket is exactly "the surviving sample at that instant".
+        let m = db
+            .metrics()
+            .range(
+                MetricQuery::gauge("cpu")
+                    .aggregation(Aggregation::Sum)
+                    .step(Duration::from_nanos(1)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(m.0.len(), 1);
+        let actual: Vec<(i64, f64)> = m.0[0].samples.iter().map(|s| (s.time.0, s.value)).collect();
+
+        let mut expected: Vec<(i64, f64)> = raw.iter().map(|(t, v)| (*t as i64, *v)).collect();
+        collapse_duplicate_samples(&mut expected);
+
+        assert_eq!(actual.len(), expected.len(), "{actual:?} vs {expected:?}");
+        for (a, e) in actual.iter().zip(expected.iter()) {
+            assert_eq!(a.0, e.0, "timestamps differ: {actual:?} vs {expected:?}");
+            assert!(
+                a.1.total_cmp(&e.1) == Ordering::Equal,
+                "value at {}: SQL {} vs PromQL {}",
+                a.0,
+                a.1,
+                e.1
+            );
+        }
     }
 }

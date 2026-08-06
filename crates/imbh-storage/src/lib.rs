@@ -603,6 +603,21 @@ impl Storage {
         )
     }
 
+    /// The canonical Arrow schema of `table` under the **current** promoted key set — the schema a
+    /// freshly written segment of that table gets, and therefore the schema compaction must produce
+    /// when it merges segments sealed under older `promote` settings.
+    fn table_schema(&self, table: Table) -> SchemaRef {
+        let keys = self.promote.keys();
+        match table {
+            Table::Logs => logs_schema(keys),
+            Table::Spans => spans_schema(keys),
+            Table::MetricsGauge | Table::MetricsSum => metric_scalar_schema(keys),
+            Table::MetricsHistogram => histogram_schema(keys),
+            Table::MetricsExpHistogram => exp_histogram_schema(keys),
+            Table::MetricsSummary => summary_schema(keys),
+        }
+    }
+
     /// The `metrics_histogram` Arrow schema.
     pub fn schema_histogram(&self) -> SchemaRef {
         histogram_schema(self.promote.keys())
@@ -1271,7 +1286,10 @@ impl Storage {
 
     /// Drop segments outside the retention policy (ARCHITECTURE.md §7): older than `max_age`, or
     /// oldest-first until the total on-disk size is under `max_disk_bytes`. Deletes the Parquet
-    /// file and its `.tidx` sidecar and rewrites the manifest. No-op for in-memory DBs. The
+    /// file and its `.tidx` sidecar and rewrites the manifest. No-op for in-memory DBs. Reclaiming
+    /// the bytes is best-effort — the manifest is rewritten and made durable *before* the unlinks,
+    /// so a file the OS refuses to remove (on Windows, one a concurrent reader still has memory-
+    /// mapped) is left as an orphan for the next open to sweep rather than failing the pass. The
     /// watermark is unchanged — dropped segments' WAL records are `<= watermark`, so they never
     /// replay.
     pub fn retain(&self) -> Result<RetentionReport> {
@@ -1356,11 +1374,12 @@ impl Storage {
             &inner.metric_segments,
             watermark,
         )?;
-        for s in &ordered {
-            if drop_set.contains(&s.relative_path) {
-                delete_segment(&dir, s)?;
-            }
-        }
+        reclaim_segments(
+            &dir,
+            ordered
+                .iter()
+                .filter(|s| drop_set.contains(&s.relative_path)),
+        );
         Ok(RetentionReport {
             segments_dropped,
             bytes_freed,
@@ -1470,7 +1489,9 @@ impl Storage {
 
     /// Compact each table's small segments within a UTC-day partition into one (ARCHITECTURE.md §7):
     /// read → concat → sort by time → write one merged Parquet, rebuild the `logs` Tantivy index,
-    /// and delete the inputs. Optional — a DB that never compacts is still correct.
+    /// and delete the inputs. Optional — a DB that never compacts is still correct. As in
+    /// [`Storage::retain`], deleting the merged-away inputs is best-effort: the merged manifest is
+    /// durable first, so an input the OS refuses to unlink becomes an orphan the next open sweeps.
     #[cfg_attr(
         feature = "tracing",
         tracing::instrument(level = "debug", name = "storage.compact", skip_all)
@@ -1557,9 +1578,7 @@ impl Storage {
         }
         // 4. …then reclaim the merged-away sources. A crash before this leaves them as orphans that
         //    `cleanup_orphans` removes on next open (the manifest no longer references them).
-        for s in &deferred_deletes {
-            delete_segment(&dir, s)?;
-        }
+        reclaim_segments(&dir, &deferred_deletes);
         #[cfg(feature = "tracing")]
         tracing::debug!(report = ?report, "compaction complete");
         Ok(report)
@@ -1591,9 +1610,19 @@ impl Storage {
                 result.extend(group);
                 continue;
             }
+            // Segments in one day partition can have been sealed under *different* promoted key
+            // sets (ARCHITECTURE.md §6.1 allows the embedder to change `promote` between runs), so
+            // the batches read off disk need not share a schema and `concat_batches` would reject
+            // them — permanently failing this partition's compaction. Normalize every batch to the
+            // canonical schema of the *live* promote set first: a promoted column added since a
+            // segment was sealed is null-filled, one that has since been de-promoted is dropped
+            // (its value is still in that row's `attributes` JSON, which is never rewritten).
+            let canonical = self.table_schema(table);
             let mut batches = Vec::new();
             for s in &group {
-                batches.extend(read_parquet_file(&dir.join(&s.relative_path))?);
+                for b in read_parquet_file(&dir.join(&s.relative_path))? {
+                    batches.push(coerce_to_schema(b, &canonical)?);
+                }
             }
             if batches.is_empty() {
                 result.extend(group);
@@ -1804,7 +1833,62 @@ fn time_bounds(batch: &RecordBatch, time_col: &str) -> (i64, i64) {
     }
 }
 
+/// Normalize `batch` to `schema`, matching columns **by name** so schema evolution across segments
+/// is survivable (ARCHITECTURE.md §6.1 promoted columns):
+///
+/// * a column both sides have is cast to the canonical type when they differ (usually an identity —
+///   the Parquet reader reconstructs the written Arrow types from the embedded `ARROW:schema`);
+/// * a canonical column *missing* from `batch` is null-filled when the field is nullable — every
+///   promoted column is, so a segment sealed before a key was promoted still merges. A missing
+///   **non-nullable** column cannot be forward evolution (no built-in column is ever absent), so it
+///   is a hard error rather than a fabricated null that would break the column's contract;
+/// * a column of `batch` that the canonical schema does *not* have is dropped — the output is built
+///   by iterating the canonical fields. That is the de-promotion direction, and it loses nothing:
+///   promoted columns are projections of the `attributes` JSON, which stays in the row verbatim.
+///
+/// This is the storage-side twin of `imbh-query`'s read-path `coerce`. It is duplicated rather than
+/// shared because `imbh-storage` and `imbh-query` are siblings (ARCHITECTURE.md §12 dependency
+/// direction `core ← {otlp, storage, index, query}`) and this version speaks plain `arrow` while the
+/// query one speaks DataFusion's arrow re-exports.
+fn coerce_to_schema(batch: RecordBatch, schema: &SchemaRef) -> Result<RecordBatch> {
+    // Fast path: identical schema (the common case — nothing changed since the segment was sealed).
+    if batch.schema().as_ref() == schema.as_ref() {
+        return Ok(batch);
+    }
+    let src = batch.schema();
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
+    for field in schema.fields() {
+        let col = match src.index_of(field.name()) {
+            Ok(idx) => {
+                let col = batch.column(idx);
+                if col.data_type() == field.data_type() {
+                    col.clone()
+                } else {
+                    arrow::compute::cast(col, field.data_type())
+                        .map_err(|e| Error::storage_ctx(format!("coerce `{}`", field.name()), e))?
+                }
+            }
+            Err(_) if field.is_nullable() => {
+                arrow::array::new_null_array(field.data_type(), batch.num_rows())
+            }
+            Err(_) => {
+                return Err(Error::storage_msg(format!(
+                    "segment is missing non-nullable column `{}`",
+                    field.name()
+                )));
+            }
+        };
+        columns.push(col);
+    }
+    RecordBatch::try_new(schema.clone(), columns)
+        .map_err(|e| Error::storage_ctx("coerce batch to canonical schema", e))
+}
+
 /// Concatenate batches and sort by the `time_col` column, ascending.
+///
+/// **Invariant**: every batch must already carry the same schema as `batches[0]`. Seal satisfies
+/// this trivially (its batches were all encoded from one immutable `promote` set); compaction, whose
+/// batches come off disk, satisfies it by running each through [`coerce_to_schema`] first.
 fn concat_and_sort(batches: &[RecordBatch], time_col: &str) -> Result<RecordBatch> {
     use arrow::compute::{concat_batches, sort_to_indices, take};
     let schema = batches[0].schema();
@@ -2599,6 +2683,37 @@ fn dir_size(path: &Path) -> u64 {
     total
 }
 
+/// Reclaim the on-disk files of segments the manifest no longer references — the drops of a
+/// [`Storage::retain`] pass and the merged-away sources of a [`Storage::compact`] pass.
+///
+/// **Best-effort by design.** Both callers persist the manifest *without* these segments and make it
+/// durable first, so by the time we get here the drop has already happened as far as every reader is
+/// concerned; the files are dead weight. A path that cannot be unlinked right now therefore leaves
+/// the process in exactly the state a crash between those two steps would leave — an orphan file the
+/// next `Db::open` sweeps in [`cleanup_orphans`] — which is why a failure here is swallowed rather
+/// than propagated. Turning it into an `Err` would report a *successful* retention/compaction as a
+/// failure and, worse, abandon the remaining segments in the batch mid-loop.
+///
+/// This matters far beyond crash windows on **Windows**, where unlinking is not the unconditional
+/// operation POSIX makes it: a file with a live memory mapping cannot be deleted at all (the section
+/// object pins it, whatever share flags its opener passed), and a Tantivy searcher over a segment's
+/// `.tidx` sidecar holds exactly such mappings. So a single concurrent `matches()` pushdown racing a
+/// retention pass would otherwise fail the whole pass. POSIX has no analogue — the unlink succeeds
+/// and the mapping keeps working against the now-nameless inode — so the strict version was silently
+/// fine on Unix and a latent portability bug on Windows.
+fn reclaim_segments<'a>(dir: &Path, segs: impl IntoIterator<Item = &'a SegmentRef>) {
+    for seg in segs {
+        if let Err(_e) = delete_segment(dir, seg) {
+            #[cfg(feature = "tracing")]
+            tracing::warn!(
+                segment = %seg.relative_path,
+                error = %_e,
+                "segment reclaim failed; left as an orphan for the next open's sweep"
+            );
+        }
+    }
+}
+
 /// Delete a segment's Parquet file and `.tidx` sidecar (ignoring already-absent paths).
 fn delete_segment(dir: &Path, seg: &SegmentRef) -> Result<()> {
     let parquet = dir.join(&seg.relative_path);
@@ -3109,6 +3224,250 @@ mod tests {
         assert!(s.segments().is_empty());
     }
 
+    // ── reclaim under a live reader (Windows portability, issue #3 shape) ────────────────────
+    //
+    // Retention and compaction both end by *unlinking* segment files the manifest no longer names.
+    // On POSIX that is unconditional — a file can be unlinked while it is open and even while it is
+    // memory-mapped, and the holder keeps reading the now-nameless inode. Windows is not like that:
+    // a file with a live mapping (a section object) cannot be deleted at all, whatever share flags
+    // its opener passed. imbh maps exactly such files — a Tantivy searcher over a segment's `.tidx`
+    // sidecar mmaps the postings/fast-field files for the life of a `matches()`/attr-equality
+    // pushdown — so a query racing a maintenance pass is the realistic hazard. The tests below stage
+    // that ordering deterministically (reader pinned *before* the reclaim, released *after* it) so
+    // the Windows CI leg exercises the real thing rather than reclaim-on-an-idle-DB.
+
+    /// Every regular file inside a `.tidx` sidecar directory (Tantivy's `meta.json`, `.managed.json`
+    /// and the per-segment postings / fast-field / store files), recursively.
+    #[cfg(feature = "search")]
+    fn tidx_files(tidx: &Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        let mut stack = vec![tidx.to_path_buf()];
+        while let Some(d) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&d) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else {
+                    out.push(p);
+                }
+            }
+        }
+        out
+    }
+
+    /// Pin a sealed segment the way a **concurrent reader** does: an open `File` on the Parquet
+    /// (what `ParquetRecordBatchReader` holds for the whole life of a segment scan) plus an open
+    /// handle *and a live memory mapping* on every `.tidx` file (what a Tantivy searcher's
+    /// `MmapDirectory` holds). Keep the returned guards alive across the reclaim under test.
+    #[cfg(feature = "search")]
+    fn pin_segment(dir: &Path, relative_path: &str) -> (Vec<std::fs::File>, Vec<memmap2::Mmap>) {
+        let parquet = dir.join(relative_path);
+        let mut files = vec![std::fs::File::open(&parquet).expect("open segment parquet")];
+        let mut maps = Vec::new();
+        for path in tidx_files(&parquet.with_extension("tidx")) {
+            let handle = std::fs::File::open(&path).expect("open .tidx file");
+            if handle.metadata().map(|m| m.len()).unwrap_or(0) > 0 {
+                // SAFETY: the mapped files are sealed sidecar segments — nothing in this process
+                // writes or truncates them, and the reclaim under test only unlinks them (which
+                // leaves the mapping valid on POSIX and is refused outright on Windows).
+                maps.push(unsafe { memmap2::Mmap::map(&handle) }.expect("map .tidx file"));
+            }
+            files.push(handle);
+        }
+        (files, maps)
+    }
+
+    /// Retention reclaiming a segment that a reader holds open **and memory-mapped** must not fail
+    /// the pass, must not break the reader, and must converge to "gone" — directly where the OS
+    /// allows the unlink, or via the next open's orphan sweep where it does not.
+    #[cfg(feature = "search")]
+    #[test]
+    fn retention_reclaims_a_segment_pinned_by_an_open_and_mapped_reader() {
+        let dir = tempfile::tempdir().unwrap();
+        let dropped;
+        {
+            let s = Storage::open(
+                dir.path(),
+                Compression::default(),
+                WalMode::Always,
+                Retention::none().max_disk_bytes(0),
+                MemoryBudget::default(),
+            )
+            .unwrap();
+            s.ingest(
+                SIGNAL_LOGS,
+                b"r1",
+                vec![row(1, "a", "request failed"), row(2, "a", "request ok")],
+                true,
+            )
+            .unwrap();
+            let seg = s.seal().unwrap().expect("segment");
+            dropped = seg.relative_path.clone();
+            assert!(
+                dir.path().join(&dropped).with_extension("tidx").is_dir(),
+                "seal built the .tidx sidecar the reader will map"
+            );
+
+            // The reader pins the segment BEFORE retention runs and outlives it — the ordering a
+            // concurrent query + maintenance pass produces, and the one Windows rejects.
+            let (files, maps) = pin_segment(dir.path(), &dropped);
+            assert!(
+                !maps.is_empty(),
+                "at least one .tidx file is memory-mapped while retention runs"
+            );
+
+            let report = s
+                .retain()
+                .expect("retention must not fail because a reader still holds the segment");
+            assert_eq!(report.segments_dropped, 1);
+            assert!(
+                s.segments().is_empty(),
+                "the manifest no longer references the dropped segment"
+            );
+
+            // The pinned reader is unharmed by the reclaim: the mapping still reads and the open
+            // Parquet handle still parses to the full row set (an in-flight scan finishes cleanly).
+            assert!(maps.iter().any(|m| !m.is_empty()), "mapping still readable");
+            let handle = files[0].try_clone().unwrap();
+            let rows: usize = ParquetRecordBatchReaderBuilder::try_new(handle)
+                .unwrap()
+                .build()
+                .unwrap()
+                .map(|b| b.unwrap().num_rows())
+                .sum();
+            assert_eq!(rows, 2, "the in-flight scan still sees its rows");
+        }
+        // Handles, mappings and the writer lock are released. Reopening must find no segment and no
+        // leftover bytes — the unlink either already happened or the orphan sweep finishes the job.
+        let s2 = open(dir.path(), WalMode::Always);
+        assert!(s2.segments().is_empty(), "no segment survives the drop");
+        assert!(!dir.path().join(&dropped).exists(), "parquet reclaimed");
+        assert!(
+            !dir.path().join(&dropped).with_extension("tidx").exists(),
+            ".tidx sidecar reclaimed"
+        );
+    }
+
+    /// The compaction twin: the merged-away *sources* are unlinked after the merged manifest is
+    /// durable, so a reader pinning them across the pass must not fail it or lose a row.
+    #[cfg(feature = "search")]
+    #[test]
+    fn compaction_reclaims_source_segments_pinned_by_an_open_and_mapped_reader() {
+        let dir = tempfile::tempdir().unwrap();
+        let src1;
+        let src2;
+        let merged;
+        {
+            let s = open(dir.path(), WalMode::Always);
+            // Two seals → two segments in the same (1970-01-01) day partition, so they compact.
+            s.ingest(
+                SIGNAL_LOGS,
+                b"r1",
+                vec![row(1, "a", "x"), row(3, "a", "z")],
+                true,
+            )
+            .unwrap();
+            src1 = s.seal().unwrap().expect("segment 1").relative_path;
+            s.ingest(SIGNAL_LOGS, b"r2", vec![row(2, "a", "y")], true)
+                .unwrap();
+            src2 = s.seal().unwrap().expect("segment 2").relative_path;
+
+            let pinned1 = pin_segment(dir.path(), &src1);
+            let pinned2 = pin_segment(dir.path(), &src2);
+            assert!(
+                !pinned1.1.is_empty() && !pinned2.1.is_empty(),
+                "both sources have a mapped .tidx while compaction runs"
+            );
+
+            let report = s
+                .compact()
+                .expect("compaction must not fail because a reader still holds the sources");
+            assert_eq!(report.segments_merged, 2);
+            assert_eq!(report.segments_created, 1);
+            assert_eq!(s.segments().len(), 1);
+            assert_eq!(
+                s.segments()[0].rows,
+                3,
+                "every row preserved through the merge"
+            );
+            merged = s.segments()[0].relative_path.clone();
+            // Pinned reads survive the reclaim of the file they came from.
+            assert!(
+                pinned1
+                    .1
+                    .iter()
+                    .chain(pinned2.1.iter())
+                    .any(|m| !m.is_empty())
+            );
+            drop((pinned1, pinned2));
+        }
+        let s2 = open(dir.path(), WalMode::Always);
+        assert_eq!(s2.segments().len(), 1);
+        assert_eq!(s2.segments()[0].relative_path, merged);
+        assert_eq!(s2.segments()[0].rows, 3);
+        for src in [&src1, &src2] {
+            assert!(!dir.path().join(src).exists(), "source {src} reclaimed");
+            assert!(
+                !dir.path().join(src).with_extension("tidx").exists(),
+                "source {src} .tidx reclaimed"
+            );
+        }
+    }
+
+    /// The property the two tests above depend on, isolated: when the OS **refuses** the unlink,
+    /// retention still succeeds. The manifest is already durable without the segment, so the file is
+    /// exactly the orphan a crash in the same window would leave, and the next open sweeps it —
+    /// failing the pass instead would report a successful drop as an error and strand the rest of
+    /// the batch. Staged on Unix, where a read-only parent directory makes `remove_file` fail
+    /// deterministically; a Windows sharing violation on a mapped `.tidx` takes the same branch.
+    #[cfg(unix)]
+    #[test]
+    fn retention_survives_a_reclaim_the_os_refuses() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let s = Storage::open(
+            dir.path(),
+            Compression::default(),
+            WalMode::Always,
+            Retention::none().max_disk_bytes(0),
+            MemoryBudget::default(),
+        )
+        .unwrap();
+        s.ingest(SIGNAL_LOGS, b"r1", vec![row(1, "a", "x")], true)
+            .unwrap();
+        let seg = s.seal().unwrap().expect("segment");
+        let parquet = dir.path().join(&seg.relative_path);
+        let partition = parquet.parent().unwrap().to_path_buf();
+
+        // Make the day partition read-only: the manifest rewrite (in the DB root) still works, the
+        // unlink inside it does not.
+        let original = std::fs::metadata(&partition).unwrap().permissions();
+        std::fs::set_permissions(&partition, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let report = s.retain();
+        std::fs::set_permissions(&partition, original).unwrap(); // restore before asserting
+
+        let report = report.expect("a refused unlink must not fail the retention pass");
+        assert_eq!(report.segments_dropped, 1);
+        assert!(
+            s.segments().is_empty(),
+            "the drop is recorded even though the bytes could not be reclaimed"
+        );
+        drop(s); // release the writer lock
+
+        // Whatever survived is an orphan the next open sweeps. (Running as root the unlink is not
+        // refused at all and the file is already gone — either way this must hold.)
+        let s2 = open(dir.path(), WalMode::Always);
+        assert!(s2.segments().is_empty());
+        assert!(
+            !parquet.exists(),
+            "an un-reclaimed segment is swept as an orphan on the next open"
+        );
+    }
+
     #[test]
     fn writer_lock_is_exclusive_and_released_on_drop() {
         let dir = tempfile::tempdir().unwrap();
@@ -3493,6 +3852,155 @@ mod tests {
         assert_eq!(s2.segments().len(), 1);
         assert_eq!(s2.segments()[0].relative_path, merged_path);
         assert_eq!(s2.segments()[0].rows, 3);
+    }
+
+    /// One UTC-day partition can hold segments sealed under **different** promoted key sets — the
+    /// embedder changed `DbBuilder::promote(...)` between runs (ARCHITECTURE.md §6.1). Compaction
+    /// reads those segments raw off disk, so before the fix `concat_batches` rejected the mismatched
+    /// schemas and that day's compaction failed forever. It must instead normalize every batch to
+    /// the canonical schema of the live promote set, in both directions: null-fill a promoted column
+    /// added after a segment was sealed, drop one that has since been de-promoted.
+    #[test]
+    fn compaction_merges_segments_sealed_under_different_promoted_keys() {
+        const ATTRS: &str = r#"{"env":"prod","region":"us"}"#;
+        let attr_row = |time: i64, body: &str| LogRow {
+            attributes: ATTRS.to_owned(),
+            ..row(time, "svc", body)
+        };
+        let dir = tempfile::tempdir().unwrap();
+
+        // Run 1 — `env` promoted: segment 1 has 13 columns. Deliberately the *widest* segment and
+        // the first of the group, because `concat_batches` indexes positionally against
+        // `batches[0]`'s schema: a narrower later batch used to panic on an out-of-range column.
+        {
+            let s = open(dir.path(), WalMode::Always).with_promote(Promote::new(["env"]));
+            s.ingest(SIGNAL_LOGS, b"r1", vec![attr_row(1, "one")], true)
+                .unwrap();
+            s.seal().unwrap().expect("segment 1");
+        }
+        // Run 2 — nothing promoted: segment 2 is back to the fixed 12-column `logs` schema.
+        {
+            let s = open(dir.path(), WalMode::Always);
+            s.ingest(SIGNAL_LOGS, b"r2", vec![attr_row(2, "two")], true)
+                .unwrap();
+            s.seal().unwrap().expect("segment 2");
+        }
+        // Run 3 — `region` promoted *instead* of `env`: the canonical schema now has `region` and no
+        // `env`, so the merge must exercise both the null-fill and the drop direction at once.
+        let s = open(dir.path(), WalMode::Always).with_promote(Promote::new(["region"]));
+        s.ingest(SIGNAL_LOGS, b"r3", vec![attr_row(3, "three")], true)
+            .unwrap();
+        s.seal().unwrap().expect("segment 3");
+        assert_eq!(s.segments().len(), 3, "three segments, one 1970-01-01 day");
+
+        let report = s.compact().unwrap();
+        assert_eq!(report.segments_merged, 3);
+        assert_eq!(report.segments_created, 1);
+        let merged = s.segments();
+        assert_eq!(
+            merged.len(),
+            1,
+            "the three same-day segments merged into one"
+        );
+        assert_eq!(
+            merged[0].rows, 3,
+            "every row preserved across the schema change"
+        );
+
+        let batches = read_parquet_file(&dir.path().join(&merged[0].relative_path)).unwrap();
+        let batch = concat_and_sort(&batches, "time").unwrap();
+        assert_eq!(batch.num_rows(), 3);
+        let merged_schema = batch.schema();
+        let names: Vec<&str> = merged_schema
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect();
+        assert!(
+            names.contains(&"region"),
+            "merged segment carries the live promoted column, got {names:?}"
+        );
+        assert!(
+            !names.contains(&"env"),
+            "the de-promoted column is dropped, got {names:?}"
+        );
+        assert_eq!(
+            str_column(&batch, "body"),
+            vec![
+                Some("one".to_owned()),
+                Some("two".to_owned()),
+                Some("three".to_owned())
+            ],
+            "rows from all three segments survive, time-sorted"
+        );
+        // `region` is only *projected* at ingest, so the two older segments null-fill it — exactly
+        // what a query over those un-compacted segments already saw via `imbh-query`'s `coerce`.
+        assert_eq!(
+            str_column(&batch, "region"),
+            vec![None, None, Some("us".to_owned())]
+        );
+        // Nothing is actually lost by the drop: `attributes` is never rewritten, so the de-promoted
+        // `env` is still there for every row.
+        for a in str_column(&batch, "attributes") {
+            assert_eq!(a.as_deref(), Some(ATTRS));
+        }
+    }
+
+    /// `coerce_to_schema` matches by name (never by position), null-fills a missing *nullable*
+    /// column, drops a source column the canonical schema lacks, and refuses to fabricate a value
+    /// for a missing non-nullable column.
+    #[test]
+    fn coerce_to_schema_matches_by_name_null_fills_and_drops() {
+        use arrow::array::{Int64Array, StringArray};
+        use arrow::datatypes::{Field, Schema};
+        use std::sync::Arc;
+
+        let canonical: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, false),
+            Field::new("promoted", DataType::Utf8, true),
+        ]));
+        // Source in reverse order, missing `promoted`, and carrying an extra `stale` column.
+        let src = Arc::new(Schema::new(vec![
+            Field::new("stale", DataType::Utf8, true),
+            Field::new("a", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            src,
+            vec![
+                Arc::new(StringArray::from(vec!["x", "y"])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![1i64, 2i64])),
+            ],
+        )
+        .unwrap();
+
+        let out = coerce_to_schema(batch, &canonical).unwrap();
+        assert_eq!(out.schema(), canonical, "extra `stale` column dropped");
+        assert_eq!(
+            out.column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .values(),
+            &[1i64, 2],
+            "`a` matched by name, not by position"
+        );
+        assert_eq!(
+            out.column(1).null_count(),
+            2,
+            "missing nullable `promoted` is null-filled"
+        );
+
+        // A missing non-nullable column is a genuine mismatch, not forward evolution.
+        let missing_required: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, false),
+            Field::new("required", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)])),
+            vec![Arc::new(Int64Array::from(vec![1i64])) as ArrayRef],
+        )
+        .unwrap();
+        assert!(coerce_to_schema(batch, &missing_required).is_err());
     }
 
     #[test]

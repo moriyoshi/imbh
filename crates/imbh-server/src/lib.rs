@@ -1355,6 +1355,14 @@ mod tests {
         assert!(stats.contains("\"durable_lsn\":"), "got {stats}");
         assert!(stats.contains("\"table\":\"logs\""), "got {stats}");
         assert!(stats.contains("\"buffer_rows\":1"), "got {stats}");
+        assert!(stats.contains("\"ingest_queue_depth\":0"), "got {stats}");
+        assert!(stats.contains("\"ingest_dropped\":0"), "got {stats}");
+        assert!(stats.contains("\"ingest_errors\":0"), "got {stats}");
+        // The body is the head API's `Stats`, which is what makes `/stats` parseable at all: this DB
+        // has never fsynced, so the durable LSN is `null` rather than the `0` it used to report.
+        let typed: imbh_head::dto::Stats = serde_json::from_str(&stats).expect("typed stats");
+        assert_eq!(typed.durable_lsn, None);
+        assert!(stats.contains("\"durable_lsn\":null"), "got {stats}");
 
         // Admin maintenance actions return JSON results (no-op on this in-memory DB).
         let f = route(&db, "POST", "/admin/flush", b"").await;

@@ -39,3 +39,9 @@ tracing = ["dep:tracing", "imbh-index?/tracing"]
 
 [dev-dependencies]
 tempfile.workspace = true
+# Test-only: the Windows-portability regression tests need to hold a *memory mapping* on a segment's
+# `.tidx` files across a retention/compaction reclaim — the shape a live Tantivy searcher has, and
+# the one case Windows refuses to unlink. Dev-only, so the shipping graph and the footprint gate
+# (`cargo tree --edges normal`) are unchanged; already in the lockfile via tantivy, so it adds no new
+# crate to vendor.
+memmap2 = "0.9"
