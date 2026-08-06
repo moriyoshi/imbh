@@ -274,8 +274,8 @@ on its own, so a script that changes nothing behaves exactly like no script at a
 .info.config                # the --log-opt map
 
 # ── in AND out: the OTel logs model, pre-filled with what the driver would store ──
-.timestamp                  # both seeded from .time_nano
-.observed_timestamp
+.timestamp                  # both seeded from .time_nano; move .timestamp, leave the other alone
+.observed_timestamp         #   -- `docker logs -f` follows this one (see "the two clocks" below)
 .severity_number            # the stdout/stderr default for this stream
 .severity_text
 .body                       # seeded with .line; any VRL value is accepted
@@ -402,17 +402,48 @@ The plugin advertises the `ReadLogs` capability, so `docker logs` is answered fr
 once the container's log stream is gone and no new lines have arrived, so `docker logs -f` on a
 stopped container returns rather than hanging.
 
-Two caveats worth knowing:
+The newline ingest stripped is restored on the way out. Without remapping, output therefore matches
+what the container printed exactly; with it, a structured body is re-rendered as one logfmt line
+(see [Remapping](#docker-logs-on-a-remapped-container)). Either way a line that had no trailing
+newline gets one.
 
-- The newline ingest stripped is restored on the way out. Without remapping, output therefore
-  matches what the container printed exactly; with it, a structured body is re-rendered as one
-  logfmt line (see [Remapping](#docker-logs-on-a-remapped-container)). Either way a line that had no
-  trailing newline gets one.
-- Follow advances by record timestamp, which is when the container *emitted* the line -- ingest
-  stores it up to one batch interval later. Follow accounts for that, except under `--tail 0`, whose
-  "only new lines" semantic means a line emitted a moment before the follow started may not appear.
-  Two records sharing a nanosecond would also be reported once; Docker's timestamps are wall-clock
-  nanoseconds, so that does not occur in practice.
+### Follow mode and the two clocks
+
+Every stored record carries two instants, and `docker logs` uses each for a different job:
+
+| Clock | Column | What it is |
+|-------|--------|------------|
+| event time | `time` | when the container **emitted** the line (or the line's own timestamp, if [remapping](#remapping) lifted one) |
+| arrival time | `observed_time` | when the driver **captured** it off the container's stream |
+
+- **What you see is ordered by event time.** History, `--tail N`, and `--since`/`--until` all work on
+  `time`, because that is what `docker logs` means and what a json-file driver would print.
+- **The follow cursor rides arrival time.** It has to. Ingest batches, so a line emitted just before
+  you ran `docker logs -f` can be *stored* just after — an event-time cursor would advance past it
+  and the line would never appear. `observed_time` only ever moves forward as rows become visible, so
+  a cursor over it cannot step over a late-stored line. `--tail 0` takes its starting cursor the same
+  way: one lookup of the newest arrival the container has already recorded, not the wall clock.
+
+Three things this does **not** fix. They are narrow, but they are real:
+
+- **A script can move the arrival clock too.** [Remapping](#remapping) reads `.observed_timestamp`
+  from the VRL root, so a script that assigns it replaces the driver's capture time with whatever it
+  computed. Set it to a constant, or to a value parsed out of the line, and the follow cursor is no
+  longer monotonic in arrival order — with the same consequence as before: `docker logs -f` may skip
+  lines. If you want to move a timestamp, move `.timestamp` (the event clock) and leave
+  `.observed_timestamp` alone; that is what the built-in script does.
+- **Exact ties are still resolved once.** The cursor is a strict `observed_time > last`, so two lines
+  stamped in the very same nanosecond, split across two polls, cost the second one. Docker's capture
+  times are wall-clock nanoseconds, so this does not arise in practice — but it is the same tie
+  hazard the old event-time cursor had, not something the arrival clock removes.
+- **`--tail 0` has no uniquely correct answer.** The json-file driver defines it as "seek to the end
+  of the file", i.e. by what is already *durably recorded*; imbh batches, so at any instant some
+  already-emitted lines are not yet recorded. Cutting at the newest recorded arrival makes the
+  boundary **stable and explainable** — everything the database had at the moment you asked is
+  history, everything captured after it is new — but it is a choice, not a proof. A line captured in
+  the same batch window as the cut still lands on whichever side of it the batch flush decides. If
+  you need "nothing before this instant, guaranteed", use `--since` with an explicit timestamp: that
+  filters on the event clock and does not depend on when ingest ran.
 
 ## Running it yourself (without the managed plugin)
 

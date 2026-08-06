@@ -688,6 +688,226 @@ fn follow_delivers_a_line_timestamped_before_the_follow_began() {
     assert_eq!(delivered.line, b"emitted before the follow\n");
 }
 
+/// Epoch nanoseconds now — the clock the driver's `--tail 0` cut used to be taken from.
+fn now_nanos() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("a post-epoch clock")
+        .as_nanos() as i64
+}
+
+/// Open a `docker logs -f` response and return a frame reader positioned at the first frame.
+fn open_follow(
+    socket: &Path,
+    body: &str,
+) -> EntryReader<ChunkedReader<std::io::BufReader<UnixStream>>> {
+    let mut follow = UnixStream::connect(socket).expect("connect for follow");
+    follow.set_read_timeout(Some(SETTLE)).expect("read timeout");
+    write!(
+        follow,
+        "POST /LogDriver.ReadLogs HTTP/1.1\r\nHost: docker\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    )
+    .expect("write the follow request");
+    follow.flush().expect("flush");
+    let mut reader = std::io::BufReader::new(follow.try_clone().expect("clone the follow socket"));
+    skip_headers(&mut reader);
+    EntryReader::new(ChunkedReader::new(reader))
+}
+
+/// Frame `entries` into a fresh stream file under `tmp` and hand it to the plugin as `container`.
+fn start_stream(
+    socket: &Path,
+    tmp: &Path,
+    name: &str,
+    container: &str,
+    opts: &str,
+    entries: &[LogEntry],
+) {
+    let path = tmp.join(name);
+    std::fs::write(&path, frame_all(entries)).expect("write the container stream");
+    let reply = post(
+        socket,
+        "/LogDriver.StartLogging",
+        &start_logging_body(&path, container, container, opts),
+    );
+    assert_eq!(reply.text(), r#"{"Err":""}"#);
+}
+
+/// `docker logs --tail 0` prints nothing at all, however much history the container has.
+#[test]
+fn tail_zero_prints_no_history() {
+    let (db, socket, tmp) = start_plugin();
+    start_stream(
+        &socket,
+        tmp.path(),
+        "tail0-stream",
+        "tailzero",
+        "",
+        &[
+            entry("stdout", "one\n", 1_700_000_000_000_000_000),
+            entry("stdout", "two\n", 1_700_000_000_000_000_001),
+        ],
+    );
+    wait_for_logs(&db, 2);
+
+    assert!(
+        read_logs(
+            &socket,
+            r#"{"Info":{"ContainerID":"tailzero"},"Config":{"Tail":0}}"#,
+        )
+        .is_empty(),
+        "--tail 0 must print no history"
+    );
+    // ...while the same container's history is there to be read.
+    assert_eq!(
+        read_logs(
+            &socket,
+            r#"{"Info":{"ContainerID":"tailzero"},"Config":{"Tail":-1}}"#,
+        )
+        .len(),
+        2
+    );
+}
+
+/// Regression, the `--tail 0 -f` event-time race.
+///
+/// `--tail 0` means "only new lines", and the driver used to answer that by setting its follow
+/// watermark to `Timestamp::now()`. But a record's `time` is when the **container emitted** the
+/// line, and ingest lands it up to one batch interval later — so every line emitted in the moments
+/// before the follow opened is stamped *before* `now` and was stepped straight over.
+///
+/// The cut is now the newest **arrival** (`observed_time`) the container has already recorded, so a
+/// line captured after that instant is delivered no matter how its event time compares to the wall
+/// clock. Here the container's whole history is stamped a minute in the past, exactly as a real one
+/// running for a minute would be; without the fix the second line — stamped a second ago, i.e. still
+/// before `now` — never arrives and this test hangs out its read timeout.
+#[test]
+fn follow_from_tail_zero_skips_history_but_not_a_line_stored_after_the_cut() {
+    let (db, socket, tmp) = start_plugin();
+    let now = now_nanos();
+
+    start_stream(
+        &socket,
+        tmp.path(),
+        "cut-history",
+        "cut00001",
+        "",
+        &[entry("stdout", "already recorded\n", now - 60_000_000_000)],
+    );
+    wait_for_logs(&db, 1);
+
+    // `--tail 0 -f`: none of the above, everything after it.
+    let mut frames = open_follow(
+        &socket,
+        r#"{"Info":{"ContainerID":"cut00001"},"Config":{"Tail":0,"Follow":true}}"#,
+    );
+    // Let the driver take its cut before the next line lands — that is the instant under test.
+    std::thread::sleep(Duration::from_millis(500));
+
+    // A line the container emitted a second *before* the follow began, stored after it.
+    start_stream(
+        &socket,
+        tmp.path(),
+        "cut-late",
+        "cut00001",
+        "",
+        &[entry(
+            "stdout",
+            "emitted just before the follow\n",
+            now - 1_000_000_000,
+        )],
+    );
+    wait_for_logs(&db, 2);
+
+    let delivered = frames
+        .next_entry()
+        .expect("follow must not skip a line stamped before the follow began")
+        .expect("a frame, not end of stream");
+    assert_eq!(
+        String::from_utf8_lossy(&delivered.line),
+        "emitted just before the follow\n",
+        "--tail 0 must skip the recorded history and deliver only what arrived after it"
+    );
+}
+
+/// A container with nothing recorded yet: the `--tail 0` probe finds no arrival to cut at, and an
+/// **empty** watermark must mean "everything from here is new" rather than "replay from the wall
+/// clock". `docker run -d … && docker logs -f --tail 0` is exactly this shape.
+#[test]
+fn follow_from_tail_zero_works_on_a_container_with_no_rows() {
+    let (db, socket, tmp) = start_plugin();
+
+    let mut frames = open_follow(
+        &socket,
+        r#"{"Info":{"ContainerID":"empty001"},"Config":{"Tail":0,"Follow":true}}"#,
+    );
+    std::thread::sleep(Duration::from_millis(500));
+
+    start_stream(
+        &socket,
+        tmp.path(),
+        "empty-stream",
+        "empty001",
+        "",
+        &[entry(
+            "stdout",
+            "first ever line\n",
+            now_nanos() - 5_000_000_000,
+        )],
+    );
+    wait_for_logs(&db, 1);
+
+    let delivered = frames
+        .next_entry()
+        .expect("follow must deliver the container's first line")
+        .expect("a frame, not end of stream");
+    assert_eq!(
+        String::from_utf8_lossy(&delivered.line),
+        "first ever line\n"
+    );
+}
+
+/// The watermark moved to the arrival clock; the **output** did not. `docker logs` prints lines in
+/// the order the container printed them, so history is ordered by event time — not by the order the
+/// frames happened to reach the driver.
+#[test]
+fn history_prints_in_event_time_order() {
+    let (db, socket, tmp) = start_plugin();
+    let base = 1_700_000_000_000_000_000i64;
+    // Framed out of order on purpose: c, a, b.
+    start_stream(
+        &socket,
+        tmp.path(),
+        "order-stream",
+        "order001",
+        "",
+        &[
+            entry("stdout", "c\n", base + 2),
+            entry("stdout", "a\n", base),
+            entry("stdout", "b\n", base + 1),
+        ],
+    );
+    wait_for_logs(&db, 3);
+
+    let lines = |body: &str| -> Vec<String> {
+        read_logs(&socket, body)
+            .iter()
+            .map(|e| String::from_utf8_lossy(&e.line).into_owned())
+            .collect()
+    };
+    assert_eq!(
+        lines(r#"{"Info":{"ContainerID":"order001"},"Config":{"Tail":-1}}"#),
+        ["a\n", "b\n", "c\n"],
+        "full history must print oldest-first by event time"
+    );
+    assert_eq!(
+        lines(r#"{"Info":{"ContainerID":"order001"},"Config":{"Tail":2}}"#),
+        ["b\n", "c\n"],
+        "--tail N must be the newest N by event time, still oldest-first"
+    );
+}
+
 /// Read past the response head, leaving the reader positioned at the first frame.
 fn skip_headers<R: std::io::BufRead>(reader: &mut R) {
     loop {
@@ -1176,6 +1396,106 @@ fn a_script_that_aborts_drops_only_the_lines_it_names() {
         rows.iter().map(|(b, _, _)| b.as_str()).collect::<Vec<_>>(),
         ["GET /orders", "GET /users"],
         "only the health-check lines should have been dropped"
+    );
+}
+
+/// The two clocks pulled fully apart: a script back-dates every line's **event** time to the epoch
+/// while Docker's capture time stays as the arrival time. The follow watermark has to ride the
+/// arrival clock, or the second line — event-stamped identically to the first, and so never "after"
+/// it — is lost.
+///
+/// This is the remap-era shape of the same race the `--tail 0` test covers: a VRL script lifting a
+/// container's own `ts=` onto the record can move event time anywhere, including backwards past
+/// everything already written.
+#[cfg(feature = "docker-remap")]
+#[test]
+fn follow_delivers_a_line_a_script_back_dated_behind_the_history() {
+    let (db, socket, tmp) = start_plugin_remapping();
+    // Every line's event time becomes the epoch; only its arrival time distinguishes it.
+    const BACK_DATE: &str =
+        r#""imbh-remap":".timestamp = from_unix_timestamp!(0, unit: \"seconds\")\n.body = .line""#;
+
+    start_stream(
+        &socket,
+        tmp.path(),
+        "backdate-history",
+        "backdt01",
+        BACK_DATE,
+        &[entry("stdout", "history\n", now_nanos() - 60_000_000_000)],
+    );
+    wait_for_logs(&db, 1);
+
+    // Full history this time, not `--tail 0`: the `--tail N`/history path must hand follow mode an
+    // arrival watermark too, not the event time of the last row it printed.
+    let mut frames = open_follow(
+        &socket,
+        r#"{"Info":{"ContainerID":"backdt01"},"Config":{"Tail":-1,"Follow":true}}"#,
+    );
+    assert_eq!(
+        frames
+            .next_entry()
+            .expect("history frame")
+            .expect("one row")
+            .line,
+        b"history\n"
+    );
+    std::thread::sleep(Duration::from_millis(500));
+
+    start_stream(
+        &socket,
+        tmp.path(),
+        "backdate-live",
+        "backdt01",
+        BACK_DATE,
+        &[entry("stdout", "live\n", now_nanos())],
+    );
+    wait_for_logs(&db, 2);
+
+    let delivered = frames
+        .next_entry()
+        .expect("follow must deliver a line whose event time is not newer than the history's")
+        .expect("a frame, not end of stream");
+    assert_eq!(String::from_utf8_lossy(&delivered.line), "live\n");
+}
+
+/// ...and the converse: with the clocks genuinely disagreeing, what `docker logs` *prints* is still
+/// ordered by event time. Only the watermark moved.
+#[cfg(feature = "docker-remap")]
+#[test]
+fn history_stays_in_event_time_order_when_the_two_clocks_disagree() {
+    let (db, socket, tmp) = start_plugin_remapping();
+    // Captured first→third, but event-stamped 300s, 200s, 100s: the two orders are exact opposites.
+    let script = r#""imbh-remap":"if contains!(.line, \"first\") { .timestamp = from_unix_timestamp!(300, unit: \"seconds\") }\nif contains!(.line, \"second\") { .timestamp = from_unix_timestamp!(200, unit: \"seconds\") }\nif contains!(.line, \"third\") { .timestamp = from_unix_timestamp!(100, unit: \"seconds\") }\n.body = .line""#;
+    let base = 1_700_000_000_000_000_000i64;
+    start_stream(
+        &socket,
+        tmp.path(),
+        "clock-stream",
+        "clocks01",
+        script,
+        &[
+            entry("stdout", "first\n", base),
+            entry("stdout", "second\n", base + 1),
+            entry("stdout", "third\n", base + 2),
+        ],
+    );
+    wait_for_logs(&db, 3);
+
+    let lines = |body: &str| -> Vec<String> {
+        read_logs(&socket, body)
+            .iter()
+            .map(|e| String::from_utf8_lossy(&e.line).into_owned())
+            .collect()
+    };
+    assert_eq!(
+        lines(r#"{"Info":{"ContainerID":"clocks01"},"Config":{"Tail":-1}}"#),
+        ["third\n", "second\n", "first\n"],
+        "history is ordered by event time, not by arrival"
+    );
+    assert_eq!(
+        lines(r#"{"Info":{"ContainerID":"clocks01"},"Config":{"Tail":2}}"#),
+        ["second\n", "first\n"],
+        "--tail N is the newest N by event time, printed oldest-first"
     );
 }
 
