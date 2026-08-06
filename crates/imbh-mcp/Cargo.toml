@@ -10,6 +10,15 @@ description = "Model Context Protocol server for imbh: read-only telemetry tools
 
 [dependencies]
 imbh.workspace = true
+# The head API's DTOs — `dto` only, never `exec` or `client`. `stats_json` (which backs both
+# `GET /stats` and the `db_stats` tool) converts a `DbStats` into `imbh_head::dto::Stats` and
+# serializes *that* derive, so the plain endpoint, the tool, and `GET /api/head/stats` cannot
+# describe one database three ways — and the output parses back into the typed value. Footprint:
+# no new third-party crate. `dto` pulls imbh (with `serde`, which ARCHITECTURE.md §10.13 measures at
+# zero added crates), imbh-core (already under imbh), serde (already under serde_json) and
+# serde_json (already here); `reqwest` and `imbh-lgtm` arrive only with the features this does not
+# enable. Dependency direction is unchanged: imbh-head does not know imbh-mcp.
+imbh-head = { workspace = true, features = ["dto"] }
 # The wire format (ARCHITECTURE.md §10.16.1): JSON-RPC in, JSON-RPC out, plus the transport's
 # `=?base64?…?=` header sentinel. Both crates are already compiled in the default graph — serde_json
 # via arrow-json, base64 via arrow-cast, both under DataFusion — so these edges add **no crate** to

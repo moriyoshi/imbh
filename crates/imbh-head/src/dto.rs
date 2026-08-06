@@ -221,15 +221,20 @@ pub struct Names {
 
 /// The answer to `GET /api/head/stats` — [`imbh::DbStats`], which carries no derive of its own.
 ///
-/// Deliberately not `GET /stats`: that endpoint's hand-written JSON is an existing public contract
-/// that reports neither the ingest-queue gauges nor anything a head could parse back into a typed
-/// value, and widening it would change what every current consumer sees.
+/// This is also what `imbhd`'s plain `GET /stats` and the MCP `db_stats` tool answer with
+/// (`imbh_mcp::stats_json` converts a [`imbh::DbStats`] here and serializes *this* derive), so the
+/// three surfaces cannot describe one database three ways. That is why the optional fields here and
+/// on [`TableStats`] are **not** `skip_serializing_if`: `/stats` has always spelled an absent
+/// per-table time bound as an explicit `null`, and one serializer means one spelling. `#[serde(default)]`
+/// keeps a payload that omits them readable all the same.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Stats {
     pub tables: Vec<TableStats>,
     pub buffer_bytes: u64,
     pub wal_bytes: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Highest durable LSN, or `null` when nothing is durable yet — never `0`, which is not a legal
+    /// LSN (`imbh::Lsn` is a `NonZero<u64>`).
+    #[serde(default)]
     pub durable_lsn: Option<u64>,
     pub ingest_queue_depth: u64,
     pub ingest_dropped: u64,
@@ -250,10 +255,41 @@ pub struct TableStats {
     pub segment_count: u64,
     pub segment_rows: u64,
     pub buffer_rows: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// `null` when the table holds no sealed segment (see [`Stats`] on why these are not omitted).
+    #[serde(default)]
     pub min_time_unix_nano: Option<i64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub max_time_unix_nano: Option<i64>,
+}
+
+impl From<&imbh::DbStats> for Stats {
+    /// The one conversion from the library's [`imbh::DbStats`] to the wire, shared by
+    /// `GET /api/head/stats`, `GET /stats` and the MCP `db_stats` tool.
+    fn from(stats: &imbh::DbStats) -> Self {
+        Stats {
+            tables: stats.tables.iter().map(TableStats::from).collect(),
+            buffer_bytes: stats.buffer_bytes as u64,
+            wal_bytes: stats.wal_bytes,
+            durable_lsn: stats.durable_lsn.map(|lsn| lsn.get()),
+            ingest_queue_depth: stats.ingest_queue_depth as u64,
+            ingest_dropped: stats.ingest_dropped,
+            ingest_errors: stats.ingest_errors,
+            ingest_rejected: stats.ingest_rejected,
+        }
+    }
+}
+
+impl From<&imbh::TableStats> for TableStats {
+    fn from(table: &imbh::TableStats) -> Self {
+        TableStats {
+            table: table.table.as_str().to_owned(),
+            segment_count: table.segment_count,
+            segment_rows: table.segment_rows,
+            buffer_rows: table.buffer_rows,
+            min_time_unix_nano: table.min_time_unix_nano,
+            max_time_unix_nano: table.max_time_unix_nano,
+        }
+    }
 }
 
 /// The body every head failure arrives in, matching the `{"error": ...}` shape the rest of `imbhd`
@@ -418,6 +454,54 @@ mod tests {
         )
         .expect("no caps");
         assert_eq!(request.caps, EvalCaps::default());
+    }
+
+    #[test]
+    fn stats_come_from_db_stats_with_every_gauge_and_a_null_for_nothing_durable() {
+        let stats = imbh::DbStats {
+            tables: vec![imbh::TableStats {
+                table: imbh::Table::Spans,
+                segment_count: 1,
+                segment_rows: 10,
+                buffer_rows: 2,
+                min_time_unix_nano: None,
+                max_time_unix_nano: None,
+            }],
+            buffer_bytes: 8,
+            wal_bytes: 16,
+            durable_lsn: None,
+            ingest_queue_depth: 3,
+            ingest_dropped: 5,
+            ingest_errors: 7,
+            ingest_rejected: 11,
+        };
+        let dto = Stats::from(&stats);
+        assert_eq!(
+            (
+                dto.ingest_queue_depth,
+                dto.ingest_dropped,
+                dto.ingest_errors,
+                dto.ingest_rejected
+            ),
+            (3, 5, 7, 11)
+        );
+        assert_eq!(dto.tables[0].table, "spans");
+
+        // Nothing durable is an explicit `null`, never `0` (not a legal `Lsn`) and never omitted —
+        // `GET /stats` shares this derive, and one serializer means one spelling.
+        let json = serde_json::to_string(&dto).expect("serialize");
+        assert!(json.contains("\"durable_lsn\":null"), "{json}");
+        assert!(json.contains("\"min_time_unix_nano\":null"), "{json}");
+        assert_eq!(
+            serde_json::from_str::<Stats>(&json).expect("round-trip"),
+            dto
+        );
+        // A payload that omits the optional fields still reads, so an older peer is not a parse
+        // error.
+        let sparse: Stats =
+            serde_json::from_str(r#"{"tables":[],"buffer_bytes":0,"wal_bytes":0,"ingest_queue_depth":0,"ingest_dropped":0,"ingest_errors":0}"#)
+                .expect("omitted optionals");
+        assert_eq!(sparse, Stats::default());
     }
 
     #[test]
