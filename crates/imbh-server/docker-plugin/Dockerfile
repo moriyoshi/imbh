@@ -67,7 +67,11 @@ COPY LICENSE THIRD-PARTY-NOTICES.txt /usr/share/doc/imbh/
 
 # The directories the plugin runtime needs: `/run/docker/plugins` holds the socket it serves,
 # `/run/docker/logging` is where the daemon creates each container's FIFO inside this rootfs, and
-# `/var/lib/imbh` is the database (bind-mounted from the host by the `data` mount in config.json).
+# `/var/lib/imbh` is the database. The last one must exist here as a *mountpoint*: config.json
+# declares it as the plugin's `propagatedMount`, so the daemon provisions the backing store itself
+# (at /var/lib/docker/plugins/<id>/propagated-mount) and mounts it over this directory at enable.
+# That is deliberately NOT a host bind mount -- a bind source is one thing the daemon will not create
+# for a plugin, which made a missing directory fail `plugin enable` with a runc mount error.
 #
 # WORKDIR and not `RUN mkdir -p`, because WORKDIR creates the directory as a builder-side metadata
 # operation while RUN would execute a shell *for the target platform* — the one thing that would drag

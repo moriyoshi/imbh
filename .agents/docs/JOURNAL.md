@@ -3368,3 +3368,79 @@ Worth noting *why* this happened, since it will recur: a long-running agent's vi
 frozen at the point it last read a file, and concurrent work invalidates its follow-up list without
 invalidating its findings. The findings in part 7 are first-hand and stand; the follow-ups were
 inferences about repo state and did not. Treat those two halves of any agent report differently.
+
+## The plugin could never be installed as documented: bind source vs. propagatedMount (2026-08-06)
+
+A user followed `docs/DOCKER_LOG_DRIVER.md` "Install" verbatim and `docker plugin enable` failed:
+
+```
+error mounting "/var/lib/imbh" to rootfs at "/var/lib/imbh":
+  stat /var/lib/imbh: no such file or directory
+```
+
+Not an environment quirk — **the documented install had never worked on a machine without a
+pre-existing `/var/lib/imbh`**, and no step created one. `docker plugin set data.source=...` reports
+success (it only records a setting), so the failure lands one command later, in the OCI runtime, with
+no `docker plugin logs` to read.
+
+The irony: the 2026-08-06 VRL entry above already recorded the exact rule — "a managed plugin's
+`type: none` mount requires its host source to exist before `docker plugin enable`, so adding one
+would have broken enable for every existing installation." That reasoning was applied to a
+*hypothetical new* mount and never turned on the `data` mount already shipping, which has the same
+requirement on any host installing for the first time.
+
+### Why the plugin cannot fix this itself
+
+`imbh-storage` already calls `create_dir_all` (`src/lib.rs:233`), and the rootfs already contains
+`/var/lib/imbh` (`Dockerfile`'s `WORKDIR`). Neither helps: the runtime establishes mounts **before**
+the entrypoint executes, so the task dies in `runc create` and `imbhd`'s `main` never runs. Any
+"provision it at startup" design is unimplementable for a bind source.
+
+### Measured, on Docker 29.2.1, with busybox probe plugins
+
+| config | `plugin enable` |
+|---|---|
+| bind mount, source missing | ✗ fails in `runc create` at the mount |
+| bind mount, source pre-created | ✓ reaches the entrypoint |
+| `propagatedMount`, no `mounts` | ✓ reaches the entrypoint; daemon provisions the store |
+| no mount at all (rootfs dir) | ✓ reaches the entrypoint |
+
+Two further measurements decided the trade-offs, both via a container bind-mounting the daemon's `/`
+(which is also how a non-root user inspects `/var/lib/docker`, and how any of this is reachable on
+Docker Desktop, where the path lives in the VM):
+
+- a marker written by the entrypoint **accumulated across three `disable`/`enable` cycles** — the
+  propagated mount persists through the lifecycle every `docker plugin set` requires;
+- `docker plugin rm` removed `/var/lib/docker/plugins/<id>/` **whole, propagated mount included** —
+  the database is destroyed with the plugin. Measured, not inferred.
+
+### What shipped
+
+`config.json` drops the `data` mount (`"mounts": []`) and declares
+`"propagatedMount": "/var/lib/imbh"`. Install is now one `docker plugin install` on every daemon, one
+fewer permission to grant, and — the reason this beat the alternative of auto-creating the bind
+source from `build.sh` — it is **platform-independent**: it asks the host filesystem for nothing, so
+Docker Desktop needs neither a VM-internal `mkdir` nor host file sharing, whose FUSE-family semantics
+imbh's advisory `flock` on `writer.lock` and its mmap'd segments have no business depending on.
+
+Breaking, and recorded in `CHANGELOG.md` under `[Unreleased]`: the database moves out of the host
+path, `plugin rm` now deletes it, and it can no longer be relocated to another disk, so `Retention`
+must be sized against the filesystem holding `/var/lib/docker`. Backup/restore and remap-script
+installation are documented as container one-liners in "Where the database lives".
+
+### Regression guard
+
+`crates/imbh-server/tests/docker_plugin_config.rs` — three ungated tests parsing the shipped
+`config.json`: no bind mount may reappear, `entrypoint[1]` must equal `propagatedMount` (a drift
+there is silent data loss into the replaced-on-upgrade rootfs), and `IMBH_DOCKER_PLUGIN_SOCKET` must
+match `interface.socket` and stay unsettable. Confirmed to fail when a mount is reintroduced, not
+merely to pass today. The file had **no** test coverage before: it is consumed by `docker plugin
+create` at package time, so every mistake in it was previously a user-machine discovery.
+
+### Verified
+
+`fmt --all --check` / `clippy --workspace --all-targets -D warnings` / `test --workspace` all clean
+(exit 0, 0 failures), plus `-p imbh-server` under `--features docker,docker-remap`. The shipped
+`config.json` was additionally packaged into a real plugin against a busybox rootfs and enabled with
+nothing provisioned by hand: it now fails only at `exec: "/usr/bin/imbhd"`, i.e. strictly after the
+mount stage. Probe plugins and the stray probe directory were removed. Nothing committed.

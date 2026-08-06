@@ -47,30 +47,122 @@ them.
 The release publishes the plugin **per architecture**, and you name the one you want:
 
 ```sh
-docker plugin install --alias imbh --disable ghcr.io/moriyoshi/imbh-log-driver:0.5.0-amd64
-docker plugin set     imbh data.source=/var/lib/imbh
-docker plugin enable  imbh
+docker plugin install --alias imbh ghcr.io/moriyoshi/imbh-log-driver:0.5.0-amd64
 ```
+
+That is the whole install. **The database directory needs no setting up** — `/var/lib/imbh` is
+declared as the plugin's [`propagatedMount`](#where-the-database-lives), so the Docker daemon creates
+the storage behind it and mounts it in at enable. There is no host path to create, no permission to
+grant for one, and the same command works on every daemon, Docker Desktop included.
 
 Tags are `X.Y.Z-amd64` / `X.Y.Z-arm64`, plus the floating `X.Y-<arch>` and `latest-<arch>`. There is
 no architecture-agnostic tag, and that is not an oversight: managed plugins have no manifest-list
 support — moby's plugin fetch path resolves a single manifest and does no platform matching, so a
-multi-arch tag would have nothing to select from. Install asks to grant the two permissions
-`config.json` declares (host networking and the host path for the database); `--grant-all-permissions`
-answers them for a script.
+multi-arch tag would have nothing to select from. Install asks to grant the one permission
+`config.json` declares (host networking); `--grant-all-permissions` answers it for a script.
+
+### Where the database lives
+
+The plugin stores its database in **storage the daemon provisions for it**, not in a directory you
+choose:
+
+```
+/var/lib/docker/plugins/<plugin-id>/propagated-mount    # on the host (or, on Docker Desktop, in the VM)
+        ↳ mounted at /var/lib/imbh inside the plugin
+```
+
+This is a deliberate trade, and the cost side is real:
+
+- ✅ **Nothing to provision.** A bind mount would need a source directory, and a missing bind source
+  is the one thing the daemon will *not* create for a plugin — it fails `plugin enable` (not `set`)
+  with `error mounting "/var/lib/imbh" to rootfs … no such file or directory`. Measured on Docker
+  29.2.1; `propagatedMount` has no such failure mode.
+- ✅ **It survives the plugin lifecycle you actually use.** `docker plugin disable` → `set` →
+  `enable`, which every settings change requires, keeps the database intact (measured across
+  repeated cycles).
+- ⚠️ **`docker plugin rm` deletes the database.** Removing the plugin removes
+  `/var/lib/docker/plugins/<id>/` whole, propagated mount included — measured, not assumed. There is
+  no undo and no prompt. Treat `plugin rm` as `DROP DATABASE`, and see
+  [Keeping the data](#keeping-the-data) before you run it.
+- ⚠️ **You cannot point it at another disk.** Log volumes grow; if `/var/lib/docker` is on a small
+  filesystem, size the [retention](#operational-notes) policy for it rather than expecting to
+  relocate the database.
+- ⚠️ **The path is root-owned**, so reading it from the host takes root — see below.
+
+#### Keeping the data
+
+The database is a normal imbh directory, so anything that can read the path can copy it. Find it and
+work through a container, which needs no `sudo` of your own (the container is root, and its `/` is
+the *daemon's* `/` — so this works unchanged on Docker Desktop, where the path lives in the VM):
+
+```sh
+ID=$(docker plugin inspect imbh --format '{{.Id}}')
+
+# back it up to the current directory
+docker plugin disable imbh                      # seal the buffer first; imbh is single-writer
+docker run --rm -v /:/host -v "$PWD:/out" busybox \
+  tar czf /out/imbh-backup.tar.gz -C "/host/var/lib/docker/plugins/$ID/propagated-mount" .
+docker plugin enable imbh
+```
+
+The same shape puts files *in* — which is how you install a remap script for
+`IMBH_DOCKER_REMAP=@/var/lib/imbh/remap/app.vrl` (see [Your own script](#your-own-script)):
+
+```sh
+docker run --rm -v /:/host -v "$PWD:/in" busybox sh -c \
+  "mkdir -p /host/var/lib/docker/plugins/$ID/propagated-mount/remap &&
+   cp /in/app.vrl /host/var/lib/docker/plugins/$ID/propagated-mount/remap/"
+```
+
+To query the database rather than copy it, prefer the OTLP/SQL endpoint the plugin already serves
+(see [Using it](#using-it)) — it is the supported read path and needs none of the above.
 
 `--alias imbh` is what makes the driver addressable as plain `--log-driver imbh` instead of by its
-full registry path. `--disable` installs without starting it, so the settings below apply before its
-first run rather than after a restart.
+full registry path.
 
-**Set the OTLP address before enabling it**, unless you want the compiled-in default of
-`172.17.0.1:4318` (see [Networking](#networking)). Unlike `build.sh`, an install cannot probe your
-daemon, so check what the bridge gateway actually is:
+**If the compiled-in OTLP address is wrong for your daemon**, add `--disable` to the install so the
+plugin does not start first, then set it. The default is `172.17.0.1:4318` (see
+[Networking](#networking)); unlike `build.sh`, an install cannot probe your daemon, so check what the
+bridge gateway actually is:
 
 ```sh
 docker network inspect bridge --format '{{range .IPAM.Config}}{{.Gateway}}{{end}}'
-docker plugin set imbh IMBH_LISTEN_ADDR=172.17.0.1:4318 IMBH_GRPC_LISTEN_ADDR=172.17.0.1:4317
+docker plugin set    imbh IMBH_LISTEN_ADDR=172.17.0.1:4318 IMBH_GRPC_LISTEN_ADDR=172.17.0.1:4317
+docker plugin enable imbh
 ```
+
+Changing it later is the same three steps with `docker plugin disable imbh` in front — and the
+database is not disturbed by that cycle.
+
+### Docker Desktop (macOS / Windows)
+
+> **Not exercised by CI**, which runs Linux daemons only. The storage mechanism is deliberately
+> platform-independent — nothing below asks the host filesystem for anything — but reports are
+> welcome.
+
+A managed plugin is a *Linux* artifact and Docker Desktop's daemon is Linux, so this is **not** the
+same limitation as the macOS binaries omitting the `docker` feature (README.md "Install the
+binaries"). That note is about a native `imbhd` on your Mac, which has no local daemon to serve; the
+published plugin instead runs inside the VM, next to the daemon that loads it.
+
+Because the database is daemon-provisioned, the install is the same one line as on Linux — there is
+no host directory to create and **no reliance on Docker Desktop's host file sharing**, which is a
+FUSE-family filesystem where imbh's advisory `flock` on `writer.lock` and its memory-mapped segments
+would both be on uncertain ground. The database stays inside the VM, on the VM's own filesystem,
+where those primitives behave normally.
+
+Two Desktop-specific things still bite:
+
+- **Pick the tag by the VM's architecture, not your machine's marketing name.** Apple silicon runs an
+  arm64 VM, so it is `…-log-driver:0.5.0-arm64`. The `-amd64` tag in the recipe above is the Linux
+  x86_64 default, and on an M-series Mac it is the wrong artifact.
+- **`curl 172.17.0.1:4318` from your Mac or PC shell will not reach it.** The plugin binds the
+  **VM's** bridge gateway, so containers reach it exactly as on Linux, but a managed plugin cannot
+  publish ports to your host. Query it from a container on the same daemon.
+
+Everything in [Keeping the data](#keeping-the-data) works unchanged here: those recipes go through a
+container, whose `/` is the VM's `/`, so they reach the database without any host sharing and without
+`sudo`.
 
 ### Building it yourself
 
@@ -78,7 +170,6 @@ Only needed if you are changing imbh:
 
 ```sh
 ./crates/imbh-server/docker-plugin/build.sh
-docker plugin set    imbh/log-driver:latest data.source=/var/lib/imbh
 docker plugin enable imbh/log-driver:latest
 ```
 
@@ -251,13 +342,14 @@ A per-container `--log-opt` always wins over the daemon-wide default.
 docker run --log-driver imbh \
   --log-opt imbh-remap='if contains!(.line, "/healthz") { abort }' nginx
 
-# daemon-wide, from a file under the plugin's data mount (no rebuild needed)
+# daemon-wide, from a file in the plugin's database directory (no rebuild needed)
 docker plugin set imbh IMBH_DOCKER_REMAP=@/var/lib/imbh/remap/app.vrl
 ```
 
-`@PATH` resolves inside the plugin's own mount namespace, not the host's. The `data` mount is already
-bind-mounted at `/var/lib/imbh`, so putting scripts there is the path that works with no extra
-configuration.
+`@PATH` resolves inside the plugin's own mount namespace, not the host's. `/var/lib/imbh` is the
+daemon-provisioned database directory and persists across `disable`/`enable`, so a script there is
+the path that works with no extra configuration — see
+[Keeping the data](#keeping-the-data) for the one-liner that copies a file into it.
 
 The script receives the Docker log-driver model **and** the OTel record the driver would have stored
 on its own, so a script that changes nothing behaves exactly like no script at all:
@@ -375,10 +467,16 @@ docker plugin set imbh IMBH_LISTEN_ADDR= IMBH_GRPC_LISTEN_ADDR=
 ```
 
 Container logging is unaffected -- the plugin protocol and the per-container FIFOs are filesystem
-objects, not network ones. Query the database by opening its directory **read-only** from the host
-(`imbh-tui`, or a second `imbhd` using `Db::open_read_only`), which needs no network either. What you
-give up is OTLP ingest: app containers have no way to reach the plugin, and they cannot use a second
-`imbhd` on the same directory instead, because imbh allows only one writer per database.
+objects, not network ones. What you give up is *every* query path: with no listener there is no SQL
+endpoint, and the database sits in the plugin's own storage under `/var/lib/docker/plugins/<id>/`
+(root-owned, and inside the VM on Docker Desktop), so a read-only `imbh-tui` or
+`Db::open_read_only` cannot simply be pointed at it the way it can at an ordinary `imbhd` directory.
+Copy it out first -- see [Keeping the data](#keeping-the-data) -- and open the copy. You also give up
+OTLP ingest: app containers have no way to reach the plugin, and they cannot run a second `imbhd` on
+the same directory instead, because imbh allows only one writer per database.
+
+Choose this when the plugin is a pure capture sink you will query offline. If you want a live query
+endpoint *and* no LAN exposure, the bridge-gateway default already gives you that.
 
 ### Why not `network.type: bridge`?
 
@@ -467,12 +565,19 @@ traces and container logs land in one database.
 
 ## Operational notes
 
+- **`docker plugin rm` destroys the database.** It removes `/var/lib/docker/plugins/<id>/` entire,
+  and the plugin's storage lives inside it. No prompt, no undo — back up first if the logs matter
+  (see [Keeping the data](#keeping-the-data)). `disable`/`enable`, including the cycle a
+  `docker plugin set` requires, is safe.
 - **One writer per database.** imbh enforces a `writer.lock`, so the plugin owns its data directory.
-  Other processes can still read it — `Db::open_read_only` sees the plugin's committed segments plus
-  its live WAL tail. Point a second, read-only `imbhd` (or `imbh-tui`) at the same directory to query
-  without contending with ingest.
-- **Retention** is imbh's, not Docker's: configure age and disk budget on the `Db` rather than
-  `max-size`/`max-file`. The defaults come from `imbh-core`'s `Retention`.
+  `Db::open_read_only` can still read a copy — it sees committed segments plus a live WAL tail — but
+  the plugin's own directory is not at a path a second process can conveniently open
+  (see [Where the database lives](#where-the-database-lives)), so the SQL endpoint is the intended
+  read path.
+- **Retention is the only size control, and it matters more here.** It is imbh's, not Docker's:
+  configure age and disk budget on the `Db` rather than `max-size`/`max-file`, with the defaults from
+  `imbh-core`'s `Retention`. Since the database cannot be relocated to another disk, set the budget
+  against whatever filesystem holds `/var/lib/docker`.
 - **Back-pressure, not loss.** When ingest falls behind, the FIFO reader blocks rather than dropping
   lines, which propagates back into the container's stdout — slow logging instead of missing logs.
 - **Batching.** Lines are ingested in batches (512 records or 200 ms, whichever comes first), so the

@@ -9,6 +9,28 @@ git history); this file tracks only what is still open.
 
 ## Open Items
 
+- [ ] **The published 0.5.0 plugin cannot be installed as its own docs describe — the fix is in
+      `[Unreleased]` and needs a release to reach anyone.** `config.json` now uses `propagatedMount`
+      instead of a `data` bind mount (JOURNAL 2026-08-06), because a bind source the daemon will not
+      create made `docker plugin enable` fail on any host without a pre-existing `/var/lib/imbh`.
+      Until a release is cut, `ghcr.io/moriyoshi/imbh-log-driver:0.5.0-*` still carries the broken
+      config, and the fixed `docs/DOCKER_LOG_DRIVER.md` in the tree **does not match the plugin those
+      tags install** — anyone following main's install steps against the 0.5.0 tag hits the original
+      error. Worth considering: a note on the released docs, or prioritising the release. Breaking
+      (the database relocates and `plugin rm` now destroys it), so it is a minor bump under the 0.x
+      rule, not a patch. Releases are cut only when explicitly asked.
+
+- [ ] **Confirm `propagatedMount` survives `docker plugin upgrade`.** Persistence across
+      `disable`/`enable` and destruction by `plugin rm` were both measured (JOURNAL 2026-08-06);
+      `upgrade` was not, because it needs a registry round trip. It decides whether upgrading the
+      plugin is a data-preserving operation, which the docs currently do not claim either way.
+
+- [ ] **Nothing exercises the plugin against a real daemon.** `docker_plugin_config.rs` now guards the
+      shipped `config.json` statically, but the packaging path (`build.sh` → `plugin create` →
+      `enable` → a container logging through it) is still only ever run by hand. This class of bug —
+      valid config, valid binary, fails at `enable` — is invisible to every existing test. An opt-in
+      test gated like the RSS soak, or a CI leg on a Linux runner with a daemon, would catch it.
+
 - [x] **The head API needs a semver bump before release (`imbh-head` is a new published crate).**
       *(closed 2026-08-06 — stale.)* Shipped: the workspace is at `0.5.0`, `v0.4.0` and `v0.5.0` are
       tagged and released, and `imbh-head` is a workspace member inheriting `version.workspace` /

@@ -161,8 +161,7 @@ cat <<EOF
 
 created ${PLUGIN}   OTLP endpoint: ${ENDPOINT}
 
-  ${DOCKER} plugin set    ${PLUGIN} data.source=/var/lib/imbh   # where the database lives on the host
-  ${DOCKER} plugin enable ${PLUGIN}
+  ${DOCKER} plugin enable ${PLUGIN}   # the database directory is provisioned by the daemon
   ${DOCKER} run --log-driver ${PLUGIN} --log-opt imbh-service=web nginx
 
   # apps reach the OTLP endpoint through the same address, on any bridge network:

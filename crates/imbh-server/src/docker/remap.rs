@@ -54,8 +54,9 @@ pub enum Source {
     #[default]
     Builtin,
     /// A script read from this path — **inside the plugin's mount namespace**, not the host's. A
-    /// managed plugin sees its own rootfs, so the `data` mount (`/var/lib/imbh`) is the path that
-    /// works without reconfiguring the plugin.
+    /// managed plugin sees its own rootfs, so the database directory (`/var/lib/imbh`, which the
+    /// daemon provisions and which persists) is the path that works without reconfiguring the
+    /// plugin.
     File(String),
     /// A script given inline.
     Inline(String),
