@@ -20,6 +20,12 @@ git history); this file tracks only what is still open.
       (the database relocates and `plugin rm` now destroys it), so it is a minor bump under the 0.x
       rule, not a patch. Releases are cut only when explicitly asked.
 
+      *(2026-08-06: **v0.6.0 is prepared but not cut.** The workspace is bumped to `0.6.0`, the
+      changelog section is closed and dated, notices are regenerated and every gate is green — see
+      JOURNAL "Preparing v0.6.0". Still open because nothing is committed, tagged or published, so
+      `ghcr.io/moriyoshi/imbh-log-driver:0.5.0-*` still carries the broken config. Close this once
+      the `v0.6.0` tag is pushed and the plugin job has published its tags.)*
+
 - [ ] **Confirm `propagatedMount` survives `docker plugin upgrade`.** Persistence across
       `disable`/`enable` and destruction by `plugin rm` were both measured (JOURNAL 2026-08-06);
       `upgrade` was not, because it needs a registry round trip. It decides whether upgrading the

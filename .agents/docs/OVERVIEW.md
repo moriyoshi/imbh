@@ -246,7 +246,10 @@ three signals, with the reference server and SDK exporter built. See
 Post-v0.1 additions (outside the original milestone plan): the **Docker logging-driver plugin** in
 `imbh-server` (optional `docker` feature) — `--log-driver imbh` writes container stdout/stderr into
 an embedded `Db` and serves `docker logs` back out of it, with no new crate in the graph
-(ARCHITECTURE.md §10.16, [docs/DOCKER_LOG_DRIVER.md](../../docs/DOCKER_LOG_DRIVER.md));
+(ARCHITECTURE.md §10.16, [docs/DOCKER_LOG_DRIVER.md](../../docs/DOCKER_LOG_DRIVER.md)) — and, since
+v0.6.0, its **VRL remap stage** (`docker-remap`, enabled in the published plugin), which parses JSON,
+logfmt, klog/glog and `key=value` lines onto the OTel record; that one *does* add crates (vrl), and
+is the sole feature in the workspace that does;
 **signal-driven graceful shutdown** for `imbhd` (`SIGINT`/`SIGTERM` → stop accepting, drain in-flight
 requests, seal the buffer, exit 0), also with no new crate (ARCHITECTURE.md §10.16); and the **MCP
 server** (`imbh-mcp`), which exposes the telemetry as 15 read-only agent tools over both of MCP's
