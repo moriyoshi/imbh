@@ -70,6 +70,32 @@ release aborts if it is missing or duplicated.
 
 ### Changed
 
+- **BREAKING (Docker log-driver plugin): the database is now provisioned by the daemon, not
+  bind-mounted from a host path.** `config.json` drops the settable `data` mount and declares
+  `/var/lib/imbh` as the plugin's `propagatedMount`, so Docker creates the storage behind it at
+  `plugin enable`.
+
+  The old configuration could not be installed without a manual step nobody documented: a bind mount
+  needs its source directory to already exist, and a missing bind *source* is the one thing the
+  daemon will not create for a plugin. `docker plugin enable` failed with `error mounting
+  "/var/lib/imbh" to rootfs … no such file or directory` — after a `plugin set` that had reported
+  success, and with no `docker plugin logs` to consult. The plugin could not fix this itself: mounts
+  are established before the entrypoint runs, so `imbhd` never got far enough to call the
+  `create_dir_all` it already had. It was worst on Docker Desktop, where the path is resolved inside
+  the Linux VM and `sudo mkdir` on the Mac or Windows host has no effect on it.
+
+  Install is now a single `docker plugin install` on every daemon, Docker Desktop included, with no
+  host directory to create, one fewer permission to grant, and no dependence on Desktop's host file
+  sharing — a FUSE-family filesystem that imbh's advisory `flock` and memory-mapped segments have no
+  business relying on.
+
+  **Migrating from 0.5.0:** the database moves from the host path you set as `data.source` into
+  `/var/lib/docker/plugins/<id>/propagated-mount`; existing logs are not carried over, and the old
+  host directory is left untouched for you to keep or delete. **`docker plugin rm` now deletes the
+  database with the plugin** — measured, no prompt and no undo — and the database can no longer be
+  placed on a different disk, so size `Retention` against the filesystem holding `/var/lib/docker`.
+  `docker plugin disable`/`enable`, including the cycle every `docker plugin set` requires, leaves it
+  intact. See `docs/DOCKER_LOG_DRIVER.md` "Where the database lives" for backup and restore.
 - **Breaking: `GET /stats` and the MCP `db_stats` tool spell a `None` durable LSN as `null` instead
   of `0`.** Zero is not a legal LSN — `imbh::Lsn` is a `NonZero<u64>` — so "nothing is durable yet"
   was indistinguishable from a real watermark to any typed reader, and it is the one part of this

@@ -33,7 +33,7 @@
     },
     {
       "name": "IMBH_DOCKER_REMAP",
-      "description": "VRL script applied to every container line before it is stored, mapping the Docker log-driver data model onto the OpenTelemetry logs data model. `default` is the built-in remapper (JSON, logfmt, klog/glog, key=value); `off` stores lines exactly as the container printed them; `@PATH` reads a script from a path inside the plugin -- the `data` mount is already there, so @/var/lib/imbh/remap/app.vrl works with no extra configuration; anything else is treated as an inline script. Override per container with --log-opt imbh-remap=...",
+      "description": "VRL script applied to every container line before it is stored, mapping the Docker log-driver data model onto the OpenTelemetry logs data model. `default` is the built-in remapper (JSON, logfmt, klog/glog, key=value); `off` stores lines exactly as the container printed them; `@PATH` reads a script from a path inside the plugin -- /var/lib/imbh is the daemon-provisioned database directory and persists, so @/var/lib/imbh/remap/app.vrl works once you place the file there (see docs/DOCKER_LOG_DRIVER.md); anything else is treated as an inline script. Override per container with --log-opt imbh-remap=...",
       "value": "default",
       "settable": ["value"]
     },
@@ -68,17 +68,7 @@
       "settable": ["value"]
     }
   ],
-  "mounts": [
-    {
-      "name": "data",
-      "description": "Host directory holding the imbh database. Set with: docker plugin set <plugin> data.source=/path",
-      "source": "/var/lib/imbh",
-      "destination": "/var/lib/imbh",
-      "type": "none",
-      "options": ["rbind", "rw"],
-      "settable": ["source"]
-    }
-  ],
+  "mounts": [],
   "network": {
     "type": "host"
   },
@@ -88,5 +78,5 @@
     "devices": null
   },
   "workdir": "/",
-  "propagatedMount": ""
+  "propagatedMount": "/var/lib/imbh"
 }
