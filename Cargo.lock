@@ -2654,6 +2654,7 @@ dependencies = [
  "fs4",
  "imbh-core",
  "imbh-index",
+ "memmap2",
  "parquet",
  "tempfile",
  "tracing",

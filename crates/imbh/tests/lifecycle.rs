@@ -134,6 +134,138 @@ fn retention_drops_aged_segments() {
     });
 }
 
+/// Every regular file that makes up a sealed segment: the Parquet file plus everything inside its
+/// `.tidx` sidecar directory.
+fn segment_parts(parquet: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = vec![parquet.to_path_buf()];
+    let mut stack = vec![parquet.with_extension("tidx")];
+    while let Some(d) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else {
+                out.push(p);
+            }
+        }
+    }
+    out
+}
+
+/// Open (and keep open) every file backing `segments` — the handles a query in flight holds while
+/// it streams a segment's Parquet and consults its `.tidx`.
+fn pin(segments: &[std::path::PathBuf]) -> Vec<std::fs::File> {
+    let mut held = Vec::new();
+    for seg in segments {
+        for part in segment_parts(seg) {
+            held.push(std::fs::File::open(&part).unwrap_or_else(|e| panic!("open {part:?}: {e}")));
+        }
+    }
+    held
+}
+
+/// **Windows portability (issue #3 shape), through the facade.** `compact()` and `maintain()` both
+/// finish by unlinking segment files the manifest no longer names. POSIX allows unlinking a file
+/// that is still open; Windows only tolerates it for handles opened with delete sharing, and refuses
+/// outright for a file that is memory-mapped (which a Tantivy searcher over a `.tidx` sidecar does).
+/// So the ordering that matters is a reader alive *across* the reclaim, not a reclaim on an idle DB
+/// — this test stages it for both passes over one on-disk database. (The mapped-file half of the
+/// hazard is covered by `imbh-storage`'s own reclaim tests, which run on the same Windows CI leg.)
+#[test]
+fn compaction_and_retention_reclaim_segments_pinned_by_open_readers() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let rt = ct_rt();
+
+    // Disk budget 0 → once maintenance runs, retention drops every sealed segment.
+    let db: Arc<Db> = Db::builder(dir)
+        .wal(WalMode::Always)
+        .retention(Retention::none().max_disk_bytes(0))
+        .open()
+        .unwrap();
+    rt.block_on(async {
+        // Two seals in the same UTC-day partition → two compactable source segments.
+        db.ingest_otlp_rich_ok("cart", "alpha", 1, &[("env", "prod")])
+            .await;
+        db.flush().await.unwrap();
+        db.ingest_otlp_rich_ok("cart", "beta", 2, &[("env", "prod")])
+            .await;
+        db.flush().await.unwrap();
+        let sources = db.segment_files(Table::Logs);
+        assert_eq!(sources.len(), 2, "two sealed logs segments to merge");
+
+        // Pin both sources BEFORE compaction and hold them across it.
+        let held = pin(&sources);
+        assert!(
+            held.len() > sources.len(),
+            ".tidx sidecar files are held too"
+        );
+        db.compact()
+            .await
+            .expect("compaction must not fail because a reader holds the sources");
+        assert_eq!(
+            count_sql(&db, "SELECT count(*) AS c FROM logs").await,
+            2,
+            "compaction preserves rows while the sources are pinned"
+        );
+        drop(held);
+
+        // Same story for retention: pin the merged segment, then let maintenance reclaim it.
+        let merged = db.segment_files(Table::Logs);
+        assert_eq!(merged.len(), 1, "the two sources merged into one segment");
+        let held = pin(&merged);
+        let report = db
+            .maintain()
+            .await
+            .expect("retention must not fail because a reader holds the segment");
+        assert!(
+            report.segments_dropped >= 1,
+            "the pinned segment is dropped"
+        );
+        assert_eq!(
+            count_sql(&db, "SELECT count(*) AS c FROM logs").await,
+            0,
+            "retention dropped the segment while it was pinned"
+        );
+        drop(held);
+        db.close().await.unwrap();
+    });
+    drop(db);
+
+    // Reopen: nothing dangles. Any file the OS refused to unlink is an orphan the open sweeps.
+    let db: Arc<Db> = Db::builder(dir).wal(WalMode::Always).open().unwrap();
+    rt.block_on(async {
+        assert_eq!(count_sql(&db, "SELECT count(*) AS c FROM logs").await, 0);
+        assert!(
+            db.segment_files(Table::Logs).is_empty(),
+            "no segment survives the reclaim"
+        );
+        db.close().await.unwrap();
+    });
+    let mut leftovers = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let p = entry.path();
+            match p.extension().and_then(|e| e.to_str()) {
+                Some("parquet") | Some("tidx") => leftovers.push(p),
+                _ if p.is_dir() => stack.push(p),
+                _ => {}
+            }
+        }
+    }
+    assert!(
+        leftovers.is_empty(),
+        "no segment bytes are left behind after the reclaim + orphan sweep: {leftovers:?}"
+    );
+}
+
 /// Small ingest helper so the test bodies read cleanly.
 trait IngestRich {
     async fn ingest_otlp_rich_ok(
