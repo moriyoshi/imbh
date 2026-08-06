@@ -13,6 +13,75 @@ release aborts if it is missing or duplicated.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Compaction could silently corrupt a day partition whose segments were sealed under different
+  promoted-key sets.** `concat_batches` takes columns **positionally** and does not validate them
+  against the schema it is handed, and compaction passed it `batches[0].schema()` — the first
+  segment's. Changing `DbBuilder::promote(...)` between two seals in the same UTC day therefore gave
+  one of three outcomes depending on segment order: a panic (`index out of bounds`) when the first
+  segment was wider, **silent** truncation of the later segments' promoted columns when it was
+  narrower, or — worst — **silent** concatenation of two differently-named promoted columns into one
+  when the widths matched, labelled with whichever name the first segment used. Two of the three
+  failed silently and wrote the result back as the merged segment. Compaction now coerces every batch
+  read off disk to the table's current canonical schema first. Note this was reachable through a
+  documented-as-supported operation: `ARCHITECTURE.md` §6.1 called adding or removing promoted keys
+  backward-compatible, which was true of the read path but not the compaction path.
+
+- **The Docker log driver's `--tail 0 -f` could miss a line emitted just before the follow started.**
+  The follow watermark jumped to `Timestamp::now()` on the **event** clock, but a record's timestamp
+  is when the container emitted the line while ingest lands it up to one batch interval later, so
+  event time is not monotone in arrival. The driver now watermarks and follows on `observed_time`,
+  which for this driver is dockerd's capture stamp. `--tail N` and full history are unchanged and
+  still print in event-time order. See `docs/DOCKER_LOG_DRIVER.md` for the residues this does not
+  eliminate — a VRL script can overwrite `.observed_timestamp`, an exact-nanosecond tie is still
+  broken once, and `--tail 0` has no uniquely correct cut against a batching store.
+
+- **Typed `MetricsApi::range`/`instant` no longer inflate `sum`/`count` on duplicate metric points**
+  under `Duplicates::LastWins`, bringing them into line with PromQL. The surviving point of a
+  duplicated instant is chosen by the same total order on the **value** that §10.5.1 already
+  specified — never by scan order — so the result stays a pure function of the fetched sample
+  multiset. Under every other policy the emitted SQL is unchanged. `Duplicates::ErrorOnRead` (the
+  default) still does not *fail* on a duplicate the way PromQL does; that asymmetry is deliberate and
+  documented.
+
+### Added
+
+- **`LogQuery::observed_after` and `LogOrder { Time, ObservedTime }`** expose the arrival clock
+  (`observed_time`, already stored on every log row) as a filter and sort axis. Additive: the `SELECT`
+  projection is unchanged, and both new fields carry `#[serde(default)]` so previously serialized
+  `LogQuery` JSON still deserializes.
+
+- **`GET /stats` and the MCP `db_stats` tool report the ingest gauges, and their output parses back
+  into a typed value.** Both are served by one hand-written serializer, `imbh_mcp::stats_json`, which
+  reported `buffer_bytes`, `wal_bytes`, `durable_lsn` and the per-table breakdown — but none of
+  `ingest_queue_depth`, `ingest_dropped`, `ingest_errors` or `ingest_rejected`. An operator watching
+  `/stats` could therefore not see an async-ingest queue backing up, an `Overflow::DropOldest`
+  eviction, a worker failure, or a duplicate-timestamp rejection, all of which are losses with no
+  caller left to report them to.
+
+  Rather than widen the hand-written writer, `stats_json` now converts a `DbStats` into
+  `imbh_head::dto::Stats` (a new `From<&imbh::DbStats>`, which `exec::stats` also uses) and
+  serializes *that* derive. `GET /stats`, `db_stats` and `GET /api/head/stats` are consequently one
+  serializer with one shape, and the plain endpoint's body deserializes into `imbh_head::dto::Stats`
+  like the head API's does — which is also how the `db_stats` tool's parse-back is now guaranteed to
+  succeed. `imbh-mcp` gains an `imbh-head` dependency (`dto` only) to do it; the feature adds no
+  third-party crate to any graph, and none of it reaches the `imbh` facade.
+
+### Changed
+
+- **Breaking: `GET /stats` and the MCP `db_stats` tool spell a `None` durable LSN as `null` instead
+  of `0`.** Zero is not a legal LSN — `imbh::Lsn` is a `NonZero<u64>` — so "nothing is durable yet"
+  was indistinguishable from a real watermark to any typed reader, and it is the one part of this
+  change a current consumer can see. A consumer that compared the number against a receipt's LSN was
+  already correct by accident and stays correct; one that parsed the field as a plain integer must
+  now accept `null`.
+- **`imbh_head::dto::Stats::durable_lsn` and `dto::TableStats`'s `min_time_unix_nano` /
+  `max_time_unix_nano` are serialized as `null` when absent** rather than omitted, now that
+  `GET /stats` shares the derive and has always emitted an explicit `null` for an absent per-table
+  bound. They keep `#[serde(default)]`, so a payload that omits them still deserializes and older
+  peers are unaffected in that direction.
+
 ## [0.5.0] - 2026-08-05
 
 ### Added

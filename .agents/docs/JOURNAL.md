@@ -2852,3 +2852,519 @@ clean, plus `-p imbh-server` clippy **and** tests under `--features docker` and
 `--features docker,docker-remap` separately. `cargo deny check licenses` and `check bans` pass;
 `THIRD-PARTY-NOTICES.txt` regenerated (it now carries the graph's first MPL-2.0 entries, plus MIT-0
 and 0BSD). Footprint gate OK on both gated axes. Nothing committed.
+
+## TODO sweep: four stale items, three fixed, one misdiagnosis (2026-08-06, part 3)
+
+A `tackle-todos` pass over the 14 open items in `TODO.md`. A source scan first: **zero**
+`// TODO` / `// FIXME` / `todo!(` / `unimplemented!(` markers across all 141 tracked `*.rs` files,
+so `TODO.md` is the whole work list. Worth recording as a property of this repo — the usual
+"grep the source for markers" half of the sweep finds nothing here, and the doc is load-bearing
+in a way it is not in most codebases.
+
+### Four items were stale, and staleness clustered by kind
+
+Items 1 (head-crate semver bump), 8 (CD has never run), 10 (the `windows-latest` job has never run)
+and 11 (release carrying the Windows fix) were all closed without work. The pattern: every one of
+them was an item whose resolution came from **something happening in CI or a release**, not from
+someone editing code. Four releases (`v0.1.1` … `v0.5.0`) and dozens of CI runs went by, each
+quietly answering an item, and nothing brought the news back to `TODO.md`. Code-shaped TODOs get
+closed by the person touching the code; process-shaped TODOs have no such trigger and rot silently.
+The verification was cheap in every case (`git ls-remote --tags`, `gh run list`,
+`gh run view --json jobs`) — worth making the first move of any sweep rather than dispatching agents
+against items that no longer exist.
+
+Two of the four left a genuine residue behind, now filed as their own open items rather than being
+lost with the parent: the **GHCR package visibility** for `imbh-log-driver` (a package created by
+`GITHUB_TOKEN` is not public just because the repo is, and a private one breaks
+`docker plugin install` for everyone), and the fact that the green Windows job is deliberately
+narrow — it never exercises **retention**, and only partly exercises compaction, which is precisely
+the open/mmapped-file-rename shape issue #3 had.
+
+### The `datafusion` assertion: the item's diagnosis was wrong
+
+`TODO.md` claimed the check was vacuous because the graph "contains only the split crates
+(`datafusion-core`, …) and no bare `datafusion`". It does contain a bare `datafusion v54.1.0` — line
+185 of 999, two matching lines. The grep matched all along.
+
+The check *was* weak, for a reason the item did not name: it printed `datafusion: yes`/`NO` and
+**exited 0**. A `NO` that does not fail the gate guards nothing no matter how good the pattern is.
+Both engine checks now set `fail=1`, matching the search-lever guard directly below them that
+already did. The pattern was broadened to the crate *family* (`datafusion(-[a-z-]+)? v`) anyway —
+not because it is broken today, but because DataFusion keeps splitting, and the day `imbh-query`
+depends on `datafusion-core` instead of the facade the old pattern would false-alarm on a healthy
+tree. That is the failure the item described, arriving later than it thought.
+
+**A reported measurement that did not survive re-check.** The subagent's headline finding was a
+`grep -q`-under-`pipefail` SIGPIPE race — `grep -q` exits on first match, the upstream writer gets
+EPIPE, and `pipefail` surfaces the writer's 141 despite the match — measured at 63 false negatives
+in 400 runs. It does not reproduce: 0 in 900 on re-check, and the mechanism **cannot** fire at the
+current size, because the tree is ~55 KiB against a 64 KiB pipe buffer, so `printf` never blocks and
+there is no broken pipe to report. The here-strings were kept as cheap insurance for a future larger
+tree, and the comment in the script was rewritten to say that rather than to assert a flake rate.
+The likelier explanation for whatever was seen: three agents were hammering `cargo` concurrently,
+and `cargo tree`'s failure under lock contention is invisible here because `2>/dev/null` swallows it.
+Lesson worth keeping: a subagent's empirically-framed claim ("63 of 400 runs") is not
+self-validating — this one had a plausible mechanism, a specific number, and a live reproduction
+story, and was still wrong.
+
+**Which surfaced a regression the fix itself introduced.** Making the checks hard-fail means an
+empty `$tree` — exactly what a `cargo tree` failure produces, silently — now turns a transient
+infrastructure hiccup into a red gate reporting that *both* engines were silently dropped. Guarded:
+the capture keeps stderr, and a failed/empty tree reports "could not run" once, distinctly, instead
+of being read as a footprint result. Distinguishing "we could not measure" from "the answer is no"
+is the general point; the gate had conflated them.
+
+### The 216-vs-71 crate count was two knobs conflated
+
+`QUALITY_GATE.md` said turning `search` off drops the tree "to 216"; the gate measured 71. Neither
+was the number the sentence wanted. Measured (aarch64-glibc, `--edges normal`, unique): default
+`ingest,query,search` = **275**; `--no-default-features --features ingest,query` = **217**, i.e.
+-58, which is the tantivy subtree and the actual cost of turning search off; `--no-default-features`
+= **71**, i.e. -204, which also drops OTLP decode and the whole DataFusion subtree. The doc's 216
+was the search lever's number wearing the bare build's name.
+
+The gate had *taught* the doc the error: its old line printed `tantivy dropped: yes (-204 crates)`,
+attributing the entire `--no-default-features` delta to tantivy. A measurement labelled with the
+wrong cause propagates into prose and is then very hard to argue with, because it is a real number.
+The gate now prints all three, labelled, and checks the precise `ingest,query` lever for tantivy
+leakage in addition to the bare build.
+
+### `/stats` converged on one serializer, at the cost of a second breaking change
+
+The item asked for three ingest gauges on `stats_json` plus a `durable_lsn` spelling fix. There are
+**four** gauges — `ingest_rejected` arrived in 0.5.0 with the duplicate-timestamp policy — and the
+`db_stats` call site that "round-trips" the JSON parses into `serde_json::Value`, so it constrained
+nothing beyond well-formedness; the real constraint was `imbh_head::dto::Stats`.
+
+Rather than widening the hand-written writer, `stats_json` now defers to that typed value
+(`serde_json::to_string(&dto::Stats::from(stats))`) and `exec::stats()` uses the same conversion, so
+there is genuinely **one** serializer instead of two that had to agree by inspection — which is how
+the gauges went missing in the first place. Cost: `imbh-mcp` gained an `imbh-head` dependency
+(`dto` feature only), +1 workspace crate, +0 third-party, `cargo tree -p imbh` unchanged at 275.
+
+The convergence **forced a second breaking change beyond the one authorised**: `dto::Stats` and
+`dto::TableStats` had to drop `skip_serializing_if`, because `/stats` has always emitted absent
+per-table bounds as explicit `null` and one serializer means one spelling. So a
+`GET /api/head/stats` consumer now sees `null` fields where they were previously omitted. Both
+changes are deserialization-compatible in each direction via `#[serde(default)]` and both are in
+`CHANGELOG.md` under `[Unreleased]`. Generalisable: "make these two surfaces share one serializer"
+is never contract-neutral — it necessarily picks a winner for every spelling the two disagreed on,
+and the disagreements are not all visible from the side you set out to change.
+
+### Dependabot: the pinning had disabled the alerts
+
+`.github/dependabot.yml` added — `github-actions` at `directory: "/"` (verified complete: no
+composite actions in the tree), weekly, minor+patch grouped so one CI run clears the batch, majors
+ungrouped so a renamed input fails on its own. **Ten** distinct actions, not the nine the item
+counted (`taiki-e/install-action` was missed).
+
+The finding that changes what this item was *for*: per GitHub's Secure use reference, Dependabot
+raises security **alerts** only for actions using semantic versioning, and explicitly **not** for
+actions pinned to SHA values. The SHA pinning — added deliberately for supply-chain safety — had
+silently opted the repo out of action security alerts altogether. So this file is not the
+convenience the item framed it as; it is the only automated channel by which an upstream action fix
+reaches `release.yml`, the workflow holding the crates.io token and the registry login. A hardening
+measure that disables the alerting for the thing it hardens is worth generalising as a shape to look
+for. Recorded in the file as its lead comment. One watch item: `dtolnay/rust-toolchain` is pinned to
+a commit on its `stable` *branch*, not a tag, so Dependabot follows branch HEAD and those PRs carry
+no version to sanity-check the diff against. No `cargo` entry — filed as an open item with the
+tradeoff, since footprint budgets here are load-bearing and Dependabot cannot reason about the
+hand-trimmed `default-features = false` sets.
+
+### Verification
+
+`cargo fmt --all --check`, `cargo build --workspace`,
+`cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace` — all clean (no
+failures across the suite). Footprint gate `OK` end to end: 275/275 crates, `imbhd` 33.3 MiB, plugin
+feature set 38.1 MiB, both engine checks passing, all three lever numbers printed. The empty-`$tree`
+guard was exercised against a simulated `cargo` failure. Nothing committed.
+
+Left open by design, unchanged by this sweep: the `v0.3.0` remote tag (still absent from `origin`;
+re-pushing deliberately burns a red 40-minute CD run — the user's call), MCP cost ceilings, the
+buffered-response write deadline, the upstream differential runner, the published-target footprint
+measurements, the `docker-remap` RSS measurement, and the two items — the `--tail 0 -f` event-time
+race and `MetricsApi`'s duplicate metric points — that both want the same ingest-sequence column and
+are therefore one serial core-schema change, not two parallel ones.
+
+## TODO sweep, phase 2: the column that should not be built (2026-08-06, part 4)
+
+Continuation of part 3. Seven more items closed, one of them by *not* doing what was approved.
+
+### The headline: an approved design was wrong, and the repo already knew
+
+The sweep's own framing said the `--tail 0 -f` tail race and `MetricsApi`'s duplicate metric points
+"both want the same ingest-sequence column", and the user approved adding it. A read-only design pass
+found that framing wrong on every limb:
+
+- **`ARCHITECTURE.md` had already considered and rejected exactly this column, twice** — §10.5.1
+  (line 738) and line 1311: *"resolved by value, never by scan order: metric segments carry no
+  ingest-sequence column … so a positional rule would let two identical queries disagree after a flush
+  or compaction."* Ordering the typed metrics dedup by an ingest sequence would have made the typed API
+  and PromQL resolve the same duplicate **differently**. The column was not merely unnecessary for that
+  consumer; it was the wrong tool, and building it would have broken a shipped invariant.
+- **The logs consumer already had its column.** `observed_time` is on the schema, on the DTO, set by
+  the Docker driver from dockerd's capture stamp, and deliberately preserved through VRL remap. It was
+  never exposed as a query axis — a plumbing gap, not a storage gap.
+- **The `Lsn` could not have worked anyway.** It is one per OTLP *request* (`lib.rs:549` says so in a
+  comment), not per row, so it cannot break a tie between two rows of the same request.
+
+Generalisable, and the reason this is worth a whole section: **the TODO entry proposed a solution, and
+the solution was carried forward as a premise through the sweep and into a user decision.** Nobody
+re-derived it. The check that caught it was cheap — read the architecture doc for prior art before
+implementing a TODO's suggested fix, because a project that has thought about a problem before has
+usually written down why it rejected the obvious answer. The habit to keep: treat the *problem* half of
+a TODO as evidence and the *solution* half as a hypothesis.
+
+Two of the three consumers were then closed with no schema change, no WAL change, no on-disk
+compatibility question, no semver break, and zero footprint cost.
+
+### A silent data-corruption bug, found sideways
+
+The design pass turned up something unrelated to its brief: `concat_and_sort` concatenated against
+`batches[0].schema()`, and arrow-select 58.4's `concat_batches` takes columns **positionally** with no
+name validation (`concat.rs:548-556` — a bare `batch.column(i)` loop; the only check is a final
+`try_new`, which validates *types*, not meaning). Compacting a UTC-day partition whose segments were
+sealed under different `promote` sets therefore gave one of three outcomes by segment order: panic when
+the first segment was wider, **silent** truncation when narrower, and **silent** cross-column
+concatenation when the widths matched — `env` values and `region` values merged into one column
+labelled with whichever name came first. Two of three failed silently and wrote the corrupted result
+back as the merged segment.
+
+Reachable through an operation the docs called supported: §6.1 said adding or removing promoted keys is
+backward-compatible, which was true of the read path (`coerce` null-fills) and false of the compaction
+path. The doc has been corrected on both halves.
+
+Worth noting how it was found: not by a bug hunt, but by a design pass asking "what breaks if a column
+is added?" — the compatibility question surfaced a defect that had nothing to do with the column and
+everything to do with schema evolution being half-implemented. Asking the compatibility question is
+cheap even when the change it was asked for never happens.
+
+### Two probes that overturned their own plan
+
+The metrics work was told to prove two assumptions before building on them. Both failed, in opposite
+directions, and the result was better than the plan:
+
+- **`CASE WHEN value = value` does not detect NaN.** DataFusion 54 orders floats by a *total* order,
+  not IEEE, so `value = value`, `value >= value` and the `< 0 OR > 0 OR = 0` idiom all return **true**
+  for NaN. Had this shipped on the design's assumption, NaN would have silently won every duplicate —
+  a wrong-number bug with a passing test suite, since no test would have thought to feed it a NaN.
+- **`isnan` is available regardless**, because DataFusion declares `datafusion-functions` as a
+  non-optional dependency with default features on, so the workspace's `default-features = false` pin
+  cannot remove it. Zero added crates, verified: 275 before and after. The hand-rolled UDF fallback
+  was never needed.
+
+A pleasing corollary: since DataFusion's float sort *is* `total_cmp`, plain `value DESC` already
+matched PromQL's `duplicate_value_cmp` second clause. Only the NaN demotion had to be stated.
+
+Both anti-regression tests were **mutation-checked** — dropping `resource, scope` from the partition
+key, or dropping `isnan`, makes them fail. That check matters more than usual here, because the
+partition-key trap is invisible to any test that does not deliberately construct rows differing only in
+`resource`: N replicas emitting the same counter at the same instant differ in nothing else, so
+partitioning on label-set identity would turn a modest over-count into a large *under*-count on exactly
+the counters people alert on.
+
+### Measurement notes
+
+- **The driver RSS soak needed a third column to be interpretable.** Plain `docker` vs `docker-remap`
+  alone could not separate "the remapper costs memory" from "the remapped payload is bigger". Adding an
+  **identity VRL script `.`** as a control — provably byte-identical output, yet still clones a seed per
+  line — split it cleanly: `identity − off` is the machinery (flat across a 100× line-rate range,
+  +1.0/+2.3/+1.4 MiB, i.e. noise), `builtin − identity` is payload growth. The item's hypothesis that
+  cost scales with container count and not line rate is now *confirmed* rather than assumed:
+  4.0 MiB fixed + 0.165 MiB per container, 67 MiB at 100 containers against a 200 MB target.
+- **`$GITHUB_STEP_SUMMARY` is unreachable from the REST API.** No summary endpoint exists and the
+  check-run `output.summary` is null; job summaries render only in the web UI. Harvesting the CD
+  footprint numbers meant downloading the five release archives and sizing the binaries directly, with
+  SHA-256 verified against the published `SHA256SUMS`. Worth writing down, because the natural plan
+  ("read the numbers CD already prints") does not work.
+- **The published footprint margin is thinner than the local gate suggests**: x86_64-linux `imbhd` is
+  41.1 MB against a 42 MB target, and the x86_64/aarch64 gap is 5.1 MB — so the aarch64 host figure the
+  gate prints is the optimistic end of the range. And no released archive has ever been built with
+  `docker-remap`, whose local measurement was +3.8 MiB against that 888 KB of headroom.
+
+### Verification
+
+`cargo fmt --all --check`, `cargo build --workspace`,
+`cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace` — all clean.
+`imbh-server` under `docker` and `docker,docker-remap` separately. Footprint gate OK, 275/275 crates
+unchanged throughout. Every behavioural fix in this phase was confirmed non-vacuous by reverting it and
+watching the new test fail: the compaction coercion (panic reproduced), the three `readlogs` hunks
+(3 of 19 e2e tests time out), and the two metrics anti-regressions (mutation-checked). Nothing
+committed.
+
+Known weakness, recorded rather than hidden: the PromQL-agreement test compares against an **inline
+mirror** of `collapse_duplicate_samples` rather than the real function, because `imbh-lgtm` depends on
+`imbh` and importing it would be a dev-dependency cycle. It is a weaker guarantee than it looks, and a
+true cross-crate check would have to live in `imbh-lgtm`.
+
+## Footprint: the gate passes on the arch that isn't the problem (2026-08-06, part 5)
+
+Closing the last two actionable sweep items turned one documentation chore into a live release risk.
+
+### §2's `imbhd` budget named a binary nobody builds
+
+The row read `x86_64-unknown-linux-musl`, and CD builds musl **nowhere** — it survives only in
+`about.toml`/`deny.toml` for license coverage. So the budget could never be checked against the thing
+it named, and in practice was checked against whatever host ran `scripts/footprint-gate.sh`. Retargeted
+to `x86_64-unknown-linux-gnu`, the largest target the archives actually ship, with the measured 41.1 MB
+from v0.5.0 beside it. No musl archive added: a sixth fat-LTO leg needs `cross`/`zigbuild` or a
+container (no native musl runner, and `zstd-sys`/`onig_sys` build vendored C), and the Alpine case is
+already served by the `bookworm-slim` image plus the CI-asserted glibc ≤ 2.36 floor.
+
+### The measurement that matters: an exact delta, and a projection over budget
+
+The `docker-remap` cost had only ever been quoted as "+3.8 MiB" from a single local build. Measured
+properly, as the difference between two local aarch64 release builds differing **only** in that
+feature: 35,973,488 → 39,997,800 bytes = **+4,024,312 B (+3.84 MiB)**. The local baseline lands within
+**24 bytes** of CD's v0.5.0 aarch64 archive (35,973,464 B) — worth noting because an earlier entry
+called those two figures "byte-identical", which is very nearly but not exactly true, and the 24 bytes
+are the local-vs-CI toolchain difference.
+
+Applying that delta to CD's **x86_64** baseline (41,112,104 B) projects **≈ 45.1 MB against the 42 MB
+target** — roughly 3 MB over, still comfortably under the 55 MB hard limit.
+
+Three things make this a live problem rather than a note:
+
+1. **`release.yml`'s Linux legs now carry `docker,docker-remap,grpc,tracing`** (as of `fc70cf8`),
+   while v0.5.0 shipped `docker,grpc,tracing`. The next release is the **first** whose x86_64 archive
+   contains the VRL subtree at all.
+2. **The footprint gate cannot catch it on this host.** On aarch64 the same binary is 5.1 MB smaller,
+   so the gate reads 40.0 MB, compares it against 42 MB, and **passes**. The measurement is real and
+   the verdict is wrong — for the shipping target, not for the measured one.
+3. **The projection errs low.** The delta was measured on aarch64, and x86_64 codegen is demonstrably
+   fatter across every target pair in Appendix C, so the true figure is more likely above 45.1 MB.
+
+Generalisable: a gate that measures *a* build and compares it against a budget written for *a
+different* build produces a green tick that means nothing. The failure here was not the number, it was
+the silent substitution of the host for the shipping target — the same shape as the earlier
+216-vs-71 crate-count confusion (part 3), where a measurement of one knob was labelled with another
+knob's name. Both were invisible because the output looked like a measurement and *was* a measurement,
+just not of the thing the label claimed.
+
+No local confirmation is possible: this host has no x86_64 cross linker. The next step is a
+`workflow_dispatch` dry run, which builds and smoke-tests all five archives and publishes nothing —
+turning the projection into a number before a release depends on it. Then the decision is one of: raise
+the target with justification, trim the VRL subtree, or ship `docker-remap` as a separate artifact so
+the default archive stays inside budget.
+
+### Sweep close-out
+
+Twenty-one of the original fourteen-plus-derived items are now closed; four remain open, and every one
+of them is open by an explicit decision rather than by neglect: the MCP per-call cost ceiling and the
+buffered-response write deadline (both reviewed 2026-08-06 and deliberately left, both still framed as
+"if this matters for a deployment"), the upstream differential runner (deferred by standing user
+request), and the x86_64 over-budget projection above, which is blocked on a CD run rather than on
+work. Nothing committed.
+
+## The second POSIX-shaped assumption, and two verification notes (2026-08-06, part 6)
+
+Gaps in parts 3–5, which recorded the sweep's headline items but skipped these. The first is a real
+portability defect and belongs in the record.
+
+### A "test coverage gap" that was hiding a defect
+
+Part 3 closed the "Windows portability job has never run" item as stale — it runs, it is green — and
+split out the residue as a coverage chore: the leg never exercises **retention**, and only partly
+exercises compaction, so deletion and rename of open or memory-mapped files was untested. That is the
+shape issue #3 had.
+
+Investigating the coverage gap found the bug the coverage would have caught.
+
+`Storage::retain` and `Storage::compact` propagated the post-manifest unlink error with `?`. On POSIX
+an unlink **always** succeeds regardless of open handles or mappings, so this was silently fine
+forever. On Windows it is not: a file with a live memory mapping cannot be deleted **at all**, whatever
+share flags its opener passed — the section object pins it. And `imbh-index`'s `search_body` /
+`search_body_bool` / `search_attr_eq` hold exactly such mappings, via Tantivy's `MmapDirectory` over
+the `.tidx` sidecars, for the life of a `matches()` or attribute-equality pushdown. Queries run on the
+tokio runtime while the background maintenance thread calls `retain()`, so the overlap is an ordinary
+production interleaving, not a contrived one.
+
+The consequence is worse than a failed cleanup. By the time the unlink runs, both callers have already
+persisted the manifest **without** those segments and made it durable — the pass has *succeeded* as far
+as every reader is concerned, and the files are dead weight. Propagating the error therefore reported a
+successful retention or compaction as a failure, and the `?` abandoned the remaining segments in the
+batch mid-loop.
+
+Fixed with a `reclaim_segments` helper making the unlink best-effort, logging under `tracing`. This is
+explicitly **not** a new failure mode: a crash in the same window already left orphans, and
+`cleanup_orphans` sweeps unreferenced `.parquet`/`.tidx` on the next open, so a refused unlink lands the
+process in a state the design already handles. Deliberately not done: a persistent retry queue so a
+refused unlink retries on the next pass rather than waiting for a reopen — that is new durable state,
+and the orphan sweep already bounds the leak.
+
+**Stated as what it is: a code-reading conclusion, not an observed failure.** The work was done on
+Linux, where the bad ordering succeeds silently; no Windows host was available and nothing was
+reproduced there. The distinction is worth preserving in the record, because "we reasoned that Windows
+rejects this" and "we saw Windows reject this" justify very different confidence.
+
+Two things worth keeping about the tests. They went into `imbh-storage` and `imbh --test lifecycle` —
+the two targets the Windows leg **already** runs — so no CI widening was needed; a test placed anywhere
+else would simply never run on Windows, which is how the gap survived in the first place. And the
+tolerance test was confirmed non-vacuous by temporarily panicking inside `reclaim_segments`: it was the
+*only* test in the suite to trip that branch, which also proves the other two delete cleanly on Linux.
+`memmap2` is a dev-dependency only and already reaches the graph through tantivy, so the footprint gate
+is untouched (275/275 verified).
+
+Generalisable, and the reason this deserves its own section: **this is the second Unix-shaped
+assumption in the on-disk path**, after issue #3's fsync of a directory handle. Both have the same
+shape — an operation that is unconditional on POSIX is *conditional* on Windows — and both were
+invisible to a green test suite running on Linux. Worth treating "what does this syscall refuse to do
+on Windows?" as a standing review question for any new filesystem call, rather than waiting for the
+next one. The corollary for planning: a coverage gap filed as a chore is worth investigating before it
+is worth filling, because the gap usually exists precisely where nobody has exercised the dangerous
+ordering.
+
+### Verification notes
+
+**Dependabot, cargo: security updates only.** Added a `cargo` entry with
+`open-pull-requests-limit: 0`, which is the *documented mechanism* rather than a trick — GitHub's
+options reference states "you can temporarily disable version updates for a package manager by setting
+this option to zero" and, separately, that "security update pull requests are not subject to this limit
+and do not count toward it". There is no separate "security only" switch. The split is deliberate:
+routine Rust version churn stays a measured act because the footprint budgets are load-bearing and the
+margin is thin (part 5: 41.1 MB against a 42 MB target on the shipping arch), and Dependabot cannot
+reason about the hand-trimmed `default-features = false` sets. But an *advisory* had no automated path
+at all — `cargo-deny` fails CI on RUSTSEC, and failing is not fixing; it names a vulnerable crate and
+waits for a human. Pairs with part 3's finding that SHA-pinning had already opted the repo out of
+Dependabot security alerts for actions.
+
+**GHCR package visibility, verified without the scope.** `gh api user/packages` needs `read:packages`,
+which the local token does not carry, so the settings-page route was blocked. The property that
+actually matters is testable anonymously and needs no scope at all: request a pull token from
+`ghcr.io/token` with no credentials, then `GET /v2/<pkg>/tags/list`. Both `moriyoshi/imbh` and
+`moriyoshi/imbh-log-driver` answer `200`, which is precisely the access a stranger's
+`docker plugin install` needs. Worth remembering as the general technique — test the capability, not
+the configuration that is supposed to grant it.
+
+---
+
+## The typed metrics dedup: the probe that failed was the useful one (2026-08-06, part 7)
+
+Closed the standing asymmetry recorded in `ARCHITECTURE.md` §10.5.1: under `Duplicates::LastWins`,
+PromQL collapsed a duplicated instant by value while the typed `MetricsApi::range`/`instant` path went
+on `SUM`/`COUNT`-ing both rows, so `sum`/`count` inflated and `avg` skewed. `RateMode::Counter` was
+always immune, since `max - min` does not care how many times a value appears. The fix wraps the
+existing scan in a `ROW_NUMBER() OVER (PARTITION BY <row identity> ORDER BY <value order>)` subquery,
+gated on `Duplicates::collapses_at_read()`, entirely inside `crates/imbh/src/metrics.rs`.
+
+### The probes came first, and one of them was wrong in an instructive way
+
+Two assumptions were probed before any code was written, because both were plausible and neither was
+evidenced anywhere in the tree.
+
+**Window functions: available.** There were zero `OVER (...)` clauses in the whole repo, and the
+workspace pins `datafusion` with `default-features = false`, so it was genuinely unknown whether
+`ROW_NUMBER()` would even plan. It does — including `PARTITION BY` over the `Dictionary(Utf8)` columns
+(`service`/`resource`/`scope`) and an unaliased derived table. Nothing to do.
+
+**IEEE `NaN <> NaN`: not available, and not for the reason expected.** The plan was to rank NaN last
+with `CASE WHEN value = value THEN 1 ELSE 0 END`, on the theory that `isnan` was missing because
+`math_expressions` is off. The probe returned `1` for a NaN row. The first hypothesis was the
+DataFusion simplifier folding `expr = expr` to `true` on a non-nullable column — but `value < 0.0 OR
+value > 0.0 OR value = 0.0` and `value >= value` also returned `1`. **DataFusion 54's float comparison
+kernels implement a total order, not IEEE semantics.** No comparison operator in this engine
+distinguishes NaN. That is the durable finding, and it is much broader than this change: any future
+code that reaches for a SQL-level NaN test in imbh will be silently wrong.
+
+**The third probe is the one that made the fallback unnecessary.** `isnan(value)` turned out to be
+registered after all, which contradicted the premise of the whole exercise, so it was worth checking
+whether that was an artifact of the test profile. It is not: `datafusion` 54.1 declares
+`[dependencies.datafusion-functions]` with **no** `default-features = false`, so that crate's default
+set — which includes `math_expressions`, itself an empty feature list gating no dependency — is on in
+every possible build. The workspace's own `default-features = false` pin on `datafusion` cannot remove
+it, and it adds nothing to the graph. So no UDF was written.
+
+Worth separating from the above, because it is a *different* claim about the same feature machinery:
+the `hex` UDF exists because `datafusion/encoding_expressions` is off, and DataFusion registers
+function *packages* according to the **`datafusion` crate's** features. `datafusion-functions` having
+compiled `base64`/`hex` does not make `encode` reachable. `isnan` is reachable because math
+registration is not gated the same way. "The sub-crate compiled it" and "the session registers it" are
+independent questions, and the trimmed-feature reasoning in §9.1 only answers the second.
+
+A pleasant corollary of the total-order finding: since DataFusion's float sort *is* `f64::total_cmp`
+(NaN above `+INFINITY`), plain `value DESC` already reproduces the second clause of `imbh-lgtm`'s
+`duplicate_value_cmp` exactly. Only the NaN demotion had to be added, giving
+`ORDER BY isnan(value) ASC, value DESC`.
+
+### The partition key is row identity, not label-set identity
+
+The trap in this change is not the SQL, it is the `PARTITION BY` list. The instinct is to reach for the
+series identity PromQL uses — `service` + `__name__` + string attributes — and that would have been a
+correctness disaster. `k8s.pod.name` and `host.name` live in the **resource**, so five replicas
+emitting the same counter at the same instant differ in *nothing* except `resource`. Partitioning on
+`(time, metric, service, attributes)` collapses a legitimate 5-way `sum` to a single point: a modest
+over-count traded for a large **under**-count, on exactly the counters people alert on. Silent
+under-counting on an alerting path is strictly worse than the bug being fixed.
+
+The key is therefore `("time", metric, service, resource, scope, attributes)` — byte-identical row
+identity. Promoted attribute columns are deliberately absent, and that is safe only because
+`imbh-storage` keeps the `attributes` JSON verbatim and treats promoted columns as projections of it
+(`crates/imbh-storage/src/lib.rs:1847`); if promotion ever *stripped* the key from the blob, two rows
+differing only in a promoted attribute would start collapsing. That dependency is now written down at
+the constant, because it is invisible from `metrics.rs`.
+
+The `WHERE` stays on the inner scan in both shapes, so the `TableProvider` pushdown contract (§9.2) and
+the `matches()`/bloom paths are untouched by the wrapper. Under the non-collapsing policies the emitted
+SQL is byte-identical to what it was before.
+
+### Verification: the mutation check is the part that carried weight
+
+Nine tests, all green, but the two that matter are anti-regressions and a passing anti-regression
+proves nothing on its own. So both bugs were reintroduced deliberately: dropping `resource, scope` from
+the partition key and dropping `isnan(...)` from the ordering each made exactly the expected tests fail
+(the resource test, the NaN test, and the PromQL-agreement test), and restoring made them pass. Without
+that step the five-replica test would have been indistinguishable from a test that passes for the wrong
+reason — it passes on the *unfixed* code too, since the bug only appears once dedup is switched on.
+
+Gate: `cargo fmt --all --check`, `cargo build --workspace`, `cargo clippy --workspace --all-targets
+-- -D warnings`, `cargo test -p imbh`, `cargo test -p imbh-lgtm`, `cargo test --workspace` — all clean.
+
+### Two things deliberately not done
+
+**`ErrorOnRead` parity is deferred, not forgotten.** Full symmetry with PromQL would make the *default*
+policy fail on a duplicate, which needs a second detection scan on every typed range query for every
+user — including the overwhelming majority who have no duplicates — and is a runtime behaviour break on
+published crates at v0.5.0. The asymmetry is also narrower than it looks: PromQL fails because a
+duplicated instant has no PromQL meaning, whereas the typed API is a SQL aggregation builder where
+`SUM` over two rows is well-defined, merely not what the user wanted. "Opt into `LastWins` for
+PromQL-consistent numbers" is a coherent contract. If parity is ever wanted, the cheap form is a
+warning surfaced through `QueryStats`, not a hard error.
+
+**The PromQL-agreement test compares against a mirror, not the real function.** `imbh-lgtm` depends on
+`imbh`, so importing `collapse_duplicate_samples` into an `imbh` test would be a dev-dependency cycle.
+The test therefore carries a verbatim copy of `duplicate_value_cmp`/`collapse_duplicate_samples`,
+flagged in a comment. This is a real weakness — it verifies agreement with a *transcription* of the
+PromQL rule, so drift in `promql.rs` would not trip it. The honest fix is to move that one test into
+`imbh-lgtm`, where both sides are in scope; it was left where it is only because the crate boundary was
+outside the change's remit.
+
+### Follow-ups this leaves behind
+
+- `ARCHITECTURE.md` §10.5.1 ends with a "Known asymmetry" note that is now stale in both halves: the
+  typed path no longer `SUM`/`COUNT`s duplicates, and the claim that "a SQL window dedup would need an
+  ingest-sequence column that does not exist" is backwards — the window dedup is value-ordered
+  *precisely because* no such column exists. It needs rewriting, not deleting.
+- The corresponding `TODO.md` entry can be closed.
+- Consider moving `range_dedup_agrees_with_the_promql_collapse` into `imbh-lgtm` to make it a genuine
+  cross-crate check.
+
+### Addendum to part 7 (same day, appended after the fact)
+
+Two of part 7's three follow-ups were already done before it was written — it was composed against a
+stale view of the tree, so the record needs correcting rather than acting on:
+
+- **§10.5.1's "Known asymmetry" note was already rewritten**, and along the lines part 7 asks for: the
+  block now describes the shipped window dedup, spells out the partition-key trap and the
+  `isnan`-vs-comparison hazard, and closes with a *"Remaining asymmetry, deliberate"* note scoped to
+  `ErrorOnRead` alone. The old text is gone; `grep "Known asymmetry: the typed"` returns nothing.
+- **The `TODO.md` entry was already closed**, with the correction that the item's own proposed fix (an
+  ingest-sequence column) was the wrong one — see part 4.
+
+The third follow-up stands and is now tracked in `TODO.md`: moving
+`range_dedup_agrees_with_the_promql_collapse` into `imbh-lgtm` so it compares against the real
+`collapse_duplicate_samples` instead of a transcription of it.
+
+Worth noting *why* this happened, since it will recur: a long-running agent's view of the tree is
+frozen at the point it last read a file, and concurrent work invalidates its follow-up list without
+invalidating its findings. The findings in part 7 are first-hand and stand; the follow-ups were
+inferences about repo state and did not. Treat those two halves of any agent report differently.

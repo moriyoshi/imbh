@@ -130,8 +130,17 @@ column explosion is an RSS/schema-churn trap. The design:
    others → NULL). Keys colliding with a built-in column name are dropped. The promoted key **also
    stays in the JSON blob** — the column is a pushdown/zero-copy accelerator, not a relocation, so
    `json_get_str` / external `json_extract` / the reference label evaluators are unaffected. Adding
-   or removing keys is backward-compatible: segments sealed before a key was promoted lack the
-   column and are null-filled at query time by the `coerce` schema-evolution path (§9).
+   or removing keys is backward-compatible on **both** the read and the compaction path: segments
+   sealed before a key was promoted lack the column and are null-filled at query time by the `coerce`
+   schema-evolution path (§9), **and are normalized to the current canonical schema again when
+   compaction merges a day partition whose segments were sealed under different promote sets**. That
+   second half is load-bearing and was once absent — `concat_batches` takes columns *positionally* and
+   does not validate them against the schema it is handed, so merging mismatched segments used to
+   panic (first segment wider), silently truncate (first segment narrower), or silently concatenate
+   two differently-named promoted columns into one. Note the null-fill is not a back-fill: a promoted
+   column is only projected from `attributes` at ingest, so pre-promotion rows stay NULL after
+   compaction — which is exactly what a query over those same un-compacted segments already returned,
+   so compaction never changes an answer.
    **Pushdown dispatch is wired**: the typed logs/metrics/traces query builders and the attribute
    discovery path route each record-`attributes` access through `SqlParams::attr_field`, which emits
    the promoted dictionary column (`CAST("key" AS VARCHAR)`, exactly like `service`) when the key is
@@ -763,9 +772,34 @@ kept on separate discriminants so a legitimate sum is never dropped because of a
 instant selector unions those two tables, so that one is a *structural* duplicate the read side
 resolves. Which of two differing values survives is also not stable across a restart.
 
-> Known asymmetry: the typed `MetricsApi::range`/`instant` path still `SUM`/`COUNT`s duplicate points
-> rather than resolving them. It degrades a number rather than denying service, and a SQL window dedup
-> would need an ingest-sequence column that does not exist.
+The typed `MetricsApi::range`/`instant` path resolves duplicates the same way, and by the same rule.
+Under `LastWins` the scan is wrapped in a `ROW_NUMBER() OVER (PARTITION BY <row identity>
+ORDER BY isnan(value) ASC, value DESC)` subquery keeping rank 1; under every other policy the SQL is
+byte-identical to what it was before, and the `WHERE` stays on the inner scan either way so the §9.2
+pushdown contract is untouched. `instant` and `range_batches` inherit it for free.
+
+Two things about that ordering are easy to get wrong and are pinned by tests:
+
+- **The partition key is row identity, not PromQL label-set identity**, and must include `resource`
+  and `scope`. `k8s.pod.name` / `host.name` live in the resource, so N replicas emitting the same
+  counter at the same instant differ in nothing else — partitioning on `(metric, service, attributes,
+  time)` alone would collapse a legitimate N-way `sum` to 1, turning a modest over-count into a large
+  *under*-count on exactly the counters people alert on. Promoted attribute columns are deliberately
+  absent from the key: they are projections of the `attributes` JSON, which already discriminates them.
+- **NaN demotion needs `isnan(value)`, not a comparison.** DataFusion 54 orders floats by a *total*
+  order rather than IEEE semantics, so `value = value`, `value >= value` and the
+  `< 0 OR > 0 OR = 0` idiom all report **true** for NaN — a NaN would silently win every duplicate.
+  `isnan` is available despite the workspace's `default-features = false` pin, because DataFusion
+  declares `datafusion-functions` as a non-optional dependency with default features on; it costs zero
+  crates. The corollary is that plain `value DESC` already matches `duplicate_value_cmp`'s second
+  clause, since DataFusion's float sort *is* `total_cmp`.
+
+> Remaining asymmetry, deliberate: `ErrorOnRead` (the default) does not *fail* on a duplicate in the
+> typed path the way PromQL does. Parity would need a second detection scan on every typed range query
+> for every user, and would turn queries that return a number today into errors on published crates.
+> The asymmetry is also narrower than it looks — a duplicated instant has no PromQL meaning, whereas
+> the typed API is a SQL aggregation builder where `SUM` over two rows is well-defined, just not what
+> the caller wanted. If parity is wanted later, the cheap form is a warning surfaced via `QueryStats`.
 
 ### 10.6 Logs API
 
@@ -787,7 +821,33 @@ source adapter reads logs through it (§10.18) — unlike the stats-returning
 `LogQuery` is built with `new()` + `service`, `severity_at_least`, `matches` (full-text), the
 `attr_*` matchers (§10.4), `trace_id`/`span_id` (raw-binary correlation equality — the trace→log
 drill-down partner of `traces().get`, bloom-prunable like §10.7), `range`/`since`, `limit`,
-`direction`, and `after(cursor)` for paging. `LogPage` carries the entries and a next-page cursor.
+`direction`, `observed_after(Timestamp)` and `order_by(LogOrder)` (§10.6.1), and `after(cursor)` for
+paging. `LogPage` carries the entries and a next-page cursor.
+
+#### 10.6.1 The two clocks, and why follow mode uses the second one
+
+Every log row carries two instants: `time`, when the producer says the event happened, and
+`observed_time`, when it was captured. `LogOrder { Time (default), ObservedTime }` and
+`observed_after` expose the second as a filter and sort axis; the `SELECT` projection is unchanged.
+
+This is what closes the Docker log driver's `--tail 0 -f` race. Event time is *not* monotone in
+arrival — ingest lands a line up to one batch interval after the container emitted it — so a watermark
+of `Timestamp::now()` on the event clock skips a line emitted just before the follow started. The
+driver now watermarks and follows on `observed_time`, which for that driver is dockerd's capture stamp
+and is monotone in arrival, while `--tail N` and full history stay ordered by **event** time because
+that is what `docker logs` prints. Only the cursor moved. Neither clock is monotone in the other, so
+paged watermarks merge by max on each clock independently rather than taking the last seen.
+
+No schema column was added. An earlier framing of this problem, and of the metrics duplicate collapse
+above, proposed an ingest-sequence column; both were closed without one, and §10.5.1 explains why the
+metrics half must *not* use scan order even if such a column existed.
+
+The residues are real and documented in `docs/DOCKER_LOG_DRIVER.md` rather than papered over: a VRL
+script can overwrite `.observed_timestamp` and break the cursor's monotonicity; an exact nanosecond
+tie is still resolved once by the strict `>`; and `--tail 0` has no uniquely correct answer at all,
+since json-file's "seek to the end of the file" is defined by what is *durably recorded* while imbh's
+batching means some already-emitted lines are not yet recorded. Arrival order makes the cut stable and
+explainable, not provably right.
 
 > *Deviations:* `PageCursor` is a numeric **offset**, not the `(timestamp, segment, ordinal)`
 > keyset the design specified (paging is not the immutable, tie-safe cursor originally intended);
@@ -1040,7 +1100,12 @@ header mirror (`MCP-Protocol-Version` / `Mcp-Method` / `Mcp-Name`) is a rule of 
 so `Transport::Stdio` validates none of it and serves a modern request on its `_meta` alone. The
 crate also owns the two JSON serializers `POST /api/query` and `GET /stats` share with the
 `query_sql` and `db_stats` tools, so the tool surface and the HTTP surface cannot describe the same
-rows — or the same database — two different ways.
+rows — or the same database — two different ways. `stats_json` takes that one step further: it
+converts `DbStats` into the head API's `imbh_head::dto::Stats` (§10.19) and serializes *that* derive,
+so `GET /stats`, `db_stats` and `GET /api/head/stats` are literally one serializer — the plain
+endpoint reports the ingest gauges, its body deserializes into the typed value, and a `None` durable
+LSN is `null` rather than the `0` that no `Lsn` can be. The `dto`-only edge to `imbh-head` adds no
+third-party crate to any graph (`imbh-mcp` 283 → 284, all of it the workspace crate itself).
 
 Neither transport adds **any crate** to any graph. The protocol speaks JSON-RPC through `serde_json`
 and Base64 (the HTTP transport's `=?base64?…?=` header sentinel, and `AnyValue::Bytes` attributes)
@@ -1607,3 +1672,95 @@ move is to own ~30 MB as the cost of the query engine and ship it. Real levers f
 embedder (documented, not default): `search` off (drop Tantivy's subtree; `matches()` degrades to
 scan), and the planned per-signal / `sql` gates. The revised budgets these produced are in
 OVERVIEW.md §2.
+
+### C.1 — Per-target shipped sizes, v0.5.0 (first cross-platform measurement)
+
+**Provenance.** Release workflow run `31004270880`
+(<https://github.com/moriyoshi/imbh/actions/runs/31004270880>), tag **`v0.5.0`**, commit `5ae4259`,
+run started 2026-08-05T12:07:28Z, Release published 2026-08-05T12:46:37Z. Harvested 2026-08-06.
+These are the first footprint numbers taken on the *published* targets rather than on a CI or
+developer host — every figure elsewhere in this appendix, and everything
+`scripts/footprint-gate.sh` prints, is a single-host reading.
+
+**How they were obtained.** `release.yml`'s `Package` step writes exactly this table into
+`$GITHUB_STEP_SUMMARY`, but **a step summary is not reachable through the REST API** — there is no
+`.../actions/jobs/<id>/summary` endpoint (404), and the job's check-run `output` returns
+`{"summary": null, "text": null}`. The numbers below were therefore measured from the run's
+`dist-*` artifacts instead: each archive was downloaded, unpacked, and the extracted files sized.
+The artifacts' SHA-256 sums are identical to the `SHA256SUMS` asset on the published Release, so
+these are the bytes users download, not a reconstruction of them.
+
+| Target (v0.5.0) | `imbhd` bytes | MiB | `imbh-tui` bytes | MiB | archive bytes | MiB |
+|---|---:|---:|---:|---:|---:|---:|
+| `x86_64-unknown-linux-gnu` | **41,112,104** | **39.2** | 40,497,648 | 38.6 | 27,942,219 | 26.6 |
+| `aarch64-unknown-linux-gnu` | **35,973,464** | **34.3** | 35,354,648 | 33.7 | 26,164,419 | 25.0 |
+| `x86_64-apple-darwin` | **36,963,516** | **35.3** | 36,637,084 | 34.9 | 26,817,413 | 25.6 |
+| `aarch64-apple-darwin` | **30,898,672** | **29.5** | 30,565,984 | 29.1 | 23,681,138 | 22.6 |
+| `x86_64-pc-windows-msvc` | **35,489,792** | **33.8** | 35,088,896 | 33.5 | 24,673,322 | 23.5 |
+
+The two binary columns are uncompressed bytes at the shipping profile (`opt-level="s"`, fat LTO,
+`codegen-units=1`, `strip="symbols"`, `panic="abort"`). The archive column is the **compressed**
+`.tar.gz` (`.zip` on Windows) and additionally carries `LICENSE` plus a 484,064-byte
+`THIRD-PARTY-NOTICES.txt`; it is not comparable to a binary size and must not be quoted as one.
+
+**What build these are.** Not the default-feature build the §2 budgets describe. At `v0.5.0` the
+Linux legs were `--features docker,grpc,tracing` and the macOS/Windows legs `--features
+grpc,tracing` (both omit `docker`: a log-driver plugin is served over a Unix socket to a *local*
+daemon). `docker-remap` — the VRL subtree, +89 crates / +3.8 MiB when measured on aarch64-glibc —
+was added to the Linux legs *after* this tag, so **no released archive has been measured with it
+yet**; that number stays unavailable until the next release run.
+
+**Readings.**
+
+- **The spread across targets is ~1.33×**, from 30.9 MB (`aarch64-apple-darwin`) to 41.1 MB
+  (`x86_64-unknown-linux-gnu`). x86_64 is the larger of each pair; on Linux, identical source at an
+  identical profile is 5,138,640 bytes heavier on x86_64 than on aarch64.
+- **`imbh-tui` is only 0.3–0.6 MB smaller than `imbhd` on every target.** The explorer is not a
+  cheap add-on — both binaries link essentially the whole DataFusion+Tantivy stack — so shipping the
+  pair roughly doubles each archive's uncompressed payload.
+- **Against §2's `imbhd` budget** (≤ 42 MB target, ≤ 55 MB hard, compared as decimal MB by
+  `scripts/footprint-gate.sh`), every target is inside the target, but the largest —
+  `x86_64-unknown-linux-gnu` at 41.1 MB — has just **887,896 bytes of headroom**. The 5-plus-MB
+  x86_64/aarch64 gap means the aarch64 host figure the gate normally reports is the *optimistic*
+  end of the range, not a representative one.
+- The `aarch64-unknown-linux-gnu` figure is byte-identical to the pre-`docker-remap` baseline
+  recorded in the 2026-08-06 JOURNAL entry, confirming that entry's host measurement and this
+  archive are the same build configuration.
+
+### C.2 — Recommendation (not a decision): the musl question
+
+**What is built vs. archived, from the same run.** `release.yml`'s matrix builds **five** targets
+and archives **all five** — there is no target that is built but not shipped, and the five Release
+assets match the five matrix legs one-for-one. The two `*-unknown-linux-gnu` archives are then
+reused downstream: unpacked into the multi-arch `ghcr.io/moriyoshi/imbh` image and into the two
+per-arch `imbh-log-driver` plugins. `x86_64-unknown-linux-musl` is **not built anywhere in CD**. It
+appears only in `about.toml` and `deny.toml`'s target lists, where it makes the license/notices gate
+cover musl-specific dependencies, and as the target the plugin rootfs used before that Dockerfile
+switched to copying a prebuilt glibc binary.
+
+**Recommendation: do not add a musl release archive. Retarget §2's `imbhd` budget to glibc
+x86_64 instead.** Four reasons:
+
+1. **The budget names a target nothing ships.** §2 picked musl when it was expected to be the
+   shipping target; it is not. Every installable artifact — five archives, the image, both plugins —
+   is glibc, MSVC, or Mach-O. A budget defined on a target that is never built can never be checked,
+   which is the exact gap C.1 was harvested to close.
+2. **A sixth leg is not free, and it reintroduces the problem the matrix was designed around.** Each
+   leg is a fat-LTO, `codegen-units=1` build (~40 minutes wall-clock for five in parallel). There is
+   no native musl GitHub runner, and `zstd-sys` — plus `onig_sys` under `docker-remap` — builds
+   vendored C, so a musl leg needs `cross`/`zigbuild` or a container: the one configuration
+   `release.yml`'s matrix comment says was deliberately avoided by building Linux natively.
+3. **The demand is already covered.** The usual reason to want musl is Alpine or `FROM scratch`.
+   imbh's published image is `debian:bookworm-slim`, and the release binaries are pinned to a glibc
+   2.35 floor (built on `ubuntu-22.04`) and CI-asserted at ≤ 2.36 so they run on it. An Alpine user
+   today is one `docker plugin install` or one `ghcr.io/moriyoshi/imbh` pull from a working
+   deployment.
+4. **If the musl *number* is what is wanted, measure it without shipping it.** A `workflow_dispatch`
+   rehearsal leg, or a single local `cross build`, yields the comparison figure at a fraction of the
+   standing cost — and does not create a sixth asset that must be checksummed, supported, and kept
+   working forever.
+
+The follow-up this implies is a documentation change, not a pipeline change: restate §2's `imbhd`
+row as a glibc x86_64 budget with the measured 41.1 MB beside it, and keep musl as a noted,
+unmeasured variant. **That edit is deliberately not made here** — changing a budget number is the
+user's call, not this measurement's.

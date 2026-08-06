@@ -56,13 +56,16 @@ original draft's numbers (≤18 MB binary, ≤12 MB idle RSS, ≤200 crates) wer
 binary, 36.0 MB exercised anonymous RSS (writer-inflated), 45.6 MB peak RSS, **269 unique
 crates** — of which datafusion's subtree is 204.
 
-**Revised budgets** (shipping target x86_64-musl; headroom over the arm-glibc probe floor for
-server deps + libc bundling). Items marked *(unmeasured)* become measurement tasks in the
-noted milestone:
+**Revised budgets.** The `imbhd` row is stated against **x86_64-unknown-linux-gnu**, the largest
+target the release archives actually ship. It used to name `x86_64-unknown-linux-musl`, which is built
+nowhere in CD — it survives only in `about.toml`/`deny.toml` for license coverage — so the budget named
+a binary nobody could measure, and in practice it was checked against whatever host ran the gate. Every
+other row is still the arm-glibc probe floor unless marked otherwise. Items marked *(unmeasured)*
+become measurement tasks in the noted milestone:
 
 | Metric (release, stripped, default features)              | Target   | Hard limit | |
 |-----------------------------------------------------------|----------|------------|---|
-| `imbhd` server binary (x86_64-unknown-linux-musl)         | ≤ 42 MB  | 55 MB      | |
+| `imbhd` server binary (x86_64-unknown-linux-gnu)          | ≤ 42 MB  | 55 MB      | measured **41.1 MB** at v0.5.0 |
 | Size delta when embedding the lib into a host binary      | ≤ 32 MB  | 42 MB      | |
 | Idle RSS (DB open, no active writer, empty pool)          | ≤ 40 MB  | 64 MB      | *(clean harness, M1)* |
 | Steady RSS ingesting 10k log records/s (default buffers)  | ≤ 200 MB | 320 MB     | *(M1 soak)* |
@@ -93,9 +96,21 @@ These budgets describe the **default-feature** build, which is what `scripts/foo
 enforces (`cargo tree -p imbh` plus a default-feature `imbhd`). An off-by-default `imbh-server`
 feature moves neither number, so the gate additionally prints — informationally, never as a failure
 — the shipped Docker log-driver plugin build (`docker,docker-remap,grpc,tracing`). That build is the
-only place `docker-remap`'s VRL subtree shows up: +89 crates and +3.8 MiB, landing the plugin binary
-at 40.0 MB against the 42 MB target (ARCHITECTURE.md §11, and the 2026-08-06 JOURNAL entry for the
-measurement).
+only place `docker-remap`'s VRL subtree shows up: +89 crates and +3.84 MiB (measured exactly, as the
+difference between two local aarch64 release builds differing only in the feature: 35,973,488 →
+39,997,800 bytes), landing the plugin binary at **40.0 MB** against the 42 MB target.
+
+> **The 40.0 MB above is the aarch64 figure, and it is the optimistic end of the range.** The gate runs
+> on the CI/dev host, but the same binary is 5.1 MB larger on x86_64: v0.5.0 measured 35,973,464 B on
+> aarch64-linux against **41,112,104 B on x86_64-linux** (Appendix C). Applying the measured +4,024,312 B
+> remap delta to the x86_64 baseline projects **≈ 45.1 MB — about 3 MB over the 42 MB target**, still
+> well under the 55 MB hard limit. This is a projection, not a measurement: the delta was measured on
+> aarch64 and x86_64 codegen is demonstrably fatter, so the real figure is more likely above 45.1 MB
+> than below. It matters now rather than later because `release.yml`'s Linux legs carry
+> `docker,docker-remap,grpc,tracing` as of `fc70cf8`, whereas v0.5.0 shipped `docker,grpc,tracing` — so
+> **the next release is the first whose x86_64 archive contains the VRL subtree at all.** A
+> `workflow_dispatch` dry run turns the projection into a number before a release depends on it. Note
+> the gate cannot catch this on an aarch64 host: it reads 40.0 MB and passes.
 
 ## 3. Non-goals (v1)
 
