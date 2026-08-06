@@ -33,10 +33,16 @@ fi
 
 echo "== release imbhd binary size =="
 bin=target/release/imbhd
-if [ ! -f "$bin" ]; then
-  echo "  building (release, fat LTO) ..."
-  cargo build --release -p imbh-server >/dev/null 2>&1
-fi
+# ALWAYS build, never "reuse it if the file is there". `target/release/imbhd` is one path shared by
+# every feature set, and anyone who has run `cargo build --release -p imbh-server --features
+# docker,docker-remap,grpc,tracing` by hand leaves the PLUGIN binary sitting at it. A skip-if-present
+# check then measures that instead — silently, and against the DEFAULT-build budget: measured
+# 39,997,776 B (the plugin build) where the default build is 34,916,248 B, a 5.1 MB phantom. It fails
+# in the dangerous direction too, reporting a stale small binary after a real regression. Building
+# unconditionally costs nothing when the tree is already current (cargo no-ops) and is the only thing
+# that reconciles the feature set with the path.
+echo "  building (release, fat LTO; no-op if current) ..."
+cargo build --release -p imbh-server >/dev/null 2>&1
 bytes=$(stat -c%s "$bin")
 mib=$(awk "BEGIN{printf \"%.1f\", $bytes/1048576}")
 echo "  imbhd: $bytes bytes = ${mib} MiB  (glibc floor; musl target <= ${BIN_TARGET_MB} MB, hard <= ${BIN_HARD_MB} MB)"

@@ -3444,3 +3444,78 @@ create` at package time, so every mistake in it was previously a user-machine di
 `config.json` was additionally packaged into a real plugin against a busybox rootfs and enabled with
 nothing provisioned by hand: it now fails only at `exec: "/usr/bin/imbhd"`, i.e. strictly after the
 mount stage. Probe plugins and the stray probe directory were removed. Nothing committed.
+
+## Preparing v0.6.0: the release gate was measuring a binary from another feature set (2026-08-06)
+
+Release prep for `v0.6.0` — the minor bump the `propagatedMount` fix has been waiting on (TODO
+"Open Items", first entry). Three things came out of it that are not the version bump itself.
+
+### The changelog was missing its headline feature
+
+`[Unreleased]` carried the compaction schema fix, the `--tail 0` arrival-clock fix, the typed-metrics
+dedup, `LogQuery::observed_after`, the `/stats` ingest gauges, and the `propagatedMount` break — but
+**not** `docker-remap` (`fc70cf8`), the largest change in the release and the one with a
+`BREAKING CHANGE:` trailer. The PR that landed it wrote its findings to JOURNAL and its user-facing
+docs to `docs/DOCKER_LOG_DRIVER.md`, and the changelog was the one surface it skipped. Nothing catches
+this: no gate reads `CHANGELOG.md`, and `git cliff` (below) would have "caught" it only by discarding
+the file. Added under `### Added`, with the plugin-visible break — a recognised line's `body` is now
+parsed fields, and `docker logs` re-renders it as logfmt — stated in the entry rather than left to the
+commit trailer.
+
+The released section is ordered Added → Changed → Fixed (matching `[0.4.0]`), not the
+Fixed → Added → Changed order the entries happened to accumulate in.
+
+### The binary-size axis was measuring the plugin build
+
+`scripts/footprint-gate.sh` printed `imbhd: 39997776 bytes = 38.1 MiB` against the ≤ 42 MB target —
+comfortably passing, and wrong. That number is **byte-identical** to the plugin-feature build recorded
+in this journal for `docker-remap` (2026-08-06). The gate's binary axis was:
+
+```sh
+bin=target/release/imbhd
+if [ ! -f "$bin" ]; then cargo build --release -p imbh-server; fi
+```
+
+`target/release/imbhd` is one path shared by every feature set. Anyone who has run
+`cargo build --release -p imbh-server --features docker,docker-remap,grpc,tracing` by hand leaves the
+plugin binary at it, and the skip-if-present check then measures that against the *default*-build
+budget. Rebuilt with default features, the real number is **34,916,248 B = 33.3 MiB = 34.9 MB** — a
+5.1 MB phantom, and 7 MB of margin the gate was not reporting.
+
+The direction that matters is the other one: the same check will report a stale *small* binary after a
+real regression, which is a gate that passes by not looking. Fixed by building unconditionally (cargo
+no-ops when current), which is the only thing that reconciles the feature set with the path. Note the
+plugin probe added in `fc70cf8` already had this exact insight — it builds into its own
+`target/footprint-plugin-probe` "deliberately", with a comment saying the gated axis reuses
+`target/release/imbhd` when present — and stopped one step short of concluding that the reuse was
+itself the bug.
+
+### `cargo release` as configured would destroy the changelog
+
+Two release-machinery findings, both pre-existing, neither fixed here:
+
+- `pre-release-hook = ["git", "cliff", "-o", "CHANGELOG.md", "--tag", "{{version}}"]` in the root
+  `Cargo.toml`, and there is **no `cliff.toml` in the repo**. Verified by running it to stdout:
+  git-cliff falls back to its built-in default config and emits a conventional-commit digest
+  (`### 🚀 Features` / `- *(docker)* [**breaking**] …`) for every tag in history. With `-o` that
+  *replaces* `CHANGELOG.md` — the hand-written Keep a Changelog prose, the migration notes, and the
+  `<!-- next-url -->` anchors the `pre-release-replacements` in `crates/imbh/Cargo.toml` match with
+  `exactly = 1`, all gone. The two mechanisms are mutually exclusive and the repo has both.
+- The `pre-release-replacements` under `[workspace.metadata.release]` (the `VERSION=` and
+  `ghcr.io/…` strings in `README.md` / `docs/DOCKER_LOG_DRIVER.md`) have never fired — the v0.5.0
+  release commit says so explicitly and corrected those strings by hand. They were corrected by hand
+  again here.
+
+Consistent with both: `v0.5.0` was prepared as a hand-written commit, not by `cargo release`.
+
+### Verified
+
+`fmt --all --check` clean; `build --workspace`, `clippy --workspace --all-targets -D warnings` and
+`test --workspace` all clean (0 failures, 64 suites). `./scripts/license-gate.sh` OK.
+`./scripts/gen-notices.sh` regenerated `THIRD-PARTY-NOTICES.txt` — the only delta is the 14 workspace
+crates moving to 0.6.0, i.e. the third-party set is unchanged since `fc70cf8`. Footprint gate OK:
+275 crates (target 275), `imbhd` 33.3 MiB after the fix, plugin build 397 crates / 38.1 MiB
+(informational), idle RSS 14.9 MB, steady RSS 94.4 MB, search-off lever 275 → 217 → 71. The §3c
+packaging dry-run (`cargo package --workspace --allow-dirty`, dirty because the bump is uncommitted)
+staged and verified all 20 members at `0.6.0`, exit 0. Nothing committed, nothing tagged, nothing
+published.

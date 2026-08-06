@@ -13,39 +13,46 @@ release aborts if it is missing or duplicated.
 
 ## [Unreleased]
 
-### Fixed
-
-- **Compaction could silently corrupt a day partition whose segments were sealed under different
-  promoted-key sets.** `concat_batches` takes columns **positionally** and does not validate them
-  against the schema it is handed, and compaction passed it `batches[0].schema()` — the first
-  segment's. Changing `DbBuilder::promote(...)` between two seals in the same UTC day therefore gave
-  one of three outcomes depending on segment order: a panic (`index out of bounds`) when the first
-  segment was wider, **silent** truncation of the later segments' promoted columns when it was
-  narrower, or — worst — **silent** concatenation of two differently-named promoted columns into one
-  when the widths matched, labelled with whichever name the first segment used. Two of the three
-  failed silently and wrote the result back as the merged segment. Compaction now coerces every batch
-  read off disk to the table's current canonical schema first. Note this was reachable through a
-  documented-as-supported operation: `ARCHITECTURE.md` §6.1 called adding or removing promoted keys
-  backward-compatible, which was true of the read path but not the compaction path.
-
-- **The Docker log driver's `--tail 0 -f` could miss a line emitted just before the follow started.**
-  The follow watermark jumped to `Timestamp::now()` on the **event** clock, but a record's timestamp
-  is when the container emitted the line while ingest lands it up to one batch interval later, so
-  event time is not monotone in arrival. The driver now watermarks and follows on `observed_time`,
-  which for this driver is dockerd's capture stamp. `--tail N` and full history are unchanged and
-  still print in event-time order. See `docs/DOCKER_LOG_DRIVER.md` for the residues this does not
-  eliminate — a VRL script can overwrite `.observed_timestamp`, an exact-nanosecond tie is still
-  broken once, and `--tail 0` has no uniquely correct cut against a batching store.
-
-- **Typed `MetricsApi::range`/`instant` no longer inflate `sum`/`count` on duplicate metric points**
-  under `Duplicates::LastWins`, bringing them into line with PromQL. The surviving point of a
-  duplicated instant is chosen by the same total order on the **value** that §10.5.1 already
-  specified — never by scan order — so the result stays a pure function of the fetched sample
-  multiset. Under every other policy the emitted SQL is unchanged. `Duplicates::ErrorOnRead` (the
-  default) still does not *fail* on a duplicate the way PromQL does; that asymmetry is deliberate and
-  documented.
+## [0.6.0] - 2026-08-06
 
 ### Added
+
+- **The Docker log driver remaps container lines with VRL: `imbh-server`'s new `docker-remap`
+  feature.** A Vector Remap Language program runs between the reassembled wire entry and the OTLP
+  record. The built-in script recognises JSON, logfmt, klog/glog and `key=value`, lifting each line's
+  own severity, timestamp and trace context onto the record and leaving its fields queryable in the
+  body. The event a script receives carries both data models at once — Docker's log-driver fields
+  (`.line`, `.source`, `.time_nano`, `.info.*`) and the OTel record the driver would have stored on
+  its own. That seeding is what makes the identity script `.` byte-for-byte the previous behaviour,
+  and it is why the built-in script only ever *overrides*: it never re-derives `service.name`,
+  `container.*` or `log.iostream`.
+
+  A script is operator input, so three invariants are re-asserted after every run. The resource's
+  `container.id` is overwritten (`ReadLogs` filters history on it, and a wrong id would merge two
+  containers' histories), `service.name` is restored when absent or empty, and `log.iostream` is
+  restored if removed. A runtime error stores the line un-remapped rather than losing it; an explicit
+  `abort` drops it. A parsed timestamp is accepted only within 26h of Docker's capture time, because
+  `ReadLogs` pages and computes its follow watermark from that clock. Configuration is one grammar
+  shared by `--log-opt imbh-remap` (per container) and `IMBH_DOCKER_REMAP` (daemon-wide): `default`,
+  `off`, `@PATH`, or an inline script. See `docs/DOCKER_LOG_DRIVER.md` "Remapping".
+
+  **Breaking for the published plugin**, which ships with the feature enabled: a recognised line's
+  `body` is now the parsed fields rather than the raw text, and `docker logs` re-renders it as a
+  logfmt line (`ts=… level=… k=v`) instead of replaying the original bytes — so a query reading
+  `body` as text sees structured data for those lines. `--log-opt imbh-remap=off` or
+  `IMBH_DOCKER_REMAP=off` restores the previous behaviour, which is also what a build without
+  `docker-remap` does; a plain string body still leaves `docker logs` verbatim, so OTLP-ingested
+  records are unaffected.
+
+  This is the one feature in the workspace that adds crates on purpose: `imbh-server`'s plugin
+  feature set goes 308 → 397 crates and the plugin binary 34.3 → 38.1 MiB. Neither axis the footprint
+  gate enforces moves — it counts `cargo tree -p imbh` (the facade, which `imbh-server` sits *above*)
+  and builds `imbhd` at default features — so `scripts/footprint-gate.sh` now also prints an
+  informational, never-failing measurement of the plugin build. vrl is the graph's first MPL-2.0
+  component (MPL §3.3 keeps the Larger Work Apache-2.0), and it falsifies two `ARCHITECTURE.md` §11
+  statements, corrected there: C code is no longer libzstd-only (`stdlib-base` forces vrl's `datadog`
+  feature, which pulls `onig_sys`), and `lz4_flex` is now a dependency. `deny.toml` and `about.toml`
+  gain MIT-0 and 0BSD accordingly.
 
 - **`LogQuery::observed_after` and `LogOrder { Time, ObservedTime }`** expose the arrival clock
   (`observed_time`, already stored on every log row) as a filter and sort axis. Additive: the `SELECT`
@@ -107,6 +114,38 @@ release aborts if it is missing or duplicated.
   `GET /stats` shares the derive and has always emitted an explicit `null` for an absent per-table
   bound. They keep `#[serde(default)]`, so a payload that omits them still deserializes and older
   peers are unaffected in that direction.
+
+### Fixed
+
+- **Compaction could silently corrupt a day partition whose segments were sealed under different
+  promoted-key sets.** `concat_batches` takes columns **positionally** and does not validate them
+  against the schema it is handed, and compaction passed it `batches[0].schema()` — the first
+  segment's. Changing `DbBuilder::promote(...)` between two seals in the same UTC day therefore gave
+  one of three outcomes depending on segment order: a panic (`index out of bounds`) when the first
+  segment was wider, **silent** truncation of the later segments' promoted columns when it was
+  narrower, or — worst — **silent** concatenation of two differently-named promoted columns into one
+  when the widths matched, labelled with whichever name the first segment used. Two of the three
+  failed silently and wrote the result back as the merged segment. Compaction now coerces every batch
+  read off disk to the table's current canonical schema first. Note this was reachable through a
+  documented-as-supported operation: `ARCHITECTURE.md` §6.1 called adding or removing promoted keys
+  backward-compatible, which was true of the read path but not the compaction path.
+
+- **The Docker log driver's `--tail 0 -f` could miss a line emitted just before the follow started.**
+  The follow watermark jumped to `Timestamp::now()` on the **event** clock, but a record's timestamp
+  is when the container emitted the line while ingest lands it up to one batch interval later, so
+  event time is not monotone in arrival. The driver now watermarks and follows on `observed_time`,
+  which for this driver is dockerd's capture stamp. `--tail N` and full history are unchanged and
+  still print in event-time order. See `docs/DOCKER_LOG_DRIVER.md` for the residues this does not
+  eliminate — a VRL script can overwrite `.observed_timestamp`, an exact-nanosecond tie is still
+  broken once, and `--tail 0` has no uniquely correct cut against a batching store.
+
+- **Typed `MetricsApi::range`/`instant` no longer inflate `sum`/`count` on duplicate metric points**
+  under `Duplicates::LastWins`, bringing them into line with PromQL. The surviving point of a
+  duplicated instant is chosen by the same total order on the **value** that §10.5.1 already
+  specified — never by scan order — so the result stays a pure function of the fetched sample
+  multiset. Under every other policy the emitted SQL is unchanged. `Duplicates::ErrorOnRead` (the
+  default) still does not *fail* on a duplicate the way PromQL does; that asymmetry is deliberate and
+  documented.
 
 ## [0.5.0] - 2026-08-05
 
@@ -591,6 +630,7 @@ release aborts if it is missing or duplicated.
   All 12 crates published to crates.io (`imbh-test-support` is dev-only and stays unpublished).
 
 <!-- next-url -->
+[0.6.0]: https://github.com/moriyoshi/imbh/releases/tag/v0.6.0
 [0.5.0]: https://github.com/moriyoshi/imbh/releases/tag/v0.5.0
 [0.4.0]: https://github.com/moriyoshi/imbh/releases/tag/v0.4.0
 [0.3.0]: https://github.com/moriyoshi/imbh/commit/07b72dd7e05f2320afcf573e0ff4e4766b9f0ec0
