@@ -83,20 +83,87 @@ else
 fi
 
 echo "== engine deps present? =="
-tree=$(cargo tree -p imbh --edges normal 2>/dev/null)
-printf '%s\n' "$tree" | grep -q 'tantivy v' && echo "  tantivy: yes" || echo "  tantivy: NO"
-printf '%s\n' "$tree" | grep -q 'datafusion v' && echo "  datafusion: yes" || echo "  datafusion: NO"
-
-echo "== search-off footprint lever (imbh --no-default-features) =="
-# The §11 `search` knob must (a) still compile and (b) actually drop the tantivy subtree. Guard both
-# so the lever can't silently break (e.g. an ungated imbh_index reference re-links tantivy).
-off=$(cargo tree -p imbh --no-default-features --edges normal --prefix none 2>/dev/null \
-  | sed 's/ (\*)//; s/ v[0-9].*//' | awk 'NF' | sort -u | wc -l)
-echo "  search-off unique crates: $off  (search-on: $crates)"
-if cargo tree -p imbh --no-default-features --edges normal 2>/dev/null | grep -q 'tantivy v'; then
-  echo "  FAIL: tantivy still present with search off — the feature lever is broken"; fail=1
+# `search` and `query` are both ON by default (crates/imbh/Cargo.toml), so both engines MUST be in
+# the default graph. Their absence here is never a deliberate footprint trim — the deliberate trim is
+# the search-off lever measured below, which uses an explicit `--no-default-features`. Absence here
+# means a feature-flag edit silently dropped a subsystem, which is a regression, so these FAIL the
+# gate rather than printing a note nobody reads (matching the search-lever guard below).
+#
+# `grep -q <<<"$tree"`, NOT `printf ... | grep -q`. `grep -q` exits the instant it matches, which
+# under this script's `set -o pipefail` can leave the upstream writer with a broken pipe and make the
+# pipeline report the writer's SIGPIPE (141) even though grep matched — a false "not present" on a
+# perfectly healthy graph. The window only opens once the writer outsizes the pipe buffer (64 KiB;
+# the tree is ~55 KiB today, so the current form does not actually race — but it is one dependency
+# away from doing so, and the failure it would produce reads as "the query engine vanished"). A
+# here-string has no upstream process and cannot race at any size. Keep every `grep -q` fed by one.
+#
+# Guard the capture first. `2>/dev/null` swallows cargo's own errors, so a `cargo tree` that fails —
+# a lock held by a concurrent cargo, a manifest error — yields an EMPTY `$tree`, and every check
+# below would read that as "the engine was dropped" and fail the gate. Distinguish "cargo could not
+# tell us" from "the answer is no": the former is an infrastructure failure, not a footprint result.
+tree_err=''
+if ! tree=$(cargo tree -p imbh --edges normal 2>&1) || [ -z "$tree" ]; then
+  tree_err=${tree:-(no output)}
+  tree=''
+fi
+if [ -z "$tree" ]; then
+  echo "  FAIL: \`cargo tree -p imbh\` produced no graph, so the engine checks could not run:"
+  printf '%s\n' "$tree_err" | head -5 | sed 's/^/    /'
+  fail=1
+elif ! grep -q 'tantivy v' <<<"$tree"; then
+  echo "  FAIL: no tantivy in the default graph — the search engine was silently dropped"; fail=1
 else
-  echo "  tantivy dropped: yes (-$((crates - off)) crates)"
+  echo "  tantivy: yes"
+fi
+# Match the whole DataFusion crate FAMILY, not just the bare `datafusion` facade. DataFusion keeps
+# splitting itself into sub-crates (datafusion-core / -session / -physical-plan / ...), so a pattern
+# pinned to `datafusion v` would report a perfectly healthy tree as broken the day imbh-query depends
+# on a split crate instead of the facade. Every datafusion* crate reaches this graph only through
+# imbh-query, so the family is present iff `query` is: verified empirically — the default tree has
+# 31 datafusion crates (189 lines), `cargo tree -p imbh --no-default-features` has zero.
+if [ -z "$tree" ]; then
+  : # already reported above; do not repeat the same infrastructure failure twice
+elif ! grep -qE 'datafusion(-[a-z-]+)? v' <<<"$tree"; then
+  echo "  FAIL: no datafusion crate in the default graph — the query engine was silently dropped"; fail=1
+else
+  echo "  datafusion: yes"
+fi
+
+echo "== search-off footprint lever (§11) =="
+# TWO different knobs live here and they used to get conflated (QUALITY_GATE.md §2 quoted one knob's
+# number against the other's name):
+#   `--no-default-features --features ingest,query` — search OFF and nothing else; the delta from the
+#       default graph is the tantivy subtree, i.e. what "turning search off costs".
+#   `--no-default-features`                          — ingest AND query AND search off, so it also
+#       takes the OTLP-decode and the whole DataFusion subtree. Much bigger delta, nothing to do with
+#       search. This is the config the compile guard below builds.
+# Print both, labelled, so the big delta can never be misread as the cost of tantivy again.
+#
+# Each tree is captured ONCE into a variable and then both counted and grepped from a here-string. The
+# old form piped `cargo tree` straight into `grep -q`, which has the same SIGPIPE-under-pipefail race
+# described above — and here it fails the DANGEROUS way round: a broken pipe makes the `if` read as
+# "tantivy not found", i.e. the guard reports the lever healthy at exactly the moment tantivy leaked
+# back in and grep matched early. `--prefix none` keeps the `name vX.Y.Z` text both uses need.
+count_tree() {
+  printf '%s\n' "$1" | sed 's/ (\*)//; s/ v[0-9].*//' | awk 'NF' | sort -u | wc -l
+}
+searchoff_tree=$(cargo tree -p imbh --no-default-features --features ingest,query \
+  --edges normal --prefix none 2>/dev/null)
+off_tree=$(cargo tree -p imbh --no-default-features --edges normal --prefix none 2>/dev/null)
+searchoff=$(count_tree "$searchoff_tree")
+off=$(count_tree "$off_tree")
+echo "  default (ingest,query,search):  $crates"
+echo "  search off only (ingest,query): $searchoff  (-$((crates - searchoff)) = the tantivy subtree)"
+echo "  all default features off:       $off  (-$((crates - off)); also drops OTLP decode + DataFusion)"
+# The §11 `search` knob must (a) still compile and (b) actually drop the tantivy subtree. Guard both
+# so the lever can't silently break (e.g. an ungated imbh_index reference re-links tantivy). Check the
+# precise lever (`ingest,query`) as well as the bare build: tantivy can leak back into either.
+if grep -q 'tantivy v' <<<"$searchoff_tree"; then
+  echo "  FAIL: tantivy still present with search off (ingest,query) — the feature lever is broken"; fail=1
+elif grep -q 'tantivy v' <<<"$off_tree"; then
+  echo "  FAIL: tantivy still present with all default features off — the feature lever is broken"; fail=1
+else
+  echo "  tantivy dropped: yes"
 fi
 echo "  compiling search-off config ..."
 if cargo build -p imbh --no-default-features >/dev/null 2>&1; then
