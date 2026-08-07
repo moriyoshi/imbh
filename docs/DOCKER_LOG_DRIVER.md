@@ -47,7 +47,7 @@ them.
 The release publishes the plugin **per architecture**, and you name the one you want:
 
 ```sh
-docker plugin install --alias imbh ghcr.io/moriyoshi/imbh-log-driver:0.6.1-amd64
+docker plugin install --alias imbh ghcr.io/moriyoshi/imbh-log-driver:0.6.2-amd64
 ```
 
 That is the whole install. **The database directory needs no setting up** — `/var/lib/imbh` is
@@ -159,7 +159,7 @@ where those primitives behave normally.
 Two Desktop-specific things still bite:
 
 - **Pick the tag by the VM's architecture, not your machine's marketing name.** Apple silicon runs an
-  arm64 VM, so it is `…-log-driver:0.6.1-arm64`. The `-amd64` tag in the recipe above is the Linux
+  arm64 VM, so it is `…-log-driver:0.6.2-arm64`. The `-amd64` tag in the recipe above is the Linux
   x86_64 default, and on an M-series Mac it is the wrong artifact.
 - **`curl 172.17.0.1:4318` from your Mac or PC shell will not reach it.** The plugin binds the
   **VM's** bridge gateway, so containers reach it exactly as on Linux, but a managed plugin cannot

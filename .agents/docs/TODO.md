@@ -9,21 +9,21 @@ git history); this file tracks only what is still open.
 
 ## Open Items
 
-- [ ] **v0.6.1 is prepared but not cut.** The workspace is bumped to `0.6.1`, the changelog section
+- [ ] **v0.6.2 is prepared but not cut.** The workspace is bumped to `0.6.2`, the changelog section
       is closed and dated, `README.md` / `docs/DOCKER_LOG_DRIVER.md` version strings are corrected by
-      hand, notices are regenerated and every gate is green — see JOURNAL "Preparing v0.6.1". Open
-      because nothing is committed, tagged or published, so the runtime bridge-network discovery that
-      makes a registry install bind an address the daemon actually has (JOURNAL 2026-08-07) has not
-      reached anyone: `ghcr.io/moriyoshi/imbh-log-driver:0.6.0-*` still carries the hard-coded
-      `172.17.0.1:4318` default. Close this once the `v0.6.1` tag is pushed and the plugin job has
-      published its tags. Releases are cut only when explicitly asked.
+      hand, notices are regenerated and every gate is green — see JOURNAL "Preparing v0.6.2". Open
+      because nothing is tagged or published, so the `auto` listener fix (JOURNAL 2026-08-07,
+      "`auto` resolved to an address nothing can bind") has not reached anyone: a registry install of
+      `ghcr.io/moriyoshi/imbh-log-driver:0.6.1-*` still busy-loops on any daemon whose bridges carry
+      an IPv6 link-local, which includes every Docker Desktop VM. Close this once the `v0.6.2` tag is
+      pushed and the plugin job has published its tags. Releases are cut only when explicitly asked.
 
-      *(The 0.5.0 `propagatedMount` install failure this entry used to track is fixed and shipped:
-      v0.6.0 was tagged and published on 2026-08-07, with both log-driver plugin jobs green.)*
+      *(v0.6.1 — the entry this replaces — was tagged and published on 2026-08-07T07:59Z with six
+      release assets, so the runtime bridge-network discovery it carried has shipped.)*
 
-- [ ] **`cargo release` still cannot be run as configured — three releases and counting.** Two
-      independent defects in the root `Cargo.toml`, both worked around by hand for v0.5.0, v0.6.0 and
-      v0.6.1 (JOURNAL "Preparing v0.6.0" / "Preparing v0.6.1"). (a) `pre-release-hook = ["git",
+- [ ] **`cargo release` still cannot be run as configured — four releases and counting.** Two
+      independent defects in the root `Cargo.toml`, worked around by hand for v0.5.0, v0.6.0, v0.6.1
+      and v0.6.2 (JOURNAL "Preparing v0.6.0" / "Preparing v0.6.1"). (a) `pre-release-hook = ["git",
       "cliff", "-o", "CHANGELOG.md", …]` with no `cliff.toml` in the repo would replace the
       hand-written Keep a Changelog file — prose, migration notes, and the `<!-- next-url -->` anchors
       `crates/imbh/Cargo.toml` matches with `exactly = 1` — with a conventional-commit digest. Either

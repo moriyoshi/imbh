@@ -3839,3 +3839,62 @@ rather than accept storms.
 regression tests: the link-local exclusion, the loopback/
 unspecified/v4-link-local set, the API backend's copy of the rule, and the backoff's bounds under
 overflow-sized failure counts).
+
+## Preparing v0.6.2: a one-bug patch release, and a binary size that is identical by coincidence (2026-08-07)
+
+Bump the shared workspace version and close the changelog. Everything since v0.6.1 is a single bug
+report landing (PR #38): `IMBH_LISTEN_ADDR=auto` resolving to an address nothing can bind, and the two
+accept loops that spun on it. `[Unreleased]` was empty, so the whole `[0.6.2]` section is written from
+the commits — two `### Fixed` items, the discovery filter and the accept backoff, in the order they
+were found rather than the order they were committed, because the second only matters as the reason
+the first was fatal rather than merely useless.
+
+### Why a patch bump, and why that is not a judgement call this time
+
+0.6.2 under the same 0.x rule the last three releases used, where a *minor* bump means something
+broke. Nothing here can: `is_usable_gateway` is private, `accept_backoff` and
+`ACCEPT_FAILURES_BEFORE_RETIRING` are `pub(crate)`, `serve_on_listener` and `bridges_from_ifaddrs`
+were already `pub(crate)`, and neither accept loop changed signature. The only behaviour an existing
+deployment can observe is `auto` no longer offering an address that never bound — which is the
+removal of a listener that did not exist.
+
+Unlike v0.6.1, this needed no argument about whether a fix wearing a feature's clothes deserves a
+minor bump. It is a fix wearing a fix's clothes.
+
+### The footprint numbers are identical to v0.6.1, and that is real
+
+The gate reports `imbhd` at **34,916,248 B** and the plugin feature set at **40,063,344 B** — byte for
+byte what v0.6.1 measured. That is exactly the shape of a stale-artifact bug, so it was checked rather
+than reported:
+
+- `target/release/imbhd` is stamped after the source files, and `strings` finds the new
+  `consecutive accept failures` message in it.
+- `target/footprint-plugin-probe/release/imbhd` likewise, with all three new strings.
+
+Both binaries are genuinely current; the sizes coincide because the added code is a few hundred bytes
+and fat-LTO output lands in the same section-aligned size. Recorded because "unchanged" and "not
+rebuilt" are indistinguishable from the number alone, and the gate's own comment (§footprint-gate.sh
+line 76) exists because that confusion has bitten this repo before in the other direction.
+
+### Still by hand, for the fourth time
+
+`README.md` (3 strings) and `docs/DOCKER_LOG_DRIVER.md` (2) moved to 0.6.2 by hand again: the
+`pre-release-replacements` for them live under `[workspace.metadata.release]`, where cargo-release
+does not read them, and the `pre-release-hook` would still run `git cliff -o CHANGELOG.md` with no
+`cliff.toml` in the repo. TODO.md's item is updated from "three releases and counting" to four rather
+than left to inherit a fifth.
+
+`THIRD-PARTY-NOTICES.txt` is regenerated; its only delta is the 14 workspace crates moving to 0.6.2,
+so the third-party set is unchanged since v0.6.0.
+
+TODO.md's first open item — v0.6.1 prepared but not cut — is closed: `v0.6.1` was tagged and published
+2026-08-07T07:59Z with six release assets. It is replaced by the same entry for this release.
+
+### Verified
+
+`fmt --all --check` clean; `build --workspace`, `clippy --workspace --all-targets -D warnings` and
+`test --workspace` all clean (**64 suites, 586 passed, 0 failed, 4 ignored** — one more than v0.6.1's
+585, which is the backoff-bounds test; the other three new tests are behind the `docker` feature and
+do not run in the default path). `./scripts/license-gate.sh` OK. Footprint gate **OK**: 275 crates
+(target 275), `imbhd` 33.3 MiB, plugin feature set 397 crates / 38.2 MiB (informational, unchanged),
+idle RSS 14.9 MB, steady RSS 95.5 MB, search-off lever 275 → 217 → 71.

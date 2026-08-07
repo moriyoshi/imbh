@@ -13,6 +13,45 @@ release aborts if it is missing or duplicated.
 
 ## [Unreleased]
 
+## [0.6.2] - 2026-08-07
+
+### Fixed
+
+- **`IMBH_LISTEN_ADDR=auto` could resolve to an address nothing can bind, and both listeners spun on
+  it.** Discovery read every address `getifaddrs` reported for a Docker bridge, filtering on the
+  interface name and the sysfs `bridge/` probe but never on address family. A bridge with IPv6
+  enabled carries an IPv6 **link-local** (`fe80::/10`) alongside its routable address, so `auto`
+  resolved to `[fe80::…]:4318` — which Linux `inet6_bind` refuses, because the `sockaddr_in6` names
+  no scope, and there is nowhere in an `IpAddr` (or in the `HOST:PORT` string built from one) to
+  carry the interface that would supply it. The bind could never succeed and the supervisor retried
+  it on every refresh.
+
+  Reported against a `docker plugin install` on **Docker Desktop for Mac**, whose VM carries an
+  `fe80::…` on `docker0`; a Linux host with IPv6 enabled has one too. The symptom was the plugin
+  pinning a core from the moment it was enabled, on both the HTTP and the OTLP/gRPC listener.
+
+  Discovery now admits only addresses a listener can bind — link-local (v4 and v6), loopback and the
+  unspecified address are dropped, in the Engine API backend as well as the interface scan. `0.0.0.0`
+  and `::` matter beyond bindability: binding the unspecified address would serve every interface the
+  host has, which is the exact exposure `auto` exists to avoid. A routable IPv6 gateway is still
+  discovered and still bound.
+
+- **Neither accept loop could survive a listener whose socket stopped working.** The HTTP loop
+  retried a failed `accept` immediately, on the assumption that every such error is per-connection
+  (`ECONNABORTED`, `EMFILE`) and transient; the OTLP/gRPC side handed the error to tonic, which treats
+  it as a connection that did not happen and comes straight back for the next one. Either way a
+  persistent error was a busy loop — which is why one unbindable address above pinned a core in two
+  different crates.
+
+  Both now share one exponential backoff (5 ms doubling to a 1 s cap), with the counter cleared by
+  every accept that succeeds, so a healthy listener never touches the timer. After 64 consecutive
+  failures — over a minute of uninterrupted failure, so nothing transient reaches it — the listener
+  retires, and the multi-address supervisor rebinds its address on the next refresh. A listener that
+  stopped accepting used to stay in the supervisor's map for ever, leaving the endpoint silently gone.
+
+  No published API moved: the backoff constants and helper are crate-internal, and both accept loops
+  keep their signatures.
+
 ## [0.6.1] - 2026-08-07
 
 ### Added
@@ -717,6 +756,7 @@ release aborts if it is missing or duplicated.
   All 12 crates published to crates.io (`imbh-test-support` is dev-only and stays unpublished).
 
 <!-- next-url -->
+[0.6.2]: https://github.com/moriyoshi/imbh/releases/tag/v0.6.2
 [0.6.1]: https://github.com/moriyoshi/imbh/releases/tag/v0.6.1
 [0.6.0]: https://github.com/moriyoshi/imbh/releases/tag/v0.6.0
 [0.5.0]: https://github.com/moriyoshi/imbh/releases/tag/v0.5.0
