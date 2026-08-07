@@ -164,6 +164,11 @@ Two Desktop-specific things still bite:
 - **`curl 172.17.0.1:4318` from your Mac or PC shell will not reach it.** The plugin binds the
   **VM's** bridge gateway, so containers reach it exactly as on Linux, but a managed plugin cannot
   publish ports to your host. Query it from a container on the same daemon.
+- **The VM's own address is bound too**, which is what makes Docker Desktop's
+  `gateway.docker.internal` / `host.docker.internal` names work as an OTLP endpoint -- those lead to
+  the VM's uplink, not to a bridge gateway, so bridge binds alone leave them refusing connections.
+  See [The extra address on Docker Desktop](#the-extra-address-on-docker-desktop) for how it is
+  found and for `IMBH_DOCKER_VM_NET`, which turns it off.
 
 Everything in [Keeping the data](#keeping-the-data) works unchanged here: those recipes go through a
 container, whose `/` is the VM's `/`, so they reach the database without any host sharing and without
@@ -454,6 +459,56 @@ offers `export DOCKER_HOST=...` or `docker context use rootless`, and both are h
 `tcp://` or `ssh://` endpoint is deliberately ignored -- this binds gateways that exist on *this*
 host, so a remote daemon's networks would be the wrong answer, not a missing one.
 
+### The extra address on Docker Desktop
+
+On Docker Desktop the daemon runs inside a Linux VM, and that VM has one interface that is not a
+bridge: its link to the machine you are sitting at, on `192.168.65.0/24` by default. Bridge gateways
+are still reachable from containers there exactly as on Linux -- but Docker Desktop's own
+`gateway.docker.internal` / `host.docker.internal` names lead to that VM link instead, so a container
+pointed at `gateway.docker.internal:4318` reaches an address no bridge listener holds, and gets a
+connection refused while `172.17.0.1:4318` answers perfectly.
+
+So `auto` binds that address too, when -- and only when -- this process is running inside a Docker
+Desktop VM. `IMBH_DOCKER_VM_NET` decides:
+
+| Value | Effect |
+|-------|--------|
+| `auto` (default) | bind it inside a Docker Desktop VM; change nothing anywhere else |
+| `on` | bind it on any host -- see the warning below |
+| `off` | never bind it: `auto` means bridge gateways and nothing else |
+
+The VM is recognised by any of three markers: a LinuxKit kernel in `/proc/version` (the macOS and
+Hyper-V backends), a `docker-desktop` UTS name (the WSL 2 backend), or the Engine API reporting
+`OperatingSystem: Docker Desktop` -- the last only when a socket is mounted, which the shipped plugin
+does not have. The interface itself is whichever one the kernel's routing table would send a packet
+out of, asked over netlink the way `ip route get` asks, so a host using policy routing gets the
+answer a packet would get rather than whatever the main table happens to say.
+
+> ⚠️ **Do not set `IMBH_DOCKER_VM_NET=on` on a LAN-connected Linux server.** There the default-route
+> interface *is* the LAN, and `/admin/*` is unauthenticated -- the exposure `auto` exists to avoid.
+> `on` is for a VM imbh does not recognise, where you know the far side of that interface is a
+> hypervisor host. Pair it with [`IMBH_ALLOW_FROM`](#restricting-who-may-connect) either way.
+
+Check what your containers actually resolve, and what the plugin bound:
+
+```sh
+# what the name resolves to inside a container -- busybox ping prints the address before it pings
+docker run --rm busybox ping -c1 gateway.docker.internal
+# ...and what the plugin bound: discovery logs one line when the VM address engages
+docker plugin logs imbh 2>&1 | grep -i "docker desktop"
+```
+
+Every address the VM's host-facing interface carries is bound, not just its primary one, so a
+Desktop version that answers those names on a secondary address of the same interface is covered
+too. An address that lives on the **host** side of the hypervisor link is a different matter: no
+listener inside the VM can hold one, and the endpoint to use there is the VM's own address or a
+bridge gateway.
+
+The `docker` token in `IMBH_ALLOW_FROM` is deliberately **not** widened by this: it still means this
+daemon's bridge subnets plus loopback, which is what containers connect from whichever address they
+reach. Admitting the machine on the other side of the VM link is a separate decision -- spell it out
+with `IMBH_ALLOW_FROM=docker,192.168.65.0/24` if you want it.
+
 ### Pinning an address instead
 
 Both listen addresses accept a comma-separated list, and each element is either `auto[:PORT]` or a
@@ -534,6 +589,11 @@ docker run --add-host=host.docker.internal:host-gateway \
   --log-driver imbh --log-opt imbh-service=web \
   myapp
 ```
+
+On **Docker Desktop** you need no `--add-host` at all: the daemon supplies `host.docker.internal` and
+`gateway.docker.internal` itself, and the plugin binds the address they lead to (see
+[The extra address on Docker Desktop](#the-extra-address-on-docker-desktop)). The `--add-host` line
+above is harmless there and keeps one recipe working on both.
 
 Give `OTEL_SERVICE_NAME` the same value as `--log-opt imbh-service=` and the container's logs,
 traces, and metrics all land under one `service`, joinable in a single SQL query. That is the point

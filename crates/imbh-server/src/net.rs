@@ -30,6 +30,7 @@ mod imp {
     use imbh_server::docker::addr::{Access, AllowFrom, BindSpec};
     use imbh_server::docker::networks::{Api, Networks, refresh_interval};
     use imbh_server::docker::serve::serve_supervised_until;
+    use imbh_server::docker::vmnet::VmNet;
 
     pub struct Net {
         networks: Arc<Networks>,
@@ -45,7 +46,11 @@ mod imp {
         pub fn new(shutdown: &Arc<Shutdown>) -> Result<Net, Box<dyn std::error::Error>> {
             let api = Api::parse(&std::env::var("IMBH_DOCKER_API").unwrap_or_default());
             let refresh = refresh_interval(std::env::var("IMBH_DOCKER_NETWORK_REFRESH").ok())?;
-            let networks = Networks::new(api);
+            // Whether `auto` also binds the VM's host-facing interface. Only a Docker Desktop VM
+            // has one; on a Linux host `auto` resolves exactly as it always has.
+            let vm = VmNet::parse(&std::env::var("IMBH_DOCKER_VM_NET").unwrap_or_default())
+                .map_err(|e| format!("IMBH_DOCKER_VM_NET: {e}"))?;
+            let networks = Networks::with_vm_net(api, vm);
             networks.spawn(refresh, shutdown);
 
             let from = AllowFrom::parse(&std::env::var("IMBH_ALLOW_FROM").unwrap_or_default())

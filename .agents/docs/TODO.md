@@ -34,6 +34,21 @@ git history); this file tracks only what is still open.
       changelog ones. Until both are fixed, "run `cargo release`" in `README.md` "Releasing" is
       advice that destroys the changelog.
 
+- [ ] **Confirm the Docker Desktop VM bind on an actual Desktop install.** `auto` now also binds the
+      VM's host-facing address there (JOURNAL 2026-08-07, "`auto` had no answer for Docker Desktop").
+      Everything it rests on is measured or unit-tested — the netlink route lookup against this
+      host's kernel and `ip route get`, the decode against synthetic messages, the detection markers
+      against captured `/proc/version` strings — but the two facts only a Desktop install can settle
+      are: (a) does `is_docker_desktop` fire inside the VM (is `/proc/version` LinuxKit as expected,
+      and does the plugin see the VM's UTS name or its own?), and (b) does the address the netlink
+      lookup returns match what `gateway.docker.internal` / `host.docker.internal` resolve to in a
+      container. If (b) comes back as a **host-side** address (192.168.65.1 / .2 / .254 in some
+      versions) then no VM-side listener can serve those names, and the docs' claim in "The extra
+      address on Docker Desktop" has to narrow to "the VM's own address" rather than the names.
+      Check with `docker plugin logs imbh | grep -i "docker desktop"` and
+      `docker run --rm busybox ping -c1 gateway.docker.internal`. CI is Linux-only, so this cannot be
+      automated here.
+
 - [ ] **Confirm `propagatedMount` survives `docker plugin upgrade`.** Persistence across
       `disable`/`enable` and destruction by `plugin rm` were both measured (JOURNAL 2026-08-06);
       `upgrade` was not, because it needs a registry round trip. It decides whether upgrading the

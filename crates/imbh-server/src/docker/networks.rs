@@ -63,6 +63,7 @@ use crate::shutdown::Shutdown;
 
 use super::addr::{Cidr, Discovery};
 use super::json;
+use super::vmnet::{self, VmNet};
 
 /// How long one Engine API call may take, connect to last byte. Short on purpose: this runs on a
 /// timer, a slow answer is worth skipping rather than waiting out, and the scan backend is standing
@@ -275,6 +276,10 @@ pub struct Bridge {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Snapshot {
     pub bridges: Vec<Bridge>,
+    /// The VM's host-facing address(es), when this daemon runs inside a Docker Desktop VM and
+    /// [`VmNet`] allows them — see [`super::vmnet`]. Empty on a Linux host, which has no such
+    /// interface, and empty under `IMBH_DOCKER_VM_NET=off`.
+    pub vm: Vec<IpAddr>,
     pub source: Source,
 }
 
@@ -282,11 +287,17 @@ impl Snapshot {
     fn empty() -> Snapshot {
         Snapshot {
             bridges: Vec::new(),
+            vm: Vec::new(),
             source: Source::Unknown,
         }
     }
 
-    /// Every distinct gateway, in discovery order — what `auto` binds.
+    /// Every distinct address `auto` binds: each bridge gateway, in discovery order, then the VM's
+    /// host-facing address(es) if there are any.
+    ///
+    /// The VM addresses come last so a Docker Desktop deployment keeps binding what it bound
+    /// before, plus one more — the bridge gateways stay the first thing the banner shows and the
+    /// first thing a `docker plugin set` recipe pins.
     pub fn gateways(&self) -> Vec<IpAddr> {
         let mut out: Vec<IpAddr> = Vec::new();
         for bridge in &self.bridges {
@@ -294,10 +305,21 @@ impl Snapshot {
                 out.push(bridge.gateway);
             }
         }
+        for addr in &self.vm {
+            if !out.contains(addr) {
+                out.push(*addr);
+            }
+        }
         out
     }
 
     /// Every distinct subnet — what the `docker` allow-list token expands to.
+    ///
+    /// Deliberately *not* widened by [`Snapshot::vm`]: `docker` means "this daemon's containers",
+    /// and a container connecting to the VM address still arrives from a bridge subnet, so it is
+    /// served either way. What the VM network would add is the machine on the other side of the
+    /// hypervisor link, and silently admitting it to a security control is not this feature's to
+    /// decide — `IMBH_ALLOW_FROM=docker,192.168.65.0/24` says it out loud.
     pub fn subnets(&self) -> Vec<Cidr> {
         let mut out: Vec<Cidr> = Vec::new();
         for bridge in &self.bridges {
@@ -331,6 +353,7 @@ type Listener = Box<dyn Fn(&Arc<Snapshot>) + Send + Sync>;
 /// The published view of the daemon's networks, plus the thread that keeps it fresh.
 pub struct Networks {
     api: Api,
+    vm: VmNet,
     snapshot: RwLock<Arc<Snapshot>>,
     listeners: Mutex<Vec<Listener>>,
 }
@@ -339,8 +362,15 @@ impl Networks {
     /// A view that has discovered nothing yet. Call [`Networks::refresh`] to fill it, or
     /// [`Networks::spawn`] to keep it filled.
     pub fn new(api: Api) -> Arc<Networks> {
+        Networks::with_vm_net(api, VmNet::default())
+    }
+
+    /// [`Networks::new`] with the Docker Desktop VM interface decided explicitly rather than
+    /// detected — `IMBH_DOCKER_VM_NET`, and [`super::vmnet`] for what it costs either way.
+    pub fn with_vm_net(api: Api, vm: VmNet) -> Arc<Networks> {
         Arc::new(Networks {
             api,
+            vm,
             snapshot: RwLock::new(Arc::new(Snapshot::empty())),
             listeners: Mutex::new(Vec::new()),
         })
@@ -365,7 +395,7 @@ impl Networks {
 
     /// Discover once and publish. Returns the current snapshot, changed or not.
     pub fn refresh(&self) -> Arc<Snapshot> {
-        self.publish(discover(&self.api))
+        self.publish(discover(&self.api, self.vm))
     }
 
     /// Publish `next`, notifying listeners only if anything actually changed — a refresh every 30
@@ -440,20 +470,46 @@ impl Discovery for Networks {
 }
 
 /// Try the Engine API, fall back to the interface scan.
-fn discover(api: &Api) -> Snapshot {
+///
+/// The VM's host-facing address is asked for on both paths and answered by the kernel either way;
+/// what the API adds there is the daemon's own `OperatingSystem`, the one *authoritative* Docker
+/// Desktop marker. The shipped plugin has no socket, so it goes without and relies on the kernel
+/// markers ([`vmnet::is_docker_desktop`]).
+fn discover(api: &Api, vm: VmNet) -> Snapshot {
     // A failure here is deliberately silent: a plugin with no socket mounted is the *expected*
     // shipping configuration, the scan below answers the same question, and this runs on a timer —
     // warning would mean one line every refresh interval, for ever.
-    if let Some(bridges) = api.socket().and_then(|s| api_bridges(&s).ok()) {
+    if let Some(socket) = api.socket()
+        && let Ok(bridges) = api_bridges(&socket)
+    {
+        // Only `auto` has anything to detect; `on` and `off` have already decided, and the extra
+        // round trip per refresh would buy nothing.
+        let os = match vm {
+            VmNet::Auto => daemon_os(&socket),
+            _ => String::new(),
+        };
         return Snapshot {
             bridges,
+            vm: vmnet::addresses(vm, &os),
             source: Source::Api,
         };
     }
     Snapshot {
         bridges: scan_bridges(),
+        vm: vmnet::addresses(vm, ""),
         source: Source::Ifaces,
     }
+}
+
+/// The daemon's own description of the platform it runs on — `OperatingSystem` from `GET /info`,
+/// which reads `Docker Desktop` on a Desktop VM and the distribution's name on a Linux host.
+///
+/// Empty when the call fails, which is a fall-through to the kernel markers rather than an error:
+/// nothing about discovery is worth failing for.
+fn daemon_os(socket: &Path) -> String {
+    get(socket, "/info")
+        .map(|body| json::string(&json::parse_any(&body), "OperatingSystem"))
+        .unwrap_or_default()
 }
 
 // ── the Engine API backend ───────────────────────────────────────────────────────────────
@@ -678,7 +734,7 @@ pub(crate) fn bridges_from_ifaddrs(
 /// gateway, so one appearing here means the interface is not what the name test took it for — and
 /// binding the unspecified address would open the endpoint on *every* interface, which is the exact
 /// exposure `auto` exists to avoid.
-fn is_usable_gateway(addr: IpAddr) -> bool {
+pub(super) fn is_usable_gateway(addr: IpAddr) -> bool {
     match addr {
         IpAddr::V4(v4) => !v4.is_loopback() && !v4.is_unspecified() && !v4.is_link_local(),
         // `Ipv6Addr::is_unicast_link_local` is still unstable, and the test is one mask.
@@ -745,7 +801,7 @@ fn is_path_component(name: &str) -> bool {
 }
 
 /// Every `(interface, address, netmask)` this host has, IPv4 and IPv6.
-fn ifaddrs() -> Vec<(String, IpAddr, IpAddr)> {
+pub(super) fn ifaddrs() -> Vec<(String, IpAddr, IpAddr)> {
     let mut out = Vec::new();
     let mut list: *mut libc::ifaddrs = std::ptr::null_mut();
     // SAFETY: `getifaddrs` allocates a linked list we own and must free exactly once. Every node is
@@ -862,6 +918,7 @@ mod tests {
     fn container_attachments_are_read_and_the_prefix_is_stripped() {
         let snapshot = Snapshot {
             bridges: bridges_from_networks_json(NETWORKS.as_bytes()),
+            vm: Vec::new(),
             source: Source::Api,
         };
         // One container on two networks comes back with both, named.
@@ -1122,6 +1179,7 @@ mod tests {
                 bridge("docker0", "172.17.0.1", "172.17.0.0/16"),
                 bridge("br-1", "172.23.0.1", "172.23.0.0/16"),
             ],
+            vm: Vec::new(),
             source: Source::Ifaces,
         };
         assert_eq!(
@@ -1131,6 +1189,35 @@ mod tests {
         assert_eq!(
             snapshot.subnets(),
             vec![cidr("172.17.0.0/16"), cidr("172.23.0.0/16")]
+        );
+    }
+
+    /// Inside a Docker Desktop VM `auto` binds one address more than the bridge gateways: the VM's
+    /// own host-facing one, which is where Docker Desktop's `*.docker.internal` names lead and
+    /// which no bridge scan can ever report. It comes last, and it does *not* widen the `docker`
+    /// allow-list token — see [`Snapshot::subnets`].
+    #[test]
+    fn the_vm_address_joins_the_gateways_without_widening_the_allow_list() {
+        let snapshot = Snapshot {
+            bridges: vec![bridge("docker0", "172.17.0.1", "172.17.0.0/16")],
+            vm: vec![ip("192.168.65.3")],
+            source: Source::Ifaces,
+        };
+        assert_eq!(
+            snapshot.gateways(),
+            vec![ip("172.17.0.1"), ip("192.168.65.3")]
+        );
+        assert_eq!(snapshot.subnets(), vec![cidr("172.17.0.0/16")]);
+
+        // A VM address that is also a bridge gateway is bound once, not twice.
+        let overlapping = Snapshot {
+            bridges: vec![bridge("docker0", "172.17.0.1", "172.17.0.0/16")],
+            vm: vec![ip("172.17.0.1"), ip("192.168.65.3")],
+            source: Source::Ifaces,
+        };
+        assert_eq!(
+            overlapping.gateways(),
+            vec![ip("172.17.0.1"), ip("192.168.65.3")]
         );
     }
 
@@ -1145,6 +1232,7 @@ mod tests {
 
         let one = Snapshot {
             bridges: vec![bridge("docker0", "172.17.0.1", "172.17.0.0/16")],
+            vm: Vec::new(),
             source: Source::Ifaces,
         };
         networks.publish(one.clone());
@@ -1164,11 +1252,16 @@ mod tests {
 
     #[test]
     fn discovery_with_the_api_off_falls_straight_through_to_the_scan() {
-        let snapshot = discover(&Api::Off);
+        let snapshot = discover(&Api::Off, VmNet::Off);
         assert_eq!(snapshot.source, Source::Ifaces);
         // And a socket that is not there is the same story, not an error.
-        let snapshot = discover(&Api::Socket(PathBuf::from("/nonexistent/imbh/docker.sock")));
+        let snapshot = discover(
+            &Api::Socket(PathBuf::from("/nonexistent/imbh/docker.sock")),
+            VmNet::Off,
+        );
         assert_eq!(snapshot.source, Source::Ifaces);
+        // `off` is what a host that is not a VM must look like, whatever the netns holds.
+        assert!(snapshot.vm.is_empty());
     }
 
     /// The `unix://` endpoint grammar the CLI writes, and the transports this cannot use.

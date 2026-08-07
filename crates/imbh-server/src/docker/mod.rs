@@ -52,6 +52,7 @@ pub mod readlogs;
 #[cfg(feature = "docker-remap")]
 pub mod remap;
 pub mod serve;
+pub mod vmnet;
 
 use std::collections::HashMap;
 use std::fs::File;

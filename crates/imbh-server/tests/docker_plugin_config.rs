@@ -138,6 +138,10 @@ fn the_network_discovery_settings_are_declared_and_settable() {
         ("IMBH_ALLOW_FROM", "any"),
         ("IMBH_DOCKER_API", "auto"),
         ("IMBH_DOCKER_NETWORK_REFRESH", "30s"),
+        // Docker Desktop is where `auto` alone is not enough -- the daemon is in a VM whose
+        // host-facing interface is not a bridge -- and it is also where an operator is most
+        // likely to want the extra listener back off again.
+        ("IMBH_DOCKER_VM_NET", "auto"),
     ] {
         assert_eq!(env_value(&cfg, name), default, "{name} default");
         let settable = env_entry(&cfg, name)["settable"]

@@ -3898,3 +3898,103 @@ TODO.md's first open item — v0.6.1 prepared but not cut — is closed: `v0.6.1
 do not run in the default path). `./scripts/license-gate.sh` OK. Footprint gate **OK**: 275 crates
 (target 275), `imbhd` 33.3 MiB, plugin feature set 397 crates / 38.2 MiB (informational, unchanged),
 idle RSS 14.9 MB, steady RSS 95.5 MB, search-off lever 275 → 217 → 71.
+
+## 2026-08-07 — `auto` had no answer for Docker Desktop, whose daemon lives one interface away
+
+A second report from the same Docker Desktop install that produced the `v0.6.2` fix. Containers
+could not reach the plugin at `gateway.docker.internal:4318`, the endpoint a Desktop user reaches
+for, even though `172.17.0.1:4318` answered.
+
+### The gap
+
+`auto` means "every bridge gateway this daemon has", and on a Linux host that is the whole answer:
+the daemon runs on the machine the containers run on, so a bridge gateway is reachable by every
+container and by nothing off the box. On Docker Desktop the daemon runs inside a Linux VM, and the
+VM has one interface that is not a bridge and not discoverable as one — its link to the machine the
+operator is sitting at, `192.168.65.0/24` by default. Docker Desktop's own `gateway.docker.internal`
+and `host.docker.internal` names lead **there**, not to a bridge gateway. Nothing the plugin bound
+answered on that address, so the failure was a connection refused at the endpoint people configure
+while an address nobody configures worked perfectly.
+
+The bridge scan cannot close this by widening: an interface is admitted only if it is `docker0` or
+`br-` plus 12 hex digits *and* sysfs says it is a bridge device (`networks.rs`), and the VM's uplink
+is neither. It is a different question — "which interface faces the host?" — and needs a different
+source.
+
+### Why netlink, not `/proc/net/route`
+
+The obvious reader for "which interface would a packet leave by" is `/proc/net/route`. It shows the
+**main** table only. A host using policy routing can have its default route in another table selected
+by an `ip rule`, and then that file either says nothing or names the wrong interface — the user
+raised exactly this when the change was scoped, and it is the reason `vmnet.rs` opens an
+`AF_NETLINK` socket instead.
+
+Two queries, in order:
+
+1. **Route get** — one `RTM_GETROUTE` naming a destination, no `NLM_F_DUMP`. The kernel runs the
+   real FIB lookup, `ip rule` policy included, and replies with the route it selected. This is what
+   `ip route get` does.
+2. **Dump**, only if that answered nothing: every route in every table, keeping those with a
+   zero-length destination and `RTN_UNICAST`.
+
+Measured against this host (which has three ordinary rules and one uplink): the route get returns
+`wlP9s9` for both the v4 and the v6 probe, and `ip route get 192.0.2.1` / `ip -6 route get
+2001:db8::1` agree; the dump fallback returns the same interface and terminates on `NLMSG_DONE`.
+
+Two details worth keeping. The probes are **documentation-range** addresses (192.0.2.1 from RFC 5737,
+2001:db8::1 from RFC 3849) rather than a real public address: `RTM_GETROUTE` never sends a packet, and
+documentation space is the range a host is least likely to carry a *specific* route for, so the
+lookup returns the default path rather than somebody's VPN split-tunnel exception. And a route get is
+answered by exactly one message with **no terminator**, so the read must not look for one — waiting
+for `NLMSG_DONE` there would spend the full receive timeout on every refresh.
+
+No new crate: `socket`/`send`/`recv` through the `libc` this crate already carries, with the
+rtnetlink messages encoded and decoded as bytes. The layouts are kernel ABI, so there is nothing to
+bind to and nothing that can drift; every decode path is a pure function over a `&[u8]` and is tested
+against synthetic messages, including every prefix of a valid one.
+
+### Why it is gated, and on what
+
+The default-route interface of an ordinary Linux server is its **LAN** interface. Binding it would
+publish an unauthenticated `/admin/*` on the office network — the exact exposure `auto` exists to
+avoid — so the address is offered only where the far side of that interface is a hypervisor host.
+Three independent markers, because no single one covers both Desktop backends:
+
+| Marker | Covers | Read from |
+|---|---|---|
+| `linuxkit` in the kernel version | macOS and Hyper-V backends | `/proc/version` |
+| UTS name `docker-desktop` | WSL 2 backend, whose kernel is an ordinary WSL one | `/proc/sys/kernel/hostname` |
+| `OperatingSystem: Docker Desktop` | any, authoritative | Engine API `GET /info` |
+
+The third is the only reliable one and the shipped plugin cannot use it: `config.json` has
+`mounts: []` (an invariant guarded by `tests/docker_plugin_config.rs`), so there is no daemon socket
+to ask. Which is also why the markers are read from `/proc` and not from the filesystem — a managed
+plugin has its own rootfs and sees nothing of the VM's `/`, but the runtime does mount `/proc`, and
+both facts above are kernel-wide. `IMBH_DOCKER_VM_NET` (`auto` | `on` | `off`, `settable`) is the
+override; a false negative costs the extra listener, a false positive costs a LAN exposure, so `on`
+carries a warning in the docs and in `config.json`.
+
+### What was deliberately *not* changed
+
+`IMBH_ALLOW_FROM=docker` still expands to bridge subnets plus loopback. A container connecting to the
+VM address still arrives *from* a bridge subnet, so it is served either way; what the VM network
+would add is the machine on the other side of the hypervisor link, and silently admitting it to a
+security control is not a listener change's decision. `IMBH_ALLOW_FROM=docker,192.168.65.0/24` says
+it out loud. `Snapshot::subnets` carries that reasoning next to the code that would otherwise be the
+obvious place to add it.
+
+`Snapshot` gained a `vm` field rather than a synthetic `Bridge` for the same reason: a `Bridge`
+carries a subnet, and a subnet is what the allow-list token reads.
+
+### Verified
+
+`fmt --all --check` clean; `clippy --workspace --all-targets -D warnings` clean; `clippy -p
+imbh-server --features docker,docker-remap,grpc --all-targets` clean. `test --workspace` clean
+(**64 suites, 586 passed, 0 failed** — unchanged, because everything new is behind the `docker`
+feature). `test -p imbh-server` with the plugin feature set **248 passed, 0 failed, 1 ignored**
+(14 new: the netlink request framing and
+attribute padding, the route-get/dump decode split, blackhole and missing-`RTA_OIF` routes, the
+terminator walk, every prefix of a truncated message, the three detection markers and the
+plain-Linux-host negative, the setting grammar, the interface selection, and a live query against
+the running kernel that also exercises the dump path). No dependency moved, so the footprint gate's
+inputs are unchanged; the default `imbhd` build does not compile any of this.

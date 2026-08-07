@@ -13,6 +13,34 @@ release aborts if it is missing or duplicated.
 
 ## [Unreleased]
 
+### Added
+
+- **`IMBH_LISTEN_ADDR=auto` now also binds the VM's host-facing address on Docker Desktop.** There
+  the daemon runs inside a Linux VM, and the addresses Docker Desktop's own
+  `gateway.docker.internal` / `host.docker.internal` names lead to are on the VM's uplink — not on
+  any bridge. A plugin that bound only bridge gateways was reachable at `172.17.0.1:4318` and
+  refused connections at the endpoint people actually configure, with nothing in the logs to say so.
+
+  The extra address is offered only inside a Docker Desktop VM, recognised by a LinuxKit kernel, a
+  `docker-desktop` UTS name, or the Engine API reporting `OperatingSystem: Docker Desktop`. On a
+  Linux host the default-route interface is the LAN, and binding it would publish an unauthenticated
+  `/admin/*` there — the exposure `auto` exists to avoid — so nothing changes on one.
+
+  The interface is resolved over **netlink**, the way `ip route get` resolves it, so a host using
+  policy routing gets the route a packet would actually take rather than whatever the main table in
+  `/proc/net/route` happens to hold. New setting `IMBH_DOCKER_VM_NET` (`auto` | `on` | `off`),
+  declared `settable` on the plugin; `on` asserts the behaviour on a VM imbh cannot recognise and
+  must not be set on a LAN-connected server. Discovery logs one line when the address engages.
+
+  `IMBH_ALLOW_FROM=docker` is deliberately **not** widened by this: it still expands to the daemon's
+  bridge subnets plus loopback, which is what containers connect from whichever address they reach.
+
+### Changed
+
+- `imbh_server::docker::networks::Snapshot` gained a `vm` field, and `Networks` a
+  `with_vm_net(api, VmNet)` constructor beside `new(api)`. Constructing a `Snapshot` literal is a
+  breaking change for embedders that do; every other use is unaffected.
+
 ## [0.6.2] - 2026-08-07
 
 ### Fixed

@@ -38,6 +38,12 @@
       "settable": ["value"]
     },
     {
+      "name": "IMBH_DOCKER_VM_NET",
+      "description": "Whether `auto` also binds the VM's host-facing interface. Only matters on Docker Desktop, where the daemon runs inside a VM: the bridge gateways are reachable from containers, but Docker Desktop's own gateway.docker.internal / host.docker.internal names lead to the VM's uplink instead, which no bridge bind answers on. `auto` (the default) adds that address when this process is running inside a Docker Desktop VM and changes nothing anywhere else; `on` adds it on any host -- do not set it on a LAN-connected Linux server, where the same interface is the LAN and /admin/* is unauthenticated; `off` never adds it. The interface is the one the kernel's own routing table would send a packet out of, policy rules included.",
+      "value": "auto",
+      "settable": ["value"]
+    },
+    {
       "name": "IMBH_DOCKER_NETWORK_REFRESH",
       "description": "How often the daemon's bridge networks are re-read, which is how `auto` notices a network created or destroyed after startup. `0` discovers once at startup and never looks again.",
       "value": "30s",
