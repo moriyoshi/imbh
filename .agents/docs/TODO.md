@@ -21,6 +21,24 @@ git history); this file tracks only what is still open.
       *(v0.6.1 — the entry this replaces — was tagged and published on 2026-08-07T07:59Z with six
       release assets, so the runtime bridge-network discovery it carried has shipped.)*
 
+      ⚠ **Do not cut v0.6.2 from current `main`.** The canonical-JSON codec swap (JOURNAL
+      2026-08-08) landed after the `0.6.2` version bump and sits under `## [Unreleased]`, and
+      cargo-release closes that section into whatever version it stamps — so cutting `0.6.2` now
+      would ship a data-format change as a patch. Either tag `v0.6.2` from the commit that closed
+      its changelog section, or renumber (see the next item).
+
+- [ ] **Decide the version for the canonical-JSON format change.** The codec swap (JOURNAL
+      2026-08-08, CHANGELOG `[Unreleased]`) changes how doubles are spelled on disk: `Double(1.0)`
+      is now `1.0`, not `1`, and extreme magnitudes take exponent form. Old segments still *read*,
+      but an integral `Double` written before the change no longer compares equal to one written
+      after it in dictionary/term equality, and `json_get_str` returns the new spelling. The public
+      Rust API surface is untouched, so this is not a signature break — it is a *stored-data* break,
+      which semver does not describe and users will not notice from a version number alone. Needs a
+      human call on (a) the bump (0.7.0 reads as the honest one) and (b) whether the release notes
+      should say anything about re-writing or accepting mixed-vintage segments. Compatibility with
+      existing data was explicitly waived when the change was requested; this item is about
+      communicating it, not revisiting it.
+
 - [ ] **`cargo release` still cannot be run as configured — four releases and counting.** Two
       independent defects in the root `Cargo.toml`, worked around by hand for v0.5.0, v0.6.0, v0.6.1
       and v0.6.2 (JOURNAL "Preparing v0.6.0" / "Preparing v0.6.1"). (a) `pre-release-hook = ["git",

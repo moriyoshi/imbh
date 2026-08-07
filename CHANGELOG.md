@@ -13,6 +13,49 @@ release aborts if it is missing or duplicated.
 
 ## [Unreleased]
 
+### Changed
+
+- **The canonical-JSON codec (`imbh-core`, ARCHITECTURE.md §6.1) now rides `serde_json`** instead of
+  the hand-rolled parser and string-builder emitter. The value model is unchanged — this is *not* a
+  `serde_json::Value` round trip. Both halves are hand-written impls over `AnyValue`
+  (`Serialize` + `collect_map` over explicitly sorted pairs on write, a `deserialize_any` `Visitor`
+  on read), because a `Value` map is a `BTreeMap`: its ordering would flip to insertion order if
+  anything in the graph ever enabled serde_json's `preserve_order`, breaking the byte-identity
+  invariant, and it would re-sort `AnyValue::Map`, which is an ordered pair list. imbh's own
+  extensions — sorted keys, base64 `bytes`, the `{"$f":"nan|inf|-inf"}` non-finite sentinel — are
+  unchanged.
+
+  **This changes the encoding of non-integral-typed doubles, and is a data-format break**:
+  `Double(1.0)` now encodes as `1.0` where it used to encode as `1`, and large/small magnitudes take
+  exponent form (`1e300`) instead of full decimal expansion. Segments written by an older version
+  still read back fine, but a `Double` whose value is integral will compare unequal to a
+  newly-written one in dictionary/term equality, and `json_get_str` returns the new spelling. The
+  upside is that the round trip is now type-preserving: `Double(1.0)` used to come back as `Int(1)`.
+
+  The hand-rolled base64 encoder for `AnyValue::Bytes` went with it, replaced by the `base64` crate's
+  `STANDARD` engine — the same one `imbh-mcp` was already using for the same bytes, so the workspace
+  no longer carries two implementations of RFC 4648. Output is byte-identical (the existing
+  `base64_matches_rfc4648` assertions pass unchanged) and it costs no crate on any graph: `base64` is
+  already pulled by `arrow-cast`/`parquet`, and `arrow` is non-optional in `imbh`/`imbh-storage`.
+
+  Footprint: `serde_json` and the `serde` traits (not the derive macro) become unconditional
+  `imbh-core` dependencies. The default facade graph is unchanged at **275 crates** — both are
+  already present via `arrow-json` — but the trimmed graphs pay for it:
+  `--no-default-features` 71 → 76 and the M6c producer build (`--features ingest`) 95 → 100.
+
+### Fixed
+
+- **Canonical-JSON reads rejected any document containing an escaped non-BMP character.** The
+  hand-rolled parser did not recombine `\uXXXX` surrogate pairs, so `"😀"` — what Python's
+  `json.dumps` emits by default, and a legal encoding of any astral-plane character — failed the
+  whole parse. At `Attributes::from_canonical_json` and in the Docker log-driver's request decoding
+  that failure is swallowed by an `unwrap_or_default()`, so the symptom was a silently empty
+  attribute map rather than an error. `serde_json`'s grammar handles the pairs correctly.
+
+- **Malformed JSON is now rejected rather than silently accepted.** The hand-rolled number scanner
+  and string reader admitted input that is not JSON: `+5`, leading zeros (`007`), out-of-range
+  exponents (`1e400`, previously read as `inf`), and raw control characters inside string literals.
+
 ## [0.6.2] - 2026-08-07
 
 ### Fixed

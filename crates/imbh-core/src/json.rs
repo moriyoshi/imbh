@@ -1,32 +1,31 @@
-//! A minimal, dependency-free JSON parser — the inverse of the canonical encoder (§6.1).
+//! The canonical-JSON reader — the inverse of the [`crate::canonical`] encoder (§6.1).
 //!
 //! It exists so DTOs and the `json_get_*` UDFs can read attribute values back out of the
-//! canonical-JSON columns without pulling `serde_json` into core (ARCHITECTURE.md §10.4). It parses the
-//! canonical subset plus ordinary JSON: objects, arrays, strings (with `\uXXXX`), int/float
-//! numbers, booleans, null, and the non-finite sentinel `{"$f":"nan|inf|-inf"}` → `Double`.
+//! canonical-JSON columns (ARCHITECTURE.md §10.4). It reads the canonical subset plus ordinary
+//! JSON: objects, arrays, strings, int/float numbers, booleans, null, and the non-finite sentinel
+//! `{"$f":"nan|inf|-inf"}` → `Double`.
 //!
-//! Limitation: `\uXXXX` surrogate pairs are not recombined (the canonical encoder never emits
-//! them — it only escapes control characters below 0x20). Base64 `bytes` come back as `Str`,
-//! since a JSON string carries no type tag.
+//! The grammar is `serde_json`'s (strict RFC 8259, so `\uXXXX` surrogate pairs recombine
+//! correctly), but the *value model* is [`AnyValue`], not `serde_json::Value`. That is why this is a
+//! hand-written [`Visitor`] over `deserialize_any` rather than a `Value` → `AnyValue` conversion:
+//! `AnyValue::Map` is an **ordered** pair list, and a `serde_json::Value` map is a `BTreeMap` that
+//! would silently re-sort the input. Going through the visitor also skips the intermediate tree.
+//!
+//! Nesting depth is bounded by `serde_json`'s own 128-deep recursion limit, which rejects
+//! pathologically nested input instead of overflowing the stack.
+//!
+//! Limitation: base64 `bytes` come back as `Str`, since a JSON string carries no type tag.
+
+use std::fmt;
+
+use serde::de::{Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
 
 use crate::value::AnyValue;
 
-/// Maximum object/array nesting depth. Guards against a stack overflow on pathologically nested
-/// input; far deeper than any real attribute document (OTLP itself is prost-recursion-limited).
-const MAX_DEPTH: usize = 128;
-
 /// Parse a complete JSON document into an [`AnyValue`]. Returns `None` on malformed input (including
-/// nesting deeper than [`MAX_DEPTH`]).
+/// trailing garbage and nesting past `serde_json`'s recursion limit).
 pub fn parse(input: &str) -> Option<AnyValue> {
-    let mut p = Parser {
-        b: input.as_bytes(),
-        i: 0,
-        depth: 0,
-    };
-    p.skip_ws();
-    let v = p.value()?;
-    p.skip_ws();
-    if p.i == p.b.len() { Some(v) } else { None }
+    serde_json::from_str::<Parsed>(input).ok().map(|p| p.0)
 }
 
 /// Parse a JSON object into ordered key/value pairs; `None` if the input is not an object.
@@ -37,197 +36,69 @@ pub fn parse_object(input: &str) -> Option<Vec<(String, AnyValue)>> {
     }
 }
 
-struct Parser<'a> {
-    b: &'a [u8],
-    i: usize,
-    depth: usize,
+/// Newtype so the deserializer targets imbh's canonical form. A `Deserialize` impl on `AnyValue`
+/// itself would collide with the externally-tagged one its optional `serde` feature derives.
+struct Parsed(AnyValue);
+
+impl<'de> Deserialize<'de> for Parsed {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        d.deserialize_any(AnyValueVisitor).map(Parsed)
+    }
 }
 
-impl Parser<'_> {
-    fn skip_ws(&mut self) {
-        while let Some(&c) = self.b.get(self.i) {
-            if c == b' ' || c == b'\t' || c == b'\n' || c == b'\r' {
-                self.i += 1;
-            } else {
-                break;
-            }
-        }
+struct AnyValueVisitor;
+
+impl<'de> Visitor<'de> for AnyValueVisitor {
+    type Value = AnyValue;
+
+    fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str("a JSON value")
     }
 
-    fn value(&mut self) -> Option<AnyValue> {
-        self.skip_ws();
-        match self.b.get(self.i)? {
-            // Containers recurse; bound the nesting at one place to guard the stack.
-            c @ (b'{' | b'[') => {
-                self.depth += 1;
-                if self.depth > MAX_DEPTH {
-                    return None;
-                }
-                let v = if *c == b'{' {
-                    self.object()
-                } else {
-                    self.array()
-                };
-                self.depth -= 1;
-                v
-            }
-            b'"' => self.string().map(AnyValue::Str),
-            b't' | b'f' => self.boolean(),
-            b'n' => self.null(),
-            _ => self.number(),
-        }
+    fn visit_unit<E>(self) -> Result<AnyValue, E> {
+        Ok(AnyValue::Null)
     }
 
-    fn object(&mut self) -> Option<AnyValue> {
-        self.i += 1; // '{'
-        let mut pairs = Vec::new();
-        self.skip_ws();
-        if self.b.get(self.i) == Some(&b'}') {
-            self.i += 1;
-            return Some(AnyValue::Map(pairs));
-        }
-        loop {
-            self.skip_ws();
-            let key = self.string()?;
-            self.skip_ws();
-            if self.b.get(self.i) != Some(&b':') {
-                return None;
-            }
-            self.i += 1;
-            let val = self.value()?;
-            pairs.push((key, val));
-            self.skip_ws();
-            match self.b.get(self.i) {
-                Some(&b',') => self.i += 1,
-                Some(&b'}') => {
-                    self.i += 1;
-                    return Some(sentinel_or_map(pairs));
-                }
-                _ => return None,
-            }
-        }
+    fn visit_bool<E>(self, v: bool) -> Result<AnyValue, E> {
+        Ok(AnyValue::Bool(v))
     }
 
-    fn array(&mut self) -> Option<AnyValue> {
-        self.i += 1; // '['
-        let mut items = Vec::new();
-        self.skip_ws();
-        if self.b.get(self.i) == Some(&b']') {
-            self.i += 1;
-            return Some(AnyValue::Array(items));
-        }
-        loop {
-            let v = self.value()?;
+    fn visit_i64<E>(self, v: i64) -> Result<AnyValue, E> {
+        Ok(AnyValue::Int(v))
+    }
+
+    fn visit_u64<E>(self, v: u64) -> Result<AnyValue, E> {
+        // `i64` is the OTel integer width, so anything past it degrades to `Double` rather than
+        // failing the whole document.
+        Ok(i64::try_from(v).map_or(AnyValue::Double(v as f64), AnyValue::Int))
+    }
+
+    fn visit_f64<E>(self, v: f64) -> Result<AnyValue, E> {
+        Ok(AnyValue::Double(v))
+    }
+
+    fn visit_str<E>(self, v: &str) -> Result<AnyValue, E> {
+        Ok(AnyValue::Str(v.to_owned()))
+    }
+
+    fn visit_string<E>(self, v: String) -> Result<AnyValue, E> {
+        Ok(AnyValue::Str(v))
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<AnyValue, A::Error> {
+        let mut items = Vec::with_capacity(seq.size_hint().unwrap_or(0));
+        while let Some(Parsed(v)) = seq.next_element()? {
             items.push(v);
-            self.skip_ws();
-            match self.b.get(self.i) {
-                Some(&b',') => self.i += 1,
-                Some(&b']') => {
-                    self.i += 1;
-                    return Some(AnyValue::Array(items));
-                }
-                _ => return None,
-            }
         }
+        Ok(AnyValue::Array(items))
     }
 
-    fn string(&mut self) -> Option<String> {
-        if self.b.get(self.i) != Some(&b'"') {
-            return None;
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<AnyValue, A::Error> {
+        let mut pairs = Vec::with_capacity(map.size_hint().unwrap_or(0));
+        while let Some((k, Parsed(v))) = map.next_entry::<String, Parsed>()? {
+            pairs.push((k, v));
         }
-        self.i += 1;
-        let mut out = String::new();
-        loop {
-            let c = *self.b.get(self.i)?;
-            self.i += 1;
-            match c {
-                b'"' => return Some(out),
-                b'\\' => {
-                    let e = *self.b.get(self.i)?;
-                    self.i += 1;
-                    match e {
-                        b'"' => out.push('"'),
-                        b'\\' => out.push('\\'),
-                        b'/' => out.push('/'),
-                        b'n' => out.push('\n'),
-                        b'r' => out.push('\r'),
-                        b't' => out.push('\t'),
-                        b'b' => out.push('\u{08}'),
-                        b'f' => out.push('\u{0c}'),
-                        b'u' => {
-                            let cp = self.hex4()?;
-                            out.push(char::from_u32(cp as u32)?);
-                        }
-                        _ => return None,
-                    }
-                }
-                // A UTF-8 continuation/lead byte: copy the whole code point verbatim.
-                _ => {
-                    let start = self.i - 1;
-                    let len = utf8_len(c)?;
-                    let end = start + len;
-                    let s = std::str::from_utf8(self.b.get(start..end)?).ok()?;
-                    out.push_str(s);
-                    self.i = end;
-                }
-            }
-        }
-    }
-
-    fn hex4(&mut self) -> Option<u16> {
-        let slice = self.b.get(self.i..self.i + 4)?;
-        let s = std::str::from_utf8(slice).ok()?;
-        let v = u16::from_str_radix(s, 16).ok()?;
-        self.i += 4;
-        Some(v)
-    }
-
-    fn boolean(&mut self) -> Option<AnyValue> {
-        if self.b.get(self.i..self.i + 4) == Some(b"true") {
-            self.i += 4;
-            Some(AnyValue::Bool(true))
-        } else if self.b.get(self.i..self.i + 5) == Some(b"false") {
-            self.i += 5;
-            Some(AnyValue::Bool(false))
-        } else {
-            None
-        }
-    }
-
-    fn null(&mut self) -> Option<AnyValue> {
-        if self.b.get(self.i..self.i + 4) == Some(b"null") {
-            self.i += 4;
-            Some(AnyValue::Null)
-        } else {
-            None
-        }
-    }
-
-    fn number(&mut self) -> Option<AnyValue> {
-        let start = self.i;
-        let mut is_float = false;
-        while let Some(&c) = self.b.get(self.i) {
-            match c {
-                b'0'..=b'9' | b'-' | b'+' => self.i += 1,
-                b'.' | b'e' | b'E' => {
-                    is_float = true;
-                    self.i += 1;
-                }
-                _ => break,
-            }
-        }
-        let text = std::str::from_utf8(self.b.get(start..self.i)?).ok()?;
-        if text.is_empty() {
-            return None;
-        }
-        if is_float {
-            text.parse::<f64>().ok().map(AnyValue::Double)
-        } else {
-            match text.parse::<i64>() {
-                Ok(n) => Some(AnyValue::Int(n)),
-                Err(_) => text.parse::<f64>().ok().map(AnyValue::Double),
-            }
-        }
+        Ok(sentinel_or_map(pairs))
     }
 }
 
@@ -245,17 +116,6 @@ fn sentinel_or_map(pairs: Vec<(String, AnyValue)>) -> AnyValue {
         }
     }
     AnyValue::Map(pairs)
-}
-
-/// Length in bytes of the UTF-8 sequence beginning with `lead`.
-fn utf8_len(lead: u8) -> Option<usize> {
-    match lead {
-        0x00..=0x7f => Some(1),
-        0xc0..=0xdf => Some(2),
-        0xe0..=0xef => Some(3),
-        0xf0..=0xf7 => Some(4),
-        _ => None,
-    }
 }
 
 #[cfg(test)]
@@ -282,17 +142,46 @@ mod tests {
     }
 
     #[test]
-    fn parses_object_keys() {
-        let pairs = parse_object(r#"{"http.route":"/cart","n":3}"#).unwrap();
-        assert_eq!(pairs.len(), 2);
-        assert_eq!(pairs[0].0, "http.route");
-        assert_eq!(pairs[0].1, AnyValue::Str("/cart".into()));
-        assert_eq!(pairs[1].1, AnyValue::Int(3));
+    fn round_trip_preserves_int_vs_double() {
+        // `Double(1.0)` encodes as `1.0`, so it must not come back as `Int(1)`.
+        for v in [
+            AnyValue::Int(1),
+            AnyValue::Double(1.0),
+            AnyValue::Double(-0.0),
+        ] {
+            assert_eq!(parse(&canonical_json_value(&v)).unwrap(), v);
+        }
+    }
+
+    #[test]
+    fn parses_object_keys_in_input_order() {
+        // Order is part of `AnyValue::Map`'s contract — a `serde_json::Value` round trip would
+        // re-sort these.
+        let pairs = parse_object(r#"{"z":1,"http.route":"/cart","n":3}"#).unwrap();
+        let keys: Vec<&str> = pairs.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, ["z", "http.route", "n"]);
+        assert_eq!(pairs[1].1, AnyValue::Str("/cart".into()));
+        assert_eq!(pairs[2].1, AnyValue::Int(3));
     }
 
     #[test]
     fn nan_sentinel_parses_to_double() {
         assert!(matches!(parse(r#"{"$f":"nan"}"#), Some(AnyValue::Double(d)) if d.is_nan()));
+    }
+
+    #[test]
+    fn recombines_surrogate_pairs() {
+        // U+1F600 written as the escaped surrogate pair every `ensure_ascii`-style encoder emits
+        // (Python's `json.dumps` by default). The hand-rolled parser this replaced could not
+        // recombine the pair and rejected the whole document.
+        let hi = r"\ud83d";
+        let lo = r"\ude00";
+        assert_eq!(
+            parse(&format!("\"{hi}{lo}\"")),
+            Some(AnyValue::Str("\u{1f600}".into()))
+        );
+        // A lone surrogate is still not a character, so the document is still rejected.
+        assert!(parse(r#""\ud83d""#).is_none());
     }
 
     #[test]
@@ -302,8 +191,25 @@ mod tests {
     }
 
     #[test]
+    fn rejects_non_json_the_hand_rolled_parser_accepted() {
+        for bad in ["+5", "007", "1e400", "\"a\u{01}b\"", "{\"a\":1,}"] {
+            assert!(parse(bad).is_none(), "should reject {bad:?}");
+        }
+    }
+
+    #[test]
+    fn big_integers_degrade_to_double() {
+        assert!(matches!(
+            parse("18446744073709551615"),
+            Some(AnyValue::Double(_))
+        ));
+        assert_eq!(parse("9223372036854775807"), Some(AnyValue::Int(i64::MAX)));
+    }
+
+    #[test]
     fn depth_guard_rejects_deep_nesting_without_overflow() {
-        // A document nested far past MAX_DEPTH parses to None (guard), not a stack overflow.
+        // A document nested far past serde_json's recursion limit parses to None (guard), not a
+        // stack overflow.
         let deep = format!("{}{}", "[".repeat(5000), "]".repeat(5000));
         assert!(parse(&deep).is_none());
         // Nesting within the limit still parses fine.

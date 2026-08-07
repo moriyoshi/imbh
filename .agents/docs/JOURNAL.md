@@ -3898,3 +3898,142 @@ TODO.md's first open item — v0.6.1 prepared but not cut — is closed: `v0.6.1
 do not run in the default path). `./scripts/license-gate.sh` OK. Footprint gate **OK**: 275 crates
 (target 275), `imbhd` 33.3 MiB, plugin feature set 397 crates / 38.2 MiB (informational, unchanged),
 idle RSS 14.9 MB, steady RSS 95.5 MB, search-off lever 275 → 217 → 71.
+
+## The hand-rolled JSON codec goes away, and the emitter turns out to be the harder half (2026-08-08)
+
+`imbh-core` carried two hand-written pieces of JSON: a 313-line recursive-descent parser (`json.rs`)
+and a string-builder canonical encoder (`canonical.rs`). Both are now `serde_json`. The interesting
+part is that they had *very* different cases against them, and the naive replacement is wrong for
+both.
+
+### The parser had a real bug hiding behind a "documented limitation"
+
+`json.rs` carried a module-doc note: "`\uXXXX` surrogate pairs are not recombined (the canonical
+encoder never emits them)". That parenthetical is true and irrelevant — the parser is not only fed
+imbh's own output. `imbh::parse_json` is also what the Docker log-driver decodes plugin requests and
+Engine API responses with. Measured:
+
+```
+input = "😀"      (U+1F600, the escaped form Python's json.dumps emits by default)
+ours  = None                ← whole document rejected
+serde = Some(String("😀"))
+```
+
+`char::from_u32(0xd83d)` returns `None`, and the `?` propagates out of `string()` all the way to
+`parse`, so *one* astral-plane character anywhere in a document loses the document. Both call sites
+swallow it: `Attributes::from_canonical_json` does `unwrap_or_default()`, `docker/json.rs::parse`
+degrades to an empty object. Silent empty attribute map, no error anywhere.
+
+The grammar was also lax in the other direction — `+5`, `007`, `1e400` (→ `inf`), and raw control
+bytes inside string literals all parsed. Neither direction is defensible for ~300 lines of code.
+
+### The emitter's case was the opposite, and the compatibility break is real
+
+`canonical.rs` is not a JSON emitter; it is a byte-identity spec that dictionary encoding, the
+Tantivy feeder, and `json_get_str` all depend on agreeing on. `serde_json` cannot produce it as-is:
+
+| case | old (`f64: Display`) | serde_json |
+|---|---|---|
+| `1e300` | 301 digits | `1e300` |
+| `1.0` | `1` | `1.0` |
+| `1e-7` | `0.0000001` | `1e-7` |
+| NaN / ±Inf | `{"$f":…}` | `null` |
+
+So switching the emitter **is** a data-format change, and it was taken deliberately (the compatibility
+constraint was explicitly waived) rather than discovered. Worth recording the one upside, because it
+is not obvious: the old form was *not* round-trip type-preserving — `Double(1.0)` encoded as `1`, and
+`parse("1")` gives `Int(1)`. With `1.0` on the wire the fractional marker survives, so `Double` stays
+`Double`. There is now a `round_trip_preserves_int_vs_double` test asserting it.
+
+### Neither half goes through `serde_json::Value` — and that is the load-bearing decision
+
+The obvious implementation (`to_string(&Value)` / `from_str::<Value>()` plus a conversion) is wrong
+here twice over, both times because of `Value`'s map:
+
+1. **Write side.** `serde_json::Map` is a `BTreeMap` *in this build*. Relying on that for the
+   sorted-key invariant means the invariant silently becomes insertion order the day anything
+   anywhere in the graph turns on `preserve_order` — Cargo features unify globally, and
+   ARCHITECTURE.md §10.16.1 already notes we deliberately leave that feature off for the MCP
+   endpoint's sake. Byte-identity is not something to hang on another crate's feature flag. The
+   encoder therefore sorts explicitly and streams pairs through `Serializer::collect_map`, which
+   writes in *iterator* order and is immune. Bonus: `collect_map` also preserves duplicate keys,
+   matching the old encoder, where a `Map` would collapse them.
+2. **Read side.** `AnyValue::Map` is an **ordered** pair list — a documented property — and a `Value`
+   round trip would re-sort it. So the reader is a `deserialize_any` `Visitor` over a private
+   `Parsed(AnyValue)` newtype, which also skips the intermediate tree entirely.
+
+The newtype is not optional, either: under the `serde` feature `AnyValue` already derives an
+externally-tagged `Serialize`/`Deserialize` (`{"Str":"x"}`) for the DTO wire form, so inherent impls
+would collide. Two JSON representations of one type, and they must stay distinguishable.
+
+The depth guard came out for free: `MAX_DEPTH = 128` was exactly `serde_json`'s own recursion limit,
+so the 5000-deep nesting test passes unchanged against the new implementation.
+
+### The dependency is not free, just free where the gate looks
+
+`serde_json` + the `serde` **traits** are now unconditional `imbh-core` deps. Deliberately
+`default-features = false, features = ["std"]` on `serde`: the codec needs the traits, not the derive
+macro, so `serde_derive` and its proc-macro build stay behind the existing optional `serde` feature
+(which changed meaning from `dep:serde` to `serde/derive` — same name, same effect downstream).
+
+| build | before | after |
+|---|---|---|
+| `imbh` default (the gate axis) | 275 | **275** |
+| `imbh --no-default-features` | 71 | 76 |
+| `--features ingest` (M6c producer) | 95 | 100 |
+| `--features query` | 210 | 211 |
+
+The gate axis is unchanged because `arrow-json` already drags `serde_json` in under DataFusion. The
++5 lands entirely on the trimmed producer/consumer graphs the M6c axis exists to keep small — that is
+the actual price of this change, and it is the reason the parser was hand-rolled in the first place.
+
+### Follow-up: the hand-rolled base64 went too, and it was free
+
+The first pass left `base64_into` in place and the rationale written down was "the sentinel, base64,
+and key sorting stay imbh's own, since no stock JSON library expresses them". Two thirds right. No
+JSON library expresses the `{"$f":…}` sentinel or the key sort — but base64 is not a JSON feature,
+and the `base64` crate's `STANDARD` engine is exactly RFC 4648 standard-alphabet-with-padding. Worse,
+`imbh-mcp` was *already* encoding the same `AnyValue::Bytes` through that same engine
+(`general_purpose::STANDARD`), so the workspace was carrying two implementations of one encoding and
+only one of them had tests.
+
+The cost turned out to be zero on **every** axis, not just the default one, which is worth recording
+because the instinct in this repo is to assume otherwise: `arrow-cast` and `parquet` both depend on
+base64, and `arrow` is a *non-optional* dep of `imbh` and `imbh-storage` — so base64 survives even
+`--no-default-features`. Crate counts after the swap are 275 / 76 / 100, unchanged from the
+serde_json pass. 20 lines of bit-twiddling deleted for nothing.
+
+The `base64_matches_rfc4648` assertions pass **unchanged**, which is the whole verification argument:
+byte-identical output, so unlike the double-formatting change this half is a pure refactor with no
+data-format consequence.
+
+### Verified
+
+`fmt --all --check` clean; `build --workspace`, `clippy --workspace --all-targets -D warnings`, and
+`test --workspace` all clean (**64 suites, 592 passed, 0 failed, 4 ignored**, up from 586 — six new
+tests: surrogate-pair recombination, the strictness matrix, int-vs-double round trip, input-order key
+preservation, duplicate-key retention, and one end-to-end
+`integral_double_attribute_survives_the_canonical_round_trip` in `imbh` that ingests an OTLP
+`DoubleValue(1.0)` beside an `IntValue(1)` and asserts both survive as their own type in
+`LogEntry.attributes`). No *pre-existing* test needed changing, which is itself worth noting: nothing
+in the suite pinned an integral double's canonical spelling — the nearest test
+(`numeric_matchers_match_typed_numeric_attributes`) used 0.1/0.9/0.95, all non-integral — so the
+format change would have shipped unnoticed without reading the encoder. That gap is what the new
+end-to-end test closes; under the old encoder it fails, reading back `Int(1)`.
+
+Feature matrix rebuilt separately: `--no-default-features`, `--no-default-features --features
+ingest`, `-p imbh-core --features serde`, `-p imbh --features serde`, `-p imbh-core --all-features`
+all green. `./scripts/license-gate.sh` OK, and `THIRD-PARTY-NOTICES.txt` needs no regeneration —
+every crate the codec adds to `imbh-core` (`serde_json`, `serde`, `serde_core`, `itoa`, `zmij`) was
+already in the workspace-wide graph, so the third-party set is unchanged.
+
+Footprint gate **OK**: 275 crates (target 275, unchanged), `imbhd` **34,916,248 B = 33.3 MiB —
+byte-identical to v0.6.2**, which is the cleanest possible confirmation that the default build was
+already linking serde_json. Plugin feature set 397 crates / 38.2 MiB (informational, unchanged), idle
+RSS 14.8 MB, steady RSS 104.8 MB. The search-off lever moved exactly where predicted: 275 → 218 → 76,
+against v0.6.2's 275 → 217 → 71.
+
+The gate was run twice — once after the serde_json pass, once after the base64 pass — and every
+failing axis reported the same numbers both times (275 crates, 34,916,248 B, 275 → 218 → 76); only
+the measurement-only idle RSS moved, by 0.1 MB, which is noise. That is the evidence that the base64
+swap is footprint-neutral rather than merely assumed to be.

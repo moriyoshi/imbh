@@ -116,11 +116,30 @@ column explosion is an RSS/schema-churn trap. The design:
 1. **Canonical JSON text column** per attribute scope: `attributes` (record-level), `resource`,
    `scope`. The **canonical form is a precise spec** (equal maps must serialize byte-identically):
    UTF-8; keys sorted by Unicode code point; no insignificant whitespace; integers as minimal
-   decimal; doubles via shortest round-trip; `bytes` → base64; non-finite doubles → a reserved
+   decimal; doubles via `serde_json`'s shortest round-trip (so `Double(1.0)` is `1.0`, not `1` — the
+   fractional marker is what distinguishes it from `Int(1)` on the way back, and large/small
+   magnitudes take exponent form); `bytes` → base64; non-finite doubles → a reserved
    sentinel object `{"$f":"nan|inf|-inf"}`; nested `kvlist`/`array` recursively canonicalized.
-   This is **one shared canonical encoder** in `imbh-core`, paired with a **dependency-free JSON
-   parser** (the inverse), used by the segment writer, the metrics/attrs materializers, and the
-   `json_get_str` UDF (§9.3). A property test asserts `canon(map) == canon(shuffle(map))`.
+   This is **one shared canonical encoder** in `imbh-core`, paired with its inverse **reader**, used
+   by the segment writer, the metrics/attrs materializers, and the `json_get_str` UDF (§9.3). A
+   property test asserts `canon(map) == canon(shuffle(map))`.
+
+   Both sides ride `serde_json`'s writer/parser through hand-written `Serialize`/`Visitor` impls over
+   `AnyValue` — **not** through `serde_json::Value`. Two reasons, both structural: a `Value` map is a
+   `BTreeMap` whose ordering would silently flip to insertion order if anything in the graph ever
+   enabled serde_json's `preserve_order` (Cargo features unify globally), which breaks the
+   byte-identity invariant outright; and `AnyValue::Map` is an *ordered* pair list, which a `Value`
+   round trip would re-sort on the read side. Streaming sorted pairs through `collect_map` on write
+   and a `deserialize_any` visitor on read makes both independent of that, and skips the intermediate
+   tree. What `serde_json` buys is the part that is genuinely hard to hand-roll: the RFC 8259 grammar
+   (the predecessor hand-rolled parser could not recombine `\uXXXX` surrogate pairs, so a document
+   carrying an escaped non-BMP character — what Python's `json.dumps` emits by default — was rejected
+   whole and silently became an empty attribute map), shortest-round-trip float formatting, and a
+   recursion limit. Only the parts no JSON library can express stay imbh's own: the `{"$f":…}`
+   sentinel and the key sort. `bytes` go through the `base64` crate's `STANDARD` engine — the same
+   one `imbh-mcp` encodes them with, so there is exactly one base64 implementation in the workspace,
+   and it is free on every graph (`arrow-cast`/`parquet` pull base64, and `arrow` is non-optional in
+   `imbh`/`imbh-storage`, so it is present even under `--no-default-features`).
 2. **Promoted `service` column.** `service.name` is always promoted to a `service` column on
    every signal (the pivot of all observability queries). The configurable `promote = [...]`
    typed-column feature is **now implemented** via `DbBuilder::promote(Promote::new([...]))`: each
@@ -679,10 +698,15 @@ server maps errors to HTTP status via error-classification helpers.
   `Option<Lsn>` = `None` rather than an in-band `Lsn(0)` sentinel),
   `SeverityNumber(u8)`, and the `Table` enum: `Logs`, `Spans`, `MetricsGauge`, `MetricsSum`,
   `MetricsHistogram`, `MetricsExpHistogram`, `MetricsSummary`.
-- **Values.** OTel `AnyValue` is the value model in `imbh-core`, serde-free by default (no
-  `serde_json` in every build; canonical JSON is handled by `imbh-core::json`); row DTOs carry owned
-  `Attributes` (key-ordered `(String, AnyValue)` pairs) with `get`/`get_str`/`iter`. `Serialize`/
-  `Deserialize` are derived only under the optional `serde` feature (§10.13).
+- **Values.** OTel `AnyValue` is the value model in `imbh-core`; row DTOs carry owned `Attributes`
+  (key-ordered `(String, AnyValue)` pairs) with `get`/`get_str`/`iter`. The canonical-JSON codec
+  (`imbh-core::{canonical,json}`, §6.1) is `Serialize`/`Visitor` impls over `AnyValue`, so
+  `serde_json` and the `serde` **traits** are unconditional deps of `imbh-core`; the `serde` *derive*
+  macro is not, and neither is `AnyValue`'s own externally-tagged `Serialize`/`Deserialize`, which
+  stay behind the optional `serde` feature (§10.13). Footprint: free on the default facade graph
+  (275 crates unchanged — `serde_json` is already there via `arrow-json`); the trimmed
+  `--no-default-features` (71 → 76) and M6c producer (95 → 100) graphs pay `serde_json` + `serde` +
+  `serde_core` + `itoa` + `zmij`.
 
 ### 10.5 Ingest
 
@@ -1533,9 +1557,11 @@ Like the rest of `imbhd` it is unauthenticated, so a real deployment gates the p
   the `imbh::console` module) and the `imbh-tracing` helper crate's `DbLayer`. `imbh-server`/`imbhd`
   pull it via `imbh/tracing-console` under their own `tracing` feature (§12 containment — keep it out
   of the default library graph); measured cost is +5 crates on `imbhd` (281, well under the 300 hard limit) with
-  the default facade build unchanged at 275. serde is present transitively but the default facade
-  graph stays serde-free; the optional `serde` feature (§10.13) turns on DTO derives without adding a
-  crate (serde is already compiled). `cargo-deny` gates licenses + duplicate-version creep (`deny.toml`); a `cargo tree`
+  the default facade build unchanged at 275. The canonical-JSON codec (§6.1) makes `serde_json` + the
+  `serde` traits unconditional deps of `imbh-core`; on the default facade graph that is free (both are
+  already compiled, via `arrow-json`), and the optional `serde` feature (§10.13) adds only the
+  `serde_derive` proc macro on top. The trimmed `--no-default-features` (71 → 76) and M6c producer
+  (95 → 100) graphs are where that codec is actually paid for. `cargo-deny` gates licenses + duplicate-version creep (`deny.toml`); a `cargo tree`
   count budget is enforced in the footprint gate. **`deny.toml` runs `all-features = true`**, so an
   optional feature's subtree is license-checked whether or not it is on — `MIT-0` and `0BSD` are on
   the allow-list because vrl reaches them, and default-off would not have avoided that.
@@ -1554,8 +1580,8 @@ Like the rest of `imbhd` it is unauthenticated, so a real deployment gates the p
 imbh/
   Cargo.toml               # workspace, shared lints, release-small profile
   crates/
-    imbh-core/             # schemas, ids, config, errors, manifest types, canonical JSON,
-                           # dependency-free JSON parser, time utils (arrow-free)
+    imbh-core/             # schemas, ids, config, errors, manifest types, canonical JSON
+                           # codec (serde_json-backed), time utils (arrow-free)
     imbh-otlp/             # OTLP decode → normalized rows (prost types), all 3 signals
     imbh-storage/          # WAL, mutable buffer, seal, segments, manifest IO, retention,
                            # compaction; owns the Arrow schemas

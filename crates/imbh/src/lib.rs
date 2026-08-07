@@ -2991,6 +2991,65 @@ mod tests {
         assert_eq!(count(LogQuery::new().attr_gt("ratio", 0.9)).await, 1);
     }
 
+    /// Regression: an OTLP `DoubleValue` whose value happens to be integral must stay a `Double`
+    /// end to end, and must not be confusable with an `IntValue` of the same magnitude.
+    ///
+    /// This is the edge the canonical encoder used to lose (ARCHITECTURE.md §6.1): `Double(1.0)`
+    /// encoded as `1`, indistinguishable on the wire from `Int(1)`, so the readback in
+    /// `LogEntry.attributes` came back as `Int`. It now encodes as `1.0`. The numeric matchers must
+    /// keep working across both spellings, since they read the JSON number either way.
+    #[tokio::test(flavor = "current_thread")]
+    async fn integral_double_attribute_survives_the_canonical_round_trip() {
+        use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
+        use opentelemetry_proto::tonic::common::v1::{AnyValue as PbAny, KeyValue, any_value};
+        use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
+        use prost::Message;
+
+        let kv = |key: &str, value: any_value::Value| KeyValue {
+            key: key.to_owned(),
+            value: Some(PbAny { value: Some(value) }),
+            ..Default::default()
+        };
+        let body = ExportLogsServiceRequest {
+            resource_logs: vec![ResourceLogs {
+                scope_logs: vec![ScopeLogs {
+                    log_records: vec![LogRecord {
+                        time_unix_nano: 1,
+                        severity_number: 9,
+                        attributes: vec![
+                            kv("whole", any_value::Value::DoubleValue(1.0)),
+                            kv("counted", any_value::Value::IntValue(1)),
+                        ],
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        }
+        .encode_to_vec();
+
+        let db = Db::in_memory().open().unwrap();
+        db.ingest_otlp_logs(&body).await.unwrap();
+
+        let page = db.logs().query(LogQuery::new()).await.unwrap();
+        let attrs = &page.entries[0].attributes;
+        assert_eq!(attrs.get("whole"), Some(&AnyValue::Double(1.0)));
+        assert_eq!(attrs.get("counted"), Some(&AnyValue::Int(1)));
+
+        // Both are still readable as numbers by the matcher path.
+        for key in ["whole", "counted"] {
+            assert_eq!(
+                db.logs()
+                    .count(LogQuery::new().attr_ge(key, 1.0).attr_le(key, 1.0))
+                    .await
+                    .unwrap(),
+                1,
+                "{key} should match numerically"
+            );
+        }
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn typed_logs_query_api() {
         let db = Db::in_memory().open().unwrap();
