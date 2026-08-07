@@ -3767,3 +3767,75 @@ which is the whole cost of discovery in the shipped plugin), idle RSS 15.0 MB, s
 search-off lever 275 → 217 → 71.
 The §3c packaging dry-run (`cargo package --workspace --allow-dirty`, dirty because the bump is
 uncommitted) staged and verified all 20 members at `0.6.1`, exit 0. Nothing tagged, nothing published.
+
+## 2026-08-07 — `auto` resolved to an address nothing can bind, and both accept loops spun on it
+
+A `docker plugin install` on **Docker Desktop for Mac** put the plugin into a busy loop the moment it
+was enabled. The reported symptom was a stream of 8-byte `\x01\x00…` writes to an **eventfd** — which
+is mio's waker, i.e. a tokio runtime being unparked over and over, not a task spinning inside one.
+That distinction did most of the work: a spinning `accept()` floods `accept4`, so the eventfd traffic
+was the *other* workers being woken by a task that kept rescheduling itself.
+
+### Bisecting it with `docker plugin set`
+
+The reporter narrowed it by disabling subsystems from the environment, which is the whole reason every
+knob is an env var:
+
+| Setting | Busy loop |
+|---|---|
+| `IMBH_LISTEN_ADDR=` + `IMBH_GRPC_LISTEN_ADDR=` + `IMBH_DOCKER_NETWORK_REFRESH=0` | no |
+| either listener back at `auto` | **yes** |
+| both listeners at a literal `HOST:PORT` | no |
+
+Both listeners, independently. `serve_on_listener` (HTTP) and `serve_grpc_on_listener` (gRPC) share no
+code — the only thing above both is `docker::serve::supervise`, and the only thing that changes with
+`auto` is that the address comes from discovery. So the address itself was the input to blame.
+
+### The bug: `getifaddrs` reports every address, not just the bindable one
+
+`ifaddrs()` accepts `AF_INET6`, and nothing downstream filtered by address family:
+`bridges_from_ifaddrs` tested the interface *name* and the sysfs `bridge/` probe only, and
+`Snapshot::gateways()` collected whatever came back. A Docker bridge with IPv6 enabled carries an
+IPv6 **link-local** (`fe80::/10`) alongside its routable address — Docker Desktop's VM has one on
+`docker0`, and so does a plain Linux host with IPv6 on. `BindSpec::resolve` dutifully bracketed it into
+`[fe80::…]:4318`, and Linux `inet6_bind` refuses a link-local whose `sockaddr_in6` names no scope.
+There is nowhere in an `IpAddr` — or in the `HOST:PORT` string built from one — to carry the interface
+that would supply that scope, so the address can never bind, and the supervisor retried it on every
+refresh for ever.
+
+### The amplifier: neither accept loop could survive a bad socket
+
+Whatever the address, no accept loop should be able to spin, and both could:
+
+- `lib.rs`'s HTTP loop had `Err(_) => continue` with a comment assuming every accept error is
+  per-connection (`ECONNABORTED`, `EMFILE`) and transient. A persistent one retries at full speed.
+- `grpc.rs`'s `Allowed` stream passed `Ready(Some(Err(_)))` straight to tonic, which treats it as a
+  connection that did not happen and comes back for the next one immediately. Same loop, different
+  crate.
+
+That is why *both* listeners spun on one bad address, and why the wake-ups looked like runtime unparks
+rather than accept storms.
+
+### The fix, in three parts
+
+1. **`is_usable_gateway`** in `networks.rs`, applied to both discovery backends: drops link-local
+   (v4 and v6), loopback, and the unspecified address. `0.0.0.0`/`::` matter beyond bindability —
+   binding the unspecified address would serve every interface the host has, which is the exposure
+   `auto` exists to avoid. A routable IPv6 (`fd00:d0::1`) is still discovered; the existing test for
+   that still passes unchanged.
+2. **Exponential accept backoff** shared by both loops (`ACCEPT_RETRY_MIN` 5 ms → `ACCEPT_RETRY_MAX`
+   1 s), with the counter cleared by every accept that works — so a healthy listener never touches the
+   timer. After `ACCEPT_FAILURES_BEFORE_RETIRING` (64, i.e. over a minute of solid failure) the
+   listener stops instead of retrying for ever.
+3. **`supervise` retires a finished listener task**, so retiring is what enables recovery rather than
+   what prevents it: the address is rebound on the next tick. Without this a socket that stopped
+   accepting would sit in `live` for ever and the endpoint would be silently gone.
+
+### Verified
+
+`fmt --all --check` clean; `clippy --workspace --all-targets -D warnings` clean; `clippy -p imbh-server
+--features docker,docker-remap,grpc --all-targets` clean; `test --workspace` clean (64 suites);
+`test -p imbh-server` with the plugin feature set **233 passed, 0 failed, 1 ignored** (4 new
+regression tests: the link-local exclusion, the loopback/
+unspecified/v4-link-local set, the API backend's copy of the rule, and the backoff's bounds under
+overflow-sized failure counts).

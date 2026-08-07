@@ -156,6 +156,8 @@ pub(crate) async fn serve_grpc_on_listener(
     let incoming = Allowed {
         inner: tokio_stream::wrappers::TcpListenerStream::new(listener),
         allow,
+        failures: 0,
+        backoff: None,
     };
     server(db)
         .serve_with_incoming_shutdown(incoming, async move {
@@ -166,14 +168,24 @@ pub(crate) async fn serve_grpc_on_listener(
         .await
 }
 
-/// An incoming-connection stream that drops what the allow-list refuses.
+/// An incoming-connection stream that drops what the allow-list refuses, and that will not spin on
+/// a listener whose `accept` is failing.
 ///
-/// Hand-written rather than assembled from stream combinators: it is a dozen lines, and the
-/// alternative is a `futures` dependency for one `filter`.
+/// Hand-written rather than assembled from stream combinators: it is a couple of dozen lines, and
+/// the alternative is a `futures` dependency for one `filter`.
+///
+/// The backoff mirrors the HTTP accept loop's, for the same reason and with the same constants:
+/// tonic's server treats an `Err` item as a connection that did not happen and comes straight back
+/// for the next one, so a persistent accept error here is a busy loop exactly as it is there.
 #[cfg(all(feature = "docker", unix))]
 struct Allowed {
     inner: tokio_stream::wrappers::TcpListenerStream,
     allow: Option<crate::PeerFilter>,
+    /// Consecutive accept failures, cleared by every accept that works.
+    failures: u32,
+    /// The delay being served out after the most recent failure, if any. Boxed because `Sleep` is
+    /// `!Unpin` and this struct is polled through a `Pin<&mut Self>` it does not project.
+    backoff: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
 }
 
 #[cfg(all(feature = "docker", unix))]
@@ -184,12 +196,45 @@ impl tokio_stream::Stream for Allowed {
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
+        use std::future::Future;
         use std::task::Poll;
+
+        // Serving out the delay an earlier failure imposed. A healthy listener never has one, so
+        // this is a single `Option` test per accepted connection.
+        if let Some(backoff) = self.backoff.as_mut()
+            && backoff.as_mut().poll(cx).is_pending()
+        {
+            return Poll::Pending;
+        }
+        self.backoff = None;
+
         loop {
             let polled = std::pin::Pin::new(&mut self.inner).poll_next(cx);
+            if let Poll::Ready(Some(Err(e))) = &polled {
+                self.failures += 1;
+                // Giving up ends the incoming stream, which stops tonic gracefully and lets the
+                // supervisor rebind the address on its next tick.
+                if self.failures > crate::ACCEPT_FAILURES_BEFORE_RETIRING {
+                    crate::warn(&format!(
+                        "gRPC listener stopped after {} consecutive accept failures: {e}",
+                        self.failures
+                    ));
+                    return Poll::Ready(None);
+                }
+                let mut backoff =
+                    Box::pin(tokio::time::sleep(crate::accept_backoff(self.failures)));
+                // Polled once so the timer registers this task's waker; a zero delay would leave
+                // nothing to wake us, so fall through and try again instead of parking.
+                if backoff.as_mut().poll(cx).is_pending() {
+                    self.backoff = Some(backoff);
+                    return Poll::Pending;
+                }
+                continue;
+            }
             let Poll::Ready(Some(Ok(stream))) = polled else {
                 return polled;
             };
+            self.failures = 0;
             let allowed = match (&self.allow, stream.peer_addr()) {
                 (None, _) => true,
                 (Some(allow), Ok(peer)) => allow(peer.ip()),
