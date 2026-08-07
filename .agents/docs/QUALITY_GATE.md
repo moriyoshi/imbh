@@ -84,28 +84,34 @@ continues splitting itself into sub-crates. All four presence checks are fed fro
 pipes — see the `grep -q` / `pipefail` pitfall in §1; it made the DataFusion check falsely report a
 missing query engine on ~16% of runs.
 
-Latest measured (2026-07-18, aarch64-glibc, release-small profile): **275** unique crates (≤ 275
-target, ≤ 300 hard) and **31.2 MiB** for the `imbhd` binary (≤ 42 MB musl target — a glibc floor,
-not the musl number). Both are within budget; the v0.1 footprint exit criterion is met on this
+Latest measured (2026-08-08 for v0.7.0, aarch64-glibc, release-small profile): **275** unique crates
+(≤ 275 target, ≤ 300 hard) and **33.3 MiB** for the `imbhd` binary (≤ 42 MB musl target — a glibc
+floor, not the musl number). Both are within budget; the v0.1 footprint exit criterion is met on this
 axis.
 
-Two different §11 levers get conflated here, so record both (re-measured 2026-08-06, aarch64-glibc,
+Two different §11 levers get conflated here, so record both (re-measured 2026-08-08, aarch64-glibc,
 `cargo tree -p imbh --edges normal`, unique crates):
 
 | Feature set | Crates | What it drops |
 | --- | --- | --- |
 | default (`ingest,query,search`) | **275** | — |
-| `--no-default-features --features ingest,query` | **217** (-58) | the tantivy subtree only — this is the *search* lever |
-| `--no-default-features` | **71** (-204) | `ingest` **and** `query` **and** `search`, so the OTLP-decode and the whole DataFusion subtree go too |
+| `--no-default-features --features ingest,query` | **218** (-57) | the tantivy subtree only — this is the *search* lever |
+| `--no-default-features` | **76** (-199) | `ingest` **and** `query` **and** `search`, so the OTLP-decode and the whole DataFusion subtree go too |
 
 The gate's `search-off footprint lever` section prints all three rows with those labels; the config
-it actually compiles is the bare `--no-default-features` build (**71**). Do not read that number as
-the cost of search — search on its own is worth 58 crates. Of the further 146 that
-`--no-default-features` removes, `query` (DataFusion + sqlparser) accounts for 139 and `ingest`
+it actually compiles is the bare `--no-default-features` build (**76**). Do not read that number as
+the cost of search — search on its own is worth 57 crates. Of the further 142 that
+`--no-default-features` removes, `query` (DataFusion + sqlparser) accounts for 135 and `ingest`
 (OTLP decode) for 24, the two overlapping by 17 (measured as `--no-default-features --features query`
-= 210 and `--no-default-features --features ingest` = 95). An earlier revision of this file quoted
+= 211 and `--no-default-features --features ingest` = 100). An earlier revision of this file quoted
 **216** against `--no-default-features`, which is the *search* lever's number attached to the wrong
 knob; don't reintroduce it.
+
+Both trimmed rows moved at v0.7.0 (217 → 218 and 71 → 76): the canonical-JSON codec swap made
+`serde_json` + the `serde` traits unconditional `imbh-core` dependencies. The default row did not
+move, because `arrow-json` already carried them there. On the `ingest,query` row the cost is exactly
+one crate — `serde` itself — since serde_json 1.0.151 depends on `serde_core`, not `serde`, so
+arrow's copy never pulled the traits crate in.
 
 Idle/steady RSS now has an opt-in soak gate (`crates/imbh/tests/soak_rss.rs`, Linux,
 `#[ignore]`): a sustained ingest→seal→query loop asserts steady `VmRSS` stays under a runaway

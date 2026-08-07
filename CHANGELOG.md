@@ -13,6 +13,8 @@ release aborts if it is missing or duplicated.
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-08-08
+
 ### Added
 
 - `Db::metrics().dimensions(metric)` — the distinct label names and values a metric's series carry
@@ -20,6 +22,14 @@ release aborts if it is missing or duplicated.
   per-series attribute sets.
 - Head API: `POST /api/head/metrics/dimensions`, with `HeadClient::metric_dimensions` and
   `exec::metric_dimensions`.
+- **`imbh-tui`'s text editors have a movable caret.** Both the per-screen query box and the
+  absolute-range form's two datetime fields were append-only — `Backspace` popped the last byte and a
+  character pushed onto the end — so fixing a typo mid-query meant deleting back to it. They now take
+  `←`/`→`, `Ctrl-B`/`Ctrl-F`, `Home`/`End`, `Ctrl-A`/`Ctrl-E`, plus the deletions a mid-string caret
+  implies: `Delete`/`Ctrl-D` forward and `Ctrl-K` kill-to-end-of-line (Emacs `kill-line`, because the
+  query box holds newline-joined queries). Both boxes scroll horizontally to keep the caret visible,
+  and completion now classifies the text *before* the caret and replaces the token there rather than
+  truncating the tail. `Ctrl-`/`Alt-` chords no longer type their own letter into the buffer.
 
 ### Changed
 
@@ -40,6 +50,13 @@ release aborts if it is missing or duplicated.
   newly-written one in dictionary/term equality, and `json_get_str` returns the new spelling. The
   upside is that the round trip is now type-preserving: `Double(1.0)` used to come back as `Int(1)`.
 
+  **On mixed-vintage data, no action is required and none is offered.** An existing database opens
+  and reads normally; both spellings decode to the same `Double`, so only *exact string* matching on
+  such an attribute — a dictionary/term equality filter, or comparing a `json_get_str` result — can
+  see the difference, and then only for a `Double` whose value happens to be integral. There is no
+  segment-rewriting tool, and compaction is not one: it concatenates already-encoded columns rather
+  than re-encoding them, so old segments keep their old spelling until the data is re-ingested.
+
   The hand-rolled base64 encoder for `AnyValue::Bytes` went with it, replaced by the `base64` crate's
   `STANDARD` engine — the same one `imbh-mcp` was already using for the same bytes, so the workspace
   no longer carries two implementations of RFC 4648. Output is byte-identical (the existing
@@ -48,8 +65,10 @@ release aborts if it is missing or duplicated.
 
   Footprint: `serde_json` and the `serde` traits (not the derive macro) become unconditional
   `imbh-core` dependencies. The default facade graph is unchanged at **275 crates** — both are
-  already present via `arrow-json` — but the trimmed graphs pay for it:
-  `--no-default-features` 71 → 76 and the M6c producer build (`--features ingest`) 95 → 100.
+  already present via `arrow-json` — but the trimmed graphs pay for it: `--no-default-features`
+  71 → 76, the M6c producer build (`--features ingest`) 95 → 100, and the search-off lever
+  (`--features ingest,query`) 217 → 218 — one crate, `serde` itself, because serde_json depends on
+  `serde_core` and so arrow's copy never pulled the traits crate in.
 
 ### Fixed
 
@@ -836,6 +855,7 @@ release aborts if it is missing or duplicated.
   All 12 crates published to crates.io (`imbh-test-support` is dev-only and stays unpublished).
 
 <!-- next-url -->
+[0.7.0]: https://github.com/moriyoshi/imbh/releases/tag/v0.7.0
 [0.6.2]: https://github.com/moriyoshi/imbh/releases/tag/v0.6.2
 [0.6.1]: https://github.com/moriyoshi/imbh/releases/tag/v0.6.1
 [0.6.0]: https://github.com/moriyoshi/imbh/releases/tag/v0.6.0
