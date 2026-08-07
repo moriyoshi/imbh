@@ -4225,3 +4225,114 @@ never reaches the buffer"), an end-to-end edit of the range form (in-place minut
 twelve existing completion tests moved from `*app.active_query_mut() = …` to `set_active_query`, which
 is what "the query, caret at the end" now means. No dependency change, so no footprint gate movement
 is possible.
+
+## Preparing v0.7.0: a minor bump that no signature justifies, and a lever row nobody had recorded (2026-08-08)
+
+Bump the shared workspace version and close the changelog. Three PRs since v0.6.2: the canonical-JSON
+codec swap (#41), the `imbh-tui` histogram catalog fixes (#42), and the query/range editor caret (#43).
+Two of the three had already written their own `[Unreleased]` entries, so most of `[0.7.0]` is
+inherited rather than reconstructed from commits — the exception is described below.
+
+### Why a minor bump, when nothing in the public API broke
+
+The public surface since v0.6.2 is **purely additive**: `Db::metrics().dimensions()`, the
+`POST /api/head/metrics/dimensions` route with its four DTOs, and `HeadClient::metric_dimensions`.
+Under the 0.x rule the last four releases used — a *minor* bump means something broke — a signature
+audit alone would have said 0.6.3.
+
+What broke is the **stored data**. The canonical-JSON emitter now spells an integral `Double` as
+`1.0` where it used to spell it `1`, and large magnitudes in exponent form. Semver has no vocabulary
+for that: it constrains the *API*, and a consumer reading the version number cannot see a format
+change in a patch digit. So 0.7.0 is chosen for what the number *communicates*, not for what a
+signature diff would compute. This was the user's call, and it closes the TODO item that was holding
+the release ("Decide the version for the canonical-JSON format change").
+
+That item's part (b) — whether the release notes should say anything about mixed-vintage segments —
+is answered in the `[0.7.0]` `### Changed` entry with a short paragraph, and its useful content is
+the *negative* result: there is no rewrite path and none is needed. Both spellings decode to the same
+`Double`, so only exact-string matching (a dictionary/term equality filter, a `json_get_str`
+comparison) can observe the difference, and only for a `Double` whose value is integral. Compaction
+is explicitly named as *not* a migration: `compact_partition` concatenates already-encoded columns, it
+does not re-encode them, so a compaction pass will not normalise old segments. That is the part a
+reader would otherwise assume.
+
+### The caret feature had no changelog entry at all
+
+PR #43 (the query/range editor caret) touched eleven files and 1,082 lines and did not touch
+`CHANGELOG.md` — the only one of the three that didn't. `[Unreleased]` therefore described two thirds
+of the release, and closing the section as-is would have shipped a user-facing feature silently. It
+was caught by diffing `v0.6.2..HEAD --stat` against the sections present, not by reading the
+changelog, which is worth noting as the check that works: the changelog cannot tell you what is
+*missing* from it. Entry added under `### Added` before the section was stamped.
+
+### `imbhd` is byte-identical to v0.6.2 for the second release running
+
+34,916,248 B again — the same number the v0.6.2 entry flagged as "exactly the shape of a stale-artifact
+bug". Coming round twice is more suspicious than once, so it was checked the same way and then some:
+
+- `target/release/imbhd` is stamped 03:19:58 today, after the fat-LTO relink that the gate triggered
+  (the version bump alone changes crate metadata, so nothing in the graph could have been reused).
+- `strings` finds `/api/head/metrics/dimensions` in it — a route that does not exist in v0.6.2.
+- The **plugin feature set did move**: 40,063,344 → 40,128,880 B (+64 KiB). Two binaries built by the
+  same gate invocation, one changing and one not, is the corroboration a single unchanged number
+  cannot supply.
+
+So the coincidence is real, twice. `-C opt-level=s -C lto=fat` output lands in the same
+section-aligned size for a few hundred bytes of added code, and the default `imbhd` gets less of this
+release's change than the plugin build does.
+
+### The 217 → 218 row, and a QUALITY_GATE table three releases stale
+
+The gate printed the search-off lever as **275 → 218 → 76** where `QUALITY_GATE.md` §2 documented
+275 → 217 → 71. The `-5` on the bare `--no-default-features` build was already recorded (CHANGELOG,
+ARCHITECTURE.md §11): the codec swap makes `serde_json` + the `serde` traits unconditional in
+`imbh-core`. The `-1` on the `ingest,query` row was not recorded anywhere, so it was measured against
+a throwaway worktree at `v0.6.2`:
+
+| config | v0.6.2 | v0.7.0 |
+| --- | --- | --- |
+| default (`ingest,query,search`) | 275 | 275 |
+| `--no-default-features --features ingest,query` | 217 | **218** |
+| `--no-default-features --features query` | 210 | 211 |
+| `--no-default-features --features ingest` | 95 | 100 |
+| `--no-default-features` | 71 | **76** |
+
+The added crate on the `ingest,query` row is exactly one, and it is `serde` itself. `serde_json`
+1.0.151 depends on `serde_core`, not `serde`, so arrow's copy of serde_json never pulled the traits
+crate into that graph; naming `serde` in `imbh-core` is what puts it there. (On the bare build the
+five are `serde`, `serde_core`, `serde_json`, `itoa`, and `zmij` — serde_json's float formatter,
+which is why `ryu` is not among them.)
+
+`QUALITY_GATE.md` §2 is updated with all of it, including the derived breakdown (`query` now accounts
+for 135 of the 142, `ingest` for 24, overlapping by 17) and the binary-size line, which still read
+**31.2 MiB / 2026-07-18** — a number from before v0.5.0, so it had survived three releases of the
+gate reporting 33.3 MiB without anyone reconciling the two.
+
+### Still by hand, for the fifth time
+
+`README.md` (3 strings) and `docs/DOCKER_LOG_DRIVER.md` (2) moved to 0.7.0 by hand again, for the
+reason TODO.md has recorded since v0.5.0: the `pre-release-replacements` for them live under
+`[workspace.metadata.release]`, where cargo-release does not read them, and the `pre-release-hook`
+would still run `git cliff -o CHANGELOG.md` with no `cliff.toml` in the repo. The item's count goes
+from four releases to five.
+
+`THIRD-PARTY-NOTICES.txt` is regenerated; its only delta is the 14 workspace crates moving to 0.7.0.
+The third-party set is unchanged since v0.6.0 — which is itself the confirmation that the codec swap
+cost no *new* third-party crate on the shipped `imbhd`/`imbh-tui` graphs, only on the trimmed ones.
+
+TODO.md's first open item — v0.6.2 prepared but not cut — is closed and verified rather than assumed:
+the `v0.6.2` Release is published (2026-08-07T12:12Z, six assets) and `ghcr.io/moriyoshi/imbh-log-driver`
+carries both `0.6.2-amd64` and `0.6.2-arm64`, so the `auto` listener fix has actually reached
+installs. It is replaced by the same entry for this release.
+
+### Verified
+
+`fmt --all --check` clean; `build --workspace`, `clippy --workspace --all-targets -D warnings` and
+`test --workspace` all clean (**64 suites, 615 passed, 0 failed, 4 ignored** — up from v0.6.2's 586,
+almost all of it `imbh-tui`, which goes to 146 unit tests on the caret and catalog work).
+`./scripts/license-gate.sh` OK. Footprint gate **OK**: 275 crates (target 275), `imbhd` 33.3 MiB,
+plugin feature set 397 crates / 38.3 MiB (informational), idle RSS 14.9 MB, steady RSS 104.9 MB,
+search-off lever 275 → 218 → 76. The §3c packaging dry-run staged and verified **all 20 members at
+0.7.0**, exit 0 — with `--allow-dirty`, because the bump is not committed and `cargo package` refuses
+a dirty tree; the real release runs it on a committed one, so the flag changes nothing it verifies.
+Nothing tagged, nothing published.

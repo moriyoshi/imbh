@@ -9,39 +9,26 @@ git history); this file tracks only what is still open.
 
 ## Open Items
 
-- [ ] **v0.6.2 is prepared but not cut.** The workspace is bumped to `0.6.2`, the changelog section
+- [ ] **v0.7.0 is prepared but not cut.** The workspace is bumped to `0.7.0`, the changelog section
       is closed and dated, `README.md` / `docs/DOCKER_LOG_DRIVER.md` version strings are corrected by
-      hand, notices are regenerated and every gate is green — see JOURNAL "Preparing v0.6.2". Open
-      because nothing is tagged or published, so the `auto` listener fix (JOURNAL 2026-08-07,
-      "`auto` resolved to an address nothing can bind") has not reached anyone: a registry install of
-      `ghcr.io/moriyoshi/imbh-log-driver:0.6.1-*` still busy-loops on any daemon whose bridges carry
-      an IPv6 link-local, which includes every Docker Desktop VM. Close this once the `v0.6.2` tag is
-      pushed and the plugin job has published its tags. Releases are cut only when explicitly asked.
+      hand, notices are regenerated and every gate is green — see JOURNAL "Preparing v0.7.0". Open
+      because nothing is tagged or published, so neither the canonical-JSON codec swap (JOURNAL
+      2026-08-08) nor the two `imbh-tui` fixes have reached anyone. Close this once the `v0.7.0` tag
+      is pushed and the plugin job has published its tags. Releases are cut only when explicitly
+      asked.
 
-      *(v0.6.1 — the entry this replaces — was tagged and published on 2026-08-07T07:59Z with six
-      release assets, so the runtime bridge-network discovery it carried has shipped.)*
+      *(v0.6.2 — the entry this replaces — was tagged and published on 2026-08-07T12:12Z with six
+      release assets, and `ghcr.io/moriyoshi/imbh-log-driver:0.6.2-{amd64,arm64}` are both on GHCR,
+      so the `auto` listener fix has shipped.)*
 
-      ⚠ **Do not cut v0.6.2 from current `main`.** The canonical-JSON codec swap (JOURNAL
-      2026-08-08) landed after the `0.6.2` version bump and sits under `## [Unreleased]`, and
-      cargo-release closes that section into whatever version it stamps — so cutting `0.6.2` now
-      would ship a data-format change as a patch. Either tag `v0.6.2` from the commit that closed
-      its changelog section, or renumber (see the next item).
+      **Why a minor, not a patch.** The canonical-JSON codec swap is a *stored-data* break — the
+      spelling of an integral `Double` changed — which semver does not describe and a patch number
+      would hide. The bump was the user's call; the accompanying release note (what mixed-vintage
+      data means, and that compaction is not a rewrite) is in the `[0.7.0]` `### Changed` entry.
 
-- [ ] **Decide the version for the canonical-JSON format change.** The codec swap (JOURNAL
-      2026-08-08, CHANGELOG `[Unreleased]`) changes how doubles are spelled on disk: `Double(1.0)`
-      is now `1.0`, not `1`, and extreme magnitudes take exponent form. Old segments still *read*,
-      but an integral `Double` written before the change no longer compares equal to one written
-      after it in dictionary/term equality, and `json_get_str` returns the new spelling. The public
-      Rust API surface is untouched, so this is not a signature break — it is a *stored-data* break,
-      which semver does not describe and users will not notice from a version number alone. Needs a
-      human call on (a) the bump (0.7.0 reads as the honest one) and (b) whether the release notes
-      should say anything about re-writing or accepting mixed-vintage segments. Compatibility with
-      existing data was explicitly waived when the change was requested; this item is about
-      communicating it, not revisiting it.
-
-- [ ] **`cargo release` still cannot be run as configured — four releases and counting.** Two
-      independent defects in the root `Cargo.toml`, worked around by hand for v0.5.0, v0.6.0, v0.6.1
-      and v0.6.2 (JOURNAL "Preparing v0.6.0" / "Preparing v0.6.1"). (a) `pre-release-hook = ["git",
+- [ ] **`cargo release` still cannot be run as configured — five releases and counting.** Two
+      independent defects in the root `Cargo.toml`, worked around by hand for v0.5.0, v0.6.0, v0.6.1,
+      v0.6.2 and v0.7.0 (JOURNAL "Preparing v0.6.0" / "Preparing v0.6.1"). (a) `pre-release-hook = ["git",
       "cliff", "-o", "CHANGELOG.md", …]` with no `cliff.toml` in the repo would replace the
       hand-written Keep a Changelog file — prose, migration notes, and the `<!-- next-url -->` anchors
       `crates/imbh/Cargo.toml` matches with `exactly = 1` — with a conventional-commit digest. Either

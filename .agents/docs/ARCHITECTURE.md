@@ -1582,7 +1582,9 @@ Like the rest of `imbhd` it is unauthenticated, so a real deployment gates the p
   `serde` traits unconditional deps of `imbh-core`; on the default facade graph that is free (both are
   already compiled, via `arrow-json`), and the optional `serde` feature (§10.13) adds only the
   `serde_derive` proc macro on top. The trimmed `--no-default-features` (71 → 76) and M6c producer
-  (95 → 100) graphs are where that codec is actually paid for. `cargo-deny` gates licenses + duplicate-version creep (`deny.toml`); a `cargo tree`
+  (95 → 100) graphs are where that codec is actually paid for; the search-off lever
+  (`--features ingest,query`) pays exactly one crate (217 → 218), `serde` itself, because serde_json
+  depends on `serde_core` and so arrow's copy never pulled the traits crate in. `cargo-deny` gates licenses + duplicate-version creep (`deny.toml`); a `cargo tree`
   count budget is enforced in the footprint gate. **`deny.toml` runs `all-features = true`**, so an
   optional feature's subtree is license-checked whether or not it is on — `MIT-0` and `0BSD` are on
   the allow-list because vrl reaches them, and default-off would not have avoided that.
