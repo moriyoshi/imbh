@@ -1,9 +1,10 @@
 //! Just enough JSON to speak the plugin protocol.
 //!
 //! Docker's plugin requests and responses are small, flat JSON documents. Reading them goes through
-//! `imbh::parse_json` — the facade's dependency-free parser (ARCHITECTURE.md §10.4) — and writing
-//! them is string concatenation over [`crate::json_string`]. No `serde_json`: the `docker` feature
-//! must not add a crate to the graph, and the shapes here are a handful of known keys.
+//! `imbh::parse_json` — the facade's canonical-JSON reader (ARCHITECTURE.md §10.4/§6.1), which is
+//! strict RFC 8259 — and writing them is string concatenation over [`crate::json_string`]. No
+//! `serde_json` DTOs here: the shapes are a handful of known keys, so the accessors below read them
+//! straight off the parsed `AnyValue` rather than deriving a struct per request type.
 
 use imbh::AnyValue;
 

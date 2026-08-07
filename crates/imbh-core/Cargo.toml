@@ -13,16 +13,32 @@ description = "imbh core: domain types, ids, config, errors, manifest types, can
 # (ARCHITECTURE.md §5/§10.2). `rt` is the minimal feature that exposes `runtime::Handle`; tokio is
 # already in the `imbh` graph (blocking facade + async loop), so this adds no new unique crates.
 tokio = { workspace = true, features = ["rt"] }
-# Optional serde derives on the domain types (off by default — ARCHITECTURE.md §10.13). See the
-# workspace dependency comment for why enabling it adds no new crate to the footprint graph.
-serde = { workspace = true, optional = true }
+# The canonical-JSON codec (§6.1) is `Serialize`/`Deserialize` impls over `AnyValue`, so the traits
+# are needed unconditionally — NOT the derive macro, which is what the optional `serde` feature below
+# turns on.
+#
+# Deliberately NOT `workspace = true`, and do not "fix" it back: the workspace entry carries
+# `features = ["derive", …]`, and Cargo feature sets are additive — a member cannot subtract an
+# inherited feature, so inheriting would drag `serde_derive` and its proc-macro build into every
+# default build for nothing. Spelled out here, the unconditional cost is just `serde` + `serde_core`.
+# Version tracks the workspace entry; keep the two in step.
+serde = { version = "1", default-features = false, features = ["std"] }
+# The canonical-JSON encoder/parser (ARCHITECTURE.md §6.1/§10.4). The canonical form is a constrained
+# JSON dialect, not stock JSON — sorted keys, base64 `bytes`, and the `{"$f":…}` non-finite sentinel —
+# so it rides serde_json's writer/parser through custom impls rather than `serde_json::Value`.
+# Footprint: free on the default facade graph (already present via `arrow-json`); on the trimmed
+# `--no-default-features` / M6c producer graphs it is the serde_json + serde + serde_core + itoa +
+# zmij subtree. See ARCHITECTURE.md §10.4.
+serde_json.workspace = true
+# The canonical encoding of an `AnyValue::Bytes` attribute (§6.1). Standard RFC 4648 alphabet with
+# padding — exactly `base64`'s `STANDARD` engine, which `imbh-mcp` was already using for the same
+# bytes, so hand-rolling a second copy here bought nothing. Footprint-free on **every** axis, not
+# just the default one: `arrow-cast` and `parquet` both pull base64, and `arrow` is a non-optional
+# dep of `imbh`/`imbh-storage`, so it is present even under `--no-default-features`.
+base64.workspace = true
 
 [features]
 # JSON (de)serialization for the domain types embedded in imbh's query builders / result DTOs
 # (Timestamp/TimeRange/Direction/Table/SeverityNumber/Attributes/AnyValue and the hex ids). Off by
-# default so the default build stays serde-free.
-serde = ["dep:serde"]
-
-[dev-dependencies]
-# JSON round-trip assertions for the `serde` feature (tests are gated `#[cfg(feature = "serde")]`).
-serde_json.workspace = true
+# default: this pulls the `serde_derive` proc macro, which the canonical codec itself does not need.
+serde = ["serde/derive"]

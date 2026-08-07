@@ -385,7 +385,7 @@ Dependency direction:
 
 | Crate | Responsibility |
 |-------|----------------|
-| `imbh-core` | schemas, ids, config, errors, manifest types, canonical JSON + a dependency-free JSON parser, time utils (arrow-free) |
+| `imbh-core` | schemas, ids, config, errors, manifest types, canonical JSON codec (serde_json-backed), time utils (arrow-free) |
 | `imbh-otlp` | OTLP decode → normalized rows for logs, traces, metrics |
 | `imbh-storage` | WAL, mutable buffer, seal, Parquet segments, manifest IO, retention, compaction; owns the Arrow schemas |
 | `imbh-index` | Tantivy schema/build/search + the row-ordinal bridge (**only crate that knows Tantivy**) |

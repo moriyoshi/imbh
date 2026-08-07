@@ -8,8 +8,9 @@
 //!   valid UTF-8, which equals code-point order).
 //! - No insignificant whitespace.
 //! - Integers as minimal decimal.
-//! - Doubles via shortest round-trip decimal (Rust's `f64` `Display` guarantees the
-//!   shortest string that round-trips; it never uses scientific notation).
+//! - Doubles via `serde_json`'s shortest round-trip decimal, which is why `Double(1.0)` encodes
+//!   as `1.0` and not `1`: the trailing `.0` is what lets [`crate::json`] read the value back as a
+//!   `Double` rather than an `Int`. Large/small magnitudes use exponent form (`1e300`).
 //! - `bytes` → base64 (standard alphabet, padded) as a JSON string.
 //! - Non-finite doubles (NaN/±Inf, which OTel permits and JSON forbids) → the reserved
 //!   sentinel object `{"$f":"nan"|"inf"|"-inf"}`.
@@ -17,127 +18,92 @@
 //!
 //! The same function backs the segment writer (dict-equality), the Tantivy JSON feeder
 //! (§8), and the `json_get_*` UDFs (§9.3) so all three agree byte-for-byte.
+//!
+//! The encoder is a [`Serialize`] impl over `serde_json`'s writer rather than a hand-rolled string
+//! builder, but it does **not** go through `serde_json::Value`: a `Value` map is a `BTreeMap` whose
+//! ordering would silently become insertion order if anything in the dependency graph ever turned on
+//! serde_json's `preserve_order` feature (features unify globally). Sorting explicitly and streaming
+//! the pairs through `collect_map` makes the key-order invariant independent of that.
+//!
+//! What is written by hand here is only what no library can express: the key sort and the `{"$f":…}`
+//! sentinel. Escaping, float formatting, and structure come from `serde_json`; `bytes` come from the
+//! `base64` crate, the same engine `imbh-mcp` encodes them with.
+
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
+use serde::Serialize;
+use serde::ser::{SerializeMap, Serializer};
 
 use crate::value::AnyValue;
 
 /// Canonicalize an ordered attribute map into a JSON object string.
 pub fn canonical_json_object(entries: &[(String, AnyValue)]) -> String {
-    let mut out = String::new();
-    encode_object(&mut out, entries);
-    out
+    encode(&CanonicalObject(entries))
 }
 
 /// Canonicalize a single [`AnyValue`] into its JSON text form.
 pub fn canonical_json_value(v: &AnyValue) -> String {
-    let mut out = String::new();
-    encode_value(&mut out, v);
-    out
+    encode(&Canonical(v))
 }
 
-fn encode_object(out: &mut String, entries: &[(String, AnyValue)]) {
-    // Sort by key code point. Stable sort keeps the last-writer order for duplicate keys,
-    // which OTel maps should not contain anyway.
-    let mut refs: Vec<&(String, AnyValue)> = entries.iter().collect();
-    refs.sort_by(|a, b| a.0.cmp(&b.0));
-    out.push('{');
-    for (i, (k, v)) in refs.iter().enumerate() {
-        if i > 0 {
-            out.push(',');
-        }
-        encode_string(out, k);
-        out.push(':');
-        encode_value(out, v);
-    }
-    out.push('}');
+/// Serialization is infallible for this value model: every map key is a `String`, every `f64` that
+/// `serde_json` would reject is intercepted by [`encode_double`], and the writer is an in-memory
+/// `String`. A failure here would mean a `serde_json` bug, not bad data.
+fn encode<T: Serialize>(v: &T) -> String {
+    serde_json::to_string(v).expect("canonical JSON encoding is infallible")
 }
 
-fn encode_value(out: &mut String, v: &AnyValue) {
-    match v {
-        AnyValue::Null => out.push_str("null"),
-        AnyValue::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
-        AnyValue::Int(i) => {
-            use std::fmt::Write as _;
-            let _ = write!(out, "{i}");
+/// An [`AnyValue`] in canonical form. A newtype, not a `Serialize` impl on `AnyValue` itself: under
+/// the `serde` feature `AnyValue` derives its own externally-tagged representation (`{"Str":"x"}`),
+/// which is the DTO wire form and deliberately not this.
+struct Canonical<'a>(&'a AnyValue);
+
+/// An attribute map in canonical form, for callers that hold the pairs rather than an `AnyValue`.
+struct CanonicalObject<'a>(&'a [(String, AnyValue)]);
+
+impl Serialize for Canonical<'_> {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match self.0 {
+            AnyValue::Null => s.serialize_unit(),
+            AnyValue::Bool(b) => s.serialize_bool(*b),
+            AnyValue::Int(i) => s.serialize_i64(*i),
+            AnyValue::Double(d) => encode_double(s, *d),
+            AnyValue::Str(v) => s.serialize_str(v),
+            AnyValue::Bytes(b) => s.serialize_str(&base64(b)),
+            AnyValue::Array(items) => s.collect_seq(items.iter().map(Canonical)),
+            AnyValue::Map(entries) => CanonicalObject(entries).serialize(s),
         }
-        AnyValue::Double(d) => encode_double(out, *d),
-        AnyValue::Str(s) => encode_string(out, s),
-        AnyValue::Bytes(b) => {
-            out.push('"');
-            base64_into(out, b);
-            out.push('"');
-        }
-        AnyValue::Array(items) => {
-            out.push('[');
-            for (i, item) in items.iter().enumerate() {
-                if i > 0 {
-                    out.push(',');
-                }
-                encode_value(out, item);
-            }
-            out.push(']');
-        }
-        AnyValue::Map(entries) => encode_object(out, entries),
     }
 }
 
-fn encode_double(out: &mut String, d: f64) {
-    if d.is_nan() {
-        out.push_str("{\"$f\":\"nan\"}");
+impl Serialize for CanonicalObject<'_> {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        // Sort by key code point. Stable sort keeps the last-writer order for duplicate keys,
+        // which OTel maps should not contain anyway.
+        let mut refs: Vec<&(String, AnyValue)> = self.0.iter().collect();
+        refs.sort_by(|a, b| a.0.cmp(&b.0));
+        s.collect_map(refs.into_iter().map(|(k, v)| (k, Canonical(v))))
+    }
+}
+
+fn encode_double<S: Serializer>(s: S, d: f64) -> Result<S::Ok, S::Error> {
+    // JSON has no NaN/Inf and `serde_json` writes them as `null`, which loses the value. OTel
+    // permits them, so they take the reserved sentinel object instead.
+    let tag = if d.is_nan() {
+        "nan"
     } else if d.is_infinite() {
-        out.push_str(if d.is_sign_negative() {
-            "{\"$f\":\"-inf\"}"
-        } else {
-            "{\"$f\":\"inf\"}"
-        });
+        if d.is_sign_negative() { "-inf" } else { "inf" }
     } else {
-        // Rust's f64 Display is shortest-round-trip decimal, no scientific notation.
-        use std::fmt::Write as _;
-        let _ = write!(out, "{d}");
-    }
+        return s.serialize_f64(d);
+    };
+    let mut map = s.serialize_map(Some(1))?;
+    map.serialize_entry("$f", tag)?;
+    map.end()
 }
 
-fn encode_string(out: &mut String, s: &str) {
-    out.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            '\u{08}' => out.push_str("\\b"),
-            '\u{0c}' => out.push_str("\\f"),
-            c if (c as u32) < 0x20 => {
-                use std::fmt::Write as _;
-                let _ = write!(out, "\\u{:04x}", c as u32);
-            }
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-}
-
-/// Standard base64 (RFC 4648) with padding, written directly into `out`.
-fn base64_into(out: &mut String, data: &[u8]) {
-    const ALPHA: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    for chunk in data.chunks(3) {
-        let b0 = chunk[0];
-        let b1 = chunk.get(1).copied().unwrap_or(0);
-        let b2 = chunk.get(2).copied().unwrap_or(0);
-        let n = ((b0 as u32) << 16) | ((b1 as u32) << 8) | (b2 as u32);
-        out.push(ALPHA[((n >> 18) & 0x3f) as usize] as char);
-        out.push(ALPHA[((n >> 12) & 0x3f) as usize] as char);
-        out.push(if chunk.len() > 1 {
-            ALPHA[((n >> 6) & 0x3f) as usize] as char
-        } else {
-            '='
-        });
-        out.push(if chunk.len() > 2 {
-            ALPHA[(n & 0x3f) as usize] as char
-        } else {
-            '='
-        });
-    }
+/// Standard base64 (RFC 4648) with padding — the same engine `imbh-mcp` encodes these bytes with.
+fn base64(data: &[u8]) -> String {
+    BASE64.encode(data)
 }
 
 #[cfg(test)]
@@ -182,6 +148,16 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_keys_are_kept_not_collapsed() {
+        // `serde_json::Map` would collapse these to the last writer; the explicit `collect_map`
+        // over sorted pairs does not, matching the pre-serde_json encoder.
+        assert_eq!(
+            canonical_json_object(&m(vec![("a", AnyValue::Int(1)), ("a", AnyValue::Int(2))])),
+            r#"{"a":1,"a":2}"#
+        );
+    }
+
+    #[test]
     fn non_finite_doubles_use_sentinel() {
         assert_eq!(
             canonical_json_value(&AnyValue::Double(f64::NAN)),
@@ -198,9 +174,12 @@ mod tests {
     }
 
     #[test]
-    fn integer_valued_double_round_trips() {
-        assert_eq!(canonical_json_value(&AnyValue::Double(1.0)), "1");
+    fn doubles_keep_their_fractional_marker() {
+        // The `.0` is load-bearing: it is the only thing distinguishing `Double(1.0)` from
+        // `Int(1)` on the way back through `crate::json::parse`.
+        assert_eq!(canonical_json_value(&AnyValue::Double(1.0)), "1.0");
         assert_eq!(canonical_json_value(&AnyValue::Double(-0.5)), "-0.5");
+        assert_eq!(canonical_json_value(&AnyValue::Int(1)), "1");
     }
 
     #[test]

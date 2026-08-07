@@ -1,8 +1,14 @@
 //! The OTel `AnyValue` model — imbh's value type for attribute values and structured
-//! log bodies. Mirrors OTLP's `AnyValue`. The default build is serde-free (ARCHITECTURE.md §10.4):
-//! canonical-JSON handling lives in [`crate::json`], never through `serde_json`. `Serialize`/
-//! `Deserialize` are derived only under the optional `serde` feature (an externally-tagged enum,
-//! e.g. `{"Str":"x"}` / `{"Int":5}`), so hosts can round-trip DTOs without taxing the default graph.
+//! log bodies. Mirrors OTLP's `AnyValue`.
+//!
+//! Two distinct JSON representations hang off this type, and they are deliberately not the same
+//! one (ARCHITECTURE.md §10.4):
+//!
+//! - The **canonical form** (§6.1) — `{"http.route":"/cart"}` — is the storage encoding, written
+//!   and read by [`crate::canonical`] / [`crate::json`] through hand-written impls. Always present.
+//! - The **DTO form** — an externally-tagged enum, `{"Str":"x"}` / `{"Int":5}` — is what the derives
+//!   below produce for hosts round-tripping query builders and result DTOs. Gated on the optional
+//!   `serde` feature so the `serde_derive` proc macro stays out of the default build.
 
 /// A value in an OTel attribute map or a structured log body.
 ///
