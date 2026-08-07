@@ -9,22 +9,30 @@ git history); this file tracks only what is still open.
 
 ## Open Items
 
-- [ ] **The published 0.5.0 plugin cannot be installed as its own docs describe — the fix is in
-      `[Unreleased]` and needs a release to reach anyone.** `config.json` now uses `propagatedMount`
-      instead of a `data` bind mount (JOURNAL 2026-08-06), because a bind source the daemon will not
-      create made `docker plugin enable` fail on any host without a pre-existing `/var/lib/imbh`.
-      Until a release is cut, `ghcr.io/moriyoshi/imbh-log-driver:0.5.0-*` still carries the broken
-      config, and the fixed `docs/DOCKER_LOG_DRIVER.md` in the tree **does not match the plugin those
-      tags install** — anyone following main's install steps against the 0.5.0 tag hits the original
-      error. Worth considering: a note on the released docs, or prioritising the release. Breaking
-      (the database relocates and `plugin rm` now destroys it), so it is a minor bump under the 0.x
-      rule, not a patch. Releases are cut only when explicitly asked.
+- [ ] **v0.6.1 is prepared but not cut.** The workspace is bumped to `0.6.1`, the changelog section
+      is closed and dated, `README.md` / `docs/DOCKER_LOG_DRIVER.md` version strings are corrected by
+      hand, notices are regenerated and every gate is green — see JOURNAL "Preparing v0.6.1". Open
+      because nothing is committed, tagged or published, so the runtime bridge-network discovery that
+      makes a registry install bind an address the daemon actually has (JOURNAL 2026-08-07) has not
+      reached anyone: `ghcr.io/moriyoshi/imbh-log-driver:0.6.0-*` still carries the hard-coded
+      `172.17.0.1:4318` default. Close this once the `v0.6.1` tag is pushed and the plugin job has
+      published its tags. Releases are cut only when explicitly asked.
 
-      *(2026-08-06: **v0.6.0 is prepared but not cut.** The workspace is bumped to `0.6.0`, the
-      changelog section is closed and dated, notices are regenerated and every gate is green — see
-      JOURNAL "Preparing v0.6.0". Still open because nothing is committed, tagged or published, so
-      `ghcr.io/moriyoshi/imbh-log-driver:0.5.0-*` still carries the broken config. Close this once
-      the `v0.6.0` tag is pushed and the plugin job has published its tags.)*
+      *(The 0.5.0 `propagatedMount` install failure this entry used to track is fixed and shipped:
+      v0.6.0 was tagged and published on 2026-08-07, with both log-driver plugin jobs green.)*
+
+- [ ] **`cargo release` still cannot be run as configured — three releases and counting.** Two
+      independent defects in the root `Cargo.toml`, both worked around by hand for v0.5.0, v0.6.0 and
+      v0.6.1 (JOURNAL "Preparing v0.6.0" / "Preparing v0.6.1"). (a) `pre-release-hook = ["git",
+      "cliff", "-o", "CHANGELOG.md", …]` with no `cliff.toml` in the repo would replace the
+      hand-written Keep a Changelog file — prose, migration notes, and the `<!-- next-url -->` anchors
+      `crates/imbh/Cargo.toml` matches with `exactly = 1` — with a conventional-commit digest. Either
+      commit a `cliff.toml` that reproduces the current file, or drop the hook and keep the
+      `pre-release-replacements` mechanism that already works. (b) The `pre-release-replacements` for
+      the `VERSION=` / `ghcr.io/…` strings live under `[workspace.metadata.release]`, where
+      cargo-release does not read them; move them into `crates/imbh/Cargo.toml` alongside the
+      changelog ones. Until both are fixed, "run `cargo release`" in `README.md` "Releasing" is
+      advice that destroys the changelog.
 
 - [ ] **Confirm `propagatedMount` survives `docker plugin upgrade`.** Persistence across
       `disable`/`enable` and destruction by `plugin rm` were both measured (JOURNAL 2026-08-06);

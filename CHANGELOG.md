@@ -13,6 +13,93 @@ release aborts if it is missing or duplicated.
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-08-07
+
+### Added
+
+- **The Docker log driver discovers the daemon's bridge networks at run time.** The plugin's
+  knowledge of Docker networking used to be a build-time constant: `build.sh` ran
+  `docker network inspect bridge` once and applied the answer with `docker plugin set`, over a
+  hard-coded `172.17.0.1:4318` in `config.json`. That literal is wrong on any daemon with a custom
+  `bip` or a re-created `docker0` — and on **every registry install**, since `docker plugin install`
+  cannot probe your daemon. The failure was silent in the worst way: container logging is
+  filesystem-only, so logs kept flowing and the only symptom was a query/OTLP endpoint that never
+  answered.
+
+  `IMBH_LISTEN_ADDR=auto` is now the shipped default. It resolves to every bridge gateway the daemon
+  has, one listener each, and re-resolves every `IMBH_DOCKER_NETWORK_REFRESH` (default `30s`), so a
+  network created by a later `docker compose up` gets a listener within that window and one destroyed
+  by `docker compose down` loses it the same way; `0` discovers once at startup. Both listen
+  addresses accept a comma-separated list whose elements are `auto[:PORT]` or a literal `HOST:PORT`.
+  A **literal** address that will not bind stays fatal, as it always has been; a **discovered** one
+  only warns, because a bridge that vanished between the scan and the bind is ordinary and the next
+  refresh picks it up.
+
+  Discovery has two backends, tried in order on every refresh: the Engine API (`GET /networks` —
+  names, IPAM gateways/subnets, per-network container attachments) and, when that socket is not
+  reachable, `getifaddrs` in the host netns. The scan works because the plugin already runs in the
+  host network namespace and Docker programs a bridge interface's address *from* its IPAM gateway —
+  the same data one layer down; what it cannot do is name the Docker network, list attached
+  containers, or recognise a bridge renamed with `com.docker.network.bridge.name`. The probe re-runs
+  each refresh rather than once, because at `docker plugin enable` during daemon boot the API socket
+  may not be serving yet. `IMBH_DOCKER_API` names the socket: a path, `off`, or `auto` (the default),
+  which looks where the Docker CLI looks and in the CLI's own order — `DOCKER_HOST`, then the active
+  context (`DOCKER_CONTEXT`, else `currentContext` in `$DOCKER_CONFIG`/`~/.docker/config.json`), then
+  `/var/run/docker.sock` and `/run/docker.sock`. Reading the context store is what makes **rootless**
+  Docker work, whose setup tool offers `export DOCKER_HOST=…` *or* `docker context use rootless`. A
+  `tcp://` or `ssh://` endpoint yields no candidate on purpose: this binds gateways that exist on
+  *this* host, so a remote daemon's networks would be actively wrong rather than missing.
+
+  The shipped plugin mounts no `docker.sock` — a managed plugin's bind source must already exist, and
+  under rootless Docker the socket is not at `/var/run/docker.sock` — so it runs in scan mode, which
+  covers binding and the allow-list completely. A standalone `imbhd` next to a daemon gets API mode
+  for free. Zero new crates: the Engine API client is HTTP/1.1 written by hand over `UnixStream` and
+  CIDR matching is `std::net`, so every axis the footprint gate measures is unchanged from 0.6.0 —
+  275 crates for the `imbh` facade, `imbhd` at 33.3 MiB, and 308 → 397 crates for `imbh-server` at
+  `docker,grpc,tracing` → `+docker-remap`. See `docs/DOCKER_LOG_DRIVER.md` "Networking".
+
+- **`IMBH_ALLOW_FROM`, an accept-time CIDR filter on the TCP listeners.** Defaults to `any`, which
+  filters nothing, so no existing deployment changes behaviour. A comma-separated list of CIDRs
+  narrows it, and the token `docker` expands to the discovered bridge subnets plus loopback,
+  re-expanding as networks come and go. This is the mitigation for `/admin/*` being unauthenticated:
+  binding a bridge gateway keeps the endpoint off the LAN, but it does not keep it away from other
+  containers on the same box, and naming one project's subnet is the narrowest useful setting. A
+  refused peer is closed on accept before a byte is read and gets no reply that would confirm
+  something is listening; refusals are reported at most once a minute with a count. An
+  `IMBH_ALLOW_FROM` that resolves to nothing refuses everything except loopback rather than falling
+  open.
+
+- **`container.network.names` and `container.network.<name>.ip` resource attributes**, plus
+  `.info.networks` for a `docker-remap` script. Available when discovery can name the networks a
+  container is on, which needs the Engine API; `IMBH_DOCKER_NETWORK_ATTRS=off` turns them off. The
+  Engine API is never called from `StartLogging`: `dockerd` runs that handler synchronously while
+  holding the container's lock and the API's network-inspect path resolves attached containers, so a
+  call back can deadlock the daemon against its own log driver. A container's resource is therefore
+  swapped by a later refresh instead — meaning a container that starts between two scans has no
+  network attributes on its first lines and gains them on the rest. `encode` reads the resource
+  pointer once per batch group and an unchanged refresh is a no-op, so the pointer-equality grouping
+  survives.
+
+### Changed
+
+- **The published plugin's `IMBH_LISTEN_ADDR` / `IMBH_GRPC_LISTEN_ADDR` defaults move from
+  `172.17.0.1:4318` / `:4317` to `auto`**, and `docker-plugin/build.sh` no longer probes the daemon
+  at package time. On a stock daemon `auto` resolves to exactly the address the literal named, so the
+  documented install is unaffected; on any other daemon it is the difference between a reachable
+  endpoint and a silent one. `IMBH_BIND=<addr>` at build time still pins one address and
+  `IMBH_BIND=none` still opens no port. A standalone `imbhd` is unchanged unless you ask for `auto`.
+- **`imbh-server`'s `docker` and `grpc` features pull `tokio-stream`'s `net` feature**, so the
+  plugin's multi-address supervisor can hand tonic a listener it bound itself. Footprint-neutral:
+  `tokio-stream` is already in the default graph via `datafusion-datasource-json`, so this adds no
+  crate — only a feature of one that is compiled either way.
+- **The sysfs bridge probe rejects anything that is not a single ordinary path component** before it
+  touches the filesystem. `is_bridge_device` interpolates an interface name into
+  `/sys/class/net/{name}/bridge`; a traversal was not reachable — names come from `getifaddrs`, the
+  kernel does not permit `/` in an interface name, and the caller short-circuits on a `docker0`-or-
+  `br-` + 12 hex name filter — but the last of those is an ordering dependency inside a `&&`, which
+  is the wrong thing to rest on when the check is free. No behaviour change for any name that can
+  actually occur.
+
 ## [0.6.0] - 2026-08-06
 
 ### Added
@@ -630,6 +717,7 @@ release aborts if it is missing or duplicated.
   All 12 crates published to crates.io (`imbh-test-support` is dev-only and stays unpublished).
 
 <!-- next-url -->
+[0.6.1]: https://github.com/moriyoshi/imbh/releases/tag/v0.6.1
 [0.6.0]: https://github.com/moriyoshi/imbh/releases/tag/v0.6.0
 [0.5.0]: https://github.com/moriyoshi/imbh/releases/tag/v0.5.0
 [0.4.0]: https://github.com/moriyoshi/imbh/releases/tag/v0.4.0
