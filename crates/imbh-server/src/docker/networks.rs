@@ -92,7 +92,16 @@ pub fn refresh_interval(env: Option<String>) -> imbh::Result<Duration> {
     }
 }
 
-/// The socket paths tried by [`Api::Auto`], after `DOCKER_HOST`.
+/// The socket paths tried last, once the environment and the context store have said nothing.
+///
+/// Both are measured, not folklore (docker 29.2.1):
+///
+/// * `/var/run/docker.sock` is the client's compiled-in default — the endpoint of the built-in
+///   `default` context, which `docker context ls` describes as "Current DOCKER_HOST based
+///   configuration" and which falls back to this when `DOCKER_HOST` is unset.
+/// * `/run/docker.sock` is where the **daemon** actually listens: systemd's `docker.socket` unit
+///   carries `ListenStream=/run/docker.sock`. On a systemd host `/var/run` is a symlink to `/run`,
+///   so the two are one file; the second entry is what covers a host where it is not.
 const WELL_KNOWN_SOCKETS: [&str; 2] = ["/var/run/docker.sock", "/run/docker.sock"];
 
 /// Where the Engine API is, if it is anywhere.
@@ -119,21 +128,118 @@ impl Api {
 
     /// The socket to try this round, if any. `Auto` re-probes every time so API mode can engage
     /// after a daemon that was not ready at plugin-enable time comes up.
+    ///
+    /// The candidate order mirrors how the Docker CLI resolves its own endpoint, verified against
+    /// docker 29.2.1 rather than assumed:
+    ///
+    /// 1. `DOCKER_HOST`, which **overrides** any selected context — the CLI warns when it does.
+    /// 2. the active context: `DOCKER_CONTEXT`, else `currentContext` in the CLI's `config.json`.
+    /// 3. [`WELL_KNOWN_SOCKETS`], which is what the built-in `default` context resolves to.
+    ///
+    /// Reading the context store is what makes **rootless** Docker work. Its setup tool offers two
+    /// equivalent recipes — export `DOCKER_HOST`, or `docker context use rootless` — and only the
+    /// first was visible before, so anyone who took the second silently got the interface-scan
+    /// backend and no `container.network.*` attributes.
+    ///
+    /// Unlike the CLI this takes the first candidate that is an actual live socket rather than
+    /// failing on the first one named. Discovery is best-effort with a scan behind it, so falling
+    /// through beats reporting nothing; and a `tcp://`/`ssh://` endpoint yields no candidate at all,
+    /// which is right here — this feature binds gateways that exist on *this* host, so a remote
+    /// daemon's networks would be actively wrong.
     fn socket(&self) -> Option<PathBuf> {
         match self {
             Api::Off => None,
             Api::Socket(path) => Some(path.clone()),
-            Api::Auto => {
-                let from_env = std::env::var("DOCKER_HOST")
-                    .ok()
-                    .and_then(|host| host.strip_prefix("unix://").map(PathBuf::from));
-                from_env
-                    .into_iter()
-                    .chain(WELL_KNOWN_SOCKETS.iter().map(PathBuf::from))
-                    .find(|path| path.exists())
-            }
+            Api::Auto => docker_host_socket()
+                .into_iter()
+                .chain(active_context_socket())
+                .chain(WELL_KNOWN_SOCKETS.iter().map(PathBuf::from))
+                .find(|path| is_socket(path)),
         }
     }
+}
+
+/// The socket named by `DOCKER_HOST`, when it names one.
+fn docker_host_socket() -> Option<PathBuf> {
+    unix_endpoint(&std::env::var("DOCKER_HOST").ok()?)
+}
+
+/// The socket named by the active context, if a context is selected and names one.
+fn active_context_socket() -> Option<PathBuf> {
+    let config = docker_config_dir()?;
+    let name = match std::env::var("DOCKER_CONTEXT") {
+        Ok(name) if !name.trim().is_empty() => name,
+        // The CLI's own `currentContext`. Only that one key is read: this file also holds registry
+        // credentials, so nothing else is parsed out of it and none of it is ever logged.
+        _ => json::string(
+            &json::parse_any(&std::fs::read(config.join("config.json")).ok()?),
+            "currentContext",
+        ),
+    };
+    context_socket_in(&config, name.trim())
+}
+
+/// The CLI's configuration directory: `$DOCKER_CONFIG`, else `~/.docker`.
+fn docker_config_dir() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("DOCKER_CONFIG").filter(|d| !d.is_empty()) {
+        return Some(PathBuf::from(dir));
+    }
+    Some(PathBuf::from(std::env::var_os("HOME")?).join(".docker"))
+}
+
+/// The Unix socket the stored context `name` points at, looked up under `config`.
+///
+/// The store is `<config>/contexts/meta/<sha256(name)>/meta.json`, and the file carries its own
+/// `Name`, so this scans and matches rather than hashing: same answer, no sha256 implementation to
+/// carry, and the CLI's choice of digest stays its own business instead of becoming our ABI.
+/// Measured shape (docker 29.2.1):
+///
+/// ```json
+/// {"Name":"rootless","Metadata":{"Description":"..."},
+///  "Endpoints":{"docker":{"Host":"unix:///run/user/1000/docker.sock","SkipTLSVerify":false}}}
+/// ```
+fn context_socket_in(config: &Path, name: &str) -> Option<PathBuf> {
+    // `default` is not a stored context: it *is* the `DOCKER_HOST`-or-compiled-default path, which
+    // the caller has already tried.
+    if name.is_empty() || name == "default" {
+        return None;
+    }
+    for entry in std::fs::read_dir(config.join("contexts/meta"))
+        .ok()?
+        .flatten()
+    {
+        let Ok(raw) = std::fs::read(entry.path().join("meta.json")) else {
+            continue;
+        };
+        let meta = json::parse_any(&raw);
+        if json::string(&meta, "Name") != name {
+            continue;
+        }
+        let endpoints = json::field(&meta, "Endpoints")
+            .cloned()
+            .unwrap_or(AnyValue::Null);
+        let docker = json::field(&endpoints, "docker")
+            .cloned()
+            .unwrap_or(AnyValue::Null);
+        return unix_endpoint(&json::string(&docker, "Host"));
+    }
+    None
+}
+
+/// The path inside a `unix://` CLI endpoint. Anything else — `tcp://`, `ssh://`, empty — is `None`.
+fn unix_endpoint(host: &str) -> Option<PathBuf> {
+    let path = host.trim().strip_prefix("unix://")?;
+    (!path.is_empty()).then(|| PathBuf::from(path))
+}
+
+/// Is there actually a socket at this path?
+///
+/// Stricter than an existence test on purpose: a stray regular file at one of the well-known paths
+/// would otherwise be chosen and then fail on connect, burning the probe for that refresh while a
+/// real socket sat further down the list.
+fn is_socket(path: &Path) -> bool {
+    use std::os::unix::fs::FileTypeExt;
+    std::fs::metadata(path).is_ok_and(|meta| meta.file_type().is_socket())
 }
 
 /// Which backend produced a snapshot.
@@ -972,6 +1078,114 @@ mod tests {
         // And a socket that is not there is the same story, not an error.
         let snapshot = discover(&Api::Socket(PathBuf::from("/nonexistent/imbh/docker.sock")));
         assert_eq!(snapshot.source, Source::Ifaces);
+    }
+
+    /// The `unix://` endpoint grammar the CLI writes, and the transports this cannot use.
+    #[test]
+    fn only_unix_endpoints_yield_a_socket() {
+        assert_eq!(
+            unix_endpoint("unix:///var/run/docker.sock"),
+            Some(PathBuf::from("/var/run/docker.sock"))
+        );
+        assert_eq!(
+            unix_endpoint("  unix:///run/user/1000/docker.sock  "),
+            Some(PathBuf::from("/run/user/1000/docker.sock"))
+        );
+        // A remote daemon is not merely unsupported here, it would be wrong: this feature binds
+        // gateways that exist on *this* host.
+        assert_eq!(unix_endpoint("tcp://10.0.0.1:2375"), None);
+        assert_eq!(unix_endpoint("ssh://user@host"), None);
+        assert_eq!(unix_endpoint("unix://"), None);
+        assert_eq!(unix_endpoint(""), None);
+    }
+
+    /// The context store, against the exact `meta.json` a real `docker context create` writes
+    /// (measured on docker 29.2.1 — see the JOURNAL entry).
+    #[test]
+    fn a_stored_context_resolves_to_its_socket() {
+        let config = tempdir("context-store");
+        // The real store names the directory `sha256(<context name>)`. This writes a deliberately
+        // unrelated directory name to prove the lookup matches on the `Name` *inside* the file and
+        // does not depend on the CLI's choice of digest.
+        write_context(
+            &config,
+            "not-a-hash",
+            r#"{"Name":"rootless","Metadata":{"Description":"rootless mode"},
+                "Endpoints":{"docker":{"Host":"unix:///run/user/1000/docker.sock","SkipTLSVerify":false}}}"#,
+        );
+        write_context(
+            &config,
+            "another",
+            r#"{"Name":"remote","Endpoints":{"docker":{"Host":"tcp://10.0.0.1:2375"}}}"#,
+        );
+
+        assert_eq!(
+            context_socket_in(&config, "rootless"),
+            Some(PathBuf::from("/run/user/1000/docker.sock")),
+            "the rootless recipe that uses a context, not DOCKER_HOST, must be found"
+        );
+        // A context that names a remote daemon yields nothing rather than a bogus local path.
+        assert_eq!(context_socket_in(&config, "remote"), None);
+        assert_eq!(context_socket_in(&config, "no-such-context"), None);
+        // `default` is not stored: it is the DOCKER_HOST-or-compiled-default path the caller
+        // already tried, so looking it up here would be a second bite at the same candidate.
+        assert_eq!(context_socket_in(&config, "default"), None);
+        assert_eq!(context_socket_in(&config, ""), None);
+        // A config directory with no context store at all is ordinary, not an error.
+        assert_eq!(
+            context_socket_in(&tempdir("context-empty"), "rootless"),
+            None
+        );
+        std::fs::remove_dir_all(&config).ok();
+    }
+
+    /// A malformed or partial `meta.json` must not stop the scan finding a later, good one.
+    #[test]
+    fn a_broken_context_file_does_not_hide_the_others() {
+        let config = tempdir("context-broken");
+        write_context(&config, "a", "not json at all");
+        write_context(&config, "b", r#"{"Name":"rootless"}"#); // no Endpoints
+        write_context(
+            &config,
+            "c",
+            r#"{"Name":"rootless2","Endpoints":{"docker":{"Host":"unix:///tmp/ok.sock"}}}"#,
+        );
+        assert_eq!(
+            context_socket_in(&config, "rootless2"),
+            Some(PathBuf::from("/tmp/ok.sock"))
+        );
+        // The one that matches by name but carries no endpoint is simply absent.
+        assert_eq!(context_socket_in(&config, "rootless"), None);
+        std::fs::remove_dir_all(&config).ok();
+    }
+
+    /// The probe wants a socket, not merely a path that exists.
+    #[test]
+    fn a_regular_file_is_not_mistaken_for_a_daemon_socket() {
+        let dir = tempdir("is-socket");
+        let file = dir.join("docker.sock");
+        std::fs::write(&file, b"not a socket").expect("write");
+        assert!(!is_socket(&file));
+        assert!(!is_socket(&dir.join("absent")));
+        assert!(!is_socket(&dir), "a directory is not a socket either");
+
+        let live = dir.join("live.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&live).expect("bind");
+        assert!(is_socket(&live));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn write_context(config: &Path, dir: &str, meta: &str) {
+        let dir = config.join("contexts/meta").join(dir);
+        std::fs::create_dir_all(&dir).expect("context dir");
+        std::fs::write(dir.join("meta.json"), meta).expect("meta.json");
+    }
+
+    fn tempdir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("imbh-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        dir
     }
 
     #[test]

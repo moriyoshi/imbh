@@ -3615,3 +3615,70 @@ one branch heavier.
 - A remap script's view of `.resource` is still frozen at `StartLogging`, so a script sees the
   pre-discovery resource while the *stored* record gets the current one. Harmless today (the built-in
   script never reads `.resource`) but worth knowing before anything depends on it.
+
+## 2026-08-07 — How the Docker client actually resolves its socket (measured)
+
+Review question on the discovery work: where does `WELL_KNOWN_SOCKETS` come from? Honest answer at
+the time: convention. `/var/run/docker.sock` because every recipe says so, `/run/docker.sock` guessed
+as "a fallback for hosts where `/var/run` is not symlinked". Unlike the rest of that module, nothing
+had been measured. So it was measured, against docker 29.2.1.
+
+### The resolution order the CLI really uses
+
+1. `-H/--host` / `--context` flags
+2. **`DOCKER_HOST`** — *overrides the active context*. The CLI says so out loud:
+   `Warning: DOCKER_HOST environment variable overrides the active context.`
+3. **`DOCKER_CONTEXT`**
+4. **`currentContext`** in `<config>/config.json`
+5. the built-in `default` context → the compiled default `unix:///var/run/docker.sock`
+
+`default` is not a stored context. `docker context ls` describes it as *"Current DOCKER_HOST based
+configuration"*, and setting `DOCKER_HOST=unix:///tmp/probe.sock` changed its listed endpoint live.
+
+### The store
+
+`<config>/contexts/meta/<sha256(name)>/meta.json`. Confirmed twice: `DOCKER_CONTEXT=nope` produced a
+path ending `ca3704aa…` = `sha256("nope")`, and a throwaway `docker context create imbh-probe` landed
+in `42dc3cae…` = `sha256("imbh-probe")`. Its contents, which is what the parser is now written
+against rather than guessed at:
+
+```json
+{"Name":"imbh-probe",
+ "Metadata":{"Description":"..."},
+ "Endpoints":{"docker":{"Host":"unix:///tmp/imbh-probe.sock","SkipTLSVerify":false}}}
+```
+
+The lookup **scans and matches on the `Name` inside the file** rather than hashing the name. Same
+answer, no sha256 to carry (nothing in the graph provides one), and the CLI's choice of digest stays
+its own business instead of becoming our ABI.
+
+### What this changed
+
+Both constants survived, but the *reasons* were wrong and are now recorded:
+`/var/run/docker.sock` is the **client's** compiled default; `/run/docker.sock` is where the
+**daemon** listens — systemd's `docker.socket` carries `ListenStream=/run/docker.sock`, and the two
+are one file only because `/var/run` is a symlink to `/run`.
+
+The real defect was elsewhere: `DOCKER_HOST` is one of *four* inputs above the default, and only that
+one was read. **Rootless Docker** is the case that bites — `dockerd-rootless-setuptool.sh` offers
+`export DOCKER_HOST=…` *or* `docker context use rootless`, and anyone taking the second silently got
+the interface-scan backend and no `container.network.*` attributes. Which is doubly awkward, because
+rootless is exactly the case cited in the operator guide and in TODO.md as the reason *not* to
+hard-code `/var/run/docker.sock` as a plugin mount source.
+
+Two smaller fixes rode along: the probe now requires an actual socket rather than any existing path
+(a stray regular file would be chosen and then fail on connect, burning the refresh while a real
+socket sat further down the list), and `$DOCKER_CONFIG` is honoured. A `tcp://`/`ssh://` endpoint
+still yields no candidate at all, which is *correct* rather than a limitation: this feature binds
+gateways that exist on this host, so a remote daemon's networks would be actively wrong. That was
+accidental before and is now stated.
+
+Only `currentContext` is parsed out of the CLI's `config.json`. That file also holds registry
+credentials, so nothing else is read from it and none of it is ever logged.
+
+### Method note
+
+The throwaway context was created and removed inside the measurement, with the config file's sha256
+compared before and after to prove nothing else was touched. `docker context rm` leaves the now-empty
+`contexts/meta` directory behind — worth knowing if a future probe checks for the store's existence
+rather than its contents.

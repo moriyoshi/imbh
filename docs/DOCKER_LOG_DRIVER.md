@@ -444,8 +444,15 @@ plugin does not mount it**: a managed plugin's bind mount source must already ex
 host, and under rootless Docker the socket is not at `/var/run/docker.sock`, so declaring it would
 make `docker plugin enable` fail on those hosts. The managed plugin therefore runs in scan mode --
 which covers binding and the allow-list completely -- and forgoes `container.network.*` attributes. A
-standalone `imbhd` running next to a daemon gets API mode for free. `IMBH_DOCKER_API` names the
-socket (`auto`, a path, or `off`).
+standalone `imbhd` running next to a daemon gets API mode for free.
+
+`IMBH_DOCKER_API` names the socket: a path, `off`, or `auto` (the default). `auto` looks where the
+Docker CLI looks, in the CLI's own order -- `DOCKER_HOST`, then the active context (`DOCKER_CONTEXT`,
+else `currentContext` in `$DOCKER_CONFIG`/`~/.docker/config.json`), then `/var/run/docker.sock` and
+`/run/docker.sock`. Reading the context store is what makes **rootless** Docker work: its setup tool
+offers `export DOCKER_HOST=...` or `docker context use rootless`, and both are honoured. A
+`tcp://` or `ssh://` endpoint is deliberately ignored -- this binds gateways that exist on *this*
+host, so a remote daemon's networks would be the wrong answer, not a missing one.
 
 ### Pinning an address instead
 
