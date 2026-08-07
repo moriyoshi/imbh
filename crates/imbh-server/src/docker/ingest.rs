@@ -583,15 +583,19 @@ mod tests {
         json::parse(json_text.as_bytes())
     }
 
-    fn attr(c: &Container, key: &str) -> Option<String> {
-        c.resource()
+    /// Borrows from the `Resource` the caller holds rather than from `Container`, because
+    /// `Container::resource` hands back an `Arc` — a temporary, if this took the container, whose
+    /// borrow could not outlive the call. Hoisting it to the caller is what lets this return `&str`
+    /// instead of cloning every attribute it reads. Same shape as `remap.rs`'s `attr`.
+    fn attr<'a>(resource: &'a Resource, key: &str) -> Option<&'a str> {
+        resource
             .attributes
             .iter()
             .find(|kv| kv.key == key)
             .and_then(|kv| match &kv.value {
                 Some(AnyValue {
                     value: Some(any_value::Value::StringValue(s)),
-                }) => Some(s.clone()),
+                }) => Some(s.as_str()),
                 _ => None,
             })
     }
@@ -612,20 +616,15 @@ mod tests {
             r#"{"ContainerID":"abc123def456789","ContainerName":"/web",
                 "ContainerImageName":"nginx:1.27","ContainerImageID":"sha256:aaa"}"#,
         ));
+        let r = c.resource();
         assert_eq!(c.name, "web");
         assert_eq!(c.service, "web");
-        assert_eq!(attr(&c, "service.name").as_deref(), Some("web"));
-        assert_eq!(attr(&c, "container.id").as_deref(), Some("abc123def456789"));
-        assert_eq!(attr(&c, "container.name").as_deref(), Some("web"));
-        assert_eq!(
-            attr(&c, "container.image.name").as_deref(),
-            Some("nginx:1.27")
-        );
-        assert_eq!(
-            attr(&c, "container.image.id").as_deref(),
-            Some("sha256:aaa")
-        );
-        assert_eq!(attr(&c, "container.runtime").as_deref(), Some("docker"));
+        assert_eq!(attr(&r, "service.name"), Some("web"));
+        assert_eq!(attr(&r, "container.id"), Some("abc123def456789"));
+        assert_eq!(attr(&r, "container.name"), Some("web"));
+        assert_eq!(attr(&r, "container.image.name"), Some("nginx:1.27"));
+        assert_eq!(attr(&r, "container.image.id"), Some("sha256:aaa"));
+        assert_eq!(attr(&r, "container.runtime"), Some("docker"));
     }
 
     #[test]
@@ -642,15 +641,16 @@ mod tests {
                 "ContainerEnv":["REGION=eu-1","TOKEN=nope","EMPTY="],
                 "Config":{"imbh-service":"checkout","labels":"app, missing","env":"REGION,EMPTY"}}"#,
         ));
+        let r = c.resource();
         assert_eq!(c.service, "checkout");
-        assert_eq!(attr(&c, "service.name").as_deref(), Some("checkout"));
-        assert_eq!(attr(&c, "container.label.app").as_deref(), Some("cart"));
-        assert_eq!(attr(&c, "container.env.REGION").as_deref(), Some("eu-1"));
-        assert_eq!(attr(&c, "container.env.EMPTY").as_deref(), Some(""));
+        assert_eq!(attr(&r, "service.name"), Some("checkout"));
+        assert_eq!(attr(&r, "container.label.app"), Some("cart"));
+        assert_eq!(attr(&r, "container.env.REGION"), Some("eu-1"));
+        assert_eq!(attr(&r, "container.env.EMPTY"), Some(""));
         // Unselected label/env values must not leak into the resource.
-        assert_eq!(attr(&c, "container.label.secret").as_deref(), None);
-        assert_eq!(attr(&c, "container.env.TOKEN").as_deref(), None);
-        assert_eq!(attr(&c, "container.label.missing").as_deref(), None);
+        assert_eq!(attr(&r, "container.label.secret"), None);
+        assert_eq!(attr(&r, "container.env.TOKEN"), None);
+        assert_eq!(attr(&r, "container.label.missing"), None);
     }
 
     #[test]
@@ -818,6 +818,7 @@ mod tests {
 #[cfg(test)]
 mod network_tests {
     use super::*;
+    use std::borrow::Cow;
     use std::net::IpAddr;
 
     fn container() -> Container {
@@ -830,32 +831,42 @@ mod network_tests {
         s.parse().expect("an IP address")
     }
 
+    /// Owned on purpose: the only caller snapshots a container's attributes, mutates it, and
+    /// compares — so these have to outlive the `Resource` they came from.
     fn attrs(c: &Container) -> Vec<(String, String)> {
         c.resource()
             .attributes
             .iter()
-            .map(|kv| (kv.key.clone(), render(kv)))
+            .map(|kv| (kv.key.clone(), render(kv).into_owned()))
             .collect()
     }
 
-    fn render(kv: &KeyValue) -> String {
+    /// `Cow` earns its place here, unlike in `attr` above: a string attribute is returned by
+    /// reference, and only `container.network.names` — an array this flattens for comparison —
+    /// has to allocate.
+    fn render(kv: &KeyValue) -> Cow<'_, str> {
         match kv.value.as_ref().and_then(|v| v.value.as_ref()) {
-            Some(any_value::Value::StringValue(s)) => s.clone(),
-            Some(any_value::Value::ArrayValue(a)) => a
-                .values
-                .iter()
-                .filter_map(|v| match &v.value {
-                    Some(any_value::Value::StringValue(s)) => Some(s.as_str()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join(","),
-            _ => String::new(),
+            Some(any_value::Value::StringValue(s)) => Cow::Borrowed(s.as_str()),
+            Some(any_value::Value::ArrayValue(a)) => Cow::Owned(
+                a.values
+                    .iter()
+                    .filter_map(|v| match &v.value {
+                        Some(any_value::Value::StringValue(s)) => Some(s.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join(","),
+            ),
+            _ => Cow::Borrowed(""),
         }
     }
 
-    fn get(c: &Container, key: &str) -> Option<String> {
-        attrs(c).into_iter().find(|(k, _)| k == key).map(|(_, v)| v)
+    fn get<'a>(resource: &'a Resource, key: &str) -> Option<Cow<'a, str>> {
+        resource
+            .attributes
+            .iter()
+            .find(|kv| kv.key == key)
+            .map(render)
     }
 
     /// A container on no known network must look exactly as it did before discovery existed — no
@@ -880,23 +891,24 @@ mod network_tests {
             ("bridge".to_owned(), ip("172.17.0.2")),
             ("myproj_default".to_owned(), ip("172.23.0.7")),
         ]);
+        let r = c.resource();
         assert_eq!(
-            get(&c, "container.network.names").as_deref(),
+            get(&r, "container.network.names").as_deref(),
             Some("bridge,myproj_default")
         );
         // Namespaced per network: a container on two networks has two addresses, and flattening
         // them to one `container.ip` would have to pick arbitrarily.
         assert_eq!(
-            get(&c, "container.network.bridge.ip").as_deref(),
+            get(&r, "container.network.bridge.ip").as_deref(),
             Some("172.17.0.2")
         );
         assert_eq!(
-            get(&c, "container.network.myproj_default.ip").as_deref(),
+            get(&r, "container.network.myproj_default.ip").as_deref(),
             Some("172.23.0.7")
         );
         // The identity attributes every query depends on are untouched.
-        assert_eq!(get(&c, "container.id").as_deref(), Some("abc123"));
-        assert_eq!(get(&c, "service.name").as_deref(), Some("web"));
+        assert_eq!(get(&r, "container.id").as_deref(), Some("abc123"));
+        assert_eq!(get(&r, "service.name").as_deref(), Some("web"));
     }
 
     /// THE property the late fill rests on: rewriting the same networks must not produce a new
@@ -922,10 +934,16 @@ mod network_tests {
     fn detaching_removes_the_attributes_again() {
         let c = container();
         c.set_networks(&[("bridge".to_owned(), ip("172.17.0.2"))]);
-        assert!(get(&c, "container.network.names").is_some());
+        let attached = c.resource();
+        assert!(get(&attached, "container.network.names").is_some());
+
         c.set_networks(&[]);
-        assert!(get(&c, "container.network.names").is_none());
-        assert_eq!(get(&c, "container.id").as_deref(), Some("abc123"));
+        // Re-read: `resource()` hands back the snapshot as of the call, so the `Arc` taken above
+        // still describes the attached container. That is the property the late fill depends on.
+        let detached = c.resource();
+        assert!(get(&detached, "container.network.names").is_none());
+        assert_eq!(get(&detached, "container.id").as_deref(), Some("abc123"));
+        assert!(get(&attached, "container.network.names").is_some());
     }
 
     /// Records encoded after a refresh must carry the new resource; the grouping still has to
