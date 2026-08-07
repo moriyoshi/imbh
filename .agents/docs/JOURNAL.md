@@ -3682,3 +3682,88 @@ The throwaway context was created and removed inside the measurement, with the c
 compared before and after to prove nothing else was touched. `docker context rm` leaves the now-empty
 `contexts/meta` directory behind — worth knowing if a future probe checks for the store's existence
 rather than its contents.
+
+## Preparing v0.6.1: a patch release that is one feature, and two crate counts that are both right (2026-08-07)
+
+Release prep for `v0.6.1`. Everything since `v0.6.0` is a single feature landing: runtime
+bridge-network discovery for the Docker log driver (`444b1b2`) plus its three review follow-ups — the
+test-only accessor refactor (`673242a`), the sysfs path-component check (`3ab6aeb`), and the
+Docker-socket resolution that reads `DOCKER_CONTEXT` and the CLI's `config.json` the way the client
+does (`26ea117`). Nothing else moved, so `[Unreleased]` was empty and the whole `[0.6.1]` section had
+to be written from the commits rather than closed from accumulated entries.
+
+### Why a patch bump when the release is a `feat`
+
+The 0.x rule this project uses is that a **minor** bump means something broke — `v0.6.0`'s own commit
+message says so ("a minor bump under the 0.x rule because two changes are breaking"). Nothing in
+0.6.1 does:
+
+- **No published Rust API moved.** `serve_async` was private and became `pub(crate)
+  serve_on_listener` (split from its bind so several listeners can share a runtime);
+  `serve_with_limits_until`, the public entry point, keeps its signature and now binds and delegates.
+  `PeerFilter` is `pub(crate)`. The one manifest change is `imbh-server`'s `docker`/`grpc` features
+  gaining `tokio-stream?/net`, which is additive and adds no crate.
+- **The one operator-visible default change is a fix wearing a feature's clothes.** The shipped
+  plugin's `IMBH_LISTEN_ADDR` / `IMBH_GRPC_LISTEN_ADDR` move from `172.17.0.1:4318` / `:4317` to
+  `auto`. On a stock daemon `auto` resolves to exactly the address the literal named, so the
+  documented install is unchanged; on a daemon with a custom `bip` or a re-created `docker0` it is
+  the difference between a reachable endpoint and a silent one. Shipping that as a *minor* bump would
+  say "this may break you" about a change whose entire purpose is to stop being broken.
+- **`IMBH_ALLOW_FROM` defaults to `any`**, so the new accept-time filter changes no existing
+  deployment.
+
+### Two crate counts, both correct, and neither is wrong about the thing that matters
+
+`444b1b2` records "Zero new crates: 282/304/411". `scripts/footprint-gate.sh` on the same tree prints
+**275** for the `imbh` facade and **308 → 397** for `imbh-server` at `docker,grpc,tracing` →
+`+docker-remap`. Neither number is stale: they count different things.
+
+The gate pipes `cargo tree -p imbh --edges normal --prefix none` through
+`sed 's/ (\*)//; s/ v[0-9].*//'` — it **strips the version before `sort -u`**, so it counts unique
+crate *names*. Counting unique `name v version` pairs on the same graph gives 282. The seven-pair gap
+is five names that appear at more than one version: `foldhash`, `getrandom`, `hashbrown`,
+`ordered-float`, `syn`. (Dropping `--edges normal` entirely gives 296 pairs, i.e. build/proc-macro
+edges are a further 14.)
+
+Worth knowing because the §2 budget is defined against the gate's number and only that one. A commit
+message quoting the pair count next to a budget quoting the name count reads as a 7-crate regression
+that never happened. The changelog entry for 0.6.1 therefore quotes the gate's numbers, not the
+commit's — the claim both were making ("unchanged from before") is true either way.
+
+### The release machinery is still two mechanisms that cannot both run
+
+Unchanged since the v0.6.0 prep, and worth restating because this is the third release in a row that
+worked around it by hand:
+
+- `pre-release-hook = ["git", "cliff", "-o", "CHANGELOG.md", …]` in the root `Cargo.toml`, with **no
+  `cliff.toml` in the repo**. Running it would replace the hand-written Keep a Changelog file — prose,
+  migration notes, and the `<!-- next-url -->` anchors the `pre-release-replacements` in
+  `crates/imbh/Cargo.toml` match with `exactly = 1` — with a conventional-commit digest.
+- The `pre-release-replacements` under `[workspace.metadata.release]` (the `VERSION=` and `ghcr.io/…`
+  strings in `README.md` / `docs/DOCKER_LOG_DRIVER.md`) have still never fired; cargo-release does not
+  read replacements from the workspace table. Corrected by hand again, all five strings.
+
+So `v0.6.1`, like `v0.5.0` and `v0.6.0`, is prepared as a hand-written commit rather than by
+`cargo release`. Fixing the config — either committing a `cliff.toml` that reproduces the current file
+or dropping the hook, and moving those replacements into `crates/imbh/Cargo.toml` where they are read
+— is now three releases overdue and is in TODO.md.
+
+### v0.6.0 shipped
+
+TODO.md's long-standing first item — the published 0.5.0 plugin that could not be installed as its own
+docs described — is closed. `v0.6.0` was tagged and published 2026-08-07T00:39Z with all five archives,
+`SHA256SUMS`, the container image, and both log-driver plugin jobs green. It is replaced by the same
+entry for this release.
+
+### Verified
+
+`fmt --all --check` clean; `build --workspace`, `clippy --workspace --all-targets -D warnings` and
+`test --workspace` all clean (**64 suites, 585 passed, 0 failed, 4 ignored**).
+`./scripts/license-gate.sh` OK. `./scripts/gen-notices.sh` regenerated `THIRD-PARTY-NOTICES.txt` —
+its only delta is the 14 workspace crates moving to 0.6.1, so the third-party set is unchanged since
+`v0.6.0`. Footprint gate **OK**: 275 crates (target 275), `imbhd` 34,916,248 B = 33.3 MiB, plugin
+feature set 397 crates / 40,063,344 B = 38.2 MiB (informational; +65,568 B over v0.6.0's 39,997,776 B,
+which is the whole cost of discovery in the shipped plugin), idle RSS 15.0 MB, steady RSS 104.8 MB,
+search-off lever 275 → 217 → 71.
+The §3c packaging dry-run (`cargo package --workspace --allow-dirty`, dirty because the bump is
+uncommitted) staged and verified all 20 members at `0.6.1`, exit 0. Nothing tagged, nothing published.
