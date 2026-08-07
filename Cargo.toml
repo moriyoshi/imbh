@@ -24,7 +24,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.6.1"
+version = "0.6.2"
 edition = "2024"
 rust-version = "1.96"
 license = "Apache-2.0"
@@ -60,28 +60,28 @@ pre-release-hook = ["git", "cliff", "-o", "CHANGELOG.md", "--tag", "{{version}}"
 # Internal crates. Each carries a `version` alongside `path` so `cargo publish` can rewrite the
 # path deps to crates.io version requirements; cargo-release keeps these in lockstep with the
 # shared workspace version on every bump (see [workspace.metadata.release]).
-imbh = { path = "crates/imbh", version = "0.6.1" }
-imbh-core = { path = "crates/imbh-core", version = "0.6.1" }
-imbh-lgtm = { path = "crates/imbh-lgtm", version = "0.6.1" }
+imbh = { path = "crates/imbh", version = "0.6.2" }
+imbh-core = { path = "crates/imbh-core", version = "0.6.2" }
+imbh-lgtm = { path = "crates/imbh-lgtm", version = "0.6.2" }
 # The head API (ARCHITECTURE.md §10.19): the JSON wire types a read-only head drives a running
 # `imbhd` over, the server-side execution of each operation against an open `Db`, and the HTTP client
 # the remote head uses. Shared by `imbh-server` (which serves it) and `imbh-tui` (which is a head).
 # `default-features = false` so each consumer names the halves it plays: `imbh-server` serves the API
 # (`exec`), `imbh-tui` both serves it in-process and drives a remote one (`exec` + `client`).
-imbh-head = { path = "crates/imbh-head", version = "0.6.1", default-features = false }
+imbh-head = { path = "crates/imbh-head", version = "0.6.2", default-features = false }
 # The MCP server (protocol dispatch + tools + the stdio transport), shared by the HTTP endpoint in
 # `imbh-server` and the stdio one in the `imbh-tui` binary.
-imbh-mcp = { path = "crates/imbh-mcp", version = "0.6.1" }
-imbh-tui = { path = "crates/imbh-tui", version = "0.6.1" }
-imbh-otlp = { path = "crates/imbh-otlp", version = "0.6.1" }
+imbh-mcp = { path = "crates/imbh-mcp", version = "0.6.2" }
+imbh-tui = { path = "crates/imbh-tui", version = "0.6.2" }
+imbh-otlp = { path = "crates/imbh-otlp", version = "0.6.2" }
 # default-features = false so the `imbh` facade's own `search` feature governs the tantivy subtree
 # (the facade re-enables it via `imbh-storage/search` + `imbh-query/search`). Standalone builds of
 # these crates (`cargo test -p imbh-storage`) still use their own `default = ["search"]`.
-imbh-storage = { path = "crates/imbh-storage", version = "0.6.1", default-features = false }
-imbh-index = { path = "crates/imbh-index", version = "0.6.1" }
-imbh-query = { path = "crates/imbh-query", version = "0.6.1", default-features = false }
-imbh-tracing = { path = "crates/imbh-tracing", version = "0.6.1" }
-imbh-proto = { path = "crates/imbh-proto", version = "0.6.1" }
+imbh-storage = { path = "crates/imbh-storage", version = "0.6.2", default-features = false }
+imbh-index = { path = "crates/imbh-index", version = "0.6.2" }
+imbh-query = { path = "crates/imbh-query", version = "0.6.2", default-features = false }
+imbh-tracing = { path = "crates/imbh-tracing", version = "0.6.2" }
+imbh-proto = { path = "crates/imbh-proto", version = "0.6.2" }
 # Dev-only shared test harness (never a dependency of a shipping crate — see the crate's Cargo.toml).
 # Intentionally path-only (no version): it is `publish = false`, so `cargo publish` strips it from
 # the published dev-dependencies of the crates that use it.
