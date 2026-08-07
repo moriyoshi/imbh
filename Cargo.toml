@@ -188,6 +188,10 @@ flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
 prost-build = "0.14"
 protox = "0.9"
 tokio = { version = "1", default-features = false, features = ["rt", "macros"] }
+# `TcpListenerStream`, so the reference server's supervised gRPC listener can serve a socket the
+# supervisor bound (see `imbh-server`'s `docker` feature). Footprint-neutral: tokio-stream is already
+# in the default graph via datafusion-datasource-json.
+tokio-stream = { version = "0.1", default-features = false }
 # POSIX signals for the reference server's graceful shutdown (`imbh-server`, ARCHITECTURE.md §10.16):
 # `std` has no way to catch `SIGTERM`, so `sigaction` + a self-pipe come from here. Footprint-neutral:
 # libc is already compiled in the default `imbhd` graph (via DataFusion), so this adds no new crate.

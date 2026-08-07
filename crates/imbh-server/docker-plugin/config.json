@@ -15,14 +15,38 @@
     },
     {
       "name": "IMBH_LISTEN_ADDR",
-      "description": "OTLP/HTTP ingest + SQL query endpoint. Defaults to the docker0 bridge address, which containers can reach and the LAN cannot; build.sh replaces it with the address this daemon actually uses. Set to the empty string to open no TCP port at all.",
-      "value": "172.17.0.1:4318",
+      "description": "OTLP/HTTP ingest + SQL query endpoint. `auto` binds every bridge network this daemon has, discovered at run time and kept up to date as networks come and go -- reachable from containers on any of them, and not from the LAN. `auto:PORT` picks the port; a literal HOST:PORT binds exactly that; a comma-separated list mixes them. Set to the empty string to open no TCP port at all.",
+      "value": "auto",
       "settable": ["value"]
     },
     {
       "name": "IMBH_GRPC_LISTEN_ADDR",
-      "description": "OTLP/gRPC ingest (the default transport for most OTel SDKs), same addressing rules as IMBH_LISTEN_ADDR. Empty disables it.",
-      "value": "172.17.0.1:4317",
+      "description": "OTLP/gRPC ingest (the default transport for most OTel SDKs), same addressing rules as IMBH_LISTEN_ADDR -- `auto` there means every bridge gateway on port 4317. Empty disables it.",
+      "value": "auto",
+      "settable": ["value"]
+    },
+    {
+      "name": "IMBH_ALLOW_FROM",
+      "description": "Which peers the TCP listeners serve. `any` (the default) filters nothing. `docker` accepts only the daemon's own bridge subnets plus loopback -- worth setting, because /admin/* is unauthenticated and binding a bridge gateway makes it reachable by every container on the box. A comma-separated list of CIDRs narrows it further, and may include `docker` as one element (e.g. `docker,10.0.0.0/8`). A refused peer is closed on accept, before any request is read.",
+      "value": "any",
+      "settable": ["value"]
+    },
+    {
+      "name": "IMBH_DOCKER_API",
+      "description": "Where to reach the Docker Engine API, which is what lets discovery name the networks a container is on and add container.network.* attributes to its logs. `auto` (the default) probes DOCKER_HOST and the well-known socket paths on every refresh; a path names a socket; `off` disables it. A managed plugin has no socket mounted unless you add one, so this normally falls back to the interface scan -- which still finds every bridge gateway and subnet. See docs/DOCKER_LOG_DRIVER.md.",
+      "value": "auto",
+      "settable": ["value"]
+    },
+    {
+      "name": "IMBH_DOCKER_NETWORK_REFRESH",
+      "description": "How often the daemon's bridge networks are re-read, which is how `auto` notices a network created or destroyed after startup. `0` discovers once at startup and never looks again.",
+      "value": "30s",
+      "settable": ["value"]
+    },
+    {
+      "name": "IMBH_DOCKER_NETWORK_ATTRS",
+      "description": "Whether stored records carry container.network.names and container.network.<name>.ip resource attributes (and .info.networks in a remap script). `on` (the default) adds them whenever discovery can name the networks a container is on, which needs the Engine API -- see IMBH_DOCKER_API. `off` never adds them. A container that starts between two refreshes has no network attributes on its first lines and gains them on the rest: the driver never asks the daemon about a container from inside the handler that is starting it, because that can deadlock the daemon against its own log driver.",
+      "value": "on",
       "settable": ["value"]
     },
     {

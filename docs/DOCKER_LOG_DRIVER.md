@@ -120,19 +120,24 @@ To query the database rather than copy it, prefer the OTLP/SQL endpoint the plug
 `--alias imbh` is what makes the driver addressable as plain `--log-driver imbh` instead of by its
 full registry path.
 
-**If the compiled-in OTLP address is wrong for your daemon**, add `--disable` to the install so the
-plugin does not start first, then set it. The default is `172.17.0.1:4318` (see
-[Networking](#networking)); unlike `build.sh`, an install cannot probe your daemon, so check what the
-bridge gateway actually is:
+**The OTLP address needs no configuring.** It defaults to `auto`, which binds every bridge network
+this daemon actually has, re-checked on a timer — so a custom `bip`, a re-created `docker0`, or a
+network created later all work without being told about (see [Networking](#networking)). To see what
+it resolved to:
 
 ```sh
 docker network inspect bridge --format '{{range .IPAM.Config}}{{.Gateway}}{{end}}'
-docker plugin set    imbh IMBH_LISTEN_ADDR=172.17.0.1:4318 IMBH_GRPC_LISTEN_ADDR=172.17.0.1:4317
-docker plugin enable imbh
 ```
 
-Changing it later is the same three steps with `docker plugin disable imbh` in front — and the
-database is not disturbed by that cycle.
+To pin one address instead, or to restrict who may connect:
+
+```sh
+docker plugin disable imbh
+docker plugin set     imbh IMBH_LISTEN_ADDR=172.17.0.1:4318 IMBH_GRPC_LISTEN_ADDR=172.17.0.1:4317
+docker plugin enable  imbh
+```
+
+The database is not disturbed by that cycle.
 
 ### Docker Desktop (macOS / Windows)
 
@@ -195,9 +200,8 @@ docker logs <container>
 docker logs -f --tail 100 --since 10m <container>
 ```
 
-…or the imbh way, over the query endpoint `imbhd` is already serving — at whatever
-`IMBH_LISTEN_ADDR` you set above, the daemon's bridge gateway (`172.17.0.1` on a default install —
-see [Networking](#networking) below):
+…or the imbh way, over the query endpoint `imbhd` is already serving — on every bridge gateway this
+daemon has, which is `172.17.0.1` on a default install (see [Networking](#networking) below):
 
 ```sh
 curl -s 172.17.0.1:4318/api/query --data \
@@ -231,7 +235,15 @@ conventions), so it survives compaction and is queryable with `json_get_str(reso
 | `service` | the `imbh-service` log-opt, else the container name, else its short id |
 | `scope` | `docker` — distinguishes driver output from an app's own OTLP |
 | `attributes` | `log.iostream` = `stdout` \| `stderr` |
-| `resource` | `service.name`, `container.id`, `container.name`, `container.image.name`, `container.image.id`, `container.runtime` = `docker`, plus selected labels/env |
+| `resource` | `service.name`, `container.id`, `container.name`, `container.image.name`, `container.image.id`, `container.runtime` = `docker`, plus selected labels/env and, when available, the container's networks |
+
+When bridge-network discovery can name the networks a container is on — which needs the Engine API,
+see [Networking](#networking) — the resource also carries `container.network.names` (an array) and
+`container.network.<name>.ip` per attached network. A container that starts between two discovery
+refreshes has no network attributes on its first lines and gains them on the rest: the driver never
+asks the daemon about a container from inside the handler that is starting it, because `dockerd`
+calls that handler while holding the container's lock and a call back can deadlock the daemon against
+its own log driver. `IMBH_DOCKER_NETWORK_ATTRS=off` turns the attributes off entirely.
 
 Lines Docker splits (anything over ~16 KiB) are reassembled into one record before storage, so a
 long line is one row, not five.
@@ -364,6 +376,8 @@ on its own, so a script that changes nothing behaves exactly like no script at a
 .info.container_labels      #    container_image_id, daemon_name, log_path
 .info.container_env         # the full map, "K=V" pre-split
 .info.config                # the --log-opt map
+.info.networks              # { network name: address }, from bridge discovery -- empty until it
+                            #   knows (see "Networking"), and it can fill in mid-container
 
 # ── in AND out: the OTel logs model, pre-filled with what the driver would store ──
 .timestamp                  # both seeded from .time_nano; move .timestamp, leave the other alone
@@ -391,26 +405,100 @@ container's full label and environment maps, which the `labels=`/`env=` log-opts
 
 ## Networking
 
-The plugin runs in the **host** network namespace, and `imbhd` binds the **docker0 bridge gateway**
-(`172.17.0.1:4318` HTTP, `:4317` gRPC on a default daemon). That address is deliberate: containers
-on every bridge network can reach it, and the LAN cannot.
+The plugin runs in the **host** network namespace and **discovers the daemon's bridge networks at
+run time**, binding one listener per bridge gateway. That is what `IMBH_LISTEN_ADDR=auto` -- the
+shipped default -- means. Those addresses are reachable from containers on every bridge network and
+have no route from the LAN, so an app container can reach the endpoint and the rest of your network
+cannot.
 
-`build.sh` does not trust the `172.17.0.1` default -- it asks the daemon what its bridge gateway
-actually is and applies it:
+Discovery re-runs every `IMBH_DOCKER_NETWORK_REFRESH` (default `30s`), so a network created by a
+`docker compose up` after the plugin started gets a listener within that window, and one destroyed
+by `docker compose down` loses its listener the same way. Set it to `0` to discover once at startup
+and never look again.
 
-```sh
-docker network inspect bridge --format '{{range .IPAM.Config}}{{.Gateway}}{{end}}'
-```
+> Earlier versions bound a single address baked in at package time: `build.sh` ran `docker network
+> inspect bridge` once and applied the answer with `docker plugin set`, over a hard-coded
+> `172.17.0.1` default. Anyone installing straight from the registry -- which is what the documented
+> install does -- got that literal default, so a daemon with a custom `bip`, or one whose `docker0`
+> had been re-created, ended up with a listener bound to an address it does not have. The failure was
+> silent: container logging is filesystem-only and kept working, so the only symptom was a query
+> endpoint that never answered.
 
-Because both addresses arrive as **environment variables**, they are re-tunable at any time without
-rebuilding the plugin (a plugin's entrypoint arguments are frozen in its `config.json`; `env` entries
-declared `settable` are not):
+### How it discovers them
+
+Two backends, tried in that order on every refresh:
+
+| Backend | How | What it sees |
+|---------|-----|--------------|
+| Engine API | `GET /networks` over the daemon's Unix socket | network names, IPAM gateways and subnets, **and** which containers are on each |
+| Interface scan | `getifaddrs` in the host netns | gateways and subnets |
+
+The scan works because the plugin is in the host network namespace, so `docker0` and every `br-*` are
+directly visible; Docker programs a bridge interface's address *from* its IPAM gateway, so on a stock
+daemon the scan gives the same gateways and subnets the API would. What it cannot do is name the
+Docker network, say which containers are attached, or recognise a bridge renamed with
+`com.docker.network.bridge.name`.
+
+The Engine API needs the daemon's socket inside the plugin's mount namespace, and **the shipped
+plugin does not mount it**: a managed plugin's bind mount source must already exist on the daemon
+host, and under rootless Docker the socket is not at `/var/run/docker.sock`, so declaring it would
+make `docker plugin enable` fail on those hosts. The managed plugin therefore runs in scan mode --
+which covers binding and the allow-list completely -- and forgoes `container.network.*` attributes. A
+standalone `imbhd` running next to a daemon gets API mode for free.
+
+`IMBH_DOCKER_API` names the socket: a path, `off`, or `auto` (the default). `auto` looks where the
+Docker CLI looks, in the CLI's own order -- `DOCKER_HOST`, then the active context (`DOCKER_CONTEXT`,
+else `currentContext` in `$DOCKER_CONFIG`/`~/.docker/config.json`), then `/var/run/docker.sock` and
+`/run/docker.sock`. Reading the context store is what makes **rootless** Docker work: its setup tool
+offers `export DOCKER_HOST=...` or `docker context use rootless`, and both are honoured. A
+`tcp://` or `ssh://` endpoint is deliberately ignored -- this binds gateways that exist on *this*
+host, so a remote daemon's networks would be the wrong answer, not a missing one.
+
+### Pinning an address instead
+
+Both listen addresses accept a comma-separated list, and each element is either `auto[:PORT]` or a
+literal `HOST:PORT`:
 
 ```sh
 docker plugin disable imbh
-docker plugin set     imbh IMBH_LISTEN_ADDR=172.17.0.1:4318
+docker plugin set     imbh IMBH_LISTEN_ADDR=172.17.0.1:4318   # one fixed address
+docker plugin set     imbh IMBH_LISTEN_ADDR=auto:9000         # every bridge gateway, port 9000
+docker plugin set     imbh IMBH_LISTEN_ADDR=auto,127.0.0.1:4318
 docker plugin enable  imbh
 ```
+
+A **literal** address that will not bind is fatal, as it always has been: a port already in use or an
+address this host does not have is a configuration error, and starting anyway would leave you
+believing in an endpoint nothing serves. A **discovered** address that will not bind is only a
+warning -- a bridge that vanished between the scan and the bind is ordinary, and the next refresh
+picks it up.
+
+Because the addresses arrive as **environment variables**, they are re-tunable at any time without
+rebuilding the plugin (a plugin's entrypoint arguments are frozen in its `config.json`; `env` entries
+declared `settable` are not). `IMBH_BIND=<addr>` at build time still pins one address, and
+`IMBH_BIND=none` still opens no port.
+
+### Restricting who may connect
+
+`IMBH_ALLOW_FROM` filters peers on accept. It defaults to `any`, which filters nothing.
+
+```sh
+docker plugin set imbh IMBH_ALLOW_FROM=docker            # the daemon's bridge subnets + loopback
+docker plugin set imbh IMBH_ALLOW_FROM=docker,10.0.0.0/8
+docker plugin set imbh IMBH_ALLOW_FROM=172.23.0.0/16     # one compose project's network
+```
+
+`docker` expands to the discovered bridge subnets plus loopback, and re-expands as networks come and
+go. A refused peer's connection is closed before a byte is read, and nothing is sent back that would
+confirm something is listening; refusals are reported at most once a minute with a count.
+
+This is worth setting. Binding a bridge gateway keeps the endpoint off the LAN, but it does **not**
+keep it away from other containers on the same box, and `/admin/*` is unauthenticated. Naming one
+project's subnet is the narrowest useful setting. Note that an `IMBH_ALLOW_FROM` that resolves to
+nothing -- `docker` on a daemon with no bridge networks -- refuses everything except loopback rather
+than falling open.
+
+### Other knobs on this listener
 
 The same mechanism tunes the **flush scheduler**, which decides when buffered lines become Parquet
 segments (and when the WAL can be reclaimed). `IMBH_FLUSH` defaults to `interval=5s`; its triggers OR
@@ -476,7 +564,8 @@ OTLP ingest: app containers have no way to reach the plugin, and they cannot run
 the same directory instead, because imbh allows only one writer per database.
 
 Choose this when the plugin is a pure capture sink you will query offline. If you want a live query
-endpoint *and* no LAN exposure, the bridge-gateway default already gives you that.
+endpoint *and* no LAN exposure, the discovered bridge gateways already give you that; add
+`IMBH_ALLOW_FROM` to narrow which containers may use it.
 
 ### Why not `network.type: bridge`?
 
@@ -550,7 +639,7 @@ about it requires the plugin packaging:
 
 ```sh
 IMBH_DOCKER_PLUGIN_SOCKET=/run/docker/plugins/imbh.sock \
-IMBH_LISTEN_ADDR=172.17.0.1:4318 \
+IMBH_LISTEN_ADDR=auto \
   imbhd /var/lib/imbh
 ```
 
@@ -558,6 +647,10 @@ Docker discovers any socket in `/run/docker/plugins` as a legacy plugin named af
 `--log-driver imbh` then works against a plain host process. That is the easiest way to try the
 driver, and the easiest way to debug it. Absent the variable, the plugin endpoint stays off and
 `imbhd` behaves exactly as before.
+
+Run this way, `imbhd` also reaches the Docker socket, so bridge discovery uses the **Engine API**
+rather than the interface scan — which is what makes `container.network.*` attributes available. It
+is the easiest way to see that half of the feature working.
 
 Because the plugin is a normal `imbhd`, everything else it serves is available at the same time:
 OTLP/HTTP ingest on `/v1/{logs,traces,metrics}`, `/stats`, `/admin/{flush,compact}`. Application

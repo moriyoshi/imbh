@@ -18,7 +18,9 @@ use std::time::{Duration, Instant};
 
 use imbh::{AnyValue as ImbhValue, Db};
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
-use opentelemetry_proto::tonic::common::v1::{AnyValue, InstrumentationScope, KeyValue, any_value};
+use opentelemetry_proto::tonic::common::v1::{
+    AnyValue, ArrayValue, InstrumentationScope, KeyValue, any_value,
+};
 use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
 use opentelemetry_proto::tonic::resource::v1::Resource;
 use prost::Message;
@@ -59,7 +61,23 @@ pub struct Container {
     pub id: String,
     pub name: String,
     pub service: String,
-    resource: Resource,
+    /// The attributes that come from the `StartLogging` document alone. Kept so a later network
+    /// refresh can rebuild the resource without re-parsing it.
+    base: Vec<KeyValue>,
+    /// The resource stamped on this container's records.
+    ///
+    /// Behind a lock because bridge-network discovery can only fill `container.network.*` in *after*
+    /// the container started: `dockerd` calls `StartLogging` synchronously while it holds that
+    /// container's lock, so asking the daemon which networks it is on from that handler risks
+    /// deadlocking the daemon against its own log driver (`networks.rs`). The plugin therefore reads
+    /// the last snapshot at start, and swaps a fuller resource in when the next refresh knows more.
+    ///
+    /// Read once per batch *group* in [`encode`], not per record, so the cost is a single uncontended
+    /// read lock per flush.
+    resource: std::sync::RwLock<Arc<Resource>>,
+    /// The same network attachments in their raw form, for the remap event's `.info.networks`.
+    /// Shared by `Arc` so a remapper can tell "unchanged since the last line" by pointer.
+    networks: std::sync::RwLock<Arc<Vec<(String, std::net::IpAddr)>>>,
     stdout_severity: (i32, &'static str),
     stderr_severity: (i32, &'static str),
     /// The compiled remap binding, when this container has one. `None` — always, without the
@@ -135,10 +153,12 @@ impl Container {
             id,
             name,
             service,
-            resource: Resource {
-                attributes: attrs,
+            resource: std::sync::RwLock::new(Arc::new(Resource {
+                attributes: attrs.clone(),
                 ..Default::default()
-            },
+            })),
+            base: attrs,
+            networks: std::sync::RwLock::new(Arc::new(Vec::new())),
             stdout_severity: severity(opt("imbh-stdout-severity")).unwrap_or((9, "INFO")),
             stderr_severity: severity(opt("imbh-stderr-severity")).unwrap_or((17, "ERROR")),
             #[cfg(feature = "docker-remap")]
@@ -192,10 +212,77 @@ impl Container {
         }
     }
 
-    /// This container's own resource, for the remapper's post-script invariant checks.
+    /// This container's current resource.
+    pub(crate) fn resource(&self) -> Arc<Resource> {
+        self.resource
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Record which bridge networks this container is attached to, as resource attributes.
+    ///
+    /// Called at `StartLogging` from whatever the last discovery snapshot knew, and again whenever a
+    /// refresh changes it — a container that started between two scans has no network attributes on
+    /// its first lines and gains them on the rest, which is the honest outcome of never calling the
+    /// daemon from the `StartLogging` handler.
+    ///
+    /// A no-op when nothing changed, so the common refresh (an idle daemon, every 30 seconds) does
+    /// not churn allocations or break `encode`'s pointer-equality grouping.
+    pub fn set_networks(&self, networks: &[(String, std::net::IpAddr)]) {
+        {
+            let mut current = self
+                .networks
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if current.as_slice() != networks {
+                *current = Arc::new(networks.to_vec());
+            }
+        }
+        let mut attrs = self.base.clone();
+        if !networks.is_empty() {
+            attrs.push(KeyValue {
+                key: "container.network.names".to_owned(),
+                value: Some(AnyValue {
+                    value: Some(any_value::Value::ArrayValue(ArrayValue {
+                        values: networks
+                            .iter()
+                            .map(|(name, _)| AnyValue {
+                                value: Some(any_value::Value::StringValue(name.clone())),
+                            })
+                            .collect(),
+                    })),
+                }),
+                ..Default::default()
+            });
+            // Namespaced per network, the way `container.label.<k>` already is: a container on two
+            // networks has two addresses, and flattening them to one would pick arbitrarily.
+            for (name, ip) in networks {
+                attrs.push(kv(&format!("container.network.{name}.ip"), &ip.to_string()));
+            }
+        }
+
+        let mut current = self
+            .resource
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if current.attributes == attrs {
+            return;
+        }
+        *current = Arc::new(Resource {
+            attributes: attrs,
+            ..Default::default()
+        });
+    }
+
+    /// This container's network attachments, for the remap event. The `Arc` is stable while they do
+    /// not change, which is what lets a remapper skip rebuilding `.info.networks` per line.
     #[cfg(feature = "docker-remap")]
-    pub(crate) fn resource(&self) -> &Resource {
-        &self.resource
+    pub(crate) fn networks(&self) -> Arc<Vec<(String, std::net::IpAddr)>> {
+        self.networks
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// How to name this container in a log message: its name, falling back to its id.
@@ -471,7 +558,7 @@ fn encode(batch: Vec<Item>) -> Vec<u8> {
             .map(|(container, resource, log_records)| ResourceLogs {
                 resource: Some(match resource {
                     Some(overridden) => (*overridden).clone(),
-                    None => container.resource.clone(),
+                    None => (*container.resource()).clone(),
                 }),
                 scope_logs: vec![ScopeLogs {
                     scope: Some(InstrumentationScope {
@@ -496,8 +583,12 @@ mod tests {
         json::parse(json_text.as_bytes())
     }
 
-    fn attr<'a>(c: &'a Container, key: &str) -> Option<&'a str> {
-        c.resource
+    /// Borrows from the `Resource` the caller holds rather than from `Container`, because
+    /// `Container::resource` hands back an `Arc` — a temporary, if this took the container, whose
+    /// borrow could not outlive the call. Hoisting it to the caller is what lets this return `&str`
+    /// instead of cloning every attribute it reads. Same shape as `remap.rs`'s `attr`.
+    fn attr<'a>(resource: &'a Resource, key: &str) -> Option<&'a str> {
+        resource
             .attributes
             .iter()
             .find(|kv| kv.key == key)
@@ -525,14 +616,15 @@ mod tests {
             r#"{"ContainerID":"abc123def456789","ContainerName":"/web",
                 "ContainerImageName":"nginx:1.27","ContainerImageID":"sha256:aaa"}"#,
         ));
+        let r = c.resource();
         assert_eq!(c.name, "web");
         assert_eq!(c.service, "web");
-        assert_eq!(attr(&c, "service.name"), Some("web"));
-        assert_eq!(attr(&c, "container.id"), Some("abc123def456789"));
-        assert_eq!(attr(&c, "container.name"), Some("web"));
-        assert_eq!(attr(&c, "container.image.name"), Some("nginx:1.27"));
-        assert_eq!(attr(&c, "container.image.id"), Some("sha256:aaa"));
-        assert_eq!(attr(&c, "container.runtime"), Some("docker"));
+        assert_eq!(attr(&r, "service.name"), Some("web"));
+        assert_eq!(attr(&r, "container.id"), Some("abc123def456789"));
+        assert_eq!(attr(&r, "container.name"), Some("web"));
+        assert_eq!(attr(&r, "container.image.name"), Some("nginx:1.27"));
+        assert_eq!(attr(&r, "container.image.id"), Some("sha256:aaa"));
+        assert_eq!(attr(&r, "container.runtime"), Some("docker"));
     }
 
     #[test]
@@ -549,15 +641,16 @@ mod tests {
                 "ContainerEnv":["REGION=eu-1","TOKEN=nope","EMPTY="],
                 "Config":{"imbh-service":"checkout","labels":"app, missing","env":"REGION,EMPTY"}}"#,
         ));
+        let r = c.resource();
         assert_eq!(c.service, "checkout");
-        assert_eq!(attr(&c, "service.name"), Some("checkout"));
-        assert_eq!(attr(&c, "container.label.app"), Some("cart"));
-        assert_eq!(attr(&c, "container.env.REGION"), Some("eu-1"));
-        assert_eq!(attr(&c, "container.env.EMPTY"), Some(""));
+        assert_eq!(attr(&r, "service.name"), Some("checkout"));
+        assert_eq!(attr(&r, "container.label.app"), Some("cart"));
+        assert_eq!(attr(&r, "container.env.REGION"), Some("eu-1"));
+        assert_eq!(attr(&r, "container.env.EMPTY"), Some(""));
         // Unselected label/env values must not leak into the resource.
-        assert_eq!(attr(&c, "container.label.secret"), None);
-        assert_eq!(attr(&c, "container.env.TOKEN"), None);
-        assert_eq!(attr(&c, "container.label.missing"), None);
+        assert_eq!(attr(&r, "container.label.secret"), None);
+        assert_eq!(attr(&r, "container.env.TOKEN"), None);
+        assert_eq!(attr(&r, "container.label.missing"), None);
     }
 
     #[test]
@@ -719,5 +812,165 @@ mod tests {
             .map(|rl| rl.scope_logs[0].log_records.len())
             .sum();
         assert_eq!(total, 200);
+    }
+}
+
+#[cfg(test)]
+mod network_tests {
+    use super::*;
+    use std::borrow::Cow;
+    use std::net::IpAddr;
+
+    fn container() -> Container {
+        Container::from_info(&json::parse(
+            br#"{"ContainerID":"abc123","ContainerName":"/web"}"#,
+        ))
+    }
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().expect("an IP address")
+    }
+
+    /// Owned on purpose: the only caller snapshots a container's attributes, mutates it, and
+    /// compares — so these have to outlive the `Resource` they came from.
+    fn attrs(c: &Container) -> Vec<(String, String)> {
+        c.resource()
+            .attributes
+            .iter()
+            .map(|kv| (kv.key.clone(), render(kv).into_owned()))
+            .collect()
+    }
+
+    /// `Cow` earns its place here, unlike in `attr` above: a string attribute is returned by
+    /// reference, and only `container.network.names` — an array this flattens for comparison —
+    /// has to allocate.
+    fn render(kv: &KeyValue) -> Cow<'_, str> {
+        match kv.value.as_ref().and_then(|v| v.value.as_ref()) {
+            Some(any_value::Value::StringValue(s)) => Cow::Borrowed(s.as_str()),
+            Some(any_value::Value::ArrayValue(a)) => Cow::Owned(
+                a.values
+                    .iter()
+                    .filter_map(|v| match &v.value {
+                        Some(any_value::Value::StringValue(s)) => Some(s.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join(","),
+            ),
+            _ => Cow::Borrowed(""),
+        }
+    }
+
+    fn get<'a>(resource: &'a Resource, key: &str) -> Option<Cow<'a, str>> {
+        resource
+            .attributes
+            .iter()
+            .find(|kv| kv.key == key)
+            .map(render)
+    }
+
+    /// A container on no known network must look exactly as it did before discovery existed — no
+    /// empty `container.network.names`, no placeholder.
+    #[test]
+    fn a_container_with_no_known_networks_gains_no_attributes() {
+        let c = container();
+        let before = attrs(&c);
+        c.set_networks(&[]);
+        assert_eq!(attrs(&c), before);
+        assert!(
+            !before
+                .iter()
+                .any(|(k, _)| k.starts_with("container.network"))
+        );
+    }
+
+    #[test]
+    fn attachments_become_resource_attributes() {
+        let c = container();
+        c.set_networks(&[
+            ("bridge".to_owned(), ip("172.17.0.2")),
+            ("myproj_default".to_owned(), ip("172.23.0.7")),
+        ]);
+        let r = c.resource();
+        assert_eq!(
+            get(&r, "container.network.names").as_deref(),
+            Some("bridge,myproj_default")
+        );
+        // Namespaced per network: a container on two networks has two addresses, and flattening
+        // them to one `container.ip` would have to pick arbitrarily.
+        assert_eq!(
+            get(&r, "container.network.bridge.ip").as_deref(),
+            Some("172.17.0.2")
+        );
+        assert_eq!(
+            get(&r, "container.network.myproj_default.ip").as_deref(),
+            Some("172.23.0.7")
+        );
+        // The identity attributes every query depends on are untouched.
+        assert_eq!(get(&r, "container.id").as_deref(), Some("abc123"));
+        assert_eq!(get(&r, "service.name").as_deref(), Some("web"));
+    }
+
+    /// THE property the late fill rests on: rewriting the same networks must not produce a new
+    /// resource, or `encode`'s pointer-equality grouping would split every batch that spans a
+    /// refresh, and an idle daemon would churn an allocation per container every 30 seconds.
+    #[test]
+    fn republishing_the_same_networks_keeps_the_same_allocation() {
+        let c = container();
+        let networks = [("bridge".to_owned(), ip("172.17.0.2"))];
+        c.set_networks(&networks);
+        let first = c.resource();
+        c.set_networks(&networks);
+        assert!(Arc::ptr_eq(&first, &c.resource()));
+
+        // A real change does swap it.
+        c.set_networks(&[("bridge".to_owned(), ip("172.17.0.9"))]);
+        assert!(!Arc::ptr_eq(&first, &c.resource()));
+    }
+
+    /// A container that leaves every network loses the attributes rather than keeping a stale
+    /// address — the base attributes are the floor, not a starting point that only grows.
+    #[test]
+    fn detaching_removes_the_attributes_again() {
+        let c = container();
+        c.set_networks(&[("bridge".to_owned(), ip("172.17.0.2"))]);
+        let attached = c.resource();
+        assert!(get(&attached, "container.network.names").is_some());
+
+        c.set_networks(&[]);
+        // Re-read: `resource()` hands back the snapshot as of the call, so the `Arc` taken above
+        // still describes the attached container. That is the property the late fill depends on.
+        let detached = c.resource();
+        assert!(get(&detached, "container.network.names").is_none());
+        assert_eq!(get(&detached, "container.id").as_deref(), Some("abc123"));
+        assert!(get(&attached, "container.network.names").is_some());
+    }
+
+    /// Records encoded after a refresh must carry the new resource; the grouping still has to
+    /// collapse a run of lines from one container into one `ResourceLogs`.
+    #[test]
+    fn encoded_records_carry_the_current_resource() {
+        let c = Arc::new(container());
+        c.set_networks(&[("bridge".to_owned(), ip("172.17.0.2"))]);
+        let batch: Vec<Item> = (0..3)
+            .map(|_| Item {
+                container: Arc::clone(&c),
+                resource: None,
+                record: LogRecord::default(),
+            })
+            .collect();
+        let encoded = ExportLogsServiceRequest::decode(encode(batch).as_slice()).expect("decode");
+        assert_eq!(encoded.resource_logs.len(), 1, "one container, one group");
+        let attributes = &encoded.resource_logs[0]
+            .resource
+            .as_ref()
+            .expect("a resource")
+            .attributes;
+        assert!(
+            attributes
+                .iter()
+                .any(|kv| kv.key == "container.network.bridge.ip"),
+            "the encoded resource must be the one the last refresh produced"
+        );
     }
 }

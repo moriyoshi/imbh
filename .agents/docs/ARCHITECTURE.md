@@ -1271,12 +1271,32 @@ as well as from positional args, because a managed plugin's `entrypoint` is froz
 `config.json` while `env` entries declared `settable` can be changed with `docker plugin set`; an
 **empty** value disables that listener, and with both off the process serves only the plugin socket
 and opens no network port. `main` runs every configured endpoint on its own thread and parks on the
-shutdown token, which is what makes them independently optional. The plugin defaults to binding the docker0
-bridge gateway -- reachable from containers on every bridge network, unroutable from the LAN -- and
-`build.sh` replaces the default with the address the daemon actually reports. *Measured, not assumed:*
+shutdown token, which is what makes them independently optional. *Measured, not assumed:*
 `network.type: bridge` is accepted by the daemon but unimplemented for managed plugins (the process
 gets an empty netns -- `lo` only, no routes), so `host` plus a bridge-gateway bind is the only way to
 be container-reachable; the empty-listener setting is the supported way to be reachable by nothing.
+
+Both addresses accept `auto`, the plugin's default, which resolves at **run time** to every bridge
+gateway the daemon has and is re-resolved on a timer (`docker::serve::supervise`, one listener per
+address as a task on one runtime). It replaces a single address baked in at package time by
+`build.sh`, over a hard-coded `172.17.0.1` fallback -- which silently produced an unreachable
+endpoint on any daemon with a custom `bip`, a re-created `docker0`, or an install that never ran
+`docker plugin set`. Binding a **literal** address is fatal as it always was; binding a discovered one
+is a warning and a retry. Discovery itself (`docker::networks`) has two backends tried in order on
+every refresh: the Engine API over the daemon's Unix socket -- network names, IPAM gateways/subnets
+and per-network container attachments -- and, when that socket is not reachable, `getifaddrs` in the
+host netns, which yields the same gateways and subnets because Docker programs a bridge interface's
+address from its IPAM gateway. The shipped plugin keeps `mounts: []`, so it runs in scan mode; a
+standalone `imbhd` gets the API. The **hard constraint** on that half: the Engine API is never called
+from `StartLogging` -- `dockerd` runs that handler while holding the container's lock and the API's
+network-inspect path resolves attached containers, so a call back can deadlock the daemon against its
+own log driver. Records therefore take `container.network.*` from the last published snapshot, and a
+container that started between two scans picks them up when the next one swaps its resource
+(`Container::set_networks`, behind an `RwLock<Arc<Resource>>` read once per batch group). The same
+snapshot backs `IMBH_ALLOW_FROM`, an accept-time CIDR filter whose `docker` token expands to the
+discovered subnets plus loopback -- the mitigation for `/admin/*` being unauthenticated and reachable
+by every container on the box. All of it is behind the `docker` feature and adds **no crate**: `libc`
+and `tokio-stream` are both already in the default graph.
 
 Shape: one reader thread per container FIFO reassembles Docker's split lines, and all readers funnel
 into a single batching worker that ingests through `Db::ingest_otlp_logs` — the same entry point the

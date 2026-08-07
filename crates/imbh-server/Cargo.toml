@@ -77,6 +77,12 @@ tonic = { workspace = true, optional = true, features = [
 # features, so enabling both is the union, not a conflict.
 opentelemetry-proto = { workspace = true, optional = true }
 prost = { workspace = true, optional = true }
+# `TcpListenerStream`, so the Docker plugin's multi-address supervisor can hand tonic a listener it
+# bound itself (and filter the peers on it) instead of letting tonic bind its own. Optional, pulled
+# only when `docker` and `grpc` are both on. Footprint-neutral: tokio-stream is already in the
+# DEFAULT graph via datafusion-datasource-json, so this edge adds **no crate** — only the `net`
+# feature of a crate that is compiled either way.
+tokio-stream = { workspace = true, optional = true, features = ["net"] }
 # Optional self-observability (ARCHITECTURE.md §11). The stderr subscriber wiring lives in the imbh
 # facade's `console` module (behind `imbh/tracing-console`, which owns the `tracing-subscriber` dep);
 # `imbhd` just calls its one-liner. `tracing` here is for the binary's own banner events. Both are
@@ -112,6 +118,7 @@ grpc = [
     "dep:opentelemetry-proto",
     "opentelemetry-proto/gen-tonic",
     "dep:prost",
+    "dep:tokio-stream",
 ]
 # Docker logging-driver plugin: serve the `docker.logdriver/1.0` plugin API on a Unix socket, read
 # each container's log FIFO, and ingest the lines as OTLP logs (`docs/DOCKER_LOG_DRIVER.md`). Unix
@@ -119,7 +126,7 @@ grpc = [
 # default so `cargo build -p imbh-server` (the footprint gate) stays at the measured crate count;
 # enable with `cargo build -p imbh-server --features docker`. Adds **no new crate** to the graph:
 # prost and opentelemetry-proto's message types are already in the default `imbh` tree via imbh-otlp.
-docker = ["dep:opentelemetry-proto", "dep:prost"]
+docker = ["dep:opentelemetry-proto", "dep:prost", "tokio-stream?/net"]
 # VRL remapping for the Docker log driver (docs/DOCKER_LOG_DRIVER.md): every container line runs
 # through a compiled Vector Remap Language program that maps the Docker log-driver data model onto the
 # OTel logs data model, with a built-in script covering JSON, logfmt, klog/glog and key=value. Off by

@@ -18,6 +18,24 @@ pub fn parse(body: &[u8]) -> AnyValue {
         .unwrap_or_else(|| AnyValue::Map(Vec::new()))
 }
 
+/// Parse a document that may be an **array** at the top level, unlike [`parse`], which is for the
+/// plugin protocol's always-object requests. The Engine API's `/networks` is a JSON array; anything
+/// unparseable degrades to `Null`, which every accessor below reads as absent.
+pub fn parse_any(body: &[u8]) -> AnyValue {
+    std::str::from_utf8(body)
+        .ok()
+        .and_then(imbh::parse_json)
+        .unwrap_or(AnyValue::Null)
+}
+
+/// The elements of a JSON array, or an empty slice for anything else.
+pub fn items(v: &AnyValue) -> &[AnyValue] {
+    match v {
+        AnyValue::Array(items) => items,
+        _ => &[],
+    }
+}
+
 /// The value at `key` of a JSON object.
 pub fn field<'a>(v: &'a AnyValue, key: &str) -> Option<&'a AnyValue> {
     match v {

@@ -488,19 +488,35 @@ pub fn serve_with_limits_until(
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    runtime.block_on(serve_async(db, addr, limits, shutdown))
+    runtime.block_on(async move {
+        // Bind first, so a bind failure still reaches the caller rather than becoming a listener
+        // that quietly is not there.
+        let listener = tokio::net::TcpListener::bind(addr).await?;
+        serve_on_listener(app(db), listener, limits, None, shutdown).await;
+        Ok(())
+    })
 }
 
-/// The accept loop. Binds first, so a bind failure still reaches the caller.
-async fn serve_async(
-    db: Arc<Db>,
-    addr: &str,
-    limits: Limits,
-    shutdown: Arc<Shutdown>,
-) -> std::io::Result<()> {
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    let app = app(db);
+/// An accept-time peer test. `None` — the only possibility without the `docker` feature — means
+/// every peer that reaches the socket is served, which is what this server has always done.
+///
+/// A boxed predicate rather than a concrete type so that the whole allow-list feature (parsing,
+/// CIDR matching, re-resolution against discovered subnets, the rate-limited refusal warning) lives
+/// under `docker::addr` and none of it is compiled into the default build.
+pub(crate) type PeerFilter = Arc<dyn Fn(std::net::IpAddr) -> bool + Send + Sync>;
 
+/// The accept loop for one already-bound listener.
+///
+/// Split out from the bind so that more than one listener can share a runtime — which is what the
+/// Docker plugin's multi-address supervisor (`docker::serve`) needs, and the only reason this is
+/// not simply the body of [`serve_with_limits_until`].
+pub(crate) async fn serve_on_listener(
+    app: Router,
+    listener: tokio::net::TcpListener,
+    limits: Limits,
+    allow: Option<PeerFilter>,
+    shutdown: Arc<Shutdown>,
+) {
     // The token is a sync primitive (a condvar, tripped from the signal watcher thread), so bridge it
     // into a future once rather than polling it. `on_trigger` runs the closure immediately if the
     // token is already tripped, which covers binding after the signal arrived.
@@ -534,7 +550,12 @@ async fn serve_async(
         };
         let stream = tokio::select! {
             accepted = listener.accept() => match accepted {
-                Ok((stream, _peer)) => stream,
+                // The peer test happens here, before a single byte is read, so a connection that is
+                // not allowed costs one accept and one close rather than a parsed request. Dropping
+                // `stream` closes it; saying nothing back is deliberate, since any reply would
+                // confirm that something is listening.
+                Ok((stream, peer)) if allow.as_ref().is_none_or(|allow| allow(peer.ip())) => stream,
+                Ok(_) => continue,
                 // Per-connection errors (`ECONNABORTED`, `EMFILE`); the listener itself is still good.
                 Err(_) => continue,
             },
@@ -614,7 +635,6 @@ async fn serve_async(
             shutdown.drain_timeout()
         ));
     }
-    Ok(())
 }
 
 /// The 408 written to a client that opened a connection and never sent a request head. Pre-rendered

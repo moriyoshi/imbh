@@ -3519,3 +3519,166 @@ crates moving to 0.6.0, i.e. the third-party set is unchanged since `fc70cf8`. F
 packaging dry-run (`cargo package --workspace --allow-dirty`, dirty because the bump is uncommitted)
 staged and verified all 20 members at `0.6.0`, exit 0. Nothing committed, nothing tagged, nothing
 published.
+
+## 2026-08-07 — Runtime bridge-network discovery for the Docker log driver
+
+The plugin's knowledge of Docker networking was a **build-time constant**. `docker-plugin/build.sh`
+ran `docker network inspect bridge --format '{{range .IPAM.Config}}{{.Gateway}}{{end}}'` once and
+applied the answer with `docker plugin set`, over a hard-coded `172.17.0.1:4318` default in
+`config.json`. The Rust code had no network awareness at all: `listen_addr()` returned one string,
+`serve_async` bound one `TcpListener` and discarded every peer.
+
+That default is wrong on any daemon with a custom `bip`, on one whose `docker0` was re-created, and
+on **every registry install** — the documented `docker plugin install` cannot probe your daemon, so
+it gets the literal. The failure is silent in the worst way: container logging is filesystem-only
+(the plugin socket and the FIFOs), so logs keep flowing and the only symptom is a query/OTLP endpoint
+that never answers.
+
+Now `IMBH_LISTEN_ADDR=auto` (the shipped default) resolves at run time to every bridge gateway the
+daemon has, re-resolved every `IMBH_DOCKER_NETWORK_REFRESH` (default 30s).
+
+### Two backends, and why the scan is not a fallback in the apologetic sense
+
+| Backend | How | Sees |
+|---|---|---|
+| `Source::Api` | `GET /networks` over the daemon's Unix socket | network names, IPAM gateways/subnets, per-network container attachments |
+| `Source::Ifaces` | `getifaddrs` in the host netns | gateways and subnets |
+
+The scan works *because* of the 2026-07-30 finding that forced `network.type: host`: the plugin sees
+`docker0` and every `br-*` directly. Docker programs a bridge interface's address **from** its IPAM
+gateway, so on a stock daemon the scan reproduces the API's gateway/subnet answer exactly — this is
+the same IPAM data, read one layer down. Interfaces are matched on `docker0` or `br-` + 12 hex
+characters **and** the existence of `/sys/class/net/<name>/bridge`, which is what excludes a veth
+named like a bridge and libvirt's `virbr*`. What the scan cannot do: name the Docker network, list
+attached containers, or recognise a bridge renamed with `com.docker.network.bridge.name`.
+
+The probe re-runs on **every** refresh, not once. At `docker plugin enable` during daemon boot the
+API socket may not be serving yet, and a one-shot probe would strand the process in scan mode for
+life.
+
+### The deadlock that shapes the whole container-attributes design
+
+`container.network.*` needs the Engine API. The obvious implementation — inspect the container in
+`StartLogging` — is a **daemon deadlock**: `dockerd` calls the log driver synchronously during
+container start while holding that container's lock, and the API's network-inspect path resolves
+attached containers. So the rule is absolute: *nothing on the plugin's request path ever calls the
+daemon.* `StartLogging` reads the last published snapshot and nothing else.
+
+That makes late arrival unavoidable — a container that starts between two scans is not in the last
+snapshot. Rather than hide it, `Container::resource` became `RwLock<Arc<Resource>>` and a refresh
+that learns new attachments swaps a fuller resource in (`set_networks`). Records before the swap have
+no network attributes; records after do. `encode` reads the `Arc` once per batch *group*, not per
+record, and `set_networks` is a no-op when nothing changed — which is what keeps the pointer-equality
+grouping intact across an idle daemon's 30-second refreshes. `.info.networks` reaches VRL the same
+way, cached in the `Remapper` by `Arc::ptr_eq` so a script that reads `.info` rebuilds the object at
+most once per refresh, and a script that does not pays nothing (the existing `wants_info` bargain).
+
+### Packaging: what was deliberately *not* done
+
+The Engine API needs the daemon's socket in the plugin's mount namespace. **No mount was added.** A
+managed plugin's bind source must already exist on the daemon host, under rootless Docker the socket
+is not at `/var/run/docker.sock`, and `tests/docker_plugin_config.rs` guards `mounts: []` precisely
+because that class of bug shipped once already (PR #32). The managed plugin therefore runs in scan
+mode — which covers binding and the allow-list completely — and forgoes container attributes; a
+standalone `imbhd` gets API mode for free. Stated in the operator guide rather than papered over.
+
+Two things remain **unmeasured** and are recorded in TODO.md: whether `docker plugin enable` accepts
+a `mounts` entry with a null/settable `source` (which would make API mode an opt-in with no default
+privilege change), and whether the daemon's API socket is serving by the time a plugin is enabled at
+daemon startup.
+
+### Footprint
+
+**Zero new crates**, measured against `main`: 282 / 304 / 411 for `imbh`, `imbh-server` default, and
+`imbh-server --features docker,docker-remap,grpc` — identical before and after. `libc` was already a
+direct dependency (signal handling) and `tokio-stream` was already in the *default* graph via
+`datafusion-datasource-json`; the latter is now a direct optional dep so the supervised gRPC listener
+can serve a socket the supervisor bound. The Engine API client is HTTP/1.1 hand-written over
+`std::os::unix::net::UnixStream` with a complete-body chunked decoder, and the JSON goes through
+`imbh::parse_json` — the same reasoning that kept `serde_json` out of `docker/json.rs`.
+
+### Where it lives, and why all of it is under `docker`
+
+`docker/addr.rs` (Cidr, AllowFrom/Access, BindSpec, the `Discovery` trait), `docker/networks.rs`
+(both backends, the refresh thread), `docker/serve.rs` (the supervisor). `lib.rs` keeps exactly two
+things: `serve_on_listener`, the pre-existing accept loop split out from its bind so several
+listeners can share a runtime, and `pub(crate) type PeerFilter = Arc<dyn Fn(IpAddr) -> bool + …>` —
+one `Option` the accept loop checks. Everything else, including the rate-limited refusal warning,
+sits inside the closure under the feature gate. A default build's accept path is what it always was,
+one branch heavier.
+
+### Follow-ups
+
+- The gRPC listener now serves a supervisor-bound socket via `serve_with_incoming_shutdown` and a
+  hand-written peer-filtering `Stream`, rather than letting tonic bind its own. This is what makes
+  "which bind failures are fatal" one rule for both protocols.
+- A remap script's view of `.resource` is still frozen at `StartLogging`, so a script sees the
+  pre-discovery resource while the *stored* record gets the current one. Harmless today (the built-in
+  script never reads `.resource`) but worth knowing before anything depends on it.
+
+## 2026-08-07 — How the Docker client actually resolves its socket (measured)
+
+Review question on the discovery work: where does `WELL_KNOWN_SOCKETS` come from? Honest answer at
+the time: convention. `/var/run/docker.sock` because every recipe says so, `/run/docker.sock` guessed
+as "a fallback for hosts where `/var/run` is not symlinked". Unlike the rest of that module, nothing
+had been measured. So it was measured, against docker 29.2.1.
+
+### The resolution order the CLI really uses
+
+1. `-H/--host` / `--context` flags
+2. **`DOCKER_HOST`** — *overrides the active context*. The CLI says so out loud:
+   `Warning: DOCKER_HOST environment variable overrides the active context.`
+3. **`DOCKER_CONTEXT`**
+4. **`currentContext`** in `<config>/config.json`
+5. the built-in `default` context → the compiled default `unix:///var/run/docker.sock`
+
+`default` is not a stored context. `docker context ls` describes it as *"Current DOCKER_HOST based
+configuration"*, and setting `DOCKER_HOST=unix:///tmp/probe.sock` changed its listed endpoint live.
+
+### The store
+
+`<config>/contexts/meta/<sha256(name)>/meta.json`. Confirmed twice: `DOCKER_CONTEXT=nope` produced a
+path ending `ca3704aa…` = `sha256("nope")`, and a throwaway `docker context create imbh-probe` landed
+in `42dc3cae…` = `sha256("imbh-probe")`. Its contents, which is what the parser is now written
+against rather than guessed at:
+
+```json
+{"Name":"imbh-probe",
+ "Metadata":{"Description":"..."},
+ "Endpoints":{"docker":{"Host":"unix:///tmp/imbh-probe.sock","SkipTLSVerify":false}}}
+```
+
+The lookup **scans and matches on the `Name` inside the file** rather than hashing the name. Same
+answer, no sha256 to carry (nothing in the graph provides one), and the CLI's choice of digest stays
+its own business instead of becoming our ABI.
+
+### What this changed
+
+Both constants survived, but the *reasons* were wrong and are now recorded:
+`/var/run/docker.sock` is the **client's** compiled default; `/run/docker.sock` is where the
+**daemon** listens — systemd's `docker.socket` carries `ListenStream=/run/docker.sock`, and the two
+are one file only because `/var/run` is a symlink to `/run`.
+
+The real defect was elsewhere: `DOCKER_HOST` is one of *four* inputs above the default, and only that
+one was read. **Rootless Docker** is the case that bites — `dockerd-rootless-setuptool.sh` offers
+`export DOCKER_HOST=…` *or* `docker context use rootless`, and anyone taking the second silently got
+the interface-scan backend and no `container.network.*` attributes. Which is doubly awkward, because
+rootless is exactly the case cited in the operator guide and in TODO.md as the reason *not* to
+hard-code `/var/run/docker.sock` as a plugin mount source.
+
+Two smaller fixes rode along: the probe now requires an actual socket rather than any existing path
+(a stray regular file would be chosen and then fail on connect, burning the refresh while a real
+socket sat further down the list), and `$DOCKER_CONFIG` is honoured. A `tcp://`/`ssh://` endpoint
+still yields no candidate at all, which is *correct* rather than a limitation: this feature binds
+gateways that exist on this host, so a remote daemon's networks would be actively wrong. That was
+accidental before and is now stated.
+
+Only `currentContext` is parsed out of the CLI's `config.json`. That file also holds registry
+credentials, so nothing else is read from it and none of it is ever logged.
+
+### Method note
+
+The throwaway context was created and removed inside the measurement, with the config file's sha256
+compared before and after to prove nothing else was touched. `docker context rm` leaves the now-empty
+`contexts/meta` directory behind — worth knowing if a future probe checks for the store's existence
+rather than its contents.
