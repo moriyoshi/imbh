@@ -572,11 +572,39 @@ fn looks_like_docker_bridge(name: &str) -> bool {
 ///
 /// Non-Linux unices have no sysfs and no Docker bridge networks either, so the name test stands
 /// alone there.
+///
+/// `name` is interpolated into a path, so it is rejected unless it is a **single ordinary path
+/// component** — no `/`, no `..`, no absolute prefix. Two things already make a traversal
+/// unreachable here: interface names come from the kernel, which does not permit `/` in one, and
+/// [`bridges_from_ifaddrs`] runs [`looks_like_docker_bridge`] first, which admits only `docker0` or
+/// `br-` plus 12 hex digits. But neither is visible from this function, and the second is an
+/// ordering dependency inside a `&&` — reorder that expression, or call this from somewhere new,
+/// and the only thing standing between a name and `/sys/class/net/../../..` would be gone. The
+/// check below costs nothing and does not depend on either.
 fn is_bridge_device(name: &str) -> bool {
+    if !is_path_component(name) {
+        return false;
+    }
     match cfg!(target_os = "linux") {
         true => Path::new(&format!("/sys/class/net/{name}/bridge")).is_dir(),
         false => true,
     }
+}
+
+/// Is `name` exactly one ordinary path component — something that can only ever name a child of the
+/// directory it is joined to?
+///
+/// Parsed rather than pattern-matched against a deny-list of `/` and `..`, so platform path syntax
+/// is the authority on what a component is.
+fn is_path_component(name: &str) -> bool {
+    let mut components = Path::new(name).components();
+    // `Normal` excludes `.`, `..`, and any root or prefix; comparing it back to `name` additionally
+    // rejects anything the parser normalized away, such as a trailing slash.
+    let single = matches!(
+        components.next(),
+        Some(std::path::Component::Normal(only)) if only.to_str() == Some(name)
+    );
+    single && components.next().is_none()
 }
 
 /// Every `(interface, address, netmask)` this host has, IPv4 and IPv6.
@@ -822,6 +850,44 @@ mod tests {
         )];
         let bridges = bridges_from_ifaddrs(&ifaddrs, |_| true);
         assert_eq!(bridges[0].subnet, cidr("fd00:d0::/64"));
+    }
+
+    /// `is_bridge_device` interpolates its argument into a path, so it must refuse anything that is
+    /// not a single ordinary component — independently of the name filter that happens to run
+    /// before it today.
+    #[test]
+    fn the_sysfs_probe_refuses_a_name_that_could_escape_its_directory() {
+        for name in [
+            "../../../etc",
+            "..",
+            ".",
+            "",
+            "/etc/passwd",
+            "docker0/../../..",
+            "a/b",
+            "docker0/",
+            "./docker0",
+        ] {
+            assert!(
+                !is_bridge_device(name),
+                "{name:?} must not reach the filesystem"
+            );
+            assert!(!is_path_component(name), "{name:?}");
+        }
+        // An ordinary name still is one. (Whether the device exists is the host's business; this
+        // asserts only that the guard does not reject it.)
+        for name in ["docker0", "br-1a2b3c4d5e6f", "eth0"] {
+            assert!(is_path_component(name), "{name:?}");
+        }
+    }
+
+    /// The two filters are independent: neither may be load-bearing for the other's job.
+    #[test]
+    fn the_name_filter_and_the_device_probe_do_not_rely_on_each_other() {
+        // A traversal that would pass the *name* filter if it were ever reordered or removed.
+        assert!(!is_bridge_device("br-../../../etc"));
+        // ...and the name filter rejects it too, on its own.
+        assert!(!looks_like_docker_bridge("br-../../../etc"));
     }
 
     /// The real thing, on whatever host runs the tests. It must not panic, and everything it
