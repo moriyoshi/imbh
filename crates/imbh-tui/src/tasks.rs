@@ -55,16 +55,15 @@ pub(crate) fn request_refresh(
 }
 
 /// Fetch a metric's dimensions off the event-loop thread and deliver them as `Update::MetricDims`.
-/// Discovery is time-range independent, so only the series cap is threaded through.
+/// Discovery is time-range and kind independent, so only the per-axis value cap is threaded through.
 pub(crate) fn request_metric_dims(
     name: String,
-    kind: String,
     backend: Backend,
-    max_series: usize,
+    max_values: usize,
     sender: mpsc::UnboundedSender<Update>,
 ) {
     tokio::spawn(async move {
-        let dims = discover_dims(&backend, &name, &kind, max_series).await;
+        let dims = discover_dims(&backend, &name, max_values).await;
         let _ = sender.send(Update::MetricDims { metric: name, dims });
     });
 }
@@ -78,14 +77,8 @@ pub(crate) fn maybe_discover_label_dims(
     options: &Options,
     sender: &mpsc::UnboundedSender<Update>,
 ) {
-    if let Some((name, kind)) = app.completion_dim_request() {
-        request_metric_dims(
-            name,
-            kind,
-            backend.clone(),
-            options.max_series,
-            sender.clone(),
-        );
+    if let Some(name) = app.completion_dim_request() {
+        request_metric_dims(name, backend.clone(), options.max_series, sender.clone());
     }
     // The Logs screen's `{…}` selector draws its vocabulary from cross-signal attribute discovery
     // rather than a per-metric tree, so it has its own (analogous) fetch path.

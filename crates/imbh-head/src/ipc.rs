@@ -53,6 +53,7 @@ use crate::{HeadError, dto};
 pub const CONTENT_TYPE: &str = "application/vnd.apache.arrow.stream";
 
 // Schema-metadata keys. Namespaced so they cannot collide with anything Arrow or DataFusion writes.
+const META_SERIES_STARTS: &str = "imbh.series.starts";
 const META_EFFECTIVE_START: &str = "imbh.traces.effective_start_ns";
 const META_LOG_STATS: &str = "imbh.logs.stats";
 const META_LOG_NEXT: &str = "imbh.logs.next_cursor";
@@ -107,11 +108,24 @@ pub fn decode(bytes: &[u8]) -> Result<RecordBatch, HeadError> {
 /// A series with no samples contributes no rows and so does not survive the encoding. That is the
 /// engine's own Arrow surface behaving the same way, and an empty series carries no information a
 /// head renders.
+///
+/// The row offset each surviving series starts at rides in the schema metadata. Within one
+/// evaluation a label set identifies a series, so the boundaries could be recovered by grouping runs
+/// of equal labels — but a result may be the *concatenation* of several evaluations
+/// ([`exec::promql`](crate::exec::promql) takes a batch of queries), and PromQL aggregation drops
+/// `__name__`, so two queries routinely answer with series that carry identical labels. Recovering
+/// the boundaries by grouping would silently fuse those into one, which is a remote head answering
+/// differently from a local one over the same data.
 pub fn series_to_batch(series: &[dto::Series]) -> RecordBatch {
     let mut labels = MapBuilder::new(None, view_builder(), view_builder());
     let mut timestamps: Vec<i64> = Vec::new();
     let mut values: Vec<f64> = Vec::new();
+    let mut starts: Vec<String> = Vec::new();
     for item in series {
+        if item.samples.is_empty() {
+            continue;
+        }
+        starts.push(timestamps.len().to_string());
         for sample in &item.samples {
             for label in &item.labels {
                 labels.keys().append_value(&label.name);
@@ -124,30 +138,66 @@ pub fn series_to_batch(series: &[dto::Series]) -> RecordBatch {
             values.push(sample.value);
         }
     }
-    batch(vec![
-        ("labels", col(labels.finish())),
-        ("ts", col(TimestampNanosecondArray::from(timestamps))),
-        ("value", col(Float64Array::from(values))),
-    ])
+    batch_with_metadata(
+        vec![
+            ("labels", col(labels.finish())),
+            ("ts", col(TimestampNanosecondArray::from(timestamps))),
+            ("value", col(Float64Array::from(values))),
+        ],
+        [(META_SERIES_STARTS.to_owned(), starts.join(","))].into(),
+    )
 }
 
-/// Rebuild the series from a long-form batch, grouping the runs of consecutive rows that share a
-/// label set — which is exactly how [`series_to_batch`] laid them down, so order and grouping both
-/// survive.
+/// Rebuild the series from a long-form batch, splitting it at the row offsets
+/// [`series_to_batch`] recorded in the schema metadata, so order, grouping, and two same-labelled
+/// series' separateness all survive.
+///
+/// A batch with no such metadata is one an older daemon wrote; fall back to grouping the runs of
+/// consecutive rows that share a label set, which is what this always did and is exact for any
+/// single-query result.
 pub fn series_from_batch(batch: &RecordBatch) -> Result<Vec<dto::Series>, HeadError> {
     let labels = column::<MapArray>(batch, "labels")?;
     let timestamps = column::<TimestampNanosecondArray>(batch, "ts")?;
     let values = column::<Float64Array>(batch, "value")?;
+    let starts: Option<Vec<usize>> = batch
+        .schema()
+        .metadata()
+        .get(META_SERIES_STARTS)
+        .map(|encoded| {
+            encoded
+                .split(',')
+                .filter(|part| !part.is_empty())
+                .map(|part| {
+                    part.parse::<usize>().map_err(|_| {
+                        malformed(format!("series start offsets are not numbers: {encoded}"))
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .transpose()?;
 
     let mut out: Vec<dto::Series> = Vec::new();
+    // The recorded offsets are ascending, so one cursor walks them alongside the rows.
+    let mut next_start = 0usize;
     for row in 0..batch.num_rows() {
         let row_labels = map_row(labels, row)?;
         let sample = dto::SamplePoint {
             timestamp_ns: timestamps.value(row),
             value: values.value(row),
         };
+        let continues = match &starts {
+            Some(starts) => {
+                let breaks = starts.get(next_start) == Some(&row);
+                if breaks {
+                    next_start += 1;
+                }
+                !breaks
+            }
+            // No boundaries recorded: a run of equal labels is one series.
+            None => out.last().is_some_and(|series| series.labels == row_labels),
+        };
         match out.last_mut() {
-            Some(series) if series.labels == row_labels => series.samples.push(sample),
+            Some(series) if continues => series.samples.push(sample),
             _ => out.push(dto::Series {
                 labels: row_labels,
                 samples: vec![sample],
@@ -538,10 +588,6 @@ fn col<A: Array + 'static>(array: A) -> ArrayRef {
     Arc::new(array)
 }
 
-fn batch(columns: Vec<(&str, ArrayRef)>) -> RecordBatch {
-    batch_with_metadata(columns, HashMap::new())
-}
-
 /// Assemble a batch, deriving each column's `Field` from the array it holds so an empty result
 /// carries a schema byte-for-byte identical to a populated one — which is what lets a head decode
 /// the empty case through exactly the same path.
@@ -732,6 +778,68 @@ mod tests {
             through_ipc(&series, |s| series_to_batch(s), series_from_batch),
             series
         );
+    }
+
+    /// `exec::promql` concatenates one evaluation per requested query, and PromQL aggregation drops
+    /// `__name__` — so two queries answering with the same label set is ordinary, not pathological.
+    /// Recovering the series boundaries by grouping runs of equal labels fused them into one, which
+    /// made a remote head answer differently from a local one over the same data (the catalog's
+    /// multi-metric selection showed a single row).
+    #[test]
+    fn two_series_with_the_same_labels_stay_two_series() {
+        let series = vec![
+            dto::Series {
+                labels: Vec::new(),
+                samples: vec![sample(1, 1.0), sample(2, 2.0)],
+            },
+            dto::Series {
+                labels: Vec::new(),
+                samples: vec![sample(1, 3.0), sample(2, 4.0)],
+            },
+            // Adjacent, identical, *and* the same samples: nothing about the rows tells them apart.
+            dto::Series {
+                labels: vec![label("service", "cart")],
+                samples: vec![sample(1, 5.0)],
+            },
+            dto::Series {
+                labels: vec![label("service", "cart")],
+                samples: vec![sample(1, 5.0)],
+            },
+        ];
+        assert_eq!(
+            through_ipc(&series, |s| series_to_batch(s), series_from_batch),
+            series
+        );
+    }
+
+    /// A batch from a daemon that predates the boundary metadata still decodes — by the run-of-equal-
+    /// labels grouping, which is exact for any single-query result.
+    #[test]
+    fn a_batch_without_boundary_metadata_falls_back_to_label_runs() {
+        let series = vec![
+            dto::Series {
+                labels: vec![label("service", "cart")],
+                samples: vec![sample(1, 1.0), sample(2, 2.0)],
+            },
+            dto::Series {
+                labels: vec![label("service", "api")],
+                samples: vec![sample(1, 3.0)],
+            },
+        ];
+        let batch = series_to_batch(&series);
+        let stripped = RecordBatch::try_new(
+            Arc::new(Schema::new(batch.schema().fields().clone())),
+            batch.columns().to_vec(),
+        )
+        .expect("same columns, metadata-free schema");
+        assert!(
+            !stripped
+                .schema()
+                .metadata()
+                .contains_key(META_SERIES_STARTS),
+            "the fallback path is the one under test"
+        );
+        assert_eq!(series_from_batch(&stripped).expect("decode"), series);
     }
 
     #[test]

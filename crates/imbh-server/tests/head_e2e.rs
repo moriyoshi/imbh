@@ -146,6 +146,44 @@ async fn a_remote_head_sees_what_a_local_one_sees() {
         "each sub-query keeps its own __name__, in request order"
     );
 
+    // Aggregation drops `__name__` (Prometheus semantics), so two sub-queries answering with the
+    // *same* labels is ordinary. The wire must still hand back two series: recovering the
+    // boundaries by grouping equal labels fused them, which is a remote head disagreeing with a
+    // local one over the same data.
+    let request = dto::EvalRequest {
+        queries: vec!["sum(cpu)".to_owned(), "sum(cpu)".to_owned()],
+        window: WINDOW,
+        caps: dto::EvalCaps::default(),
+    };
+    let local = exec::promql(&db, &request).await.expect("local promql");
+    let remote = client.promql(&request).await.expect("remote promql");
+    assert_eq!(local.len(), 2, "two sub-queries, two series: {local:?}");
+    assert!(local[0].labels.is_empty() && local[1].labels.is_empty());
+    assert_eq!(local, remote);
+
+    // ── metric dimensions (JSON) ────────────────────────────────────────────────────────────────
+    let request = dto::MetricDimensionsRequest {
+        metric: "cpu".to_owned(),
+        max_values: None,
+    };
+    let local = exec::metric_dimensions(&db, &request)
+        .await
+        .expect("local dimensions");
+    let remote = client
+        .metric_dimensions(&request)
+        .await
+        .expect("remote dimensions");
+    assert_eq!(local, remote);
+    assert_eq!(
+        local.dimensions,
+        vec![dto::MetricDimension {
+            label: "service".to_owned(),
+            values: vec!["cart".to_owned()],
+            truncated: false,
+        }],
+        "the resource axis is groupable and comes back named"
+    );
+
     // ── LogQL metric expression (Arrow IPC) ─────────────────────────────────────────────────────
     let request = eval(r#"rate({service="cart"}[5m])"#);
     let local = exec::logql(&db, &request).await.expect("local logql");
@@ -338,6 +376,7 @@ fn the_head_prefix_is_a_gateable_unit() {
     for path in [
         imbh_head::path::STATS,
         imbh_head::path::METRICS_CATALOG,
+        imbh_head::path::METRICS_DIMENSIONS,
         imbh_head::path::METRICS_PROMQL,
         imbh_head::path::METRICS_EXEMPLARS,
         imbh_head::path::TRACES_SEARCH,

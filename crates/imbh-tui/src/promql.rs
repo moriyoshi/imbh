@@ -92,6 +92,24 @@ pub(crate) fn metric_ident_from_promql(query: &str) -> Option<String> {
     None
 }
 
+/// The metric a catalog-built query visualizes, used to name its series when several queries are
+/// shown together. PromQL aggregation drops `__name__` by design, so a `sum by (…)` or a
+/// `histogram_quantile(…)` result cannot say which metric it came from and the series list would
+/// show two selected metrics as indistinguishable rows.
+///
+/// The `_bucket` suffix on a histogram's selector is Prometheus' spelling for that metric's buckets,
+/// not a metric in its own right, so it is trimmed back to the OTel name the catalog lists — which
+/// is also the name the exemplar lookup needs.
+pub(crate) fn query_metric_name(query: &str) -> Option<String> {
+    let ident = metric_ident_from_promql(query)?;
+    if query.trim_start().starts_with("histogram_quantile")
+        && let Some(base) = ident.strip_suffix("_bucket")
+    {
+        return Some(base.to_owned());
+    }
+    Some(ident)
+}
+
 /// Return the index just past the `)` matching the `(` at `open`; the end of the slice if unbalanced.
 pub(crate) fn skip_paren_group(bytes: &[u8], open: usize) -> usize {
     let mut depth = 0usize;
@@ -127,12 +145,22 @@ pub(crate) fn matcher_braces(matchers: &[(&str, &str)]) -> String {
 
 /// Build the PromQL to visualize a metric of the given OTel kind, restricted to `matchers` and
 /// optionally aggregated by `group_by`: gauges plot as-is (avg when grouped), cumulative sums as a
-/// per-second rate, histograms as a p95 over the bucket rate (aggregated by `le`).
+/// per-second rate, histograms as a p95 over the bucket rate.
+///
+/// `dimensions` are the metric's discovered label axes ([`crate::fetch::discover_dims`]) and matter
+/// only to the histogram-without-`group_by` case. A gauge or sum selected whole keeps one series per
+/// label set for free — the selector and `rate()` both carry every label through, `__name__`
+/// included. A histogram cannot: its quantile is only expressible as an aggregation, so whatever the
+/// `sum by (…)` list omits is summed away. Grouping by `le` alone therefore collapsed the whole
+/// metric into a single anonymous `{}` series, which made several selected histograms
+/// indistinguishable in the series list. Naming the metric's own axes (plus `__name__`) restores the
+/// per-series, per-metric split the other kinds have.
 pub(crate) fn build_metric_query(
     name: &str,
     kind: &str,
     matchers: &[(&str, &str)],
     group_by: Option<&str>,
+    dimensions: &[&str],
 ) -> String {
     let braces = matcher_braces(matchers);
     match (kind, group_by) {
@@ -140,23 +168,19 @@ pub(crate) fn build_metric_query(
             "histogram_quantile(0.95, sum by ({label}, le) (rate({name}_bucket{braces}[5m])))"
         ),
         ("histogram", None) => {
-            format!("histogram_quantile(0.95, sum by (le) (rate({name}_bucket{braces}[5m])))")
+            // `le` first (the bucket axis `histogram_quantile` consumes), then the identity and the
+            // metric's own axes, so the resulting series read like a gauge's would.
+            let mut labels = vec!["le", "__name__"];
+            labels.extend(dimensions);
+            format!(
+                "histogram_quantile(0.95, sum by ({}) (rate({name}_bucket{braces}[5m])))",
+                labels.join(", ")
+            )
         }
         ("sum", Some(label)) => format!("sum by ({label}) (rate({name}{braces}[5m]))"),
         ("sum", None) => format!("rate({name}{braces}[5m])"),
         (_, Some(label)) => format!("avg by ({label}) ({name}{braces})"),
         (_, None) => format!("{name}{braces}"),
-    }
-}
-
-/// The bare selector used to *discover* a metric's groupable dimensions: evaluated as an instant over
-/// the metric's whole retained span, its returned series carry the full label set (data-point
-/// attributes plus the resource `service`), which we read to build the tree. A plain selector (not a
-/// rate) avoids depending on samples landing in a rate window.
-pub(crate) fn discovery_promql(name: &str, kind: &str) -> String {
-    match kind {
-        "histogram" => format!("{name}_bucket"),
-        _ => name.to_owned(),
     }
 }
 
@@ -168,26 +192,64 @@ mod tests {
     fn build_metric_query_covers_kinds_matchers_and_group_by() {
         // Whole metric (no matchers, no group-by) reproduces the kind's base expression.
         assert_eq!(
-            build_metric_query("temperature", "gauge", &[], None),
+            build_metric_query("temperature", "gauge", &[], None, &[]),
             "temperature"
         );
         assert_eq!(
-            build_metric_query("reqs", "sum", &[], None),
+            build_metric_query("reqs", "sum", &[], None, &[]),
             "rate(reqs[5m])"
         );
         // Group-by.
         assert_eq!(
-            build_metric_query("cpu", "gauge", &[], Some("host")),
+            build_metric_query("cpu", "gauge", &[], Some("host"), &["host"]),
             "avg by (host) (cpu)"
         );
         assert_eq!(
-            build_metric_query("lat", "histogram", &[], Some("service")),
+            build_metric_query("lat", "histogram", &[], Some("service"), &["service"]),
             "histogram_quantile(0.95, sum by (service, le) (rate(lat_bucket[5m])))"
         );
         // Matchers combine across axes.
         assert_eq!(
-            build_metric_query("cpu", "gauge", &[("service", "cart"), ("host", "a")], None),
+            build_metric_query(
+                "cpu",
+                "gauge",
+                &[("service", "cart"), ("host", "a")],
+                None,
+                &["service", "host"]
+            ),
             "cpu{service=\"cart\",host=\"a\"}"
+        );
+    }
+
+    /// A histogram selected *whole* must keep the same per-series, per-metric split a gauge or a sum
+    /// gets for free. Its quantile is only expressible as an aggregation, so every label the
+    /// `sum by (…)` list omits is summed away: grouping by `le` alone collapsed the metric to one
+    /// anonymous `{}` series and made several selected histograms indistinguishable in the list.
+    #[test]
+    fn a_whole_histogram_keeps_its_identity_and_its_axes() {
+        // No discovered axes: `__name__` alone still tells two selected histograms apart.
+        assert_eq!(
+            build_metric_query("lat", "histogram", &[], None, &[]),
+            "histogram_quantile(0.95, sum by (le, __name__) (rate(lat_bucket[5m])))"
+        );
+        // With axes: one quantile series per label set, exactly as a gauge's bare selector gives.
+        assert_eq!(
+            build_metric_query("lat", "histogram", &[], None, &["route", "service"]),
+            "histogram_quantile(0.95, sum by (le, __name__, route, service) \
+             (rate(lat_bucket[5m])))"
+        );
+        // A checked value narrows through the matcher; the axes stay named, so the pinned value is
+        // still visible on the resulting series' labels.
+        assert_eq!(
+            build_metric_query(
+                "lat",
+                "histogram",
+                &[("route", "get")],
+                None,
+                &["route", "service"]
+            ),
+            "histogram_quantile(0.95, sum by (le, __name__, route, service) \
+             (rate(lat_bucket{route=\"get\"}[5m])))"
         );
     }
 
@@ -218,6 +280,30 @@ mod tests {
             Some("latency_bucket")
         );
         assert_eq!(metric_ident_from_promql("(((").as_deref(), None);
+    }
+
+    #[test]
+    fn a_query_names_the_metric_it_visualizes() {
+        assert_eq!(query_metric_name("cpu{host=\"a\"}").as_deref(), Some("cpu"));
+        assert_eq!(
+            query_metric_name("sum by (service) (rate(reqs[5m]))").as_deref(),
+            Some("reqs")
+        );
+        // The `_bucket` suffix is Prometheus' spelling for a histogram's buckets, not a metric of
+        // its own: the catalog (and the exemplar lookup) know it as `lat`.
+        assert_eq!(
+            query_metric_name(
+                "histogram_quantile(0.95, sum by (le, __name__) (rate(lat_bucket[5m])))"
+            )
+            .as_deref(),
+            Some("lat")
+        );
+        // ...and only there. A counter genuinely named `*_bucket` keeps its name.
+        assert_eq!(
+            query_metric_name("rate(token_bucket[5m])").as_deref(),
+            Some("token_bucket")
+        );
+        assert_eq!(query_metric_name("((("), None);
     }
 
     #[test]

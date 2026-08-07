@@ -428,15 +428,9 @@ pub(crate) fn handle_key(
         // Space expands/collapses the selected metric or dimension in the catalog tree, lazily
         // fetching a metric's dimensions on first expand.
         KeyCode::Char(' ') if app.on_catalog() => {
-            if let Some((name, kind)) = app.toggle_node() {
-                // Discovery spans all metric data (picker-independent); only the series cap matters.
-                request_metric_dims(
-                    name,
-                    kind,
-                    backend.clone(),
-                    options.max_series,
-                    sender.clone(),
-                );
+            if let Some(name) = app.toggle_node() {
+                // Discovery spans all metric data (picker-independent); only the value cap matters.
+                request_metric_dims(name, backend.clone(), options.max_series, sender.clone());
             }
         }
         // Catalog → series list (Enter): build the matching PromQL and visualize it — every metric

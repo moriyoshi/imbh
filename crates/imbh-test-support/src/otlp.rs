@@ -417,6 +417,53 @@ pub fn otlp_sum(
     .encode_to_vec()
 }
 
+/// An OTLP explicit-bucket cumulative histogram for `service` carrying record-level `attrs`, with one
+/// data point per `(time, counts)` entry (`counts.len() == bounds.len() + 1`). The multi-point,
+/// attributed shape a `rate()`/`histogram_quantile()` evaluation needs.
+pub fn otlp_hist_labeled(
+    service: &str,
+    metric_name: &str,
+    attrs: &[(&str, &str)],
+    bounds: &[f64],
+    points: &[(u64, &[u64])],
+) -> Vec<u8> {
+    use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
+    use opentelemetry_proto::tonic::metrics::v1::{
+        Histogram, HistogramDataPoint, Metric, ResourceMetrics, ScopeMetrics, metric,
+    };
+
+    let data_points = points
+        .iter()
+        .map(|(time, counts)| HistogramDataPoint {
+            time_unix_nano: *time,
+            count: counts.iter().sum(),
+            explicit_bounds: bounds.to_vec(),
+            bucket_counts: counts.to_vec(),
+            attributes: attrs.iter().map(|(k, v)| kv(k, v)).collect(),
+            ..Default::default()
+        })
+        .collect();
+    ExportMetricsServiceRequest {
+        resource_metrics: vec![ResourceMetrics {
+            resource: Some(service_resource(service)),
+            scope_metrics: vec![ScopeMetrics {
+                metrics: vec![Metric {
+                    name: metric_name.to_owned(),
+                    unit: "s".to_owned(),
+                    data: Some(metric::Data::Histogram(Histogram {
+                        data_points,
+                        aggregation_temporality: 2,
+                    })),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+    }
+    .encode_to_vec()
+}
+
 /// A one-point OTLP explicit-bucket cumulative histogram (`counts.len() == bounds.len() + 1`).
 pub fn otlp_hist(metric_name: &str, bounds: &[f64], counts: &[u64]) -> Vec<u8> {
     use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;

@@ -236,6 +236,40 @@ pub async fn metric_catalog(db: &Arc<Db>) -> Result<dto::MetricCatalog, HeadErro
     Ok(dto::MetricCatalog { metrics })
 }
 
+/// One metric's groupable labels and their distinct values — what a "group/filter by …" picker is
+/// built from.
+///
+/// Read from the metric tables rather than by evaluating a selector, which is the only way it can
+/// work for every kind: PromQL has no bare selector for a cumulative histogram (its buckets are
+/// reachable only through `histogram_quantile(…)`), so a discovery query phrased in PromQL answers
+/// nothing at all for the one family whose labels are hardest to guess. Reading the tables is also
+/// independent of the picker's time range and of any evaluation cap.
+pub async fn metric_dimensions(
+    db: &Arc<Db>,
+    request: &dto::MetricDimensionsRequest,
+) -> Result<dto::MetricDimensions, HeadError> {
+    let dimensions = db
+        .metrics()
+        .dimensions(&request.metric)
+        .await
+        .map_err(HeadError::from_db)?;
+    let cap = request.max_values.unwrap_or(usize::MAX);
+    Ok(dto::MetricDimensions {
+        dimensions: dimensions
+            .into_iter()
+            .map(|(label, mut values)| {
+                let truncated = values.len() > cap;
+                values.truncate(cap);
+                dto::MetricDimension {
+                    label,
+                    values,
+                    truncated,
+                }
+            })
+            .collect(),
+    })
+}
+
 /// One metric's exemplars — the metric→trace drill-down links.
 pub async fn exemplars(
     db: &Arc<Db>,

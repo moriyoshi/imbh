@@ -4037,3 +4037,95 @@ The gate was run twice — once after the serde_json pass, once after the base64
 failing axis reported the same numbers both times (275 crates, 34,916,248 B, 275 → 218 → 76); only
 the measurement-only idle RSS moved, by 0.1 MB, which is noise. That is the evidence that the base64
 swap is footprint-neutral rather than merely assumed to be.
+
+## 2026-08-08 — imbh-tui histogram catalog: discovery, grouping, and a head-API series fuse
+
+Two reported defects in the Metrics catalog for histogram metrics. They share a root cause and turned
+up a third, unreported one in the head API on the way.
+
+### 1. A histogram had no dimensions to filter by
+
+`fetch::discover_dims` discovered a metric's groupable axes by evaluating its **bare PromQL
+selector** over the metric's whole retained span and reading the label keys/values off the returned
+series. That works for a gauge and a sum. It cannot work for a cumulative histogram: `parse_expr` in
+`imbh-lgtm` refuses a bare histogram selector outright ("histogram selectors require canonical
+`histogram_quantile(sum by (le, ...)(rate(...)))`"), because the buckets are not a scalar series.
+`discover_dims` swallows every failure into `Vec::new()`, so a histogram silently got
+`dims = Some([])` → the tree rendered `(no dimensions)` → no axis existed to check, and the metric
+could never be filtered. Confirmed by reproduction before touching anything: `discover_dims` returned
+`[]` for a histogram whose data carries both `route` and `service`.
+
+There is no PromQL phrasing that fixes this — the labels are what you are trying to discover, so you
+cannot name them in a `sum by (…)` up front, and `attributes/keys` is cross-signal and says nothing
+about which metric carries what. Discovery had to stop being an evaluation. Added
+`Db::metrics().dimensions(metric)` (a `SELECT DISTINCT service, attributes` union over the five
+metric tables, folding the promoted `service` column in under the name a PromQL label set gives it)
+and a head operation over it, so both backends answer identically. It is kind-agnostic, exact,
+picker-independent, and bounded by no evaluation cap — all properties the old path only approximated.
+`metrics().series()` stays as it was: the raw per-series attribute sets, resource axis excluded.
+
+### 2. Several selected histograms showed as one series
+
+`build_metric_query` emitted `histogram_quantile(0.95, sum by (le) (rate(m_bucket[5m])))`. A quantile
+is only expressible as an aggregation, so every label the `sum by (…)` list omits is summed away —
+a metric split over N label sets plotted as **one** anonymous `{}` series, where a gauge selected
+whole plots N. With defect 1 in force there were no discovered axes to name, so the two defects held
+each other up. The grouping now names `le`, `__name__` and the metric's own discovered axes.
+
+`__name__` in the grouping does *not* survive: `LabelSet::by`/`without` drop it unconditionally
+(Prometheus semantics). Worth recording — it means **no** aggregation result can carry its metric
+name, `rate()` included, so the comment in `fetch.rs` claiming each sub-query's series "keeps its
+`__name__`" was wrong for sums too, not just histograms. Only a bare selector keeps it.
+
+So the TUI now runs the catalog's sub-queries **one at a time** rather than as one `EvalRequest`
+batch, and synthesizes `__name__=<metric>` onto each result. Only when more than one query runs: a
+single (possibly hand-typed) query is already unambiguous, and naming an arbitrary expression from
+its leading identifier would be a claim we cannot make. The `_bucket` suffix is trimmed for a
+`histogram_quantile` query, which also repairs the metric-detail exemplar lookup for histograms (it
+was looking up `latency_bucket`, a name no exemplar is stored under). The batch endpoint stays for
+callers that do not need to attribute results; the cost it now documents is provenance, not just the
+extra catalog reads it saves.
+
+### 3. (Unreported) a remote head fused two same-labelled series into one
+
+Found while reproducing #2. `ipc::series_from_batch` reconstructed the series boundaries by
+**grouping runs of consecutive rows with equal labels**. Within one evaluation that is exact — the
+evaluator builds from a `BTreeMap<LabelSet, _>`, so a label set identifies a series. But
+`exec::promql` concatenates one evaluation per requested query, and since aggregation drops
+`__name__`, two queries answering with identical labels is ordinary rather than pathological. The
+decoder merged them: `imbh-tui --url` showed **one** row where the local backend showed two, over the
+same data. That is precisely the property `head_e2e.rs` exists to defend, and no case covered it.
+
+Fixed by recording each series' starting row offset in the IPC schema metadata (`imbh.series.starts`)
+— the module already documents "anything not row-shaped rides in the schema metadata", and it leaves
+the column schema, and so the `prom_matrix_schema` parity test, untouched. A batch without the
+metadata falls back to the old grouping, so a new client still reads an old daemon.
+
+### Verified
+
+`fmt --all --check` clean; `build --workspace`, `clippy --workspace --all-targets -D warnings`, and
+`test --workspace` all clean (**64 suites, 600 passed, 0 failed, 4 ignored**, up from the 592 of the
+serde_json entry above — the eight new tests listed below). No dependency or feature change, so the
+footprint gate is not implicated — `Cargo.toml`/`Cargo.lock` are untouched.
+
+Rebased onto the canonical-JSON refactor before merging, and re-run there: the two conflicts were
+both append collisions in `CHANGELOG.md` and this file, and the codec swap does not reach this work —
+`dimensions()` reads only `AnyValue::Str` attributes, so the `Double` re-spelling that entry calls a
+data-format break cannot touch it.
+
+New regression tests: `imbh` `metrics_dimensions_cover_every_kind_and_the_service_axis`;
+`imbh-head` `two_series_with_the_same_labels_stay_two_series` and
+`a_batch_without_boundary_metadata_falls_back_to_label_runs`; `imbh-server` `head_e2e` gained a
+colliding-label batch case and a `metrics/dimensions` parity case; `imbh-tui`
+`fetch::histogram_catalog` (dimensions offered, a checked value actually filtering, several
+histograms staying distinguishable) plus `a_whole_histogram_keeps_its_identity_and_its_axes` and
+`a_query_names_the_metric_it_visualizes`. `imbh-test-support` gained `otlp_hist_labeled` — a
+multi-point, attributed cumulative histogram, which no existing fixture provided.
+
+### Open
+
+- `Options::max_series` now doubles as the per-axis value cap for dimension discovery. It is a
+  reasonable bound but not the same quantity; if a picker ever needs its own limit, `max_values` is
+  already a distinct field on `dto::MetricDimensionsRequest` (and `truncated` is already reported).
+- The additions are API-additive across `imbh` and `imbh-head`, so the next release is a minor bump,
+  not a patch.

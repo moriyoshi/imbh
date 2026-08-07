@@ -106,16 +106,40 @@ impl Backend {
         .map(|catalog| catalog.metrics)
     }
 
-    /// Evaluate one or more PromQL queries, concatenating their series. Several at once because the
-    /// metric catalog emits one selector per checked metric — and because sending them together
-    /// costs one metric-catalog read rather than one apiece (see [`imbh_head::exec::promql`]).
+    /// One metric's groupable labels and their values — the catalog tree's dimension axes. Read from
+    /// the metric tables rather than evaluated, which is what makes it answer for a histogram too
+    /// (see [`imbh_head::exec::metric_dimensions`]).
+    pub(crate) async fn metric_dimensions(
+        &self,
+        metric: &str,
+        max_values: usize,
+    ) -> Result<Vec<dto::MetricDimension>, HeadError> {
+        let request = dto::MetricDimensionsRequest {
+            metric: metric.to_owned(),
+            max_values: Some(max_values),
+        };
+        match self {
+            Backend::Local(db) => exec::metric_dimensions(db, &request).await,
+            Backend::Remote(client) => client.metric_dimensions(&request).await,
+        }
+        .map(|result| result.dimensions)
+    }
+
+    /// Evaluate one PromQL query.
+    ///
+    /// The head API takes a batch (and a batch costs one metric-catalog read rather than one
+    /// apiece), but a batch answers with the series *concatenated* and PromQL aggregation drops
+    /// `__name__`, so the caller could no longer tell which query produced which series. The catalog
+    /// screen visualizes several metrics at once and must, so it issues them one at a time — a
+    /// handful of round trips on an interactive refresh, in exchange for a series list that names
+    /// what it is showing.
     pub(crate) async fn promql(
         &self,
-        queries: &[String],
+        query: &str,
         range: EvalRange,
         limits: EvalLimits,
     ) -> Result<Vec<dto::Series>, HeadError> {
-        let request = eval_request(queries, range, limits);
+        let request = eval_request(std::slice::from_ref(&query.to_owned()), range, limits);
         match self {
             Backend::Local(db) => exec::promql(db, &request).await,
             Backend::Remote(client) => client.promql(&request).await,

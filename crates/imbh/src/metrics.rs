@@ -210,6 +210,71 @@ impl MetricsApi {
         Ok(out)
     }
 
+    /// The distinct **label dimensions** of `metric`: every label a series of it carries, each with
+    /// its sorted distinct values, sorted by label name.
+    ///
+    /// "Label" here is what a *query* sees rather than what a row stores: the promoted `service`
+    /// column surfaces under the `service` key — the name PromQL evaluation gives it — alongside
+    /// every string-valued data-point attribute. That is the difference from
+    /// [`series`](Self::series), which answers the raw per-series attribute sets and deliberately
+    /// leaves the resource axis out.
+    ///
+    /// Kind-agnostic: it unions the five metric tables by name, so a histogram answers this exactly
+    /// as a gauge does. That is the point of it existing. PromQL cannot *select* a cumulative
+    /// histogram bare — its buckets are reachable only through `histogram_quantile(…)` — so a UI
+    /// building a "group/filter by …" picker cannot discover a histogram's labels by evaluating a
+    /// selector the way it can for a gauge or a sum.
+    pub async fn dimensions(&self, metric: &str) -> Result<Vec<(String, Vec<String>)>> {
+        let mut params = SqlParams::with_promote(self.db.storage.promote().keys());
+        let m = params.str(metric);
+        let sql = [
+            Table::MetricsGauge,
+            Table::MetricsSum,
+            Table::MetricsHistogram,
+            Table::MetricsExpHistogram,
+            Table::MetricsSummary,
+        ]
+        .iter()
+        .map(|table| {
+            format!(
+                "SELECT DISTINCT service, attributes FROM {} WHERE metric = {m}",
+                table.as_str()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" UNION ");
+        let mut out: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
+            std::collections::BTreeMap::new();
+        for b in &self
+            .db
+            .sql_with_params(sql, params.into_values())
+            .collect()
+            .await?
+        {
+            for i in 0..b.num_rows() {
+                if let Some(service) = get_str(b.column(0).as_ref(), i) {
+                    out.entry("service".to_owned()).or_default().insert(service);
+                }
+                let Some(json) = get_str(b.column(1).as_ref(), i) else {
+                    continue;
+                };
+                for (key, value) in Attributes::from_canonical_json(&json).iter() {
+                    // Only string-valued attributes become labels; that is what a PromQL label set
+                    // carries, so a picker must not offer an axis a matcher could never match.
+                    if let AnyValue::Str(value) = value {
+                        out.entry(key.to_owned())
+                            .or_default()
+                            .insert(value.to_string());
+                    }
+                }
+            }
+        }
+        Ok(out
+            .into_iter()
+            .map(|(label, values)| (label, values.into_iter().collect()))
+            .collect())
+    }
+
     /// All exemplars recorded for `metric` — the trace links to drill from a metric spike into an
     /// example trace (ARCHITECTURE.md §6.4). Unions the four point types that carry exemplars (gauge/sum/
     /// histogram/exp-histogram; summaries have none) and parses the stored `exemplars` JSON.
