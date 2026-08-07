@@ -52,10 +52,14 @@
 //! immediately with `128 + signum`. See `imbh_server::shutdown`.
 
 use std::error::Error;
+use std::sync::Arc;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
 
 use imbh_server::Shutdown;
+
+mod net;
+use net::Net;
 
 /// Extra patience beyond the drain each listener performs itself, covering the wake-up connection and
 /// the plugin's ingest drain. A listener past this is not coming back before the process exits.
@@ -118,15 +122,27 @@ fn main() -> Result<(), Box<dyn Error>> {
         ));
     }
 
+    // Runtime bridge-network discovery, and the access rule resolved against it. Started before the
+    // listeners so `IMBH_LISTEN_ADDR=auto` has an answer by the time one binds; a no-op struct
+    // without the `docker` feature, which is also the only build with anything to discover.
+    let net = Arc::new(Net::new(&shutdown)?);
+
     let db = imbh::Db::builder(&dir)
         .maintenance(imbh::Maintenance::Background(maintenance_interval))
         .flush(flush)
         .duplicates(duplicates)
         .open()?;
 
+    let shown = addr
+        .as_deref()
+        .map(|addr| net.describe_addr(addr, net::HTTP_PORT));
+    let allow_from = net.describe_access();
     banner(
         &dir,
-        addr.as_deref(),
+        Listening {
+            addr: shown.as_deref(),
+            allow_from: allow_from.as_deref(),
+        },
         &flush,
         maintenance_interval,
         drain,
@@ -157,7 +173,14 @@ fn main() -> Result<(), Box<dyn Error>> {
         // per container. Resolving here rather than inside the plugin keeps every environment knob in
         // one place (see the module doc), and it cannot fail — a bad script is reported per container.
         #[cfg_attr(not(feature = "docker-remap"), allow(unused_mut))]
-        let mut plugin_config = imbh_server::docker::PluginConfig::default();
+        let mut plugin_config = imbh_server::docker::PluginConfig {
+            // `container.network.*` resource attributes, when discovery can name the networks a
+            // container is on. Only the Engine API can — the interface scan sees gateways and
+            // subnets but cannot map a container to one — so these stay absent without it.
+            networks: net
+                .container_networks(std::env::var("IMBH_DOCKER_NETWORK_ATTRS").ok().as_deref())?,
+            ..Default::default()
+        };
         #[cfg(feature = "docker-remap")]
         {
             plugin_config.remap =
@@ -186,11 +209,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         let http_db = db.clone();
         endpoints += 1;
         serve_on_thread("HTTP", &stopped_tx, {
-            let shutdown = shutdown.clone();
-            move || {
-                imbh_server::serve_with_limits_until(http_db, &addr, limits, shutdown)
-                    .map_err(|e| format!("HTTP server error on {addr}: {e}"))
-            }
+            let (shutdown, net) = (shutdown.clone(), Arc::clone(&net));
+            move || net.serve_http(http_db, &addr, limits, shutdown)
         });
     }
 
@@ -198,16 +218,17 @@ fn main() -> Result<(), Box<dyn Error>> {
     if let Some(grpc_addr) = grpc_addr {
         let grpc_db = db.clone();
         #[cfg(feature = "tracing")]
-        tracing::info!(%grpc_addr, "OTLP/gRPC: Logs/Trace/Metrics Service Export");
+        tracing::info!(grpc_addr = %net.describe_addr(&grpc_addr, net::GRPC_PORT),
+            "OTLP/gRPC: Logs/Trace/Metrics Service Export");
         #[cfg(not(feature = "tracing"))]
-        println!("  OTLP/gRPC: {grpc_addr}  (Logs/Trace/Metrics Service Export)");
+        println!(
+            "  OTLP/gRPC: {}  (Logs/Trace/Metrics Service Export)",
+            net.describe_addr(&grpc_addr, net::GRPC_PORT)
+        );
         endpoints += 1;
         serve_on_thread("OTLP/gRPC", &stopped_tx, {
-            let shutdown = shutdown.clone();
-            move || {
-                imbh_server::grpc::serve_grpc_blocking_until(grpc_db, &grpc_addr, shutdown)
-                    .map_err(|e| format!("gRPC server error on {grpc_addr}: {e}"))
-            }
+            let (shutdown, net) = (shutdown.clone(), Arc::clone(&net));
+            move || net.serve_grpc(grpc_db, &grpc_addr, shutdown)
         });
     }
 
@@ -233,6 +254,13 @@ fn main() -> Result<(), Box<dyn Error>> {
     db.blocking().close()?;
     report_stopped();
     Ok(())
+}
+
+/// What the startup banner says about the listening posture: the HTTP address as it finally
+/// resolved (`auto` becomes the gateways it found), and the peer filter when one is in force.
+struct Listening<'a> {
+    addr: Option<&'a str>,
+    allow_from: Option<&'a str>,
 }
 
 /// Run one endpoint's blocking serve loop on its own thread, reporting to `stopped` when it returns.
@@ -324,13 +352,14 @@ fn report_stopped() {
 /// otherwise the default build prints to stdout so `imbhd` stays self-describing.
 fn banner(
     dir: &str,
-    addr: Option<&str>,
+    listening: Listening<'_>,
     flush: &imbh::FlushPolicy,
     maintenance_interval: Duration,
     drain: Duration,
     limits: imbh_server::Limits,
     duplicates: imbh::Duplicates,
 ) {
+    let Listening { addr, allow_from } = listening;
     #[cfg(feature = "tracing")]
     {
         match addr {
@@ -341,6 +370,9 @@ fn banner(
                 tracing::info!("mcp: POST /mcp (Model Context Protocol, read-only tools)");
             }
             None => tracing::info!(%dir, "imbhd started with no HTTP listener"),
+        }
+        if let Some(allow_from) = allow_from {
+            tracing::info!(%allow_from, "connections are accepted only from these networks");
         }
         tracing::info!(
             policy = %flush,
@@ -364,6 +396,9 @@ fn banner(
                 println!("  mcp:       POST /mcp  (Model Context Protocol, read-only tools)");
             }
             None => println!("imbhd started, no HTTP listener  (data dir: {dir})"),
+        }
+        if let Some(allow_from) = allow_from {
+            println!("  allow:     {allow_from}  (every other peer is refused on accept)");
         }
         // The effective policy, in the same syntax IMBH_FLUSH accepts — so an operator can copy it
         // back out, tweak one trigger, and know exactly what is running.

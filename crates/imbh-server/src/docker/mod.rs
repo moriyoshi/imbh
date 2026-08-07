@@ -43,12 +43,15 @@
 //! No new crate: the wire types use prost's derive and OTLP's message types, both already in the
 //! default `imbh` graph via `imbh-otlp`. JSON goes through `imbh::parse_json`. Unix only.
 
+pub mod addr;
 pub mod entry;
 pub mod ingest;
 mod json;
+pub mod networks;
 pub mod readlogs;
 #[cfg(feature = "docker-remap")]
 pub mod remap;
+pub mod serve;
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -135,10 +138,13 @@ pub fn serve_plugin_until(
 /// A struct rather than more positional arguments, so a future knob is an added field rather than a
 /// breaking signature change — which is why the four `serve_plugin*` functions above keep the shapes
 /// they shipped with and delegate here.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct PluginConfig {
     /// Ingest batching.
     pub ingest: IngestConfig,
+    /// Bridge-network discovery, when the operator wants `container.network.*` attributes on stored
+    /// records. `None` leaves every record exactly as it was before discovery existed.
+    pub networks: Option<Arc<networks::Networks>>,
     /// The daemon-wide remap default, overridable per container by `--log-opt imbh-remap`.
     #[cfg(feature = "docker-remap")]
     pub remap: remap::Source,
@@ -208,6 +214,7 @@ async fn serve_plugin_async(
 
     let listener = tokio::net::UnixListener::bind(socket)?;
     let plugin = Arc::new(Plugin::new(db, config));
+    plugin.follow_networks();
     let app = plugin_app(Arc::clone(&plugin));
 
     let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
@@ -445,6 +452,9 @@ impl http_body::Body for FrameBody {
 /// A container's live FIFO reader.
 struct Stream {
     container_id: String,
+    /// The same `Arc` the reader thread pumps into, kept here so a network refresh can update this
+    /// container's resource without disturbing the reader (see [`Container::set_networks`]).
+    container: Arc<Container>,
     stop: Arc<AtomicBool>,
 }
 
@@ -460,6 +470,8 @@ pub(crate) struct Plugin {
     /// Compiled scripts, so a restart storm of containers sharing one script compiles it once.
     #[cfg(feature = "docker-remap")]
     scripts: remap::Cache,
+    /// Bridge-network discovery, when network attributes are wanted.
+    networks: Option<Arc<networks::Networks>>,
 }
 
 impl Plugin {
@@ -472,7 +484,42 @@ impl Plugin {
             remap: config.remap,
             #[cfg(feature = "docker-remap")]
             scripts: remap::Cache::default(),
+            networks: config.networks,
         }
+    }
+
+    /// Keep every live container's `container.network.*` attributes in step with discovery.
+    ///
+    /// This is the *only* path by which a container learns its networks after `StartLogging`, and it
+    /// exists because the handler must never call the daemon: `dockerd` runs `StartLogging`
+    /// synchronously while holding the container's lock, and the Engine API's network-inspect path
+    /// resolves attached containers, so a call back from there can deadlock the daemon against its
+    /// own log driver.
+    pub(crate) fn follow_networks(self: &Arc<Self>) {
+        let Some(networks) = self.networks.clone() else {
+            return;
+        };
+        // Weak, so the registered callback does not keep a shut-down plugin alive: the discovery
+        // thread outlives nothing, but it does own this closure for the life of the process.
+        let plugin = Arc::downgrade(self);
+        networks.on_change(move |snapshot| {
+            let Some(plugin) = plugin.upgrade() else {
+                return;
+            };
+            let live: Vec<Arc<Container>> = plugin
+                .streams
+                .lock()
+                .expect("docker plugin stream registry")
+                .values()
+                .map(|stream| Arc::clone(&stream.container))
+                .collect();
+            // The registry lock is released before the resources are rebuilt: `set_networks` takes a
+            // per-container write lock, and holding both would put the discovery thread between
+            // `StartLogging` and every FIFO reader's flush.
+            for container in live {
+                container.set_networks(&snapshot.container_networks(&container.id));
+            }
+        });
     }
 
     /// Dispatch one plugin request. Exposed to tests so the endpoints can be exercised without a
@@ -543,6 +590,12 @@ impl Plugin {
         #[cfg(feature = "docker-remap")]
         container.bind_remap(&info, &self.remap, &self.scripts)?;
         let container = Arc::new(container);
+        // Whatever the last refresh knew. A container that started since then has no network
+        // attributes yet and gains them on the next one (`follow_networks`) — the daemon is never
+        // called from this handler.
+        if let Some(networks) = &self.networks {
+            container.set_networks(&networks.snapshot().container_networks(&container.id));
+        }
 
         let stop = Arc::new(AtomicBool::new(false));
         let container_id = container.id.clone();
@@ -560,6 +613,7 @@ impl Plugin {
                 path.clone(),
                 Stream {
                     container_id: container_id.clone(),
+                    container: Arc::clone(&container),
                     stop: stop.clone(),
                 },
             );

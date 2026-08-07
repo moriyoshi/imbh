@@ -31,6 +31,30 @@ git history); this file tracks only what is still open.
       `upgrade` was not, because it needs a registry round trip. It decides whether upgrading the
       plugin is a data-preserving operation, which the docs currently do not claim either way.
 
+- [ ] **Measure whether a managed plugin accepts a `mounts` entry with a null/settable `source`.**
+      Bridge-network discovery (JOURNAL 2026-08-07) has two backends; the Engine API one needs the
+      daemon's socket inside the plugin's mount namespace, which the shipped `config.json`
+      deliberately does not grant. moby models `PluginConfigMount.Source` as `*string`, which
+      *suggests* a nil source is a declared-but-inactive mount an operator could turn on with
+      `docker plugin set imbh dockersock.source=/var/run/docker.sock`. If that holds, API mode — and
+      with it `container.network.*` attributes — becomes opt-in for the managed plugin with no
+      default privilege change. If it does not, the current posture stands and the limitation stays
+      documented. **Do not** hard-code `/var/run/docker.sock` as a mount source either way: under
+      rootless Docker it is elsewhere, and a missing bind source fails `plugin enable` — the exact
+      bug `tests/docker_plugin_config.rs` exists to prevent.
+
+- [ ] **Measure whether the daemon's API socket is serving when a plugin is enabled at daemon boot.**
+      Decides whether API-mode discovery can engage on a cold start or only on the first refresh
+      afterwards. Not a correctness issue — the probe re-runs every refresh precisely because this is
+      unknown — but it is what the operator guide should promise.
+
+- [ ] **A remap script sees a pre-discovery `.resource`.** `Bound`'s resource seed is built once at
+      `StartLogging`, so when a later network refresh swaps the container's resource
+      (`Container::set_networks`), the *stored* record gets the new one but a script's `.resource`
+      still shows the old. Harmless today — the built-in script never reads `.resource`, and
+      `.info.networks` *is* refreshed per line — but it is a real inconsistency to fix before
+      anything depends on it. (JOURNAL 2026-08-07.)
+
 - [ ] **Nothing exercises the plugin against a real daemon.** `docker_plugin_config.rs` now guards the
       shipped `config.json` statically, but the packaging path (`build.sh` → `plugin create` →
       `enable` → a container logging through it) is still only ever run by hand. This class of bug —

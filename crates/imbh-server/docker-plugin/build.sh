@@ -131,30 +131,34 @@ ${DOCKER} plugin disable -f "${PLUGIN}" > /dev/null 2>&1 || true
 ${DOCKER} plugin rm -f "${PLUGIN}" > /dev/null 2>&1 || true
 ${DOCKER} plugin create "${PLUGIN}" "${WORK}"
 
-# Point the OTLP listeners at the bridge address *this* daemon actually uses, rather than trusting
-# config.json's 172.17.0.1 default. That address is reachable from containers on every bridge network
-# (`--add-host=host.docker.internal:host-gateway` resolves to it) but has no route from the LAN, so
-# apps can ship traces and metrics to the plugin without the endpoint leaving the machine. A daemon
-# configured with a custom `bip` uses something else entirely, which is why this is asked, not
-# assumed. Settable later without a rebuild: `${DOCKER} plugin set ${PLUGIN} IMBH_LISTEN_ADDR=...`.
+# The OTLP listeners default to `auto`, which the plugin resolves at run time: it binds every bridge
+# network this daemon has and keeps that set current as networks are created and destroyed. Nothing
+# needs to be baked in here any more -- a daemon with a custom `bip`, a re-created docker0, or a
+# network that did not exist at install time all just work. Those addresses are reachable from
+# containers on any bridge network and have no route from the LAN, so apps can ship traces and
+# metrics to the plugin without the endpoint leaving the machine.
 #
-# Override with IMBH_BIND=<addr> to choose explicitly, or IMBH_BIND=none for no TCP listeners at all
-# (container logs still flow -- they use the plugin's Unix socket, not the network).
-BIND=${IMBH_BIND:-$(${DOCKER} network inspect bridge \
-  --format '{{range .IPAM.Config}}{{.Gateway}}{{end}}' 2>/dev/null || true)}
+# Override with IMBH_BIND=<addr> to pin one address explicitly, or IMBH_BIND=none for no TCP
+# listeners at all (container logs still flow -- they use the plugin's Unix socket, not the network).
+# Both are settable later without a rebuild:
+#   ${DOCKER} plugin set ${PLUGIN} IMBH_LISTEN_ADDR=...
+BIND=${IMBH_BIND:-auto}
 
 if [ "${BIND}" = none ]; then
   echo "==> disabling both TCP listeners (IMBH_BIND=none)"
   ${DOCKER} plugin set "${PLUGIN}" IMBH_LISTEN_ADDR= IMBH_GRPC_LISTEN_ADDR=
   ENDPOINT="(no TCP listener)"
-elif [ -n "${BIND}" ]; then
-  echo "==> binding OTLP to ${BIND} (this daemon's bridge gateway)"
+elif [ "${BIND}" = auto ]; then
+  # Asked purely so the line below can name a real address; the plugin does its own discovery and
+  # does not depend on this answer.
+  GATEWAY=$(${DOCKER} network inspect bridge \
+    --format '{{range .IPAM.Config}}{{.Gateway}}{{end}}' 2>/dev/null || true)
+  echo "==> binding OTLP to every bridge network (IMBH_LISTEN_ADDR=auto)"
+  ENDPOINT="http://${GATEWAY:-<bridge-gateway>}:4318 (and every other bridge gateway)"
+else
+  echo "==> binding OTLP to ${BIND} (IMBH_BIND)"
   ${DOCKER} plugin set "${PLUGIN}" "IMBH_LISTEN_ADDR=${BIND}:4318" "IMBH_GRPC_LISTEN_ADDR=${BIND}:4317"
   ENDPOINT="http://${BIND}:4318"
-else
-  echo "==> WARNING: could not read this daemon's bridge gateway; leaving the config.json default"
-  echo "    Set it yourself: ${DOCKER} plugin set ${PLUGIN} IMBH_LISTEN_ADDR=<addr>:4318"
-  ENDPOINT="http://172.17.0.1:4318 (unverified default)"
 fi
 
 cat <<EOF

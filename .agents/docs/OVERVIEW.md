@@ -249,7 +249,10 @@ an embedded `Db` and serves `docker logs` back out of it, with no new crate in t
 (ARCHITECTURE.md §10.16, [docs/DOCKER_LOG_DRIVER.md](../../docs/DOCKER_LOG_DRIVER.md)) — and, since
 v0.6.0, its **VRL remap stage** (`docker-remap`, enabled in the published plugin), which parses JSON,
 logfmt, klog/glog and `key=value` lines onto the OTel record; that one *does* add crates (vrl), and
-is the sole feature in the workspace that does;
+is the sole feature in the workspace that does; its **runtime bridge-network discovery**
+(`IMBH_LISTEN_ADDR=auto` binds every bridge gateway the daemon has, re-resolved on a timer, with an
+`IMBH_ALLOW_FROM` accept-time CIDR filter and optional `container.network.*` resource attributes),
+again with no new crate;
 **signal-driven graceful shutdown** for `imbhd` (`SIGINT`/`SIGTERM` → stop accepting, drain in-flight
 requests, seal the buffer, exit 0), also with no new crate (ARCHITECTURE.md §10.16); and the **MCP
 server** (`imbh-mcp`), which exposes the telemetry as 15 read-only agent tools over both of MCP's

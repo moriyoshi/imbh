@@ -137,6 +137,76 @@ pub async fn serve_grpc_until(
         .await
 }
 
+/// [`serve_grpc_until`] on a listener somebody else bound, optionally refusing peers.
+///
+/// The Docker plugin's multi-address supervisor (`docker::serve`) owns the socket so that one
+/// definition of "which bind failures are fatal" covers both protocols; tonic is happy to take the
+/// listener as an incoming stream rather than binding its own.
+///
+/// `allow` is applied to that stream, which puts a refused peer exactly where the HTTP accept loop
+/// puts it — closed before a byte is read, with nothing sent back that would confirm something is
+/// listening.
+#[cfg(all(feature = "docker", unix))]
+pub(crate) async fn serve_grpc_on_listener(
+    db: Arc<Db>,
+    listener: tokio::net::TcpListener,
+    allow: Option<crate::PeerFilter>,
+    shutdown: Arc<crate::Shutdown>,
+) -> Result<(), tonic::transport::Error> {
+    let incoming = Allowed {
+        inner: tokio_stream::wrappers::TcpListenerStream::new(listener),
+        allow,
+    };
+    server(db)
+        .serve_with_incoming_shutdown(incoming, async move {
+            while !shutdown.is_triggered() {
+                tokio::time::sleep(SHUTDOWN_POLL).await;
+            }
+        })
+        .await
+}
+
+/// An incoming-connection stream that drops what the allow-list refuses.
+///
+/// Hand-written rather than assembled from stream combinators: it is a dozen lines, and the
+/// alternative is a `futures` dependency for one `filter`.
+#[cfg(all(feature = "docker", unix))]
+struct Allowed {
+    inner: tokio_stream::wrappers::TcpListenerStream,
+    allow: Option<crate::PeerFilter>,
+}
+
+#[cfg(all(feature = "docker", unix))]
+impl tokio_stream::Stream for Allowed {
+    type Item = std::io::Result<tokio::net::TcpStream>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        use std::task::Poll;
+        loop {
+            let polled = std::pin::Pin::new(&mut self.inner).poll_next(cx);
+            let Poll::Ready(Some(Ok(stream))) = polled else {
+                return polled;
+            };
+            let allowed = match (&self.allow, stream.peer_addr()) {
+                (None, _) => true,
+                (Some(allow), Ok(peer)) => allow(peer.ip()),
+                // A connection whose peer cannot be read is one that has already gone away; there
+                // is nothing to test and nothing to serve.
+                (Some(_), Err(_)) => false,
+            };
+            if allowed {
+                return Poll::Ready(Some(Ok(stream)));
+            }
+            // Dropping the stream closes it. Round again rather than returning `Pending`, which
+            // would park the listener with a readable socket and no waker pending.
+            drop(stream);
+        }
+    }
+}
+
 /// How often the gRPC shutdown future rechecks the token. Bounds how long `imbhd`'s exit waits on
 /// this listener; small enough to be invisible next to a supervisor's stop grace.
 const SHUTDOWN_POLL: std::time::Duration = std::time::Duration::from_millis(50);

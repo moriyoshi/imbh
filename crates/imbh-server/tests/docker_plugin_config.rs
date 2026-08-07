@@ -102,3 +102,77 @@ fn the_plugin_socket_path_agrees_with_the_declared_interface() {
          breaks activation with an error that names neither side",
     );
 }
+
+/// Every listener address must be discovered, not baked in.
+///
+/// The plugin used to ship `172.17.0.1:4318` and rely on `build.sh` running `docker network inspect`
+/// once and applying the answer with `docker plugin set`. Anyone who installed straight from the
+/// registry -- which is what the documented install does -- got the literal default, and a daemon
+/// with a custom `bip`, or one whose docker0 was re-created, then had a listener bound to an address
+/// it does not have. The failure is silent: container logging is filesystem-only and keeps working,
+/// so the only symptom is a query endpoint nothing answers on.
+///
+/// `auto` binds every bridge gateway the daemon actually has, re-checked on a timer. Pinning this
+/// here because it is a one-word edit away from regressing to the shape that shipped broken.
+#[test]
+fn the_listener_addresses_are_discovered_rather_than_hard_coded() {
+    let cfg = config();
+    for name in ["IMBH_LISTEN_ADDR", "IMBH_GRPC_LISTEN_ADDR"] {
+        let value = env_value(&cfg, name);
+        assert_eq!(
+            value, "auto",
+            "{name} must default to `auto`, not to a literal address this daemon may not have",
+        );
+    }
+}
+
+/// The discovery knobs must be tunable on an installed plugin.
+///
+/// A plugin's `entrypoint` is frozen in this file, so anything an operator may need to change has to
+/// arrive as a `settable` env entry -- otherwise the only way to alter it is to rebuild and
+/// re-register the plugin, which destroys the database (`plugin rm` is `DROP DATABASE`).
+#[test]
+fn the_network_discovery_settings_are_declared_and_settable() {
+    let cfg = config();
+    for (name, default) in [
+        ("IMBH_ALLOW_FROM", "any"),
+        ("IMBH_DOCKER_API", "auto"),
+        ("IMBH_DOCKER_NETWORK_REFRESH", "30s"),
+    ] {
+        assert_eq!(env_value(&cfg, name), default, "{name} default");
+        let settable = env_entry(&cfg, name)["settable"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            settable.iter().any(|s| s.as_str() == Some("value")),
+            "{name} must be settable with `docker plugin set`",
+        );
+    }
+}
+
+/// `IMBH_ALLOW_FROM` must default to filtering nothing.
+///
+/// The listeners are reachable from every container on the box, which is exactly what makes the
+/// plugin useful; narrowing that is an operator's decision, and a default of `docker` would break
+/// any deployment reaching the endpoint from somewhere else the moment it upgraded.
+#[test]
+fn the_allow_list_is_off_by_default() {
+    assert_eq!(env_value(&config(), "IMBH_ALLOW_FROM"), "any");
+}
+
+fn env_entry<'a>(cfg: &'a serde_json::Value, name: &str) -> &'a serde_json::Value {
+    cfg["env"]
+        .as_array()
+        .expect("env is an array")
+        .iter()
+        .find(|entry| entry["name"].as_str() == Some(name))
+        .unwrap_or_else(|| panic!("config.json declares no {name}"))
+}
+
+fn env_value(cfg: &serde_json::Value, name: &str) -> String {
+    env_entry(cfg, name)["value"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned()
+}

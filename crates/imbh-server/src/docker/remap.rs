@@ -186,7 +186,7 @@ impl Bound {
         if script.wants_info {
             root.insert("info".into(), container_info(info));
         }
-        let resource = resource_to_vrl(container.resource());
+        let resource = resource_to_vrl(&container.resource());
         root.insert("resource".into(), resource.clone());
         Bound {
             script,
@@ -243,6 +243,19 @@ fn container_info(info: &ImbhValue) -> Value {
     }
     out.insert("container_env".into(), Value::Object(env));
     Value::Object(out)
+}
+
+/// A container's bridge-network attachments, exactly as `Container` holds them.
+type Attachments = Arc<Vec<(String, std::net::IpAddr)>>;
+
+/// A container's bridge-network attachments as a VRL object: network name → address.
+fn networks_to_vrl(networks: &[(String, std::net::IpAddr)]) -> Value {
+    Value::Object(
+        networks
+            .iter()
+            .map(|(name, ip)| (name.as_str().into(), Value::from(ip.to_string())))
+            .collect(),
+    )
 }
 
 fn string_map_to_vrl(pairs: &[(String, String)]) -> Value {
@@ -323,6 +336,9 @@ pub struct Remapper {
     /// producing the same resource shares one allocation — which is what keeps `encode`'s grouping
     /// a pointer comparison (see `ingest::encode`).
     interned: Option<(Value, Arc<Resource>)>,
+    /// The container's network attachments as VRL saw them last, keyed by the `Arc` they came from.
+    /// Networks change on a discovery refresh, not per line, so this is rebuilt at most that often.
+    networks: Option<(Attachments, Value)>,
     failures: u64,
     last_report: Option<Instant>,
 }
@@ -338,6 +354,7 @@ impl Remapper {
                 secrets: Secrets::default(),
             },
             interned: None,
+            networks: None,
             failures: 0,
             last_report: None,
         }
@@ -350,7 +367,7 @@ impl Remapper {
         let (number, band) = container.severity_for(stderr);
         let nanos = entry.time_nano.max(0);
 
-        self.seed(entry, stream, nanos, number, band);
+        self.seed(container, entry, stream, nanos, number, band);
 
         let resolved = self.runtime.resolve(
             &mut self.target,
@@ -377,6 +394,7 @@ impl Remapper {
     /// have stored on its own. That is what makes the identity script `.` a no-op.
     fn seed(
         &mut self,
+        container: &Container,
         entry: &LogEntry,
         stream: &'static str,
         nanos: i64,
@@ -384,6 +402,22 @@ impl Remapper {
         band: &'static str,
     ) {
         self.target.value = self.bound.seed.clone();
+        // `.info.networks` is the one part of `.info` that is not fixed at `StartLogging`: bridge
+        // discovery fills it in afterwards (`Container::set_networks`), because the driver must never
+        // ask the daemon about a container from inside the handler that is starting it.
+        if self.bound.script.wants_info {
+            let networks = container.networks();
+            let stale = !matches!(&self.networks, Some((seen, _)) if Arc::ptr_eq(seen, &networks));
+            if stale {
+                self.networks = Some((networks.clone(), networks_to_vrl(&networks)));
+            }
+            if let Some((_, value)) = &self.networks
+                && let Value::Object(root) = &mut self.target.value
+                && let Some(Value::Object(info)) = root.get_mut("info")
+            {
+                info.insert("networks".into(), value.clone());
+            }
+        }
         let Value::Object(root) = &mut self.target.value else {
             return;
         };
@@ -785,6 +819,51 @@ mod tests {
         assert_eq!(got("label").as_deref(), Some("cart"));
         assert_eq!(got("env").as_deref(), Some("eu-1"));
         assert_eq!(got("opt").as_deref(), Some("checkout"));
+    }
+
+    /// `.info.networks` is the one part of `.info` that is not fixed at `StartLogging`: bridge
+    /// discovery fills it in afterwards, so the remapper has to read it from the container per line
+    /// rather than from the frozen seed.
+    #[test]
+    fn a_script_sees_the_containers_networks_and_sees_them_change() {
+        let (container, bound) = bind(
+            r#"{"ContainerID":"abc","ContainerName":"/web"}"#,
+            r#".body = .info.networks"#,
+        );
+        let mut remapper = Remapper::new(bound);
+
+        // Before discovery knows anything, the map is present and empty rather than missing — a
+        // script can write `.info.networks.bridge` without a fallible lookup either way.
+        let (record, _) = record_of(remapper.apply(&container, &entry("stdout", "x\n")));
+        let Some(any_value::Value::KvlistValue(list)) = &record.body.as_ref().unwrap().value else {
+            panic!("expected a map body");
+        };
+        assert!(list.values.is_empty());
+
+        container.set_networks(&[
+            ("bridge".to_owned(), "172.17.0.2".parse().unwrap()),
+            ("myproj_default".to_owned(), "172.23.0.7".parse().unwrap()),
+        ]);
+        let (record, _) = record_of(remapper.apply(&container, &entry("stdout", "x\n")));
+        let Some(any_value::Value::KvlistValue(list)) = &record.body.as_ref().unwrap().value else {
+            panic!("expected a map body");
+        };
+        assert_eq!(attr(&list.values, "bridge"), Some("172.17.0.2"));
+        assert_eq!(attr(&list.values, "myproj_default"), Some("172.23.0.7"));
+    }
+
+    /// A script that never mentions `.info` must not pay for the networks object at all — the same
+    /// `wants_info` bargain the rest of `.info` already gets.
+    #[test]
+    fn a_script_that_ignores_info_is_not_charged_for_the_networks() {
+        let (container, bound) = bind(r#"{"ContainerID":"abc"}"#, ".body = .line");
+        container.set_networks(&[("bridge".to_owned(), "172.17.0.2".parse().unwrap())]);
+        let mut remapper = Remapper::new(bound);
+        record_of(remapper.apply(&container, &entry("stdout", "x\n")));
+        assert!(
+            remapper.networks.is_none(),
+            "the networks object must not be built for a script that cannot see it"
+        );
     }
 
     #[test]
