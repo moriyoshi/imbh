@@ -486,6 +486,11 @@ pub(crate) fn bridges_from_networks_json(body: &[u8]) -> Vec<Bridge> {
                 // address a listener could bind. Nothing to do with it.
                 continue;
             };
+            // The same reasoning one step on: a gateway that is there but cannot be bound is no more
+            // use than one that is missing.
+            if !is_usable_gateway(gateway) {
+                continue;
+            }
             out.push(Bridge {
                 name: name.clone(),
                 iface: iface.clone(),
@@ -644,7 +649,9 @@ pub(crate) fn bridges_from_ifaddrs(
 ) -> Vec<Bridge> {
     ifaddrs
         .iter()
-        .filter(|(name, _, _)| looks_like_docker_bridge(name) && is_bridge(name))
+        .filter(|(name, addr, _)| {
+            looks_like_docker_bridge(name) && is_usable_gateway(*addr) && is_bridge(name)
+        })
         .map(|(name, addr, mask)| Bridge {
             // The daemon is the only thing that knows the Docker network name; the interface is the
             // most useful stand-in, and it is what an operator sees in `ip link` anyway.
@@ -655,6 +662,30 @@ pub(crate) fn bridges_from_ifaddrs(
             containers: Vec::new(),
         })
         .collect()
+}
+
+/// Is this an address a listener could actually bind — i.e. one `auto` may resolve to?
+///
+/// `getifaddrs` reports **every** address an interface carries, and a Docker bridge with IPv6
+/// enabled carries an IPv6 **link-local** (`fe80::/10`) alongside its routable one. A link-local is
+/// not a usable listen address: `bind(2)` refuses a `sockaddr_in6` naming one with no scope id, and
+/// there is nowhere in an `IpAddr` — or in the `HOST:PORT` string [`super::addr::BindSpec::resolve`]
+/// builds from one — to carry the interface that would supply the scope. Admitting one costs a
+/// listener that never comes up, plus a bind retried on every refresh for ever. Measured on Docker
+/// Desktop, whose VM carries an `fe80::…` on `docker0`; a Linux host with IPv6 enabled has one too.
+///
+/// Loopback and the unspecified address are excluded for a different reason: neither is a bridge
+/// gateway, so one appearing here means the interface is not what the name test took it for — and
+/// binding the unspecified address would open the endpoint on *every* interface, which is the exact
+/// exposure `auto` exists to avoid.
+fn is_usable_gateway(addr: IpAddr) -> bool {
+    match addr {
+        IpAddr::V4(v4) => !v4.is_loopback() && !v4.is_unspecified() && !v4.is_link_local(),
+        // `Ipv6Addr::is_unicast_link_local` is still unstable, and the test is one mask.
+        IpAddr::V6(v6) => {
+            !v6.is_loopback() && !v6.is_unspecified() && (v6.segments()[0] & 0xffc0) != 0xfe80
+        }
+    }
 }
 
 /// Does this interface name look like one Docker made?
@@ -956,6 +987,66 @@ mod tests {
         )];
         let bridges = bridges_from_ifaddrs(&ifaddrs, |_| true);
         assert_eq!(bridges[0].subnet, cidr("fd00:d0::/64"));
+    }
+
+    /// A bridge with IPv6 enabled carries a link-local alongside its routable addresses, and
+    /// `getifaddrs` reports all of them. `auto` must not resolve to the link-local: `bind(2)`
+    /// refuses one that names no scope, so admitting it costs a listener that never comes up and a
+    /// bind retried on every refresh — which is how it was found, on Docker Desktop.
+    #[test]
+    fn an_ipv6_link_local_is_not_a_gateway() {
+        let mask6 = ip("ffff:ffff:ffff:ffff::");
+        let ifaddrs = vec![
+            ("docker0".to_owned(), ip("172.17.0.1"), ip("255.255.0.0")),
+            ("docker0".to_owned(), ip("fe80::42:acff:fe11:2233"), mask6),
+            // A routable IPv6 on the same bridge is still a gateway.
+            ("docker0".to_owned(), ip("fd00:d0::1"), mask6),
+        ];
+        let bridges = bridges_from_ifaddrs(&ifaddrs, |_| true);
+        assert_eq!(
+            bridges.iter().map(|b| b.gateway).collect::<Vec<_>>(),
+            vec![ip("172.17.0.1"), ip("fd00:d0::1")]
+        );
+    }
+
+    /// The rest of what is not a bridge gateway. `0.0.0.0`/`::` matter most: binding the
+    /// unspecified address would serve every interface the host has, which is the exposure `auto`
+    /// exists to avoid.
+    #[test]
+    fn loopback_unspecified_and_ipv4_link_local_are_not_gateways() {
+        for (addr, mask) in [
+            ("127.0.0.1", "255.0.0.0"),
+            ("0.0.0.0", "0.0.0.0"),
+            ("169.254.10.1", "255.255.0.0"),
+            ("::1", "ffff:ffff:ffff:ffff::"),
+            ("::", "::"),
+        ] {
+            let ifaddrs = vec![("docker0".to_owned(), ip(addr), ip(mask))];
+            assert!(
+                bridges_from_ifaddrs(&ifaddrs, |_| true).is_empty(),
+                "{addr} must not become a bind address"
+            );
+        }
+    }
+
+    /// The API backend reads gateways from IPAM rather than from the netns, but an unbindable one
+    /// is just as useless there.
+    #[test]
+    fn the_api_backend_drops_an_unbindable_gateway_too() {
+        let body = br#"[
+          {
+            "Name": "v6only", "Id": "1a2b3c4d5e6f7788", "Driver": "bridge",
+            "IPAM": {"Config": [
+              {"Subnet": "fe80::/64", "Gateway": "fe80::1"},
+              {"Subnet": "172.31.0.0/16", "Gateway": "172.31.0.1"}
+            ]}
+          }
+        ]"#;
+        let bridges = bridges_from_networks_json(body);
+        assert_eq!(
+            bridges.iter().map(|b| b.gateway).collect::<Vec<_>>(),
+            vec![ip("172.31.0.1")]
+        );
     }
 
     /// `is_bridge_device` interpolates its argument into a path, so it must refuse anything that is
