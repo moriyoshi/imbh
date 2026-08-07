@@ -61,12 +61,17 @@ pub struct EvalCaps {
 /// The queries are *source text*, not translated expressions — translation is part of what the head
 /// delegates, so a head and the daemon can never disagree about what a query means.
 ///
-/// Several at once because a head routinely asks for several: the metric catalog emits one selector
-/// per checked metric, and the evaluator has no `or`, so each must run on its own. Sending them
-/// together is one request and, more to the point, **one** metric-catalog read — the catalog is what
-/// PromQL translation resolves a selector's kind against, so a query apiece would re-read it apiece.
-/// Their result series are concatenated in request order; each keeps its own `__name__` label, so
-/// they stay distinguishable.
+/// Several at once because a head may ask for several: the metric catalog emits one selector per
+/// checked metric, and the evaluator has no `or`, so each must run on its own. Sending them together
+/// is one request and, more to the point, **one** metric-catalog read — the catalog is what PromQL
+/// translation resolves a selector's kind against, so a query apiece would re-read it apiece.
+///
+/// The price is provenance: the result series are concatenated in request order and nothing marks
+/// where one query's answer ends. A *selector* keeps its `__name__`, but an aggregation drops it
+/// (Prometheus semantics — `sum by (…)` and `rate()` alike), so two queries can answer with series
+/// that are indistinguishable. A caller that must attribute each series to its query — as one
+/// listing several metrics side by side must — should send them one at a time and pay the extra
+/// catalog reads.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EvalRequest {
     pub queries: Vec<String>,
@@ -126,6 +131,16 @@ pub struct LogVolumeRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExemplarsRequest {
     pub metric: String,
+}
+
+/// `POST /api/head/metrics/dimensions`: one metric's groupable labels.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MetricDimensionsRequest {
+    pub metric: String,
+    /// Cap on the distinct values reported per label; a label with more is truncated rather than
+    /// dropped, so a high-cardinality axis still appears in a picker. `None` means no cap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_values: Option<usize>,
 }
 
 /// `POST /api/head/attributes/values`: the distinct values of one attribute key. A `POST` rather
@@ -189,6 +204,22 @@ pub struct LogVolumeResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MetricCatalog {
     pub metrics: Vec<imbh::MetricMeta>,
+}
+
+/// One groupable label of a metric, with the distinct values it takes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MetricDimension {
+    pub label: String,
+    pub values: Vec<String>,
+    /// Whether `values` was cut short by the request's `max_values`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub truncated: bool,
+}
+
+/// The answer to `POST /api/head/metrics/dimensions`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MetricDimensions {
+    pub dimensions: Vec<MetricDimension>,
 }
 
 /// One exemplar, flattened to hex ids. The facade's [`imbh::Exemplar`] would serialize directly, but

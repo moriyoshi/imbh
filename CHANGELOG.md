@@ -13,6 +13,14 @@ release aborts if it is missing or duplicated.
 
 ## [Unreleased]
 
+### Added
+
+- `Db::metrics().dimensions(metric)` — the distinct label names and values a metric's series carry
+  (the promoted `service` axis included), for any metric kind. `metrics().series()` remains the raw
+  per-series attribute sets.
+- Head API: `POST /api/head/metrics/dimensions`, with `HeadClient::metric_dimensions` and
+  `exec::metric_dimensions`.
+
 ### Changed
 
 - **The canonical-JSON codec (`imbh-core`, ARCHITECTURE.md §6.1) now rides `serde_json`** instead of
@@ -55,6 +63,35 @@ release aborts if it is missing or duplicated.
 - **Malformed JSON is now rejected rather than silently accepted.** The hand-rolled number scanner
   and string reader admitted input that is not JSON: `+5`, leading zeros (`007`), out-of-range
   exponents (`1e400`, previously read as `inf`), and raw control characters inside string literals.
+
+- **`imbh-tui`'s metric catalog could not filter a histogram, and collapsed it to one anonymous
+  series.** Two defects with one root: the catalog tree describes a metric in PromQL, and PromQL
+  cannot describe a cumulative histogram the way it describes a gauge.
+
+  Dimension discovery evaluated the metric's *bare selector* and read the label keys/values off the
+  returned series. A histogram has no bare selector — `latency_bucket` is refused, because its
+  buckets are only reachable through `histogram_quantile(…)` — so discovery silently returned
+  nothing, every histogram showed up in the tree as `(no dimensions)`, and there was no axis to
+  filter or group by. It now reads the metric tables through a new head operation
+  (`POST /api/head/metrics/dimensions`, `Db::metrics().dimensions()`), which is kind-agnostic,
+  independent of the selected time range, and bounded by no evaluation cap.
+
+  Visualizing a histogram then aggregated with `sum by (le)` alone. A quantile is only expressible
+  as an aggregation, so every label not named there was summed away: a `latency` split across five
+  routes plotted as a single `{}` series, and several selected histograms were indistinguishable
+  rows. The grouping now names the metric's own discovered axes, so a histogram selected whole keeps
+  the one-series-per-label-set split a gauge or a sum gets for free.
+
+- **A head API result could fuse two distinct series into one.** `POST /api/head/metrics/promql`
+  takes a batch of queries and concatenates their series, and PromQL drops `__name__` on aggregation
+  (`sum by (…)` and `rate()` alike), so two queries answering with identical labels is ordinary. The
+  Arrow IPC decoder recovered the series boundaries by grouping runs of equal labels and merged them
+  — a **remote** head answering differently from a local one over the same data. The encoder now
+  records each series' starting row offset in the schema metadata and the decoder splits there,
+  falling back to the old grouping for a batch written before that metadata existed.
+
+  `imbh-tui`'s series list additionally issues one query per selected metric instead of one batch, so
+  it can name each metric in the row rather than showing rows nothing tells apart.
 
 ## [0.6.2] - 2026-08-07
 

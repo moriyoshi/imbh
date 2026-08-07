@@ -60,9 +60,9 @@ impl App {
     }
 
     /// When the caret is in a label position for a known-but-undiscovered metric, mark it loading and
-    /// return `(name, kind)` so the caller can fetch its dimensions (the label vocabulary). Returns
-    /// `None` once loaded/in-flight, or outside a label context, so it fires at most once per metric.
-    pub(crate) fn completion_dim_request(&mut self) -> Option<(String, String)> {
+    /// return its name so the caller can fetch its dimensions (the label vocabulary). Returns `None`
+    /// once loaded/in-flight, or outside a label context, so it fires at most once per metric.
+    pub(crate) fn completion_dim_request(&mut self) -> Option<String> {
         if self.mode != Mode::Editing || self.screen() != Screen::Metrics {
             return None;
         }
@@ -74,7 +74,7 @@ impl App {
         let node = self.metric_tree.iter_mut().find(|n| n.name == metric)?;
         if node.dims.is_none() && !node.loading {
             node.loading = true;
-            Some((node.name.clone(), node.kind.clone()))
+            Some(node.name.clone())
         } else {
             None
         }
@@ -231,7 +231,7 @@ mod tests {
         assert!(app.completion.is_none());
         assert_eq!(
             app.completion_dim_request(),
-            Some(("http_requests_total".to_owned(), "sum".to_owned()))
+            Some("http_requests_total".to_owned())
         );
         // Marked loading now, so it does not fire again.
         assert_eq!(app.completion_dim_request(), None);

@@ -39,6 +39,7 @@ pub fn routes() -> Router<Arc<Db>> {
     Router::new()
         .route(path::STATS, get(stats))
         .route(path::METRICS_CATALOG, get(metric_catalog))
+        .route(path::METRICS_DIMENSIONS, post(metric_dimensions))
         .route(path::METRICS_PROMQL, post(promql))
         .route(path::METRICS_EXEMPLARS, post(exemplars))
         .route(path::TRACES_SEARCH, post(traceql))
@@ -82,6 +83,14 @@ async fn logql(State(db): State<Arc<Db>>, body: Bytes) -> Response {
     respond_ipc(offload(exec::logql(&db, &request)).await, |value| {
         Ok(ipc::series_to_batch(value))
     })
+}
+
+async fn metric_dimensions(State(db): State<Arc<Db>>, body: Bytes) -> Response {
+    let request: dto::MetricDimensionsRequest = match decode(&body) {
+        Ok(request) => request,
+        Err(response) => return response,
+    };
+    respond(offload(exec::metric_dimensions(&db, &request)).await)
 }
 
 async fn exemplars(State(db): State<Arc<Db>>, body: Bytes) -> Response {

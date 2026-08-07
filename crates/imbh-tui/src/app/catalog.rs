@@ -181,9 +181,9 @@ impl App {
     }
 
     /// Handle Space on the selected node: expand/collapse a metric or dimension, or toggle a value's
-    /// checkbox (exclusive within its dimension). Returns `Some((name, kind))` when a metric was
-    /// expanded for the first time and its dimensions must be fetched.
-    pub(crate) fn toggle_node(&mut self) -> Option<(String, String)> {
+    /// checkbox (exclusive within its dimension). Returns the metric name when a metric was expanded
+    /// for the first time and its dimensions must be fetched.
+    pub(crate) fn toggle_node(&mut self) -> Option<String> {
         let mut to_load = None;
         match self.selected_tree_row()? {
             TreeRowRef::Metric(mi) => {
@@ -191,7 +191,7 @@ impl App {
                 if !node.expanded && node.dims.is_none() && !node.loading {
                     node.loading = true;
                     node.expanded = true;
-                    to_load = Some((node.name.clone(), node.kind.clone()));
+                    to_load = Some(node.name.clone());
                 } else {
                     node.expanded = !node.expanded;
                 }
@@ -245,7 +245,13 @@ impl App {
                     .map(|value| (dim.label.as_str(), value.as_str()))
             })
             .collect::<Vec<_>>();
-        build_metric_query(&node.name, &node.kind, &matchers, group_by)
+        // The metric's own axes, which a histogram's aggregation has to name explicitly to keep the
+        // series split the other kinds get for free (see `build_metric_query`).
+        let labels = dims
+            .iter()
+            .map(|dim| dim.label.as_str())
+            .collect::<Vec<_>>();
+        build_metric_query(&node.name, &node.kind, &matchers, group_by, &labels)
     }
 
     /// The queries to run when visualizing from the catalog. Checking any series (a dimension value)
@@ -308,7 +314,7 @@ mod tests {
         // Expand the second metric (reqs); dims not loaded yet -> a placeholder row appears.
         app.selected = 1;
         let load = app.toggle_node();
-        assert_eq!(load, Some(("reqs".to_owned(), "sum".to_owned())));
+        assert_eq!(load, Some("reqs".to_owned()));
         assert_eq!(app.snapshot.table.as_ref().unwrap().rows.len(), 3);
 
         // Dimensions arrive; the placeholder becomes a dimension row.

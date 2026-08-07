@@ -182,6 +182,15 @@ impl HeadClient {
             .await
     }
 
+    /// One metric's groupable labels. See
+    /// [`exec::metric_dimensions`](crate::exec::metric_dimensions).
+    pub async fn metric_dimensions(
+        &self,
+        request: &dto::MetricDimensionsRequest,
+    ) -> Result<dto::MetricDimensions, HeadError> {
+        self.post_json(path::METRICS_DIMENSIONS, request).await
+    }
+
     /// One metric's exemplars. See [`exec::exemplars`](crate::exec::exemplars).
     pub async fn exemplars(
         &self,

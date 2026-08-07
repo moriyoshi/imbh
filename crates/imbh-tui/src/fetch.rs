@@ -1,12 +1,10 @@
 //! The queries behind a refresh: evaluating the panel query for a screen and the ancillary lookups
 //! (trace waterfalls, catalog dimensions, the evaluation window).
 
-use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
-use imbh::{PageCursor, SpanId, Table as DbTable, Timestamp, TraceId};
-use imbh_head::HeadError;
-use imbh_head::exec::table_from_name;
+use imbh::{PageCursor, SpanId, Timestamp, TraceId};
+use imbh_head::{HeadError, dto};
 use imbh_lgtm::{
     EvalLimits, EvalRange, FetchBounds, ImbhQueryModel, LogFetchRequest, LogFilter,
     LogStreamSchema, TranslateContext, build_log_query, translate_logql,
@@ -19,99 +17,34 @@ use crate::model::{
     DetailPane, DimNode, LogCorrelation, LogRecord, Options, Screen, SeriesData, Snapshot,
     TableData,
 };
-use crate::promql::discovery_promql;
+use crate::promql::query_metric_name;
 use crate::time::{format_timestamp_ns, humanize_secs};
 use crate::ui::glyphs::Glyphs;
 use crate::waterfall::{TraceDetail, build_trace_detail};
 
-/// The `[min, max]` timestamp span across all metric tables, from the backend's stats. Falls back to
-/// a wide window ending at `now` if no metric data has a recorded span. Makes catalog dimension
-/// discovery independent of the selected time range.
-pub(crate) async fn metric_time_span(backend: &Backend) -> (i64, i64) {
-    const WIDE_NS: i64 = 3_600_000_000_000 * 24 * 365 * 30; // ~30 years
-    let now = Timestamp::now().0;
-    let fallback = (now.saturating_sub(WIDE_NS), now);
-    let Ok(stats) = backend.stats().await else {
-        return fallback;
-    };
-    // The wire carries the physical table *name*; map it back so the metric families are matched as
-    // tables rather than by string prefix.
-    let is_metric = |name: &str| {
-        matches!(
-            table_from_name(name),
-            Some(
-                DbTable::MetricsGauge
-                    | DbTable::MetricsSum
-                    | DbTable::MetricsHistogram
-                    | DbTable::MetricsExpHistogram
-                    | DbTable::MetricsSummary
-            )
-        )
-    };
-    let min = stats
-        .tables
-        .iter()
-        .filter(|t| is_metric(&t.table))
-        .filter_map(|t| t.min_time_unix_nano)
-        .min();
-    let max = stats
-        .tables
-        .iter()
-        .filter(|t| is_metric(&t.table))
-        .filter_map(|t| t.max_time_unix_nano)
-        .max();
-    match (min, max) {
-        (Some(min), Some(max)) => (min, max),
-        _ => fallback,
-    }
-}
-
-/// Discover a metric's groupable dimensions by evaluating its bare selector as an instant over the
-/// metric's whole retained span (picker-independent), collecting the label keys/values from the
-/// returned series (labels include the resource `service` and data-point attributes; `__name__`/`le`
-/// are internal and excluded). Empty on any failure.
+/// Discover a metric's groupable dimensions — the axes the catalog tree offers to filter and group
+/// by. Read straight from the metric tables (see [`Backend::metric_dimensions`]), so it is
+/// independent of the selected time range and answers for *every* metric kind.
+///
+/// It used to evaluate the metric's bare PromQL selector and read the labels off the returned
+/// series, which silently discovered nothing for a histogram: PromQL has no bare selector for one
+/// (`latency_bucket` is refused — buckets are reachable only through `histogram_quantile(…)`), so
+/// every histogram showed up in the tree as "(no dimensions)" and could never be filtered.
+///
+/// Empty on any failure.
 pub(crate) async fn discover_dims(
     backend: &Backend,
     name: &str,
-    kind: &str,
-    max_series: usize,
+    max_values: usize,
 ) -> Vec<DimNode> {
-    let (span_start, span_end) = metric_time_span(backend).await;
-    // One instant just past the last sample, looking back across the whole span.
-    let at = span_end.saturating_add(1);
-    let eval_range = EvalRange {
-        start_ns: at,
-        end_ns: at,
-        step_ns: 1,
-        lookback_ns: (at.saturating_sub(span_start).max(1) as u128).min(u64::MAX as u128) as u64,
-    };
-    let limits = EvalLimits {
-        max_series,
-        ..EvalLimits::default()
-    };
-    let Ok(series) = backend
-        .promql(&[discovery_promql(name, kind)], eval_range, limits)
-        .await
-    else {
+    let Ok(dimensions) = backend.metric_dimensions(name, max_values).await else {
         return Vec::new();
     };
-    let mut by_label: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    for item in &series {
-        for label in &item.labels {
-            if label.name == "__name__" || label.name == "le" {
-                continue;
-            }
-            by_label
-                .entry(label.name.clone())
-                .or_default()
-                .insert(label.value.clone());
-        }
-    }
-    by_label
+    dimensions
         .into_iter()
-        .map(|(label, values)| DimNode {
-            label,
-            values: values.into_iter().collect(),
+        .map(|dimension| DimNode {
+            label: dimension.label,
+            values: dimension.values,
             expanded: false,
             selected: None,
         })
@@ -289,31 +222,55 @@ pub(crate) async fn load_snapshot(
                 });
             }
             // One or more newline-separated PromQL queries (the catalog joins several when multiple
-            // metrics are checked; the executor has no `or`, so each runs on its own). Their result
-            // series are concatenated — each keeps its `__name__` label, so they stay distinguishable.
+            // metrics are checked; the executor has no `or`, so each runs on its own).
             let sub_queries = query
                 .split('\n')
                 .map(str::trim)
                 .filter(|q| !q.is_empty())
                 .map(str::to_owned)
                 .collect::<Vec<_>>();
-            let series = backend
-                .promql(&sub_queries, eval_range, limits)
-                .await
-                .map_err(|error| error.to_string())?;
+            // Each sub-query is evaluated on its own so its series stay attributable to it. PromQL
+            // aggregation drops `__name__` on purpose (`LabelSet::by`/`without` both do, which is
+            // Prometheus semantics), so a `sum by (…)` or `histogram_quantile(…)` series cannot say
+            // which metric produced it: run several together into one concatenated result and two
+            // selected metrics that share a label set become indistinguishable rows. Knowing the
+            // boundaries lets us put the name back below.
+            let mut series: Vec<(Option<String>, dto::Series)> = Vec::new();
+            for sub_query in &sub_queries {
+                let evaluated = backend
+                    .promql(sub_query, eval_range, limits)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                // Only a multi-metric selection needs the name put back; a single query (including
+                // anything hand-typed) is already unambiguous, and naming it from a guess at its
+                // leading identifier would be a claim we cannot make about an arbitrary expression.
+                let name = (sub_queries.len() > 1)
+                    .then(|| query_metric_name(sub_query))
+                    .flatten();
+                series.extend(evaluated.into_iter().map(|item| (name.clone(), item)));
+            }
             // Build the summary rows and, in the same pass, retain each series' full
             // `(timestamp_ns, value)` history so the detailed viewer can plot the selected one.
             let mut rows = Vec::with_capacity(series.len());
             let mut series_data = Vec::with_capacity(series.len());
-            for item in &series {
-                let labels = if item.labels.is_empty() {
+            for (name, item) in &series {
+                let named = name
+                    .as_deref()
+                    .filter(|_| item.labels.iter().all(|label| label.name != "__name__"))
+                    .map(|name| format!("__name__={name}"));
+                let labels = named
+                    .into_iter()
+                    .chain(
+                        item.labels
+                            .iter()
+                            .map(|label| format!("{}={}", label.name, label.value)),
+                    )
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let labels = if labels.is_empty() {
                     "{}".to_owned()
                 } else {
-                    item.labels
-                        .iter()
-                        .map(|label| format!("{}={}", label.name, label.value))
-                        .collect::<Vec<_>>()
-                        .join(",")
+                    labels
                 };
                 let values = item
                     .samples
@@ -361,7 +318,7 @@ pub(crate) async fn load_snapshot(
                 chart: chart_values(
                     series
                         .first()
-                        .map_or(&[][..], |series| series.samples.as_slice())
+                        .map_or(&[][..], |(_, series)| series.samples.as_slice())
                         .iter()
                         .map(|sample| sample.value),
                 ),
@@ -599,6 +556,173 @@ pub(crate) async fn load_snapshot(
                 next_cursor: page_next,
             })
         }
+    }
+}
+
+#[cfg(test)]
+mod histogram_catalog {
+    //! The Metrics catalog against a database of histograms — the kind whose picker was broken.
+    //!
+    //! Two cumulative histograms (`latency`, split over two `route` values, and `rtt`), each with
+    //! three points so a `rate()` window has something to extrapolate over.
+
+    use std::sync::Arc;
+
+    use imbh::Db;
+    use imbh_test_support::otlp::otlp_hist_labeled;
+
+    use super::*;
+    use crate::app::App;
+    use crate::model::{QueryResult, Route};
+
+    async fn backend() -> Backend {
+        let db: Arc<Db> = Db::in_memory().open().expect("open in-memory db");
+        for (metric, route) in [("latency", "get"), ("latency", "post"), ("rtt", "get")] {
+            db.ingest_otlp_metrics(&otlp_hist_labeled(
+                "api",
+                metric,
+                &[("route", route)],
+                &[1.0, 5.0],
+                &[
+                    (1_000_000_000, &[1, 2, 3][..]),
+                    (2_000_000_000, &[2, 4, 6][..]),
+                    (3_000_000_000, &[3, 6, 9][..]),
+                ],
+            ))
+            .await
+            .expect("ingest metrics");
+        }
+        Backend::from(db)
+    }
+
+    fn options() -> Options {
+        Options {
+            window: Some((1_000_000_000, 4_000_000_000)),
+            ..Options::default()
+        }
+    }
+
+    /// The catalog tree, with every metric expanded and its dimensions discovered — the state the
+    /// user is in when they start checking series.
+    async fn catalog(backend: &Backend) -> App {
+        let mut app = App::new();
+        app.route = Route::Metrics;
+        let snapshot = load_snapshot(backend.clone(), Screen::Metrics, "", &options(), None, None)
+            .await
+            .expect("catalog listing");
+        app.apply(QueryResult {
+            generation: 0,
+            screen: Screen::Metrics,
+            result: Ok(snapshot),
+        });
+        app.build_metric_tree();
+        for index in 0..app.metric_tree.len() {
+            let name = app.metric_tree[index].name.clone();
+            let dims = discover_dims(backend, &name, 1000).await;
+            app.apply_metric_dims(&name, dims);
+            app.metric_tree[index].expanded = true;
+        }
+        app
+    }
+
+    async fn rows(backend: &Backend, queries: &[String]) -> Vec<String> {
+        load_snapshot(
+            backend.clone(),
+            Screen::Metrics,
+            &queries.join("\n"),
+            &options(),
+            None,
+            None,
+        )
+        .await
+        .expect("evaluation")
+        .table
+        .expect("the series list renders as a table")
+        .rows
+        .into_iter()
+        .map(|row| row[0].clone())
+        .collect()
+    }
+
+    /// A histogram's dimensions used to be discovered by evaluating its bare selector, which PromQL
+    /// refuses for a histogram — so every histogram showed "(no dimensions)" and could not be
+    /// filtered at all.
+    #[tokio::test]
+    async fn a_histogram_offers_its_dimensions_like_any_other_kind() {
+        let backend = backend().await;
+        let dims = discover_dims(&backend, "latency", 1000).await;
+        let axes = dims
+            .iter()
+            .map(|dim| (dim.label.as_str(), dim.values.clone()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            axes,
+            vec![
+                ("route", vec!["get".to_owned(), "post".to_owned()]),
+                ("service", vec!["api".to_owned()]),
+            ],
+            "the resource axis and the data-point attribute are both groupable"
+        );
+    }
+
+    /// Checking a dimension value must actually narrow the histogram's series, the way it does for a
+    /// gauge or a sum.
+    #[tokio::test]
+    async fn checking_a_dimension_value_filters_a_histogram() {
+        let backend = backend().await;
+        let mut app = catalog(&backend).await;
+        let latency = app
+            .metric_tree
+            .iter()
+            .position(|node| node.name == "latency")
+            .expect("latency is catalogued");
+
+        // Unfiltered: one quantile series per label set, not one lump for the whole metric.
+        assert_eq!(
+            rows(&backend, &[app.metric_node_query(latency, None)]).await,
+            vec!["route=get,service=api", "route=post,service=api"],
+        );
+
+        // Check `route=get` (what Space on that value row does).
+        let route = app.metric_tree[latency]
+            .dims
+            .as_mut()
+            .expect("dimensions discovered")
+            .iter_mut()
+            .find(|dim| dim.label == "route")
+            .expect("the route axis");
+        route.selected = Some(0);
+        assert_eq!(route.values[0], "get");
+
+        assert_eq!(
+            rows(&backend, &app.visualize_queries()).await,
+            vec!["route=get,service=api"],
+            "the checked value must narrow the histogram, not be ignored"
+        );
+    }
+
+    /// Selecting several metrics used to collapse to a single indistinguishable row: a histogram's
+    /// quantile is an aggregation, so grouping by `le` alone summed every label away, and PromQL
+    /// drops `__name__` on aggregation so the concatenated result could not name its metrics either.
+    #[tokio::test]
+    async fn several_selected_histograms_stay_distinguishable() {
+        let backend = backend().await;
+        let mut app = catalog(&backend).await;
+        for node in &mut app.metric_tree {
+            node.whole_selected = true;
+        }
+        let queries = app.visualize_queries();
+        assert_eq!(queries.len(), 2, "both metrics are visualized: {queries:?}");
+
+        assert_eq!(
+            rows(&backend, &queries).await,
+            vec![
+                "__name__=latency,route=get,service=api",
+                "__name__=latency,route=post,service=api",
+                "__name__=rtt,route=get,service=api",
+            ],
+            "every underlying series survives, and each says which metric it belongs to"
+        );
     }
 }
 

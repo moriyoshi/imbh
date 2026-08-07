@@ -57,6 +57,7 @@ pub mod path {
 
     pub const STATS: &str = "/api/head/stats";
     pub const METRICS_CATALOG: &str = "/api/head/metrics/catalog";
+    pub const METRICS_DIMENSIONS: &str = "/api/head/metrics/dimensions";
     pub const METRICS_PROMQL: &str = "/api/head/metrics/promql";
     pub const METRICS_EXEMPLARS: &str = "/api/head/metrics/exemplars";
     pub const TRACES_SEARCH: &str = "/api/head/traces/search";

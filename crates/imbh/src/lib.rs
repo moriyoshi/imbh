@@ -4172,6 +4172,59 @@ mod tests {
         assert_eq!(series.len(), 2, "series() reaches the summary table too");
     }
 
+    /// `dimensions()` answers "what can I group or filter this metric by" for *any* kind, including
+    /// the one PromQL cannot select bare (a cumulative histogram, reachable only through
+    /// `histogram_quantile`), and folds in the promoted resource axis `series()` leaves out.
+    #[tokio::test(flavor = "current_thread")]
+    async fn metrics_dimensions_cover_every_kind_and_the_service_axis() {
+        let db = Db::in_memory().open().unwrap();
+        db.ingest_otlp_metrics(&otlp_gauge_labeled("cart", "g", "zone", &["b", "a"]))
+            .await
+            .unwrap();
+        db.ingest_otlp_metrics(&otlp_histogram(
+            "cart",
+            "lat",
+            1,
+            3,
+            6.0,
+            &[1.0, 5.0],
+            &[1, 1, 1],
+        ))
+        .await
+        .unwrap();
+        db.ingest_otlp_metrics(&otlp_histogram(
+            "checkout",
+            "lat",
+            2,
+            3,
+            6.0,
+            &[1.0, 5.0],
+            &[1, 1, 1],
+        ))
+        .await
+        .unwrap();
+
+        // The gauge: the data-point attribute plus the resource axis, values sorted.
+        assert_eq!(
+            db.metrics().dimensions("g").await.unwrap(),
+            vec![
+                ("service".to_owned(), vec!["cart".to_owned()]),
+                ("zone".to_owned(), vec!["a".to_owned(), "b".to_owned()]),
+            ]
+        );
+        // The histogram answers the same way — the whole point of reading the tables rather than
+        // evaluating a selector, which PromQL refuses for this kind.
+        assert_eq!(
+            db.metrics().dimensions("lat").await.unwrap(),
+            vec![(
+                "service".to_owned(),
+                vec!["cart".to_owned(), "checkout".to_owned()]
+            )]
+        );
+        // A metric with no data has no axes.
+        assert!(db.metrics().dimensions("nope").await.unwrap().is_empty());
+    }
+
     /// Build an OTLP monotonic Sum with one data point per `(time, value)` and the given
     /// `aggregation_temporality` (1 = DELTA, 2 = CUMULATIVE).
     fn otlp_sum(service: &str, metric: &str, temporality: i32, points: &[(u64, f64)]) -> Vec<u8> {

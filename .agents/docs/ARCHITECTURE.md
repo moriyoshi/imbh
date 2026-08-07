@@ -1480,13 +1480,22 @@ trace-window narrowing all happen in the same code either way, so the two modes 
 same question differently. `crates/imbh-server/tests/head_e2e.rs` asserts exactly that, operation by
 operation, over a real loopback socket.
 
-The eleven operations are the ones a head cannot synthesize from anything else `imbhd` serves:
-`stats`, `metrics/catalog`, `metrics/promql`, `metrics/exemplars`, `traces/search`, `traces/get`,
-`logs/query`, `logs/volume`, `logs/logql`, `attributes/keys`, `attributes/values`. Four of those have
-no counterpart anywhere else in the server: nothing else **evaluates** PromQL, LogQL, or TraceQL
-(`query_metric_range`/`search_traces` are the *typed-builder* path — they cannot express
-`sum by (svc) (rate(x[5m]))`), and nothing else surfaces exemplars. `logs/query` additionally carries
-the `PageCursor` and span-id correlation that the viewer's paging and trace drill-down need.
+The twelve operations are the ones a head cannot synthesize from anything else `imbhd` serves:
+`stats`, `metrics/catalog`, `metrics/dimensions`, `metrics/promql`, `metrics/exemplars`,
+`traces/search`, `traces/get`, `logs/query`, `logs/volume`, `logs/logql`, `attributes/keys`,
+`attributes/values`. Four of those have no counterpart anywhere else in the server: nothing else
+**evaluates** PromQL, LogQL, or TraceQL (`query_metric_range`/`search_traces` are the *typed-builder*
+path — they cannot express `sum by (svc) (rate(x[5m]))`), and nothing else surfaces exemplars.
+`logs/query` additionally carries the `PageCursor` and span-id correlation that the viewer's paging
+and trace drill-down need.
+
+`metrics/dimensions` answers "what can I group or filter this metric by" by reading the metric tables
+(`Db::metrics().dimensions`), not by evaluating anything. It exists because a picker cannot be built
+out of PromQL: `attributes/keys` is cross-signal and says nothing about which metric carries what,
+and evaluating a bare selector to read its labels back — which is how `imbh-tui`'s catalog tree used
+to do it — is impossible for a cumulative histogram, whose buckets PromQL reaches only through
+`histogram_quantile(…)`. Reading the tables is kind-agnostic, exact, independent of the picker's time
+range, and unbounded by any evaluation cap.
 
 **Why not `/mcp`.** The MCP endpoint (§10.16.1) answers the same database for an *agent*: its tools
 are shaped for a model (`since` windows, prose descriptions, one JSON document per call) and are
@@ -1516,11 +1525,23 @@ nothing — and it keeps `imbh/proto` (and its protox codegen) out of both binar
 one extra materialize-then-encode on a page of at most a few thousand rows, which is not a cost worth
 a second execution path.
 
-**An eval request carries every sub-query**, because a head routinely asks for several: the metric
-catalog emits one selector per checked metric, and the evaluator has no `or`, so each must run on its
-own. Sending them together is one round trip and, more to the point, **one** metric-catalog read —
-the catalog is what PromQL translation resolves a selector's kind against, so a query apiece would
+**An eval request carries every sub-query**, because a head may ask for several: the metric catalog
+emits one selector per checked metric, and the evaluator has no `or`, so each must run on its own.
+Sending them together is one round trip and, more to the point, **one** metric-catalog read — the
+catalog is what PromQL translation resolves a selector's kind against, so a query apiece would
 re-read it apiece.
+
+What a batch costs is **provenance**. The result series concatenate in request order with nothing
+marking where one query's answer ends, and PromQL drops `__name__` on aggregation (Prometheus
+semantics — `sum by (…)` and `rate()` alike), so two sub-queries routinely answer with series that
+carry identical labels. Two consequences follow. First, the IPC decoder cannot recover the series
+boundaries by grouping runs of equal labels; it would fuse them, which is a remote head disagreeing
+with a local one, so `series_to_batch` records each series' starting row offset in the schema
+metadata and `series_from_batch` splits there (falling back to label runs for a batch written before
+that metadata existed). Second, a caller that must *say* which metric each series is — `imbh-tui`'s
+series list, showing several checked metrics side by side — cannot use the batch at all, and issues
+one query per metric so it can name each answer. The batch stays for callers that do not need to
+attribute the results.
 
 **Footprint.** `imbh-head` is downstream of the facade, so the crate-count gate (`cargo tree -p imbh`)
 is unchanged at 275. The feature split keeps each consumer to the half it plays: `imbh-server` takes
