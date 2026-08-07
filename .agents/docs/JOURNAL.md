@@ -4129,3 +4129,99 @@ multi-point, attributed cumulative histogram, which no existing fixture provided
   already a distinct field on `dto::MetricDimensionsRequest` (and `truncated` is already reported).
 - The additions are API-additive across `imbh` and `imbh-head`, so the next release is a minor bump,
   not a patch.
+
+## The TUI query box grows a real caret, and completion had to follow it (2026-08-08)
+
+`imbh-tui`'s two text editors — the query box and the absolute-range form — were append-only:
+`Backspace` popped the last byte, a character pushed onto the end, and the block caret was a reversed
+space drawn *after* the text. Fixing a typo in the middle of
+`http_requests_total{service="checkout",method="POST"}` meant deleting back to it. This adds caret
+movement (`←`/`→`, `Ctrl-B`/`Ctrl-F`, `Home`/`End`, `Ctrl-A`/`Ctrl-E`) plus the deletions a mid-string
+caret implies (`Delete` / `Ctrl-D` forward, `Ctrl-K` kill-to-end-of-line), and scrolls the box
+horizontally when the query outgrows it.
+
+`Ctrl-K` follows Emacs `kill-line` rather than "truncate at the caret", which is not pedantry here:
+the box really can hold newline-joined queries (the catalog's multi-metric "visualize" writes them),
+so a kill stops at the next `\n`, and a caret sitting *on* the break kills only the break and joins
+the two lines. Nothing is stashed — there is no yank to pair a kill ring with.
+
+### The caret is one byte offset, and every read clamps it
+
+`App::query_cursor` is a byte offset into the *active* query — but which buffer is active follows the
+screen (`query: [String; 4]`), and Back/Forward, a screen switch, and the catalog's "visualize" all
+swap that buffer without the editor's knowledge. Rather than track the caret per buffer, every read
+goes through `App::query_caret`, which clamps into the current buffer and floors onto a character
+boundary; `begin_editing` (the only door into `Mode::Editing`) parks it at the end. That makes a
+stale offset unobservable instead of a panic waiting on a `&query[..caret]` slice. `set_active_query`
+is the new way to replace a buffer wholesale, so the two can't drift.
+
+### Completion classifies the prefix, not the buffer
+
+`completion_context` was documented as "the caret is always the end of the string", and three call
+sites passed `active_query()`. With a movable caret those become `query_before_caret()`, and
+`accept_completion` switches from `truncate` + `push_str` to `replace_range(caret - token_len..caret)`
+— it replaces the token *before* the caret and leaves the tail alone. Caret movement also re-derives
+the popup, since which token is being completed is a function of where the caret sits. This was the
+non-obvious half of the change: the completion machinery silently assumed append-only editing, and
+nothing in the type system said so.
+
+A related latent bug fell out: `KeyCode::Char(c)` in edit mode had no modifier guard, so `Ctrl-B`
+already typed a literal `b`. Every Emacs binding would have inserted its own letter without the
+`!ctrl && !alt` guard now on that arm.
+
+### Rendering a caret inside coloured text
+
+The lexer emits `Vec<Span>` and its output is not char-for-char with its input in one place: a `\n`
+(queries are stored newline-joined for multi-metric visualization) renders as a three-column
+separator. So `highlight_query` became a thin wrapper over `highlight_spans`, which pairs each span
+with the **source byte range** it came from; `highlight_caret` splits the span containing the caret
+and reverses exactly that character, falling back to marking the whole span when the rendered width
+and the source width disagree (the newline case). While restructuring the lexer's loop into
+one-span-per-iteration, the whitespace run stopped swallowing `\n` — previously a newline adjacent to
+a space landed in a raw span and reached the single-line `Line` as a literal control character.
+
+### Overflow: scroll by the least amount that keeps the caret visible
+
+`Paragraph::scroll((0, x))` on the unwrapped query line, with `x = caret_column - (inner_width - 1)`,
+saturating at 0. The caret column is a display width (`unicode-width`), not a byte offset, with each
+newline counted as the separator it renders as. At rest the line stays pinned to its start, which is
+the pre-existing behaviour; only editing scrolls. A render test at 48 columns asserts the caret sits
+on the last column inside the border with the query's tail visible, and on the first column after
+`Home` with its head visible.
+
+### The second editor made the abstraction pay for itself
+
+The absolute-range form (two datetime fields) was the same append-only editor — `pop()` on Backspace,
+`push()` on a character, a caret drawn after the text — so "the same treatment" would have been a
+second copy of the caret arithmetic. Instead the whole thing moved into a new `textfield` module: a
+borrowed `TextField { text: &mut String, caret: &mut usize }`, the eight editing primitives, and one
+`handle_edit_key` that owns the key map (cursor keys, the Emacs aliases, `Backspace`, `Delete`/
+`Ctrl-D`, `Ctrl-K`, and the guarded character arm). Both editors now bind their *own* keys first and
+hand the rest to that function, which reports whether it took the key — so the query box can refresh
+its completion popup on exactly the keys that changed something, and the form doesn't have to care.
+
+The form's two fields share one caret (`abs_cursor`), re-seated at the end of whichever field takes
+focus, since `Tab`/`↑`/`↓` are field switches. Resuming the old field's offset on the way back would
+be the other defensible choice; parking at the end matches how the form opens and how `begin_editing`
+behaves, so both editors read the same way.
+
+Its overflow handling had to be done by hand rather than with `Paragraph::scroll`: the two fields and
+the hint line share one paragraph, so scrolling the widget would drag the *other* rows sideways too.
+`caret_spans` therefore builds one cell per character, accumulates display columns (a column is not an
+index once a character is wide), and emits only the window containing the caret. Overflow needs ~19
+characters of junk in a 48-column popup to trigger, but it is exactly the case where a user is typing
+blind, which is the thing this change set is about.
+
+### Verified
+
+`fmt --all --check` clean; `build --workspace`, `clippy --workspace --all-targets -D warnings`, and
+`test --workspace` all clean. `imbh-tui` goes 118 → 141 tests: caret movement and its Emacs aliases,
+backspace/delete/kill around the caret, whole-character steps over a multi-byte `é`, the modifier guard
+(no `Ctrl-`/`Alt-` letter reaches the buffer, but `Shift` still types), mid-query completion accept,
+caret clamping across a buffer swap, the reversed-character assertions on `highlight_caret`, the
+horizontal-scroll render test, the `textfield` primitives on their own (including "a declined key
+never reaches the buffer"), an end-to-end edit of the range form (in-place minute fix → field switch →
+`Ctrl-A`/`Ctrl-K` → a rejected commit → a good one), and the popup field's caret/window spans. The
+twelve existing completion tests moved from `*app.active_query_mut() = …` to `set_active_query`, which
+is what "the query, caret at the end" now means. No dependency change, so no footprint gate movement
+is possible.

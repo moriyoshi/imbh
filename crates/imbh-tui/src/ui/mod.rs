@@ -23,7 +23,7 @@ use crate::chart::ascii_chart;
 use crate::format::wrapped_rows;
 use crate::mascot::{MASCOT_ART_HEIGHT, MASCOT_BOTTOM_MARGIN, mascot_art, mascot_phase};
 use crate::model::{Focus, MENU_LEN, Mode, Options, Route, Screen};
-use crate::syntax::highlight_query;
+use crate::syntax::{highlight_caret, highlight_query};
 use crate::time::format_datetime_ns;
 use crate::ui::glyphs::Glyphs;
 use crate::ui::logs::draw_log_detail;
@@ -49,6 +49,15 @@ pub(crate) fn focus_border(focused: bool) -> Style {
     } else {
         Style::default()
     }
+}
+
+/// The column the query editor's caret occupies within the rendered query line: the display width of
+/// everything before it, with each newline counted as the separator width it renders as (queries are
+/// stored newline-joined but painted on one line).
+fn caret_column(app: &App, g: &Glyphs) -> u16 {
+    let separator = format!(" {} ", g.vline);
+    let before = app.query_before_caret().replace('\n', &separator);
+    before.width().min(u16::MAX as usize) as u16
 }
 
 /// Overlay the animated mascot ("Atta") at the [`Mascot`](crate::mascot::Mascot) controller's
@@ -345,15 +354,14 @@ pub(crate) fn draw(frame: &mut ratatui::Frame<'_>, app: &App, options: &Options)
     };
 
     if let Some(query_area) = query_area {
-        let mut spans = highlight_query(app.screen(), app.active_query(), &g);
-        if app.mode == Mode::Editing {
-            // A block caret; the global cursor stays hidden so this marks the edit point.
-            spans.push(Span::styled(
-                " ",
-                Style::default().add_modifier(Modifier::REVERSED),
-            ));
-        }
-        let query_title = if app.mode == Mode::Editing {
+        let editing = app.mode == Mode::Editing;
+        // The block caret marks the edit point (the terminal's own cursor stays hidden).
+        let spans = if editing {
+            highlight_caret(app.screen(), app.active_query(), app.query_caret(), &g)
+        } else {
+            highlight_query(app.screen(), app.active_query(), &g)
+        };
+        let query_title = if editing {
             format!(
                 "Query (Enter: run {s} Tab: complete {s} Esc: cancel)",
                 s = g.sep
@@ -361,8 +369,17 @@ pub(crate) fn draw(frame: &mut ratatui::Frame<'_>, app: &App, options: &Options)
         } else {
             "Query (e: edit)".to_owned()
         };
+        // A query longer than the box would otherwise be clipped at the right edge, hiding the caret as
+        // soon as the text outgrows the pane. While editing, scroll horizontally by the least amount
+        // that keeps the caret's column inside the box; at rest the line stays pinned to its start.
+        let inner_width = query_area.width.saturating_sub(2);
+        let offset = if editing {
+            caret_column(app, &g).saturating_sub(inner_width.saturating_sub(1))
+        } else {
+            0
+        };
         frame.render_widget(
-            Paragraph::new(Line::from(spans)).block(
+            Paragraph::new(Line::from(spans)).scroll((0, offset)).block(
                 g.block()
                     .border_style(focus_border(focus == Focus::Query))
                     .title(query_title),
@@ -700,8 +717,8 @@ mod tests {
             ("metrics query + completion", {
                 let mut app = App::new();
                 app.route = Route::Metrics;
-                app.query[1] = "rate(".to_owned();
                 app.mode = Mode::Editing;
+                app.set_active_query("rate("); // caret at the end, as `begin_editing` leaves it
                 app.completion = Some(Completion {
                     candidates: vec![Candidate {
                         text: "http_requests".to_owned(),
@@ -790,6 +807,62 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn a_query_longer_than_its_box_scrolls_to_keep_the_caret_visible() {
+        use ratatui::backend::TestBackend;
+
+        // 48 columns: the query box's inner width is 46, so this query is comfortably wider than it.
+        let query = "http_requests_total{service=\"checkout\",host=\"node-a\",method=\"POST\"}";
+        assert!(query.len() > 46);
+        let options = Options::default();
+        // The row the query box's text lands on: the menu bar, then the box's top border.
+        let query_row = 2;
+        let text_at = |app: &App| {
+            let mut terminal = Terminal::new(TestBackend::new(48, 12)).unwrap();
+            terminal.draw(|frame| draw(frame, app, &options)).unwrap();
+            let buffer = terminal.backend().buffer().clone();
+            let row: String = (0..buffer.area.width)
+                .map(|x| buffer[(x, query_row)].symbol().to_owned())
+                .collect();
+            // The caret is the reversed cell, reported as its column within the row.
+            let caret = (0..buffer.area.width).find(|x| {
+                buffer[(*x, query_row)]
+                    .style()
+                    .add_modifier
+                    .contains(Modifier::REVERSED)
+            });
+            (row, caret)
+        };
+
+        let mut app = App::new();
+        app.route = Route::Metrics;
+        app.mode = Mode::Editing;
+        app.set_active_query(query); // caret at the end, as `begin_editing` leaves it
+
+        // Caret at the end: the box shows the tail of the query with the caret on the last column
+        // inside the border, instead of clipping the query and losing the caret entirely.
+        let (row, caret) = text_at(&app);
+        assert!(row.contains("method=\"POST\"}"), "query row: {row:?}");
+        assert!(!row.contains("http_requests_total"), "query row: {row:?}");
+        assert_eq!(
+            caret,
+            Some(46),
+            "the caret sits just inside the right border"
+        );
+
+        // Walking the caret back to the start scrolls the window back with it.
+        app.query_field().home();
+        let (row, caret) = text_at(&app);
+        assert!(row.contains("http_requests_total"), "query row: {row:?}");
+        assert_eq!(caret, Some(1), "the caret sits just inside the left border");
+
+        // A query that fits is never scrolled.
+        app.set_active_query("up");
+        let (row, caret) = text_at(&app);
+        assert!(row.starts_with("│up"), "query row: {row:?}");
+        assert_eq!(caret, Some(3));
     }
 
     #[test]

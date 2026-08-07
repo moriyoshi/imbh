@@ -19,6 +19,7 @@
 //! * [`fetch`] / [`tasks`] — the queries behind a refresh, dispatched off the event-loop thread.
 //! * [`ui`] — rendering; it reads [`App`](app::App) and never mutates it.
 //! * [`syntax`] / [`completion`] / [`promql`] — the query-language support behind the editor.
+//! * [`textfield`] — the caret and editing keys the query box and the range form share.
 //! * [`format`] / [`time`] / [`waterfall`] / [`detail_text`] / [`chart`] — display helpers.
 //! * [`mascot`] — the animated easter egg that rides on top of it all.
 //!
@@ -43,6 +44,7 @@ mod runtime;
 mod syntax;
 mod tasks;
 mod terminal;
+mod textfield;
 mod time;
 mod ui;
 mod waterfall;

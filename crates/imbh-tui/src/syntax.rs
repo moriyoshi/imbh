@@ -1,7 +1,9 @@
 //! Query-language knowledge shared by the editor: the keyword/function vocabularies, the trailing
 //! identifier the caret sits on, and the lightweight lexer that colours the input bar.
 
-use ratatui::style::{Color, Style};
+use std::ops::Range;
+
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Span;
 
 use crate::model::Screen;
@@ -147,7 +149,8 @@ pub(crate) fn functions_for(screen: Screen) -> &'static [&'static str] {
 }
 
 /// The identifier token at the very end of the query — the run of `[A-Za-z0-9_:.]` the editor's caret
-/// (always the end of the string) currently sits on. This is what completion suggests against.
+/// sits on. Callers pass the query *up to the caret*, so "the end of the string" is the caret. This is
+/// what completion suggests against.
 pub(crate) fn current_token(query: &str) -> &str {
     let mut start = query.len();
     for (index, ch) in query.char_indices().rev() {
@@ -178,40 +181,54 @@ pub(crate) fn trailing_ident(s: &str) -> &str {
     &s[start..]
 }
 
-/// Tokenize a query into coloured spans for the input bar. Deliberately a lightweight lexer shared by
-/// all three languages (strings, numbers/durations, identifiers/functions, operators, punctuation)
-/// rather than a per-grammar parser; it is presentation only and never rejects input.
-pub(crate) fn highlight_query(screen: Screen, query: &str, g: &Glyphs) -> Vec<Span<'static>> {
+/// Tokenize a query into coloured spans for the input bar, each paired with the byte range of `query`
+/// it was produced from — what the caret renderer needs to split a span at the edit point. Deliberately
+/// a lightweight lexer shared by all three languages (strings, numbers/durations, identifiers/
+/// functions, operators, punctuation) rather than a per-grammar parser; it is presentation only and
+/// never rejects input.
+///
+/// Every span's content reproduces its source range verbatim, with one exception: a `\n` renders as a
+/// three-column separator (see below), so the two are not interchangeable — [`highlight_caret`] keys
+/// off exactly that.
+pub(crate) fn highlight_spans(
+    screen: Screen,
+    query: &str,
+    g: &Glyphs,
+) -> Vec<(Span<'static>, Range<usize>)> {
     // `?` is included so the imbh LogQL dialect's `|?` / `!?` term operators highlight as a unit.
     const OPERATORS: &[char] = &[
         '=', '!', '~', '<', '>', '|', '&', '+', '-', '*', '/', '^', '?',
     ];
     let keywords = keywords_for(screen);
     let chars: Vec<char> = query.chars().collect();
-    let mut spans: Vec<Span<'static>> = Vec::new();
+    // Char index -> byte offset, with a final entry for the end of the string, so each span's char
+    // bounds map back to a byte range of `query`.
+    let offsets: Vec<usize> = query
+        .char_indices()
+        .map(|(at, _)| at)
+        .chain(std::iter::once(query.len()))
+        .collect();
+    let mut spans: Vec<(Span<'static>, Range<usize>)> = Vec::new();
     let take = |from: usize, to: usize| chars[from..to].iter().collect::<String>();
     let mut i = 0;
     while i < chars.len() {
         let c = chars[i];
-        if c == '\n' {
+        let start = i;
+        let span = if c == '\n' {
             // Several queries are stored newline-joined (multi-metric visualization); show each break
             // as a visible separator so the single-line bar stays readable.
-            spans.push(Span::styled(
+            i += 1;
+            Span::styled(
                 format!(" {} ", g.vline),
                 Style::default().fg(Color::DarkGray),
-            ));
-            i += 1;
-            continue;
-        }
-        if c.is_whitespace() {
-            let start = i;
-            while i < chars.len() && chars[i].is_whitespace() {
+            )
+        } else if c.is_whitespace() {
+            while i < chars.len() && chars[i].is_whitespace() && chars[i] != '\n' {
                 i += 1;
             }
-            spans.push(Span::raw(take(start, i)));
+            Span::raw(take(start, i))
         } else if c == '"' || c == '\'' || c == '`' {
             let quote = c;
-            let start = i;
             i += 1;
             while i < chars.len() {
                 if chars[i] == '\\' && quote != '`' {
@@ -224,22 +241,14 @@ pub(crate) fn highlight_query(screen: Screen, query: &str, g: &Glyphs) -> Vec<Sp
                     break;
                 }
             }
-            spans.push(Span::styled(
-                take(start, i),
-                Style::default().fg(Color::Green),
-            ));
+            Span::styled(take(start, i), Style::default().fg(Color::Green))
         } else if c.is_ascii_digit() {
             // Numbers and durations (e.g. `5m`, `1h30m`, `0.5`) — trailing unit letters included.
-            let start = i;
             while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '.') {
                 i += 1;
             }
-            spans.push(Span::styled(
-                take(start, i),
-                Style::default().fg(Color::Magenta),
-            ));
+            Span::styled(take(start, i), Style::default().fg(Color::Magenta))
         } else if c.is_alphabetic() || c == '_' || c == ':' {
-            let start = i;
             while i < chars.len()
                 && (chars[i].is_alphanumeric() || matches!(chars[i], '_' | ':' | '.'))
             {
@@ -256,28 +265,77 @@ pub(crate) fn highlight_query(screen: Screen, query: &str, g: &Glyphs) -> Vec<Sp
             } else {
                 Style::default()
             };
-            spans.push(Span::styled(word, style));
+            Span::styled(word, style)
         } else if OPERATORS.contains(&c) {
-            let start = i;
             while i < chars.len() && OPERATORS.contains(&chars[i]) {
                 i += 1;
             }
-            spans.push(Span::styled(
-                take(start, i),
-                Style::default().fg(Color::Yellow),
-            ));
+            Span::styled(take(start, i), Style::default().fg(Color::Yellow))
         } else if matches!(c, '{' | '}' | '[' | ']' | '(' | ')' | ',') {
-            spans.push(Span::styled(
-                c.to_string(),
-                Style::default().fg(Color::DarkGray),
-            ));
             i += 1;
+            Span::styled(c.to_string(), Style::default().fg(Color::DarkGray))
         } else {
-            spans.push(Span::raw(c.to_string()));
             i += 1;
-        }
+            Span::raw(c.to_string())
+        };
+        spans.push((span, offsets[start]..offsets[i]));
     }
     spans
+}
+
+/// The coloured spans for the input bar (see [`highlight_spans`]), without the source ranges.
+pub(crate) fn highlight_query(screen: Screen, query: &str, g: &Glyphs) -> Vec<Span<'static>> {
+    highlight_spans(screen, query, g)
+        .into_iter()
+        .map(|(span, _)| span)
+        .collect()
+}
+
+/// The coloured spans with the character at byte offset `caret` drawn reversed — a block caret, since
+/// the terminal's own cursor stays hidden. A caret at the end of the query (the usual case while
+/// typing) has no character to reverse, so a reversed space is appended instead.
+///
+/// A `\n` renders wider than its source, so a caret on one marks the whole separator rather than
+/// slicing a string that no longer lines up with the input.
+pub(crate) fn highlight_caret(
+    screen: Screen,
+    query: &str,
+    caret: usize,
+    g: &Glyphs,
+) -> Vec<Span<'static>> {
+    let reversed = |style: Style| style.add_modifier(Modifier::REVERSED);
+    let mut out: Vec<Span<'static>> = Vec::new();
+    let mut marked = false;
+    for (span, range) in highlight_spans(screen, query, g) {
+        if marked || !range.contains(&caret) {
+            out.push(span);
+            continue;
+        }
+        marked = true;
+        let source = &query[range.start..range.end];
+        if span.content.chars().count() != source.chars().count() {
+            out.push(Span::styled(span.content, reversed(span.style)));
+            continue;
+        }
+        // The caret's character offset within the span, which the equal char counts above make valid
+        // for the rendered content too.
+        let rel = source[..caret - range.start].chars().count();
+        let content = span.content.as_ref();
+        let before: String = content.chars().take(rel).collect();
+        let at: String = content.chars().skip(rel).take(1).collect();
+        let after: String = content.chars().skip(rel + 1).collect();
+        if !before.is_empty() {
+            out.push(Span::styled(before, span.style));
+        }
+        out.push(Span::styled(at, reversed(span.style)));
+        if !after.is_empty() {
+            out.push(Span::styled(after, span.style));
+        }
+    }
+    if !marked {
+        out.push(Span::styled(" ", reversed(Style::default())));
+    }
+    out
 }
 
 #[cfg(test)]
@@ -304,6 +362,56 @@ mod tests {
                 .any(|span| span.content.as_ref() == "\"api\""
                     && span.style.fg == Some(Color::Green))
         );
+    }
+
+    #[test]
+    fn the_caret_reverses_exactly_the_character_it_sits_on() {
+        let g = Glyphs::new(false);
+        let query = "rate(x)";
+        let rebuilt = |spans: &[Span<'static>]| {
+            spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        };
+        let reversed = |spans: &[Span<'static>]| {
+            spans
+                .iter()
+                .filter(|span| span.style.add_modifier.contains(Modifier::REVERSED))
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        };
+
+        // Mid-query: the input is still reproduced verbatim, with just that one character reversed.
+        let spans = highlight_caret(Screen::Metrics, query, 5, &g);
+        assert_eq!(rebuilt(&spans), query);
+        assert_eq!(reversed(&spans), "x");
+        // The `(` before it, i.e. the last character of a span rather than the first.
+        assert_eq!(
+            reversed(&highlight_caret(Screen::Metrics, query, 4, &g)),
+            "("
+        );
+        // Inside a multi-character token.
+        assert_eq!(
+            reversed(&highlight_caret(Screen::Metrics, query, 2, &g)),
+            "t"
+        );
+
+        // At the end there is nothing to reverse, so the caret is an appended block.
+        let spans = highlight_caret(Screen::Metrics, query, query.len(), &g);
+        assert_eq!(rebuilt(&spans), format!("{query} "));
+        assert_eq!(reversed(&spans), " ");
+
+        // A multi-byte character is marked whole.
+        assert_eq!(
+            reversed(&highlight_caret(Screen::Logs, "{a=\"é\"}", 4, &g)),
+            "é"
+        );
+
+        // A newline renders wider than its source (a separator), so the caret marks all of it rather
+        // than slicing a string that no longer lines up with the input.
+        let spans = highlight_caret(Screen::Metrics, "a\nb", 1, &g);
+        assert_eq!(reversed(&spans), format!(" {} ", g.vline));
     }
 
     #[test]

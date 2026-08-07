@@ -9,14 +9,14 @@ use crate::completion::{
 use crate::model::{Mode, Screen};
 
 impl App {
-    /// Recompute the completion popup for the identifier token at the end of the active query. Clears
-    /// it outside edit mode, when the token is empty, or when the only match is the token itself.
+    /// Recompute the completion popup for the identifier token the caret sits on. Clears it outside
+    /// edit mode, when the token is empty, or when the only match is the token itself.
     pub(crate) fn refresh_completion(&mut self) {
         if self.mode != Mode::Editing {
             self.completion = None;
             return;
         }
-        let (context, token) = completion_context(self.active_query());
+        let (context, token) = completion_context(self.query_before_caret());
         let token = token.to_owned();
         // Expression position waits for at least one character before popping up (metric/function
         // lists are large); label-name/value position offers its (smaller) vocabulary immediately, so
@@ -66,7 +66,7 @@ impl App {
         if self.mode != Mode::Editing || self.screen() != Screen::Metrics {
             return None;
         }
-        let metric = match completion_context(self.active_query()).0 {
+        let metric = match completion_context(self.query_before_caret()).0 {
             CompletionContext::LabelName { metric }
             | CompletionContext::LabelValue { metric, .. } => metric?,
             _ => return None,
@@ -88,7 +88,7 @@ impl App {
         if self.mode != Mode::Editing || self.screen() != Screen::Logs {
             return None;
         }
-        match completion_context(self.active_query()).0 {
+        match completion_context(self.query_before_caret()).0 {
             CompletionContext::LabelName { .. } => {
                 if self.log_labels.is_none() && !self.log_labels_loading {
                     self.log_labels_loading = true;
@@ -112,6 +112,8 @@ impl App {
     }
 
     /// Replace the token under the caret with the highlighted candidate, appending `(` for functions.
+    /// Only the token *before* the caret is replaced — whatever follows the caret is left untouched,
+    /// and the caret lands at the end of the inserted text.
     pub(crate) fn accept_completion(&mut self) {
         let Some(completion) = self.completion.take() else {
             return;
@@ -119,16 +121,18 @@ impl App {
         let Some(candidate) = completion.candidates.get(completion.selected) else {
             return;
         };
-        let token_len = completion_context(self.active_query()).1.len();
+        let caret = self.query_caret();
+        let token_len = completion_context(self.query_before_caret()).1.len();
         let replacement = if candidate.kind == CandidateKind::Function {
             format!("{}(", candidate.text)
         } else {
             candidate.text.clone()
         };
-        let query = self.active_query_mut();
-        query.truncate(query.len() - token_len);
-        query.push_str(&replacement);
-        // The new trailing token (empty after a `(`, or the full name) may still have suggestions.
+        self.active_query_mut()
+            .replace_range(caret - token_len..caret, &replacement);
+        self.query_cursor = caret - token_len + replacement.len();
+        // The new token before the caret (empty after a `(`, or the full name) may still have
+        // suggestions.
         self.refresh_completion();
     }
 }
@@ -147,13 +151,13 @@ mod tests {
         app.metric_names = vec!["http_requests_total".to_owned()];
 
         // Function completion appends `(`.
-        *app.active_query_mut() = "rat".to_owned();
+        app.set_active_query("rat");
         app.refresh_completion();
         app.accept_completion();
         assert_eq!(app.active_query(), "rate(");
 
         // Metric completion replaces the token verbatim.
-        *app.active_query_mut() = "rate(htt".to_owned();
+        app.set_active_query("rate(htt");
         app.refresh_completion();
         app.accept_completion();
         assert_eq!(app.active_query(), "rate(http_requests_total");
@@ -164,13 +168,13 @@ mod tests {
         let mut app = App::new();
         app.route = Route::Metrics;
         // Not editing -> never suggest.
-        *app.active_query_mut() = "rat".to_owned();
+        app.set_active_query("rat");
         app.refresh_completion();
         assert!(app.completion.is_none());
 
         // Editing, but the token already equals the only candidate -> nothing more to offer.
         app.mode = Mode::Editing;
-        *app.active_query_mut() = "rate".to_owned();
+        app.set_active_query("rate");
         app.refresh_completion();
         assert!(app.completion.is_none());
     }
@@ -178,7 +182,7 @@ mod tests {
     #[test]
     fn completion_offers_label_names_inside_a_matcher() {
         let mut app = app_with_discovered_dims();
-        *app.active_query_mut() = "http_requests_total{s".to_owned();
+        app.set_active_query("http_requests_total{s");
         app.refresh_completion();
         let completion = app.completion.as_ref().expect("label-name candidates");
         let texts = completion
@@ -198,7 +202,7 @@ mod tests {
     #[test]
     fn completion_offers_label_values_inside_a_quoted_matcher() {
         let mut app = app_with_discovered_dims();
-        *app.active_query_mut() = "http_requests_total{service=\"c".to_owned();
+        app.set_active_query("http_requests_total{service=\"c");
         app.refresh_completion();
         let completion = app.completion.as_ref().expect("label-value candidates");
         let texts = completion
@@ -225,7 +229,7 @@ mod tests {
         let mut app = app_with_discovered_dims();
         // Reset the metric to "not discovered yet".
         app.metric_tree[0].dims = None;
-        *app.active_query_mut() = "http_requests_total{s".to_owned();
+        app.set_active_query("http_requests_total{s");
         // No label vocabulary yet -> no popup, but a discovery request is emitted exactly once.
         app.refresh_completion();
         assert!(app.completion.is_none());
@@ -242,7 +246,7 @@ mod tests {
         // Unlike Metrics/Traces (whose Expr vocabulary is large and waits for input), the Logs box's
         // short operator-hint list pops immediately after a selector.
         let mut app = logs_app_with_labels();
-        *app.active_query_mut() = "{}".to_owned();
+        app.set_active_query("{}");
         app.refresh_completion();
         let completion = app.completion.as_ref().expect("operator-hint popup");
         assert!(
@@ -256,7 +260,7 @@ mod tests {
     #[test]
     fn completion_offers_log_label_names_inside_a_matcher() {
         let mut app = logs_app_with_labels();
-        *app.active_query_mut() = "{h".to_owned();
+        app.set_active_query("{h");
         app.refresh_completion();
         let completion = app.completion.as_ref().expect("log label-name candidates");
         let texts = completion
@@ -277,7 +281,7 @@ mod tests {
     #[test]
     fn completion_offers_log_label_values_inside_a_quoted_matcher() {
         let mut app = logs_app_with_labels();
-        *app.active_query_mut() = "{service.name=\"c".to_owned();
+        app.set_active_query("{service.name=\"c");
         app.refresh_completion();
         let completion = app.completion.as_ref().expect("log label-value candidates");
         let texts = completion
@@ -303,7 +307,7 @@ mod tests {
         app.route = Route::Logs;
         app.mode = Mode::Editing;
         // No label vocabulary discovered yet.
-        *app.active_query_mut() = "{s".to_owned();
+        app.set_active_query("{s");
         app.refresh_completion();
         assert!(app.completion.is_none(), "no vocabulary -> no popup yet");
         assert_eq!(
@@ -328,7 +332,7 @@ mod tests {
         app.mode = Mode::Editing;
         app.log_labels = Some(vec!["service.name".to_owned()]);
         // In a quoted value for an as-yet-undiscovered key.
-        *app.active_query_mut() = "{service.name=\"c".to_owned();
+        app.set_active_query("{service.name=\"c");
         app.refresh_completion();
         assert!(app.completion.is_none(), "no values yet -> no popup");
         assert_eq!(
