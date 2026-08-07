@@ -15,6 +15,7 @@ use crate::tasks::{
     maybe_discover_label_dims, request_metric_dims, request_metric_exemplars, request_refresh,
     request_vocabulary, request_waterfall,
 };
+use crate::textfield::handle_edit_key;
 
 /// Whether the event loop should keep running after a key press.
 #[derive(PartialEq, Eq)]
@@ -189,10 +190,14 @@ pub(crate) fn handle_key(
     }
     match app.mode {
         Mode::Editing => {
+            // The editor's own bindings first; everything else is offered to the text field below, so
+            // the caret keys (and the modifier guard that keeps `Ctrl-B` from typing a `b`) are the
+            // shared ones.
             match key.code {
                 KeyCode::Esc => {
                     app.mode = Mode::Normal;
                     app.completion = None;
+                    return Control::Continue;
                 }
                 KeyCode::Enter => {
                     app.mode = Mode::Normal;
@@ -207,31 +212,35 @@ pub(crate) fn handle_key(
                     // Running the query moves the user's attention to the results, so focus lands there.
                     app.focus = Focus::Primary;
                     request_refresh(app, backend.clone(), options.clone(), sender.clone());
+                    return Control::Continue;
                 }
-                // Tab accepts the highlighted completion; ↑/↓ move within the popup.
-                KeyCode::Tab => app.accept_completion(),
+                // Tab accepts the highlighted completion (which refreshes the popup itself); ↑/↓ move
+                // within the popup and must leave the candidates as they are.
+                KeyCode::Tab => {
+                    app.accept_completion();
+                    maybe_discover_label_dims(app, backend, options, sender);
+                    return Control::Continue;
+                }
                 KeyCode::Down => {
                     if let Some(completion) = app.completion.as_mut() {
                         completion.selected =
                             (completion.selected + 1).min(completion.candidates.len() - 1);
                     }
+                    return Control::Continue;
                 }
                 KeyCode::Up => {
                     if let Some(completion) = app.completion.as_mut() {
                         completion.selected = completion.selected.saturating_sub(1);
                     }
-                }
-                KeyCode::Backspace => {
-                    app.active_query_mut().pop();
-                    app.refresh_completion();
-                    maybe_discover_label_dims(app, backend, options, sender);
-                }
-                KeyCode::Char(character) => {
-                    app.active_query_mut().push(character);
-                    app.refresh_completion();
-                    maybe_discover_label_dims(app, backend, options, sender);
+                    return Control::Continue;
                 }
                 _ => {}
+            }
+            // A caret move or an edit both change which token the caret sits on, so the popup (and the
+            // vocabulary behind it) follows. A key the field declines changes nothing.
+            if handle_edit_key(app.query_field(), key) {
+                app.refresh_completion();
+                maybe_discover_label_dims(app, backend, options, sender);
             }
             return Control::Continue;
         }
@@ -269,32 +278,37 @@ pub(crate) fn handle_key(
             return Control::Continue;
         }
         Mode::AbsoluteRange => {
+            // The form's own bindings (dismiss, field switch, commit) first; the two datetime fields are
+            // then edited by the same keys as the query box, caret and all. Tab/↑/↓ re-seat the shared
+            // caret on the field they focus.
             match key.code {
-                KeyCode::Esc => app.mode = Mode::Normal,
-                KeyCode::Tab => app.abs_field ^= 1,
-                KeyCode::Up => app.abs_field = 0,
-                KeyCode::Down => app.abs_field = 1,
-                KeyCode::Backspace => {
-                    if app.abs_field == 0 {
-                        app.abs_start.pop();
-                    } else {
-                        app.abs_end.pop();
-                    }
+                KeyCode::Esc => {
+                    app.mode = Mode::Normal;
+                    return Control::Continue;
                 }
-                KeyCode::Char(character) => {
-                    if app.abs_field == 0 {
-                        app.abs_start.push(character);
-                    } else {
-                        app.abs_end.push(character);
-                    }
+                KeyCode::Tab => {
+                    app.focus_abs_field(app.abs_field ^ 1);
+                    return Control::Continue;
+                }
+                KeyCode::Up => {
+                    app.focus_abs_field(0);
+                    return Control::Continue;
+                }
+                KeyCode::Down => {
+                    app.focus_abs_field(1);
+                    return Control::Continue;
                 }
                 // `commit_absolute` always runs (recording a parse error on failure); the guard only
                 // gates the follow-up refresh on a successful commit.
-                KeyCode::Enter if app.commit_absolute() => {
-                    request_refresh(app, backend.clone(), options.clone(), sender.clone());
+                KeyCode::Enter => {
+                    if app.commit_absolute() {
+                        request_refresh(app, backend.clone(), options.clone(), sender.clone());
+                    }
+                    return Control::Continue;
                 }
                 _ => {}
             }
+            handle_edit_key(app.abs_text_field(), key);
             return Control::Continue;
         }
         Mode::Menu => {
@@ -441,7 +455,7 @@ pub(crate) fn handle_key(
             let queries = app.visualize_queries();
             if !queries.is_empty() {
                 app.push_history();
-                *app.active_query_mut() = queries.join("\n");
+                app.set_active_query(queries.join("\n"));
                 app.selected = 0;
                 app.scroll = 0;
                 request_refresh(app, backend.clone(), options.clone(), sender.clone());
@@ -625,6 +639,9 @@ pub(crate) fn begin_editing(
 ) {
     app.mode = Mode::Editing;
     app.focus = Focus::Query;
+    // Editing always opens with the caret at the end of the query, which is also what makes
+    // `query_cursor` meaningful for the buffer it is about to edit.
+    app.query_field().end();
     if app.screen() == Screen::Metrics && app.metric_names.is_empty() {
         request_vocabulary(app.screen(), backend.clone(), sender.clone());
     }
@@ -684,6 +701,242 @@ pub(crate) fn switch_screen(
 mod tests {
     use super::*;
     use crate::model::TableData;
+    use crate::testutil::app_with_discovered_dims;
+
+    /// A backend and update channel for driving [`handle_key`]. `Backend::connect` contacts nothing,
+    /// and the editing tests below start from an app whose completion vocabulary is already
+    /// discovered, so no key they press dispatches a fetch.
+    fn harness() -> (
+        Backend,
+        Options,
+        mpsc::UnboundedSender<Update>,
+        mpsc::UnboundedReceiver<Update>,
+    ) {
+        let (sender, receiver) = mpsc::unbounded_channel();
+        let backend = Backend::connect("http://127.0.0.1:1").expect("a well-formed url");
+        (backend, Options::default(), sender, receiver)
+    }
+
+    /// Press a key in the app's current mode.
+    fn press(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
+        let (backend, options, sender, _receiver) = harness();
+        handle_key(
+            app,
+            KeyEvent::new(code, modifiers),
+            &backend,
+            &options,
+            &sender,
+        );
+    }
+
+    /// An editing app whose vocabulary is loaded, with `query` in the box and the caret at its end
+    /// (where `begin_editing` parks it).
+    fn editing(query: &str) -> App {
+        let mut app = app_with_discovered_dims();
+        app.set_active_query(query);
+        app
+    }
+
+    #[test]
+    fn the_cursor_keys_and_their_emacs_aliases_move_the_query_caret() {
+        let mut app = editing("rate(x)");
+        assert_eq!(
+            app.query_caret(),
+            7,
+            "editing opens with the caret at the end"
+        );
+
+        press(&mut app, KeyCode::Left, KeyModifiers::NONE);
+        press(&mut app, KeyCode::Left, KeyModifiers::NONE);
+        assert_eq!(app.query_caret(), 5);
+        // Typing lands at the caret, not at the end of the buffer.
+        press(&mut app, KeyCode::Char('y'), KeyModifiers::NONE);
+        assert_eq!(app.active_query(), "rate(yx)");
+        assert_eq!(app.query_caret(), 6);
+
+        // Ctrl-B/Ctrl-F are the same movement, and never type their own letter.
+        press(&mut app, KeyCode::Char('b'), KeyModifiers::CONTROL);
+        assert_eq!((app.active_query(), app.query_caret()), ("rate(yx)", 5));
+        press(&mut app, KeyCode::Char('f'), KeyModifiers::CONTROL);
+        assert_eq!((app.active_query(), app.query_caret()), ("rate(yx)", 6));
+
+        // Home/End (and Ctrl-A/Ctrl-E) jump to the ends.
+        press(&mut app, KeyCode::Home, KeyModifiers::NONE);
+        assert_eq!(app.query_caret(), 0);
+        press(&mut app, KeyCode::End, KeyModifiers::NONE);
+        assert_eq!(app.query_caret(), 8);
+        press(&mut app, KeyCode::Char('a'), KeyModifiers::CONTROL);
+        assert_eq!((app.active_query(), app.query_caret()), ("rate(yx)", 0));
+        press(&mut app, KeyCode::Char('e'), KeyModifiers::CONTROL);
+        assert_eq!((app.active_query(), app.query_caret()), ("rate(yx)", 8));
+
+        // Both ends saturate rather than running off the buffer.
+        press(&mut app, KeyCode::Right, KeyModifiers::NONE);
+        assert_eq!(app.query_caret(), 8);
+        press(&mut app, KeyCode::Home, KeyModifiers::NONE);
+        press(&mut app, KeyCode::Left, KeyModifiers::NONE);
+        assert_eq!(app.query_caret(), 0);
+    }
+
+    #[test]
+    fn backspace_and_delete_act_around_the_caret() {
+        let mut app = editing("rate(x)");
+        press(&mut app, KeyCode::Left, KeyModifiers::NONE); // between `x` and `)`
+        press(&mut app, KeyCode::Backspace, KeyModifiers::NONE);
+        assert_eq!((app.active_query(), app.query_caret()), ("rate()", 5));
+        // Delete (and Ctrl-D) take the character *under* the caret.
+        press(&mut app, KeyCode::Delete, KeyModifiers::NONE);
+        assert_eq!((app.active_query(), app.query_caret()), ("rate(", 5));
+        press(&mut app, KeyCode::Char('d'), KeyModifiers::CONTROL);
+        assert_eq!(app.active_query(), "rate(", "delete at the end is a no-op");
+        press(&mut app, KeyCode::Home, KeyModifiers::NONE);
+        press(&mut app, KeyCode::Backspace, KeyModifiers::NONE);
+        assert_eq!(
+            app.active_query(),
+            "rate(",
+            "backspace at the start is a no-op"
+        );
+        press(&mut app, KeyCode::Char('d'), KeyModifiers::CONTROL);
+        assert_eq!((app.active_query(), app.query_caret()), ("ate(", 0));
+    }
+
+    #[test]
+    fn ctrl_k_kills_from_the_caret_to_the_end_of_the_line() {
+        let mut app = editing("rate(http_requests_total)");
+        press(&mut app, KeyCode::Home, KeyModifiers::NONE);
+        press(&mut app, KeyCode::Right, KeyModifiers::NONE);
+        press(&mut app, KeyCode::Right, KeyModifiers::NONE);
+        press(&mut app, KeyCode::Char('k'), KeyModifiers::CONTROL);
+        assert_eq!((app.active_query(), app.query_caret()), ("ra", 2));
+        // At the end there is nothing left to kill.
+        press(&mut app, KeyCode::Char('k'), KeyModifiers::CONTROL);
+        assert_eq!(app.active_query(), "ra");
+
+        // A newline-joined query (what the catalog's multi-metric "visualize" writes) kills one line at
+        // a time, and a caret *on* the break kills only the break, joining the two.
+        let mut app = editing("up\nrate(x)\ndown");
+        press(&mut app, KeyCode::Home, KeyModifiers::NONE);
+        press(&mut app, KeyCode::Char('k'), KeyModifiers::CONTROL);
+        assert_eq!(app.active_query(), "\nrate(x)\ndown");
+        press(&mut app, KeyCode::Char('k'), KeyModifiers::CONTROL);
+        assert_eq!(app.active_query(), "rate(x)\ndown");
+        press(&mut app, KeyCode::End, KeyModifiers::NONE);
+        press(&mut app, KeyCode::Char('k'), KeyModifiers::CONTROL);
+        assert_eq!(
+            app.active_query(),
+            "rate(x)\ndown",
+            "a kill at the very end changes nothing"
+        );
+    }
+
+    /// A successful commit dispatches a refresh, which spawns — hence the runtime.
+    #[tokio::test]
+    async fn the_absolute_range_form_edits_both_fields_with_the_same_caret_keys() {
+        let mut app = App::new();
+        app.open_absolute_form();
+        assert_eq!(app.abs_field, 0);
+        assert_eq!(
+            app.abs_caret(),
+            app.abs_start.len(),
+            "the form opens on the start field with the caret at its end"
+        );
+
+        // Fix the minutes in place, as a user would: back over `:00`, delete a digit, type another.
+        app.abs_start = "2026-07-21 15:00:00".to_owned();
+        app.abs_cursor = app.abs_start.len();
+        for _ in 0..3 {
+            press(&mut app, KeyCode::Left, KeyModifiers::NONE);
+        }
+        press(&mut app, KeyCode::Backspace, KeyModifiers::NONE);
+        press(&mut app, KeyCode::Char('5'), KeyModifiers::NONE);
+        assert_eq!(app.abs_start, "2026-07-21 15:05:00");
+        assert_eq!(app.abs_caret(), 16);
+
+        // The caret is shared between the two fields, so moving between them re-seats it at the end of
+        // whichever now has focus — and coming back does not resume the old field's offset.
+        press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!((app.abs_field, app.abs_caret()), (1, app.abs_end.len()));
+        press(&mut app, KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!((app.abs_field, app.abs_caret()), (0, app.abs_start.len()));
+        press(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+        assert_eq!((app.abs_field, app.abs_caret()), (1, app.abs_end.len()));
+
+        // `Ctrl-A` + `Ctrl-K` clears the focused field (and `Ctrl-A` never types an `a`).
+        press(&mut app, KeyCode::Char('a'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Char('k'), KeyModifiers::CONTROL);
+        assert_eq!(app.abs_end, "");
+        // Enter on an unparseable field keeps the form open with the error, as before.
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(app.mode, Mode::AbsoluteRange);
+        assert!(app.abs_error.is_some());
+
+        // Typing a valid end commits the window and closes the form.
+        for character in "2026-07-21 16:00:00".chars() {
+            press(&mut app, KeyCode::Char(character), KeyModifiers::NONE);
+        }
+        assert_eq!(app.abs_end, "2026-07-21 16:00:00");
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(app.abs_window.is_some());
+        assert_eq!(
+            app.abs_start, "2026-07-21 15:05:00",
+            "the in-place edit is what was committed"
+        );
+    }
+
+    #[test]
+    fn caret_editing_steps_over_whole_multi_byte_characters() {
+        // The caret is a byte offset, so anything but whole-character steps would panic on a slice.
+        let mut app = editing("{svc=\"café\"}");
+        press(&mut app, KeyCode::Left, KeyModifiers::NONE); // before `}`
+        press(&mut app, KeyCode::Left, KeyModifiers::NONE); // before `"`
+        press(&mut app, KeyCode::Backspace, KeyModifiers::NONE);
+        assert_eq!(app.active_query(), "{svc=\"caf\"}");
+        press(&mut app, KeyCode::Char('é'), KeyModifiers::NONE);
+        press(&mut app, KeyCode::Char('s'), KeyModifiers::NONE);
+        assert_eq!(app.active_query(), "{svc=\"cafés\"}");
+        // And a caret that has stepped over the multi-byte character still splits the query cleanly.
+        press(&mut app, KeyCode::Left, KeyModifiers::NONE);
+        press(&mut app, KeyCode::Left, KeyModifiers::NONE);
+        assert_eq!(app.query_before_caret(), "{svc=\"caf");
+    }
+
+    #[test]
+    fn a_modified_letter_never_types_itself_into_the_query() {
+        // Ctrl-<letter> is a caret command; Alt-<letter> is unbound. Neither may reach the buffer, or
+        // every Emacs binding would insert its own letter as a side effect.
+        let mut app = editing("");
+        for (code, modifiers) in [
+            (KeyCode::Char('b'), KeyModifiers::CONTROL),
+            (KeyCode::Char('f'), KeyModifiers::CONTROL),
+            (KeyCode::Char('a'), KeyModifiers::CONTROL),
+            (KeyCode::Char('e'), KeyModifiers::CONTROL),
+            (KeyCode::Char('d'), KeyModifiers::CONTROL),
+            (KeyCode::Char('k'), KeyModifiers::CONTROL),
+            (KeyCode::Char('x'), KeyModifiers::CONTROL),
+            (KeyCode::Char('b'), KeyModifiers::ALT),
+        ] {
+            press(&mut app, code, modifiers);
+        }
+        assert_eq!(app.active_query(), "");
+        // A shifted letter is ordinary input, though.
+        press(&mut app, KeyCode::Char('R'), KeyModifiers::SHIFT);
+        assert_eq!(app.active_query(), "R");
+    }
+
+    #[test]
+    fn moving_the_caret_re_derives_the_completion_popup() {
+        // The popup completes the token the caret sits on, so walking back into a token reopens it and
+        // walking off one closes it.
+        let mut app = editing("http_requests_total{ser");
+        press(&mut app, KeyCode::Left, KeyModifiers::NONE);
+        let completion = app.completion.as_ref().expect("label-name candidates");
+        assert_eq!(completion.candidates[0].text, "service");
+        // Accepting mid-query replaces only the token before the caret and keeps the tail.
+        press(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+        assert_eq!(app.active_query(), "http_requests_total{servicer");
+        assert_eq!(app.query_caret(), "http_requests_total{service".len());
+    }
 
     #[test]
     fn cursor_moves_within_bounds_and_falls_back_to_scroll() {

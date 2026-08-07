@@ -59,7 +59,8 @@ impl App {
         let (start, end) = self.effective_window();
         self.abs_start = format_datetime_ns(start);
         self.abs_end = format_datetime_ns(end);
-        self.abs_field = 0;
+        // Opens on the start field with the caret at its end, as the query box opens.
+        self.focus_abs_field(0);
         self.abs_error = None;
         self.mode = Mode::AbsoluteRange;
     }

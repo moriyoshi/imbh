@@ -248,7 +248,7 @@ impl App {
             // caller issues then renders the tree instead of a series table. The row cursor indexed the
             // series rows, which mean nothing in the catalog, so it restarts at the top.
             SeriesUp::Catalog => {
-                self.active_query_mut().clear();
+                self.set_active_query(String::new());
                 self.selected = 0;
             }
         }

@@ -25,12 +25,19 @@ use crate::model::{
     ExemplarMarker, Focus, LogCorrelation, MetricNode, Mode, NavEntry, QueryResult, Route, Screen,
     Snapshot, TreeRowRef,
 };
+use crate::textfield::{TextField, caret_in};
 use crate::waterfall::TraceDetail;
 
 pub(crate) struct App {
     /// The current view (single source of truth); the `screen` is derived from it.
     pub(crate) route: Route,
     pub(crate) query: [String; 4],
+    /// The edit caret in the active query buffer, as a byte offset. Only meaningful in
+    /// [`Mode::Editing`], which is only ever entered through `begin_editing` (it parks the caret at the
+    /// end of the buffer). Every read goes through [`App::query_caret`], which clamps into the *current*
+    /// buffer, so a buffer swapped out from under it (a screen switch, Back/Forward, the catalog's
+    /// "visualize") can never leave a dangling offset.
+    pub(crate) query_cursor: usize,
     /// Transient input overlay on top of the route (menu / editing / range picker), or `Normal`.
     pub(crate) mode: Mode,
     pub(crate) range_index: usize,
@@ -48,6 +55,9 @@ pub(crate) struct App {
     pub(crate) abs_start: String,
     pub(crate) abs_end: String,
     pub(crate) abs_field: usize,
+    /// The edit caret in the *focused* field, as a byte offset. One caret for both, re-seated at the
+    /// end of whichever field takes focus (`focus_abs_field`); reads clamp, like `query_cursor`.
+    pub(crate) abs_cursor: usize,
     pub(crate) abs_error: Option<String>,
     /// Background auto-refresh, off by default; toggled with space. Manual/query/switch refreshes
     /// always run regardless.
@@ -166,6 +176,7 @@ impl App {
                 // Logs default: a bare selector matching everything (filtered list + volume sparkline).
                 "{}".to_owned(),
             ],
+            query_cursor: 0,
             mode: Mode::Normal,
             range_index,
             range_cursor: range_index,
@@ -174,6 +185,7 @@ impl App {
             abs_start: String::new(),
             abs_end: String::new(),
             abs_field: 0,
+            abs_cursor: 0,
             abs_error: None,
             auto_refresh: false,
             loading: false,
@@ -270,6 +282,70 @@ impl App {
         &mut self.query[index]
     }
 
+    /// Replace the active query wholesale, parking the caret at its end. The way anything but the
+    /// editor itself should write the buffer, so `query_cursor` never trails a query it no longer
+    /// describes.
+    pub(crate) fn set_active_query(&mut self, query: impl Into<String>) {
+        *self.active_query_mut() = query.into();
+        self.query_cursor = self.active_query().len();
+    }
+
+    /// The edit caret as a byte offset into the active query, clamped into the buffer and onto a
+    /// character boundary — the only way `query_cursor` should be read.
+    pub(crate) fn query_caret(&self) -> usize {
+        caret_in(self.active_query(), self.query_cursor)
+    }
+
+    /// The active query up to the caret. What completion classifies: the eligible vocabulary follows
+    /// from where the caret sits, not from the end of the buffer.
+    pub(crate) fn query_before_caret(&self) -> &str {
+        &self.active_query()[..self.query_caret()]
+    }
+
+    /// The query box as an editable one-line field (buffer + caret), which is what the editing keys
+    /// act on.
+    pub(crate) fn query_field(&mut self) -> TextField<'_> {
+        let index = self.query_index();
+        TextField {
+            text: &mut self.query[index],
+            caret: &mut self.query_cursor,
+        }
+    }
+
+    /// The focused absolute-range field's text (0 = start, 1 = end).
+    pub(crate) fn abs_text(&self) -> &str {
+        if self.abs_field == 0 {
+            &self.abs_start
+        } else {
+            &self.abs_end
+        }
+    }
+
+    /// The caret in the focused absolute-range field, clamped as [`App::query_caret`] is.
+    pub(crate) fn abs_caret(&self) -> usize {
+        caret_in(self.abs_text(), self.abs_cursor)
+    }
+
+    /// The focused absolute-range field as an editable one-line field.
+    pub(crate) fn abs_text_field(&mut self) -> TextField<'_> {
+        let text = if self.abs_field == 0 {
+            &mut self.abs_start
+        } else {
+            &mut self.abs_end
+        };
+        TextField {
+            text,
+            caret: &mut self.abs_cursor,
+        }
+    }
+
+    /// Focus one of the two absolute-range fields (0 = start, 1 = end), parking the caret at its end.
+    /// One caret is shared between the fields, so moving between them has to re-seat it.
+    pub(crate) fn focus_abs_field(&mut self, field: usize) {
+        self.abs_field = field;
+        self.abs_cursor = self.abs_text().len();
+    }
+
     pub(crate) fn apply(&mut self, result: QueryResult) {
         self.loading = false;
         if result.generation != self.generation || result.screen != self.screen() {
@@ -364,6 +440,30 @@ mod tests {
     #[test]
     fn auto_refresh_is_off_by_default() {
         assert!(!App::new().auto_refresh);
+    }
+
+    #[test]
+    fn the_query_caret_is_clamped_to_the_buffer_it_is_read_against() {
+        let mut app = App::new();
+        app.route = Route::Logs;
+        app.set_active_query("{service.name=\"cart\"}");
+        assert_eq!(
+            app.query_caret(),
+            21,
+            "a fresh query parks the caret at its end"
+        );
+
+        // The active buffer changes with the screen, so a caret left over from another screen's (longer)
+        // query must clamp rather than slice out of bounds.
+        app.route = Route::Metrics; // an empty buffer
+        assert_eq!(app.query_caret(), 0);
+        assert_eq!(app.query_before_caret(), "");
+
+        // And a caret that would land inside a multi-byte character snaps back to its start.
+        app.set_active_query("café");
+        app.query_cursor = 4; // the middle of the two-byte `é`
+        assert_eq!(app.query_caret(), 3);
+        assert_eq!(app.query_before_caret(), "caf");
     }
 
     #[test]
