@@ -505,6 +505,36 @@ pub fn serve_with_limits_until(
 /// under `docker::addr` and none of it is compiled into the default build.
 pub(crate) type PeerFilter = Arc<dyn Fn(std::net::IpAddr) -> bool + Send + Sync>;
 
+/// How long an accept loop waits after its first failed `accept`, and the cap the delay doubles up
+/// to.
+///
+/// A failed `accept` is usually the connection's fault, not the listener's — `ECONNABORTED` is a
+/// peer that left between the SYN and the accept, `EMFILE` clears as soon as a descriptor frees —
+/// so retrying is right. Retrying *immediately* is not: when the error is really the socket's, the
+/// retry fails just as fast, and the loop pins a core for as long as the process runs. Backing off
+/// costs milliseconds on the transient case and bounds the pathological one.
+const ACCEPT_RETRY_MIN: Duration = Duration::from_millis(5);
+const ACCEPT_RETRY_MAX: Duration = Duration::from_secs(1);
+
+/// Consecutive accept failures after which a listener gives up instead of retrying for ever. With
+/// the backoff above that is over a minute of uninterrupted failure, so nothing transient reaches
+/// it.
+///
+/// Giving up is what makes recovery possible rather than what prevents it: `docker::serve`'s
+/// supervisor rebinds the address on its next tick (see its `is_finished` check). A single-address
+/// server has no supervisor and simply stops, which is still a better answer than a socket that
+/// cannot accept and will not say so.
+pub(crate) const ACCEPT_FAILURES_BEFORE_RETIRING: u32 = 64;
+
+/// The delay before the `n`th consecutive accept retry: exponential from [`ACCEPT_RETRY_MIN`],
+/// capped at [`ACCEPT_RETRY_MAX`].
+pub(crate) fn accept_backoff(failures: u32) -> Duration {
+    let shift = failures.saturating_sub(1).min(31);
+    ACCEPT_RETRY_MIN
+        .saturating_mul(1u32 << shift)
+        .min(ACCEPT_RETRY_MAX)
+}
+
 /// The accept loop for one already-bound listener.
 ///
 /// Split out from the bind so that more than one listener can share a runtime — which is what the
@@ -537,7 +567,18 @@ pub(crate) async fn serve_on_listener(
     builder.timer(TokioTimer::new());
     builder.header_read_timeout(limits.timeouts.header_deadline());
 
+    // Consecutive `accept` failures, cleared by every accept that works. Non-zero means the loop is
+    // serving out a backoff rather than parked in `accept`, so a healthy listener never touches the
+    // timer.
+    let mut failures: u32 = 0;
+
     loop {
+        if failures > 0 {
+            tokio::select! {
+                _ = tokio::time::sleep(accept_backoff(failures)) => {}
+                _ = &mut stop_rx => break,
+            }
+        }
         // The permit is taken *before* the accept, so the cap bounds connections the kernel has handed
         // us rather than letting them pile up inside the process.
         let permit = tokio::select! {
@@ -554,10 +595,26 @@ pub(crate) async fn serve_on_listener(
                 // not allowed costs one accept and one close rather than a parsed request. Dropping
                 // `stream` closes it; saying nothing back is deliberate, since any reply would
                 // confirm that something is listening.
-                Ok((stream, peer)) if allow.as_ref().is_none_or(|allow| allow(peer.ip())) => stream,
-                Ok(_) => continue,
-                // Per-connection errors (`ECONNABORTED`, `EMFILE`); the listener itself is still good.
-                Err(_) => continue,
+                Ok((stream, peer)) if allow.as_ref().is_none_or(|allow| allow(peer.ip())) => {
+                    failures = 0;
+                    stream
+                }
+                Ok(_) => {
+                    failures = 0;
+                    continue;
+                }
+                // Usually per-connection (`ECONNABORTED`, `EMFILE`) and the listener is still good,
+                // so retry — but after a delay, and not for ever. See `ACCEPT_RETRY_MIN`.
+                Err(e) => {
+                    failures += 1;
+                    if failures > ACCEPT_FAILURES_BEFORE_RETIRING {
+                        warn(&format!(
+                            "listener stopped after {failures} consecutive accept failures: {e}"
+                        ));
+                        break;
+                    }
+                    continue;
+                }
             },
             _ = &mut stop_rx => break,
         };
@@ -1045,6 +1102,25 @@ fn error_response(e: &imbh::Error) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The property that matters is that a retry is never free: an accept loop that retries with no
+    /// delay is a busy loop, which is what this backoff exists to prevent.
+    #[test]
+    fn accept_retries_are_delayed_and_bounded() {
+        assert_eq!(accept_backoff(1), ACCEPT_RETRY_MIN);
+        assert_eq!(accept_backoff(2), ACCEPT_RETRY_MIN * 2);
+        // Every delay is positive, monotonic, and capped — including at the retirement threshold
+        // and at absurd counts, where a naive shift or multiply would overflow.
+        let mut previous = Duration::ZERO;
+        for failures in [1, 2, 3, 10, ACCEPT_FAILURES_BEFORE_RETIRING, 1000, u32::MAX] {
+            let delay = accept_backoff(failures);
+            assert!(delay >= ACCEPT_RETRY_MIN, "{failures}");
+            assert!(delay <= ACCEPT_RETRY_MAX, "{failures}");
+            assert!(delay >= previous, "{failures}");
+            previous = delay;
+        }
+        assert_eq!(accept_backoff(u32::MAX), ACCEPT_RETRY_MAX);
+    }
 
     #[test]
     fn listen_address_precedence() {

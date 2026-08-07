@@ -140,6 +140,15 @@ async fn supervise(
         // Retired first, so a bridge that changed its address frees the old socket before the new
         // one is bound — the same port on a different address is otherwise a needless conflict.
         live.retain(|addr, entry| {
+            // A listener whose task has ended is not listening, whatever the address set says: it
+            // gave up after `crate::ACCEPT_FAILURES_BEFORE_RETIRING` consecutive accept failures.
+            // Forgetting it here is what lets the bind below bring the address back on this tick —
+            // without it, a socket that stopped accepting would stay in the map for ever and the
+            // endpoint would be silently gone.
+            if entry.task.is_finished() {
+                warn(&format!("listener on {addr} stopped; rebinding"));
+                return false;
+            }
             let keep = wanted.contains(addr);
             if !keep {
                 warn(&format!("no longer listening on {addr}"));
