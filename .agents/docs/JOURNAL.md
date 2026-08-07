@@ -3998,3 +3998,69 @@ terminator walk, every prefix of a truncated message, the three detection marker
 plain-Linux-host negative, the setting grammar, the interface selection, and a live query against
 the running kernel that also exercises the dump path). No dependency moved, so the footprint gate's
 inputs are unchanged; the default `imbhd` build does not compile any of this.
+
+## 2026-08-07 — Verifying the Docker Desktop VM bind: a hostile host, and a QEMU guest
+
+The change above rests on a claim that unit tests cannot make: that `auto` gains the VM's uplink
+inside a VM and gains **nothing** outside one. Both halves were measured against real listeners
+(`ss -ltn` / `netstat -ltn`, not the startup banner).
+
+### The host: the adversarial half
+
+This workstation is the case the gate exists for — its default route leaves by `wlP9s9`,
+`192.168.10.131`, a LAN interface, which is exactly the interface the netlink lookup returns.
+
+| Run | Bound |
+|---|---|
+| `auto`, API mode (live daemon socket) | 8 addresses, all bridge gateways (`172.17.0.1`, `172.18`–`172.23.0.1`, `[fc00:f853:ccd:e793::1]`) |
+| `auto`, scan mode (`IMBH_DOCKER_API=off`) | the same 8; zero detection lines in the log |
+| `IMBH_DOCKER_VM_NET=on` | those 8 **plus** `192.168.10.131` and three global `2400:4051:…` addresses |
+
+The third row is what makes the first two mean anything: the LAN address is absent under `auto`
+because detection declined, not because the lookup came up empty. Detection declined on all three
+markers — kernel `6.17.0-1021-nvidia`, hostname not `docker-desktop`, Engine API `OperatingSystem:
+Ubuntu`.
+
+**It also found a documentation gap.** `on` bound three *globally routable* IPv6 addresses alongside
+the RFC1918 one, because every address the interface carries is taken. The warning said "not on a
+LAN-connected server"; the exposure is potentially internet-facing, and both `DOCKER_LOG_DRIVER.md`
+and the plugin's `config.json` now say so.
+
+### The guest: the half a Linux host cannot show
+
+A native aarch64 QEMU guest, direct `-kernel` boot of this host's own kernel with a 17 MB initramfs
+(busybox + the release `imbhd` + its four libs). No modules — `VIRTIO_NET`, `VIRTIO_PCI` and PL011
+are all `=y` in `/boot/config-6.17.0-1021-nvidia` — no disk, no cloud image. The guest's topology is
+the Docker Desktop one: `eth0 10.0.2.15/24`, default route via `10.0.2.2` (QEMU user-mode NAT), and
+**no Docker bridges at all**, so the VM address is the only thing `auto` could ever resolve to.
+
+| # | UTS name | Setting | Bound |
+|---|---|---|---|
+| 1 | `vm-generic` | `auto` | nothing — "no address resolved" |
+| 2 | `docker-desktop` | `auto` | `10.0.2.15:47320`, `[fec0::5054:ff:fe12:3456]:47320`, detection line logged |
+| 3 | `docker-desktop` | `off` | nothing |
+| 4 | `vm-generic` | `on` | as row 2 |
+
+Row 2 is the one that could not be reached any other way: detection firing on a real UTS namespace,
+the netlink lookup following it, and the bind following that — the same sequence a Docker Desktop VM
+runs, with only the marker's *source* differing (a LinuxKit kernel string there, the WSL 2 hostname
+here). Row 1 is the same guest one hostname apart, which is as close as this gets to proving the
+gate is the only thing standing between the two outcomes.
+
+`x86` was the wrong instinct on the way in: this host is aarch64, so an x86 guest would have meant
+emulating a foreign architecture *and* cross-compiling `imbhd`. A native guest reuses the release
+binary unchanged, and `qemu-system-arm` is the package (`qemu-system-misc`, which was installed,
+carries neither arm nor x86). The kernel image is `0600 root:root`, so a readable copy has to be
+made by hand; everything else needs no privilege.
+
+One observation worth keeping: QEMU's user-mode network hands the guest a **site-local**
+`fec0::/10` address (deprecated by RFC 3879), and `is_usable_gateway` admits it — correctly, since
+it is bindable and it is what the uplink carries. Only link-local, loopback and the unspecified
+address are excluded, and narrowing that further would cost the feature on a VM whose uplink has
+nothing else.
+
+### Verified
+
+`fmt --all --check` clean; `test -p imbh-server --test docker_plugin_config` clean after the
+`config.json` wording change (6 passed). The code is untouched by this entry — the two edits are the
+sharpened `on` warning in `docs/DOCKER_LOG_DRIVER.md` and in the plugin's `config.json` description.

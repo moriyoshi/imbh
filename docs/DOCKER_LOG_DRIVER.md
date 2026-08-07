@@ -486,8 +486,12 @@ answer a packet would get rather than whatever the main table happens to say.
 
 > ⚠️ **Do not set `IMBH_DOCKER_VM_NET=on` on a LAN-connected Linux server.** There the default-route
 > interface *is* the LAN, and `/admin/*` is unauthenticated -- the exposure `auto` exists to avoid.
-> `on` is for a VM imbh does not recognise, where you know the far side of that interface is a
-> hypervisor host. Pair it with [`IMBH_ALLOW_FROM`](#restricting-who-may-connect) either way.
+> It is worse than a LAN on a dual-stack host: **every** address that interface carries is bound, so
+> a machine with IPv6 gets its globally-routable addresses bound too, and the endpoint is then only
+> as private as your firewall. Measured on one ordinary workstation, `on` added its RFC1918 v4
+> address and *three* global IPv6 addresses. `on` is for a VM imbh does not recognise, where you know
+> the far side of that interface is a hypervisor host; pair it with
+> [`IMBH_ALLOW_FROM`](#restricting-who-may-connect) either way.
 
 Check what your containers actually resolve, and what the plugin bound:
 
