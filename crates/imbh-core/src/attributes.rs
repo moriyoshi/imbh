@@ -79,10 +79,17 @@ impl Attributes {
 /// Extract a value for `key` from a canonical-JSON object string (used by the `json_get_*`
 /// UDFs, ARCHITECTURE.md §9.3).
 pub fn json_get(json: &str, key: &str) -> Option<AnyValue> {
-    json::parse_object(json)?
-        .into_iter()
-        .find(|(k, _)| k == key)
-        .map(|(_, v)| v)
+    // Fast path: walk the object, skip non-matching values without allocating, stop early once the
+    // (canonically sorted) keys pass `key`. Falls back to the full parse whenever that cannot apply —
+    // an escaped key `serde_json` will not lend as `&str`, or malformed input — so the answer is
+    // always the one the full parse would have given.
+    match json::pick_field_public(json, key) {
+        Ok(found) => found,
+        Err(()) => json::parse_object(json)?
+            .into_iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v),
+    }
 }
 
 #[cfg(test)]
@@ -108,5 +115,54 @@ mod tests {
             Some(AnyValue::Str("cart".into()))
         );
         assert_eq!(json_get("{}", "k"), None);
+    }
+
+    /// `json_get`'s fast path skips non-matching values instead of materializing them, and falls back
+    /// to the full parse when it cannot borrow a key. Both halves must agree with the full parse on
+    /// **every** shape, or an attribute filter silently changes its answer depending on what else the
+    /// record happened to carry. Compares the two implementations directly rather than asserting
+    /// hand-written expectations, so the reference is the behaviour that shipped.
+    #[test]
+    fn json_get_agrees_with_the_full_parse() {
+        fn reference(json: &str, key: &str) -> Option<AnyValue> {
+            crate::json::parse_object(json)?
+                .into_iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v)
+        }
+
+        let docs = [
+            // Ordinary, and a value *after* the probed key so skipping is exercised.
+            r#"{"a":"1","k":"hit","z":"tail"}"#,
+            // Every value type the canonical grammar admits, all before the target.
+            r#"{"arr":[1,2,{"deep":"x"}],"b":true,"f":1.5,"i":3,"k":"hit","nil":null,"obj":{"n":{"m":1}}}"#,
+            // The non-finite sentinel, both as a skipped value and as the target.
+            r#"{"before":{"$f":"nan"},"k":{"$f":"-inf"}}"#,
+            // Escaped non-BMP characters in a skipped value and in the target's value.
+            r#"{"emoji":"😀","k":"😀 tail"}"#,
+            // An **escaped key** — the case the fast path cannot borrow, forcing the fallback.
+            r#"{"abc":"skipped","k":"hit"}"#,
+            // The probed key itself escaped.
+            r#"{"a":"1","k":"hit"}"#,
+            // Keys NOT in canonical sorted order: an early-exit optimization would break this.
+            r#"{"z":"tail","k":"hit","a":"1"}"#,
+            // Duplicate keys — `parse_object` keeps both; first must win in both paths.
+            r#"{"k":"first","k":"second"}"#,
+            // Empty, absent, non-object, and malformed.
+            "{}",
+            r#"{"other":"x"}"#,
+            r#"["not","an","object"]"#,
+            r#"{"k":"unterminated"#,
+            "",
+        ];
+        for doc in docs {
+            for key in ["k", "missing", "a", "z"] {
+                assert_eq!(
+                    json_get(doc, key),
+                    reference(doc, key),
+                    "fast path disagreed on key {key:?} in {doc}"
+                );
+            }
+        }
     }
 }

@@ -20,9 +20,15 @@ use crate::error::{Error, Result};
 /// working unchanged. The column is a pushdown / zero-copy *accelerator*, not a relocation: a
 /// promoted-label filter can hit a real dictionary column instead of a `json_get_str` scan.
 ///
-/// Changing the set is backward-compatible: segments sealed before a key was promoted simply lack
-/// the column and are null-filled at query time (the `coerce` schema-evolution path). An empty
-/// `Promote` (the default) adds no columns and costs nothing.
+/// Changing the set between runs is safe for **queries**: segments sealed before a key was promoted
+/// lack the column and are null-filled at query time (the `coerce` schema-evolution path), and the
+/// query layer falls back to reading that key out of the JSON blob exactly on those rows, so a filter
+/// or group-by on a newly promoted key still sees its history. An empty `Promote` (the default) adds
+/// no columns and costs nothing.
+///
+/// *(Before 0.7.0 this was not true. The null-fill was real but the query layer emitted only the
+/// column form, so a filter on a newly promoted key silently matched nothing on every pre-promotion
+/// segment — this doc previously called that "backward-compatible". See `SqlParams::attr_field`.)*
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Promote {
     keys: Vec<String>,
@@ -175,7 +181,28 @@ impl Retention {
     pub fn disk_budget(&self) -> Option<u64> {
         self.max_disk_bytes
     }
+
+    /// Rebuild a policy from its two bounds — the inverse of [`Self::max_age`] / [`Self::disk_budget`],
+    /// so the policy can be persisted and read back rather than living only in a builder call.
+    ///
+    /// The policy is **durable database state**: a housekeeper process that applies retention must
+    /// apply the *host's* policy, not one invented from its own flags, and two handles on one
+    /// directory must not disagree about when data is deleted. Same reasoning as [`Promote`].
+    pub fn from_parts(max_age: Option<Duration>, max_disk_bytes: Option<u64>) -> Self {
+        Retention {
+            max_age,
+            max_disk_bytes,
+        }
+    }
 }
+
+impl PartialEq for Retention {
+    fn eq(&self, other: &Self) -> bool {
+        self.max_age == other.max_age && self.max_disk_bytes == other.max_disk_bytes
+    }
+}
+
+impl Eq for Retention {}
 
 impl Default for Retention {
     fn default() -> Self {

@@ -10,6 +10,16 @@
 //! `Inexact`, so DataFusion keeps a `FilterExec` with the `matches` / `json_get_str` UDF above the
 //! scan — the index is a pure accelerator and Parquet stays the ground truth. Index-less segments,
 //! non-`body` text matchers, and non-equality attribute matchers simply fall through to a full scan.
+//!
+//! **Time/range pruning.** A comparison against an `INT64`-domain column — `time`/`start_time`/
+//! `observed_time` (`Timestamp`), whether written bare or in the `CAST(col AS BIGINT)` form the typed
+//! builders emit — is also claimed `Inexact` and turned into a [`RangeProbe`]. Each segment's Parquet
+//! row-group **statistics** then decide whether the segment can contain a matching row at all: when
+//! every row group is ruled out the file is skipped whole (the `segments_pruned` counter, exactly like
+//! the bloom path), and when only some are ruled out the read is narrowed to the survivors. Statistics
+//! only ever prove a row group *cannot* match, so this never drops a row — and the `FilterExec` above
+//! the scan re-checks the predicate regardless. A segment without statistics for the column is always
+//! read.
 
 use std::fmt;
 use std::path::PathBuf;
@@ -17,20 +27,20 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 
 use async_trait::async_trait;
-use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::arrow::datatypes::{DataType, SchemaRef, TimeUnit};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::{Session, TableProvider};
 use datafusion::common::Column;
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::TaskContext;
+use datafusion::logical_expr::expr::InList;
 use datafusion::logical_expr::{
     BinaryExpr, Cast, Expr, Operator, TableProviderFilterPushDown, TableType,
 };
-#[cfg(feature = "search")]
-use datafusion::parquet::arrow::arrow_reader::RowSelector;
 use datafusion::parquet::arrow::arrow_reader::{
-    ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder, RowSelection,
+    ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder, RowSelection, RowSelector,
 };
+use datafusion::parquet::file::statistics::Statistics;
 use datafusion::physical_expr::LexOrdering;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::streaming::{PartitionStream, StreamingTableExec};
@@ -102,9 +112,10 @@ impl ScanAccum {
 /// A snapshot of [`ScanAccum`] returned by `run_sql` — one query's read-side pruning stats.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ScanStats {
-    /// Segments actually read (i.e. not bloom-pruned).
+    /// Segments actually read (i.e. neither bloom- nor statistics-pruned).
     pub segments_scanned: u64,
-    /// Segments skipped whole by a Parquet bloom filter (`trace_id`/`span_id` point lookups).
+    /// Segments skipped whole, either by a Parquet bloom filter (`trace_id`/`span_id` point lookups)
+    /// or by Parquet row-group statistics (a time/range predicate outside the segment's min/max).
     pub segments_pruned: u64,
     /// Rows materialized from the buffer ∪ segments — after the Tantivy `RowSelection` pruned each
     /// segment — i.e. the rows the `matches`/`json_get_str` UDF filters actually evaluated.
@@ -122,20 +133,37 @@ pub struct SegmentInput {
     pub parquet_path: PathBuf,
     pub index_path: Option<PathBuf>,
     pub rows: u64,
+    /// The segment's `[min, max]` event-time bounds (inclusive, nanoseconds) as recorded in the
+    /// manifest, describing its table's `time_column` ([`crate::TableInput`]). When present, a pushed
+    /// time predicate that cannot intersect this range skips the segment **without opening the file
+    /// at all** — no `File::open`, no Parquet footer read, no `.tidx` search.
+    ///
+    /// That is the whole point of carrying it: the footer-statistics path can only prune *after*
+    /// paying to read the footer, which measured as the dominant cost of a narrow query once
+    /// row-level pruning was in place (~35 us/segment across 60 segments). `None` disables the check
+    /// and falls back to the footer statistics, which stay correct on their own.
+    pub time_range: Option<(i64, i64)>,
 }
 
 /// A table = mutable-buffer snapshot ∪ sealed segments. `text_column` names the column whose
 /// `matches(col, …)` predicate drives the Tantivy `RowSelection` bridge (`Some("body")` for
 /// logs); `None` disables index pushdown (all `matches` fall back to the UDF). `bloom_columns`
 /// names the binary id columns that carry a Parquet bloom filter in each segment (`trace_id`,
-/// `span_id` for spans); a `col = X'…'` equality on one of them lets the scan skip whole segments
-/// whose bloom proves the value absent (ARCHITECTURE.md §8). Empty for tables without blooms.
+/// `span_id` for spans); a raw-binary membership predicate on one of them (`col = X'…'`, `col IN
+/// (X'…', …)`, or the equivalent `OR` chain) lets the scan skip whole segments whose blooms prove
+/// every probed value absent (ARCHITECTURE.md §8). Empty for tables without blooms.
+///
+/// `time_column` names the column that each [`SegmentInput::time_range`] describes — the table's
+/// sort column (`time` for logs and metrics, `start_time` for spans). It must be `None` unless those
+/// bounds are populated, and it is what keeps the manifest-range skip honest: a range predicate on
+/// some *other* INT64 column (`duration_ns`, say) must never be tested against time bounds.
 pub struct SegmentTableProvider {
     schema: SchemaRef,
     buffer: RecordBatch,
     segments: Vec<SegmentInput>,
     text_column: Option<String>,
     bloom_columns: Vec<String>,
+    time_column: Option<String>,
     stats: Arc<ScanAccum>,
 }
 
@@ -146,12 +174,14 @@ impl SegmentTableProvider {
         segments: Vec<SegmentInput>,
         text_column: Option<String>,
         bloom_columns: Vec<String>,
+        time_column: Option<String>,
         stats: Arc<ScanAccum>,
     ) -> Self {
         Self {
             schema,
             buffer,
             segments,
+            time_column,
             text_column,
             bloom_columns,
             stats,
@@ -197,11 +227,12 @@ impl TableProvider for SegmentTableProvider {
                 if matches_text_terms(f, self.text_column.as_deref()).is_some()
                     || not_matches_text_terms(f, self.text_column.as_deref()).is_some()
                     || (self.has_attr_index() && attr_eq_predicate(f).is_some())
-                    || bloom_id_eq(f, &self.bloom_columns).is_some()
+                    || bloom_probe(f, &self.bloom_columns).is_some()
+                    || stats_range_probe(f, &self.schema).is_some()
                 {
-                    // Inexact: we may pre-prune (Tantivy row-selection or a bloom-filter segment
-                    // skip), but DataFusion re-checks the predicate above the scan, so the pruning
-                    // is a pure accelerator and results are identical.
+                    // Inexact: we may pre-prune (Tantivy row-selection, a bloom-filter segment skip,
+                    // or a row-group statistics range skip), but DataFusion re-checks the predicate
+                    // above the scan, so the pruning is a pure accelerator and results are identical.
                     TableProviderFilterPushDown::Inexact
                 } else {
                     TableProviderFilterPushDown::Unsupported
@@ -244,17 +275,28 @@ impl TableProvider for SegmentTableProvider {
             Vec::new()
         };
 
-        // Extract raw-id equalities (`trace_id`/`span_id` = X'…') the segment bloom filters can
-        // rule out (ARCHITECTURE.md §8). Each probe is a (column, value-bytes) pair; a segment is
-        // skipped only when a bloom filter *proves* the value absent — never on uncertainty.
-        let bloom_probes: Vec<(String, Vec<u8>)> = if self.bloom_columns.is_empty() {
+        // Extract raw-id membership predicates (`trace_id`/`span_id` `= X'…'`, `IN (X'…', …)`, or the
+        // `= a OR = b` chain the simplifier rewrites a short `IN` into) that the segment bloom filters
+        // can rule out (ARCHITECTURE.md §8). Each probe is a (column, candidate-value-set) pair; a
+        // segment is skipped only when the bloom filters *prove* every candidate absent — never on
+        // uncertainty.
+        let bloom_probes: Vec<(String, Vec<Vec<u8>>)> = if self.bloom_columns.is_empty() {
             Vec::new()
         } else {
             filters
                 .iter()
-                .filter_map(|f| bloom_id_eq(f, &self.bloom_columns))
+                .filter_map(|f| bloom_probe(f, &self.bloom_columns))
                 .collect()
         };
+
+        // Comparisons against an INT64-domain column (the `Timestamp` time columns, bare or under the
+        // `CAST(col AS BIGINT)` the typed builders emit) that Parquet row-group statistics can rule
+        // out. A segment whose every row group is excluded is skipped without reading a single row —
+        // the whole point of a `WHERE time > now() - 5m` over a month of data.
+        let range_probes: Vec<ColumnRangeProbe> = filters
+            .iter()
+            .filter_map(|f| stats_range_probe(f, &self.schema))
+            .collect();
 
         let has_constraint = !terms.is_empty() || !not_terms.is_empty() || !attr_probes.is_empty();
 
@@ -273,6 +315,8 @@ impl TableProvider for SegmentTableProvider {
             not_terms,
             attr_probes,
             bloom_probes,
+            range_probes,
+            time_column: self.time_column.clone(),
             has_constraint,
             stats: self.stats.clone(),
         });
@@ -300,7 +344,9 @@ struct SegmentPartitionStream {
     terms: Vec<String>,
     not_terms: Vec<String>,
     attr_probes: Vec<(String, String)>,
-    bloom_probes: Vec<(String, Vec<u8>)>,
+    bloom_probes: Vec<(String, Vec<Vec<u8>>)>,
+    range_probes: Vec<ColumnRangeProbe>,
+    time_column: Option<String>,
     has_constraint: bool,
     stats: Arc<ScanAccum>,
 }
@@ -321,6 +367,8 @@ impl PartitionStream for SegmentPartitionStream {
             not_terms: self.not_terms.clone(),
             attr_probes: self.attr_probes.clone(),
             bloom_probes: self.bloom_probes.clone(),
+            range_probes: self.range_probes.clone(),
+            time_column: self.time_column.clone(),
             has_constraint: self.has_constraint,
             current: None,
         };
@@ -347,7 +395,9 @@ struct SegmentBatchIter {
     terms: Vec<String>,
     not_terms: Vec<String>,
     attr_probes: Vec<(String, String)>,
-    bloom_probes: Vec<(String, Vec<u8>)>,
+    bloom_probes: Vec<(String, Vec<Vec<u8>>)>,
+    range_probes: Vec<ColumnRangeProbe>,
+    time_column: Option<String>,
     has_constraint: bool,
     /// The reader for the segment currently being drained, one batch at a time.
     current: Option<ParquetRecordBatchReader>,
@@ -366,6 +416,31 @@ impl SegmentBatchIter {
             .bytes_scanned
             .fetch_add(b.get_array_memory_size() as u64, Relaxed);
         Ok(b)
+    }
+}
+
+impl SegmentBatchIter {
+    /// Whether the manifest's declared time bounds for `seg` already prove no row can satisfy the
+    /// pushed time predicates — the ARCHITECTURE.md §9.2 "manifest range skip".
+    ///
+    /// Only probes on `time_column` are consulted: [`SegmentInput::time_range`] describes that column
+    /// and nothing else, so testing a `duration_ns` comparison against it would skip segments that do
+    /// contain matching rows. Requires both a known `time_column` and a populated `time_range`;
+    /// either being absent simply defers to the footer statistics.
+    ///
+    /// Bounds are **inclusive** on both ends, matching `SegmentRef`'s `min_time_unix_nano` /
+    /// `max_time_unix_nano`, and [`RangeProbe::excludes`] is written against that convention — which
+    /// is what makes a row sitting exactly on a half-open range's `start` survive.
+    fn manifest_range_excludes(&self, seg: &SegmentInput) -> bool {
+        let Some(time_column) = self.time_column.as_deref() else {
+            return false;
+        };
+        let Some((min, max)) = seg.time_range else {
+            return false;
+        };
+        self.range_probes
+            .iter()
+            .any(|p| p.column == time_column && p.probe.excludes(min, max))
     }
 }
 
@@ -408,6 +483,20 @@ impl Iterator for SegmentBatchIter {
                 pruned = tracing::field::Empty,
             )
             .entered();
+            // 3a. The cheapest skip there is: the manifest already told us this segment's time
+            // bounds, so a time predicate that cannot intersect them rules it out with **no file
+            // opened** — no `File::open`, no footer read, no `.tidx` search. Deliberately ahead of
+            // `row_selection_for` and `open_segment`, both of which cost I/O. The footer-statistics
+            // path below stays in place and remains correct on its own; this only front-runs it for
+            // segments whose declared range already settles the question.
+            if self.manifest_range_excludes(&seg) {
+                self.stats.segments_pruned.fetch_add(1, Relaxed);
+                #[cfg(feature = "tracing")]
+                scan_span.record("pruned", true);
+                #[cfg(test)]
+                prune_counters::PRUNED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                continue;
+            }
             // The `.tidx` is searched whenever a pushable predicate meets an indexed segment (whatever
             // the cost gate then decides). Records that the index was consulted, for `QueryStats`.
             if self.has_constraint && seg.index_path.is_some() {
@@ -420,7 +509,12 @@ impl Iterator for SegmentBatchIter {
                     Ok(s) => s,
                     Err(e) => return Some(Err(e)),
                 };
-            match open_segment(&seg.parquet_path, selection, &self.bloom_probes) {
+            match open_segment(
+                &seg.parquet_path,
+                selection,
+                &self.bloom_probes,
+                &self.range_probes,
+            ) {
                 Ok(None) => {
                     self.stats.segments_pruned.fetch_add(1, Relaxed);
                     #[cfg(feature = "tracing")]
@@ -474,6 +568,63 @@ fn not_matches_text_terms(expr: &Expr, text_column: Option<&str>) -> Option<Vec<
         return None;
     };
     matches_text_terms(inner, text_column)
+}
+
+/// The bloom-filter probe `expr` implies, if any: `(column_name, candidate_values)` where the
+/// predicate can only be true for a row whose `column_name` is **one of** `candidate_values`. A
+/// segment may then be skipped when the blooms prove *every* candidate absent.
+///
+/// Three shapes are recognized, all on a bloom-indexed id column with raw binary literals:
+/// * `col = X'…'` — the point lookup (`TracesApi::get`-shaped);
+/// * `col IN (X'…', …)` — the trace-search shape (k trace ids at once), non-negated only: `NOT IN`
+///   proves nothing about absence;
+/// * `col = X'a' OR col = X'b'` — what DataFusion's `ShortenInListSimplifier` rewrites a short `IN`
+///   (≤ 3 values) into *before* filter pushdown, so the `IN` shape alone would miss the common case.
+///   Both sides must probe the same column; a disjunct on any other column (or an unrecognized one)
+///   means the row could match without `col` holding a candidate, so nothing is claimed.
+///
+/// Returns `None` for anything else — including the `hex(col) = '…'` UDF form, which never yields the
+/// raw id bytes a bloom lookup needs. Correctness never depends on this firing: a miss just means the
+/// segment is read unpruned (DataFusion still applies the predicate above the `Inexact` pushdown).
+fn bloom_probe(expr: &Expr, bloom_columns: &[String]) -> Option<(String, Vec<Vec<u8>>)> {
+    match expr {
+        // A disjunction: the candidate sets union, but only if both sides constrain one same column.
+        Expr::BinaryExpr(BinaryExpr {
+            left,
+            op: Operator::Or,
+            right,
+        }) => {
+            let (column, mut values) = bloom_probe(left, bloom_columns)?;
+            let (right_column, right_values) = bloom_probe(right, bloom_columns)?;
+            if column != right_column {
+                return None;
+            }
+            values.extend(right_values);
+            Some((column, values))
+        }
+        Expr::BinaryExpr(_) => bloom_id_eq(expr, bloom_columns).map(|(c, v)| (c, vec![v])),
+        Expr::InList(InList {
+            expr,
+            list,
+            negated,
+        }) => {
+            if *negated || list.is_empty() {
+                return None;
+            }
+            let name = column_name(expr)?;
+            if !bloom_columns.iter().any(|c| c == &name) {
+                return None;
+            }
+            // Every list element must be a binary literal — one non-literal (a column reference, a
+            // string) and the predicate can hold for a value we cannot probe.
+            let values = list
+                .iter()
+                .map(binary_literal_bytes)
+                .collect::<Option<_>>()?;
+            Some((name, values))
+        }
+        _ => None,
+    }
 }
 
 /// If `expr` is a raw binary equality on one of this table's bloom-indexed id columns
@@ -530,6 +681,269 @@ fn binary_literal_bytes(expr: &Expr) -> Option<Vec<u8>> {
         Expr::Cast(Cast { expr, .. }) => binary_literal_bytes(expr),
         _ => None,
     }
+}
+
+/// One pushed comparison `<op> <i64 literal>` that Parquet row-group statistics can rule out.
+/// `value` is the literal in the column's own INT64 storage domain — for a `Timestamp` column that
+/// is the raw tick count Parquet stores, which is also exactly what `CAST(col AS BIGINT)` yields, so
+/// both spellings of a time bound compare against the statistics without conversion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RangeProbe {
+    op: RangeOp,
+    value: i64,
+}
+
+/// The comparison operators a min/max statistic can decide. `!=` is deliberately absent: a row group
+/// whose min/max bracket the value can still contain other values, so it proves nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RangeOp {
+    Lt,
+    LtEq,
+    Gt,
+    GtEq,
+    Eq,
+}
+
+impl RangeOp {
+    /// The operator of the mirrored expression (`lit < col` ⇒ `col > lit`), so a literal-on-the-left
+    /// comparison prunes identically.
+    fn mirrored(self) -> Self {
+        match self {
+            RangeOp::Lt => RangeOp::Gt,
+            RangeOp::LtEq => RangeOp::GtEq,
+            RangeOp::Gt => RangeOp::Lt,
+            RangeOp::GtEq => RangeOp::LtEq,
+            RangeOp::Eq => RangeOp::Eq,
+        }
+    }
+
+    fn from_operator(op: Operator) -> Option<Self> {
+        match op {
+            Operator::Lt => Some(RangeOp::Lt),
+            Operator::LtEq => Some(RangeOp::LtEq),
+            Operator::Gt => Some(RangeOp::Gt),
+            Operator::GtEq => Some(RangeOp::GtEq),
+            Operator::Eq => Some(RangeOp::Eq),
+            _ => None,
+        }
+    }
+}
+
+impl RangeProbe {
+    /// `true` iff **no** value in the inclusive interval `[min, max]` can satisfy this comparison —
+    /// i.e. the row group is *proven* to hold no matching row and may be skipped. Never returns
+    /// `true` on uncertainty: this is the only place correctness rests, and it is the exact dual of
+    /// the operator (`col > v` needs some element `> v`, which is impossible iff `max <= v`, …).
+    ///
+    /// Rows whose column value is NULL are covered too: Parquet min/max describe the non-null values
+    /// only, but a comparison is NULL (never true) for a NULL operand, so a NULL row can never be the
+    /// match a skip would lose.
+    fn excludes(&self, min: i64, max: i64) -> bool {
+        match self.op {
+            RangeOp::Gt => max <= self.value,
+            RangeOp::GtEq => max < self.value,
+            RangeOp::Lt => min >= self.value,
+            RangeOp::LtEq => min > self.value,
+            RangeOp::Eq => self.value < min || self.value > max,
+        }
+    }
+}
+
+/// A pushed range predicate paired with the column it constrains.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ColumnRangeProbe {
+    column: String,
+    probe: RangeProbe,
+}
+
+/// If `expr` is a comparison between an INT64-domain column of `schema` and a matching integer
+/// literal, return the probe its Parquet statistics can be tested against. `None` for every other
+/// shape — a miss only means the segment is read unpruned.
+///
+/// Accepted column spellings (see [`int64_domain_column`]): a bare `Timestamp`/`Int64` column, and
+/// the value-preserving casts around it — notably `CAST("time" AS BIGINT)`, which every typed query
+/// builder emits for its time range. The literal must already be in that same domain (DataFusion's
+/// type coercion guarantees this for a well-typed comparison), so no lossy conversion is ever
+/// performed here.
+fn stats_range_probe(expr: &Expr, schema: &SchemaRef) -> Option<ColumnRangeProbe> {
+    let Expr::BinaryExpr(BinaryExpr { left, op, right }) = expr else {
+        return None;
+    };
+    let op = RangeOp::from_operator(*op)?;
+    range_probe_sides(left, right, op, schema)
+        .or_else(|| range_probe_sides(right, left, op.mirrored(), schema))
+}
+
+/// One operand ordering of [`stats_range_probe`]: `col_side` must resolve to an INT64-domain column
+/// and `lit_side` to a literal of that same type.
+fn range_probe_sides(
+    col_side: &Expr,
+    lit_side: &Expr,
+    op: RangeOp,
+    schema: &SchemaRef,
+) -> Option<ColumnRangeProbe> {
+    let (column, domain) = int64_domain_column(col_side, schema)?;
+    let value = i64_literal_in(lit_side, &domain)?;
+    Some(ColumnRangeProbe {
+        column,
+        probe: RangeProbe { op, value },
+    })
+}
+
+/// The column behind an expression whose value is stored by Parquet as a signed `INT64`, together
+/// with the Arrow type the comparison actually happens in. Only two base types qualify — `Int64` and
+/// `Timestamp(_, _)` — because both map to the `INT64` physical type with signed ordering, so their
+/// row-group statistics can be read as `i64` without any reinterpretation.
+///
+/// A `CAST` is unwrapped **only** when it cannot change the stored value: `Timestamp → Int64` (Arrow
+/// reinterprets the tick count), `Int64 → Int64`, and `Timestamp → Timestamp` with the *same*
+/// `TimeUnit` (only the timezone annotation differs; Arrow timestamps are always UTC instants). A
+/// unit-changing or numeric-narrowing cast returns `None` rather than risk a wrong bound.
+fn int64_domain_column(expr: &Expr, schema: &SchemaRef) -> Option<(String, DataType)> {
+    match expr {
+        Expr::Column(Column { name, .. }) => {
+            let field = schema.field_with_name(name).ok()?;
+            match field.data_type() {
+                DataType::Int64 | DataType::Timestamp(_, _) => {
+                    Some((name.clone(), field.data_type().clone()))
+                }
+                _ => None,
+            }
+        }
+        Expr::Cast(Cast { expr, field }) => {
+            let (name, src) = int64_domain_column(expr, schema)?;
+            let data_type = field.data_type();
+            match (&src, data_type) {
+                (DataType::Timestamp(_, _) | DataType::Int64, DataType::Int64) => {
+                    Some((name, DataType::Int64))
+                }
+                (DataType::Timestamp(a, _), DataType::Timestamp(b, _)) if a == b => {
+                    Some((name, data_type.clone()))
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// The `i64` value of a literal **already typed as** `dt` — the domain [`int64_domain_column`]
+/// reported for the other operand. Requiring an exact type match (including the timestamp
+/// `TimeUnit`) is what makes the comparison against raw Parquet statistics sound; a mismatched or
+/// non-literal operand yields `None` and the segment is simply read unpruned.
+fn i64_literal_in(expr: &Expr, dt: &DataType) -> Option<i64> {
+    let Expr::Literal(v, _) = expr else {
+        return None;
+    };
+    match (dt, v) {
+        (DataType::Int64, ScalarValue::Int64(Some(v))) => Some(*v),
+        (DataType::Timestamp(TimeUnit::Second, _), ScalarValue::TimestampSecond(Some(v), _)) => {
+            Some(*v)
+        }
+        (
+            DataType::Timestamp(TimeUnit::Millisecond, _),
+            ScalarValue::TimestampMillisecond(Some(v), _),
+        ) => Some(*v),
+        (
+            DataType::Timestamp(TimeUnit::Microsecond, _),
+            ScalarValue::TimestampMicrosecond(Some(v), _),
+        ) => Some(*v),
+        (
+            DataType::Timestamp(TimeUnit::Nanosecond, _),
+            ScalarValue::TimestampNanosecond(Some(v), _),
+        ) => Some(*v),
+        _ => None,
+    }
+}
+
+/// Which row groups of a segment survive the pushed range probes.
+#[derive(Debug, PartialEq, Eq)]
+enum RowGroups {
+    /// Nothing was ruled out — read the file as-is.
+    All,
+    /// Every row group is proven to hold no matching row — skip the segment entirely.
+    None,
+    /// Only these row groups (in ascending order) can match.
+    Subset(Vec<usize>),
+}
+
+/// Test every row group's statistics against the pushed range probes. A row group is dropped only
+/// when some probe *proves* it cannot match ([`RangeProbe::excludes`]); a missing column, missing
+/// statistics, or a non-`INT64` statistic keeps it (statistics may only ever rule a row group out).
+fn surviving_row_groups(
+    builder: &ParquetRecordBatchReaderBuilder<std::fs::File>,
+    range_probes: &[ColumnRangeProbe],
+) -> RowGroups {
+    let metadata = builder.metadata();
+    let num_row_groups = metadata.num_row_groups();
+    if num_row_groups == 0 || range_probes.is_empty() {
+        return RowGroups::All;
+    }
+    // Resolve each probe's leaf-column index once for this file; a probe on a column the segment does
+    // not carry (an older segment, a promoted column) simply cannot prune.
+    let columns = builder.parquet_schema().columns();
+    let resolved: Vec<(usize, RangeProbe)> = range_probes
+        .iter()
+        .filter_map(|p| {
+            let idx = columns.iter().position(|c| c.name() == p.column)?;
+            Some((idx, p.probe))
+        })
+        .collect();
+    if resolved.is_empty() {
+        return RowGroups::All;
+    }
+    let mut keep = Vec::with_capacity(num_row_groups);
+    for rg in 0..num_row_groups {
+        let meta = metadata.row_group(rg);
+        let excluded = resolved.iter().any(|(idx, probe)| {
+            match meta.column(*idx).statistics().and_then(int64_bounds) {
+                Some((min, max)) => probe.excludes(min, max),
+                None => false, // no usable statistics → the row group must be read
+            }
+        });
+        if !excluded {
+            keep.push(rg);
+        }
+    }
+    if keep.is_empty() {
+        RowGroups::None
+    } else if keep.len() == num_row_groups {
+        RowGroups::All
+    } else {
+        RowGroups::Subset(keep)
+    }
+}
+
+/// The `(min, max)` of an `INT64` column chunk. Deliberately narrow: [`int64_domain_column`] only
+/// admits `Int64`/`Timestamp` columns, whose physical type is `INT64` with signed ordering, so any
+/// other statistics variant here means the column is not what the predicate thought it was and
+/// nothing is pruned.
+fn int64_bounds(stats: &Statistics) -> Option<(i64, i64)> {
+    match stats {
+        Statistics::Int64(s) => Some((*s.min_opt()?, *s.max_opt()?)),
+        _ => None,
+    }
+}
+
+/// Express "read only these row groups" as a whole-file [`RowSelection`], so it can be intersected
+/// with a Tantivy row selection (which is addressed in whole-file row ordinals and would be silently
+/// re-based by `with_row_groups`).
+fn row_group_selection(
+    builder: &ParquetRecordBatchReaderBuilder<std::fs::File>,
+    keep: &[usize],
+) -> RowSelection {
+    let metadata = builder.metadata();
+    let selectors: Vec<RowSelector> = (0..metadata.num_row_groups())
+        .map(|rg| {
+            let rows = metadata.row_group(rg).num_rows() as usize;
+            if keep.contains(&rg) {
+                RowSelector::select(rows)
+            } else {
+                RowSelector::skip(rows)
+            }
+        })
+        .collect();
+    RowSelection::from(selectors)
 }
 
 fn utf8_literal(expr: &Expr) -> Option<String> {
@@ -721,15 +1135,24 @@ fn row_selection_from_sorted(sorted_hits: &[u64], total: u64) -> RowSelection {
 /// can be skipped. Reads via the `parquet` crate directly (not DataFusion), which yields `Utf8` — not
 /// `Utf8View` — string columns matching the canonical schema.
 ///
-/// Before opening, if any `bloom_probes` (raw `trace_id`/`span_id` equalities) is *proven absent* by
-/// this segment's Parquet bloom filter, the segment is skipped (`Ok(None)`) — the point-lookup
-/// accelerator of ARCHITECTURE.md §8. A segment lacking a bloom filter for the probed column (older
-/// segments, or a maybe-present answer) is always read: bloom filters only ever rule a value *out*,
-/// so this can never drop a matching row.
+/// Before opening, if some `bloom_probes` entry (a raw `trace_id`/`span_id` candidate set) has
+/// *every* candidate proven absent by this segment's Parquet bloom filters, the segment is skipped
+/// (`Ok(None)`) — the point-lookup accelerator of ARCHITECTURE.md §8. A segment lacking a bloom
+/// filter for the probed column (older segments), or reporting any candidate maybe-present, is
+/// always read: bloom filters only ever rule a value *out*, so this can never drop a matching row.
+///
+/// The `range_probes` (time/`INT64` comparisons) are then tested against the row-group statistics
+/// already present in the footer this open just read: a segment whose every row group is ruled out is
+/// skipped (`Ok(None)`) without touching a data page — so `WHERE time > now() - 5m` over a month of
+/// segments opens each footer but reads rows from only the in-range ones. When just *some* row groups
+/// are ruled out the read is narrowed to the survivors; if a Tantivy `selection` is also in play the
+/// narrowing is expressed as a whole-file `RowSelection` and intersected with it, because
+/// `with_row_groups` would silently re-base the selection's row ordinals onto the kept groups.
 fn open_segment(
     path: &PathBuf,
     selection: Option<RowSelection>,
-    bloom_probes: &[(String, Vec<u8>)],
+    bloom_probes: &[(String, Vec<Vec<u8>>)],
+    range_probes: &[ColumnRangeProbe],
 ) -> DFResult<Option<ParquetRecordBatchReader>> {
     let file = std::fs::File::open(path)
         .map_err(|e| DataFusionError::Execution(format!("open segment {}: {e}", path.display())))?;
@@ -738,8 +1161,20 @@ fn open_segment(
     if !bloom_probes.is_empty() && bloom_rules_out(&builder, bloom_probes)? {
         return Ok(None);
     }
-    if let Some(sel) = selection {
-        builder = builder.with_row_selection(sel);
+    match surviving_row_groups(&builder, range_probes) {
+        RowGroups::None => return Ok(None),
+        RowGroups::All => {
+            if let Some(sel) = selection {
+                builder = builder.with_row_selection(sel);
+            }
+        }
+        RowGroups::Subset(keep) => match selection {
+            None => builder = builder.with_row_groups(keep),
+            Some(sel) => {
+                let rg_sel = row_group_selection(&builder, &keep);
+                builder = builder.with_row_selection(rg_sel.intersection(&sel));
+            }
+        },
     }
     let reader = builder
         .build()
@@ -747,14 +1182,22 @@ fn open_segment(
     Ok(Some(reader))
 }
 
-/// `true` iff some probe `(column, value)` is *proven absent* from the whole segment: every row
-/// group has a bloom filter for that column and none report the value present. Any row group
-/// missing a bloom filter, or reporting the value maybe-present, means the segment must be read.
+/// `true` iff some probe `(column, values)` has its **whole candidate set** *proven absent* from the
+/// segment: for every row group, that column has a bloom filter and none of `values` is reported
+/// present. Any row group missing a bloom filter, or reporting *any* candidate maybe-present, means
+/// the segment must be read — a probe set is a disjunction (`col = v1 OR … OR col = vn`), so one
+/// maybe-present member already makes a matching row possible.
+///
+/// Distinct probes, by contrast, are conjuncts (`WHERE a AND b`), so ruling out *any single* one is
+/// enough to skip the segment.
 fn bloom_rules_out(
     builder: &ParquetRecordBatchReaderBuilder<std::fs::File>,
-    bloom_probes: &[(String, Vec<u8>)],
+    bloom_probes: &[(String, Vec<Vec<u8>>)],
 ) -> DFResult<bool> {
-    for (column, value) in bloom_probes {
+    for (column, values) in bloom_probes {
+        if values.is_empty() {
+            continue; // no candidate to probe → nothing proven
+        }
         let Some(col_idx) = builder
             .parquet_schema()
             .columns()
@@ -768,17 +1211,20 @@ fn bloom_rules_out(
             continue;
         }
         let mut all_absent = true;
-        for rg in 0..num_row_groups {
-            let bloom = builder
+        'row_groups: for rg in 0..num_row_groups {
+            // No bloom for this row group → can't rule the segment out.
+            let Some(sbbf) = builder
                 .get_row_group_column_bloom_filter(rg, col_idx)
-                .map_err(|e| DataFusionError::Execution(format!("read bloom filter: {e}")))?;
-            match bloom {
-                // Bloom present and value not in it → this row group is proven absent.
-                Some(sbbf) if !sbbf.check(&value[..]) => {}
-                // No bloom for this row group, or maybe-present → can't rule the segment out.
-                _ => {
+                .map_err(|e| DataFusionError::Execution(format!("read bloom filter: {e}")))?
+            else {
+                all_absent = false;
+                break;
+            };
+            for value in values {
+                // Maybe-present candidate → this row group may hold a matching row.
+                if sbbf.check(&value[..]) {
                     all_absent = false;
-                    break;
+                    break 'row_groups;
                 }
             }
         }
@@ -895,6 +1341,7 @@ mod tests {
             parquet_path: dir.path().join("seg.parquet"),
             index_path: Some(idx),
             rows: rows.len() as u64,
+            time_range: None,
         };
 
         let sel = |terms: &[&str], not_terms: &[&str], probes: &[(&str, &str)]| {
@@ -932,6 +1379,7 @@ mod tests {
             parquet_path: dir.path().join("seg.parquet"),
             index_path: None,
             rows: 6,
+            time_range: None,
         };
         assert!(
             row_selection_for(
@@ -1021,9 +1469,11 @@ mod tests {
                 parquet_path,
                 index_path: Some(tidx),
                 rows: parquet_bodies.len() as u64,
+                time_range: None,
             }],
             text_column: Some("body"),
             bloom_columns: &[],
+            time_column: None,
         };
 
         let (_schema, batches, stats) = crate::run_sql(
@@ -1112,6 +1562,7 @@ mod bloom_tests {
             parquet_path: path,
             index_path: None,
             rows: 1,
+            time_range: None,
         }
     }
 
@@ -1129,6 +1580,7 @@ mod bloom_tests {
             segments,
             None,
             vec!["trace_id".to_owned(), "span_id".to_owned()],
+            None,
             Arc::new(ScanAccum::default()),
         )
     }
@@ -1242,6 +1694,7 @@ mod bloom_tests {
                 parquet_path: nobloom_path,
                 index_path: None,
                 rows: 1,
+                time_range: None,
             }]),
             &format!(
                 "SELECT name FROM spans WHERE trace_id = X'{}'",
@@ -1256,6 +1709,184 @@ mod bloom_tests {
         );
         assert_eq!(prune_counters::pruned(), 0, "no bloom → never pruned");
         assert_eq!(prune_counters::read(), 1);
+    }
+
+    /// The **trace-search** shape: `trace_id IN (…)` over k raw ids must prune the segments holding
+    /// none of them — the whole point of `TracesApi::search`'s phase-2 fetch. Covers both physical
+    /// forms of the predicate, since DataFusion's simplifier rewrites a short `IN` (≤ 3 values) into
+    /// an `OR` chain *before* filter pushdown, and leaves longer ones as an `InList`. `NOT IN` must
+    /// prune nothing (a bloom proves absence, which says nothing about a negated membership).
+    #[tokio::test(flavor = "current_thread")]
+    #[allow(clippy::await_holding_lock)] // single-thread runtime; the guard serializes the global counter asserts
+    async fn in_list_lookup_prunes_segments_holding_no_candidate() {
+        let _serial = super::prune_counters::SERIAL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let seg_a = write_segment_file(dir.path(), "a.parquet", [0xAA; 16], [0x01; 8], "a-span");
+        let seg_b = write_segment_file(dir.path(), "b.parquet", [0xBB; 16], [0x02; 8], "b-span");
+        let seg_c = write_segment_file(dir.path(), "c.parquet", [0xCC; 16], [0x03; 8], "c-span");
+        let segs = vec![seg_a, seg_b, seg_c];
+
+        // Two candidates (≤ THRESHOLD_INLINE_INLIST → an `OR` chain by the time it is pushed down):
+        // segment C holds neither and is skipped.
+        prune_counters::reset();
+        let two = run(
+            provider_over(segs.clone()),
+            &format!(
+                "SELECT name FROM spans WHERE trace_id IN (X'{}', X'{}')",
+                "aa".repeat(16),
+                "bb".repeat(16)
+            ),
+        )
+        .await;
+        assert_eq!(row_count(&two), 2, "both candidate traces' spans returned");
+        assert_eq!(
+            prune_counters::pruned(),
+            1,
+            "segment C skipped via its bloom"
+        );
+        assert_eq!(prune_counters::read(), 2);
+
+        // Four candidates (> the inline threshold → a genuine `Expr::InList` reaches the provider),
+        // two of them absent from every segment: only A and B are read.
+        prune_counters::reset();
+        let four = run(
+            provider_over(segs.clone()),
+            &format!(
+                "SELECT name FROM spans WHERE trace_id IN (X'{}', X'{}', X'{}', X'{}')",
+                "aa".repeat(16),
+                "bb".repeat(16),
+                "dd".repeat(16),
+                "ee".repeat(16)
+            ),
+        )
+        .await;
+        assert_eq!(row_count(&four), 2);
+        assert_eq!(
+            prune_counters::pruned(),
+            1,
+            "segment C skipped via its bloom"
+        );
+        assert_eq!(prune_counters::read(), 2);
+
+        // Every candidate absent → every segment pruned, empty (and still correct) result.
+        prune_counters::reset();
+        let none = run(
+            provider_over(segs.clone()),
+            &format!(
+                "SELECT name FROM spans WHERE trace_id IN (X'{}', X'{}')",
+                "dd".repeat(16),
+                "ee".repeat(16)
+            ),
+        )
+        .await;
+        assert_eq!(row_count(&none), 0);
+        assert_eq!(prune_counters::pruned(), 3, "all three segments skipped");
+        assert_eq!(prune_counters::read(), 0);
+
+        // `NOT IN` claims nothing: absence from a bloom cannot rule the segment out.
+        prune_counters::reset();
+        let negated = run(
+            provider_over(segs),
+            &format!(
+                "SELECT name FROM spans WHERE trace_id NOT IN (X'{}', X'{}')",
+                "aa".repeat(16),
+                "bb".repeat(16)
+            ),
+        )
+        .await;
+        assert_eq!(row_count(&negated), 1, "only segment C's span survives");
+        assert_eq!(prune_counters::pruned(), 0, "NOT IN proves no absence");
+        assert_eq!(prune_counters::read(), 3);
+    }
+
+    /// The probe extractor itself, over the shapes it must and must not claim.
+    #[test]
+    fn bloom_probe_extraction() {
+        use datafusion::prelude::{col, lit};
+
+        let cols = vec!["trace_id".to_owned(), "span_id".to_owned()];
+        let id = |b: u8| ScalarValue::FixedSizeBinary(16, Some(vec![b; 16]));
+
+        // Multi-value `IN` over the bloom column → the whole candidate set.
+        assert_eq!(
+            bloom_probe(
+                &col("trace_id").in_list(vec![lit(id(0xAA)), lit(id(0xBB))], false),
+                &cols
+            ),
+            Some(("trace_id".to_owned(), vec![vec![0xAA; 16], vec![0xBB; 16]]))
+        );
+        // Single-value `IN` → a one-element set (same as the `=` point lookup).
+        assert_eq!(
+            bloom_probe(&col("trace_id").in_list(vec![lit(id(0xAA))], false), &cols),
+            Some(("trace_id".to_owned(), vec![vec![0xAA; 16]]))
+        );
+        assert_eq!(
+            bloom_probe(&col("trace_id").eq(lit(id(0xAA))), &cols),
+            Some(("trace_id".to_owned(), vec![vec![0xAA; 16]]))
+        );
+        // Negated: `NOT IN` proves nothing about absence.
+        assert!(
+            bloom_probe(
+                &col("trace_id").in_list(vec![lit(id(0xAA)), lit(id(0xBB))], true),
+                &cols
+            )
+            .is_none()
+        );
+        // A non-binary list element: the predicate could hold for a value we cannot probe.
+        assert!(
+            bloom_probe(
+                &col("trace_id").in_list(vec![lit(id(0xAA)), lit("aa")], false),
+                &cols
+            )
+            .is_none()
+        );
+        // Not a bloom-indexed column.
+        assert!(bloom_probe(&col("name").in_list(vec![lit(id(0xAA))], false), &cols).is_none());
+        // A `CAST` the type-coercer may wrap around the column is still unwrapped.
+        assert_eq!(
+            bloom_probe(
+                &Expr::Cast(Cast::new(
+                    Box::new(col("trace_id")),
+                    DataType::FixedSizeBinary(16)
+                ))
+                .in_list(vec![lit(id(0xAA))], false),
+                &cols
+            ),
+            Some(("trace_id".to_owned(), vec![vec![0xAA; 16]]))
+        );
+        // The `OR` chain a short `IN` is simplified into: same column → the candidate sets union.
+        assert_eq!(
+            bloom_probe(
+                &col("trace_id")
+                    .eq(lit(id(0xAA)))
+                    .or(col("trace_id").eq(lit(id(0xBB)))),
+                &cols
+            ),
+            Some(("trace_id".to_owned(), vec![vec![0xAA; 16], vec![0xBB; 16]]))
+        );
+        // …but a disjunct on another column (or an unrecognized one) means a row can match without
+        // `trace_id` holding a candidate — nothing is claimed.
+        assert!(
+            bloom_probe(
+                &col("trace_id")
+                    .eq(lit(id(0xAA)))
+                    .or(col("span_id")
+                        .eq(lit(ScalarValue::FixedSizeBinary(8, Some(vec![0x01; 8]))))),
+                &cols
+            )
+            .is_none()
+        );
+        assert!(
+            bloom_probe(
+                &col("trace_id")
+                    .eq(lit(id(0xAA)))
+                    .or(col("name").eq(lit("a-span"))),
+                &cols
+            )
+            .is_none()
+        );
     }
 
     /// The scan is **lazy** (prescription I-4a): building the plan reads nothing, and pulling a single
@@ -1286,6 +1917,7 @@ mod bloom_tests {
             segs,
             None,
             vec!["trace_id".to_owned(), "span_id".to_owned()],
+            None,
             stats.clone(),
         );
         let ctx = SessionContext::new();
@@ -1319,5 +1951,555 @@ mod bloom_tests {
             3,
             "draining the stream reads every segment"
         );
+    }
+}
+
+/// Time/range segment pruning from Parquet row-group statistics. Feature-independent (statistics
+/// live in the Parquet file, like blooms), so this compiles and runs with or without `search`.
+#[cfg(test)]
+mod range_tests {
+    use super::*;
+    use datafusion::arrow::array::{Array, ArrayRef, StringArray, TimestampNanosecondArray};
+    use datafusion::arrow::datatypes::{Field, Schema};
+    use datafusion::parquet::arrow::ArrowWriter;
+    use datafusion::parquet::file::properties::WriterProperties;
+    use datafusion::prelude::{SessionContext, col, lit};
+
+    fn ts_type() -> DataType {
+        DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into()))
+    }
+
+    /// A miniature `logs`-shaped table: the nanosecond `time` column the range pruning targets, plus
+    /// a text column so a result row can be identified.
+    fn logs_test_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("time", ts_type(), false),
+            Field::new("body", DataType::Utf8, false),
+        ]))
+    }
+
+    /// Write a segment holding one row per entry of `times` (body = `row-<time>`). `rows_per_group`
+    /// forces the Parquet row-group size so the *within*-segment path can be exercised; the
+    /// production writer emits one row group per segment.
+    fn write_time_segment(
+        dir: &std::path::Path,
+        file: &str,
+        times: &[i64],
+        rows_per_group: Option<usize>,
+    ) -> SegmentInput {
+        let schema = logs_test_schema();
+        let time_col = TimestampNanosecondArray::from(times.to_vec()).with_timezone("UTC");
+        let bodies: Vec<String> = times.iter().map(|t| format!("row-{t}")).collect();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(time_col) as ArrayRef,
+                Arc::new(StringArray::from(bodies)) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let mut props = WriterProperties::builder();
+        if let Some(n) = rows_per_group {
+            props = props.set_max_row_group_row_count(Some(n));
+        }
+        let path = dir.join(file);
+        let f = std::fs::File::create(&path).unwrap();
+        let mut w = ArrowWriter::try_new(f, schema, Some(props.build())).unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+        SegmentInput {
+            parquet_path: path,
+            index_path: None,
+            rows: times.len() as u64,
+            time_range: None,
+        }
+    }
+
+    /// Run `sql` over a `logs` table of these segments, returning the `body` of each result row
+    /// (**sorted** — the query carries no `ORDER BY`, so batch order is not part of the contract) and
+    /// the scan statistics.
+    async fn run(segments: Vec<SegmentInput>, sql: &str) -> (Vec<String>, ScanStats) {
+        run_inner(segments, sql, None).await
+    }
+
+    /// [`run`] with the manifest-range skip armed: `time_column` names the column each segment's
+    /// declared `time_range` describes.
+    async fn run_with_time_column(
+        segments: Vec<SegmentInput>,
+        sql: &str,
+    ) -> (Vec<String>, ScanStats) {
+        run_inner(segments, sql, Some("time".to_owned())).await
+    }
+
+    async fn run_inner(
+        segments: Vec<SegmentInput>,
+        sql: &str,
+        time_column: Option<String>,
+    ) -> (Vec<String>, ScanStats) {
+        let accum = Arc::new(ScanAccum::default());
+        let schema = logs_test_schema();
+        let provider = SegmentTableProvider::new(
+            schema.clone(),
+            RecordBatch::new_empty(schema),
+            segments,
+            Some("body".to_owned()),
+            Vec::new(),
+            time_column,
+            accum.clone(),
+        );
+        let ctx = SessionContext::new();
+        ctx.register_table("logs", Arc::new(provider)).unwrap();
+        let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
+        let mut out = Vec::new();
+        for b in &batches {
+            let c = b
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("every test here selects `body`");
+            for i in 0..c.len() {
+                out.push(c.value(i).to_owned());
+            }
+        }
+        out.sort();
+        (out, accum.snapshot())
+    }
+
+    /// The whole point of the change: a bounded `WHERE time …` must not READ the segments whose
+    /// Parquet statistics prove they hold nothing in range. Asserted on the process-global prune
+    /// counters (a read segment bumps READ, a skipped one PRUNED) — never on timing. Covers, in one
+    /// test so the counters describe one scan at a time: an interior range (both flanking segments
+    /// skipped), a range matching nothing at all, an *inclusive/exclusive boundary* (a row sitting
+    /// exactly on the bound is still returned, and so is its segment), and an unbounded query (every
+    /// segment read — pruning must never fire without a predicate).
+    #[tokio::test(flavor = "current_thread")]
+    #[allow(clippy::await_holding_lock)] // single-thread runtime; the guard serializes the global counter asserts
+    async fn time_range_prunes_out_of_range_segments() {
+        // Serialize against every other test whose `scan()` bumps the global READ/PRUNED counters.
+        let _serial = prune_counters::SERIAL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        // Three disjoint segments: A [100,200], B [300,400], C [500,600].
+        let segs = || {
+            vec![
+                write_time_segment(dir.path(), "a.parquet", &[100, 200], None),
+                write_time_segment(dir.path(), "b.parquet", &[300, 400], None),
+                write_time_segment(dir.path(), "c.parquet", &[500, 600], None),
+            ]
+        };
+
+        // 1. An interior range: only B can match, so A and C are never read.
+        prune_counters::reset();
+        let (rows, stats) = run(
+            segs(),
+            r#"SELECT body FROM logs
+               WHERE CAST("time" AS BIGINT) >= 300 AND CAST("time" AS BIGINT) < 500"#,
+        )
+        .await;
+        assert_eq!(rows, vec!["row-300", "row-400"]);
+        assert_eq!(prune_counters::read(), 1, "only segment B is read");
+        assert_eq!(prune_counters::pruned(), 2, "segments A and C are skipped");
+        assert_eq!(stats.segments_scanned, 1);
+        assert_eq!(stats.segments_pruned, 2);
+        assert_eq!(stats.rows_scanned, 2, "only B's two rows are materialized");
+
+        // 2. A range no segment overlaps: every segment is skipped, nothing is decoded at all.
+        prune_counters::reset();
+        let (rows, stats) = run(
+            segs(),
+            r#"SELECT body FROM logs WHERE CAST("time" AS BIGINT) > 1000"#,
+        )
+        .await;
+        assert!(rows.is_empty());
+        assert_eq!(prune_counters::read(), 0);
+        assert_eq!(prune_counters::pruned(), 3, "all three segments skipped");
+        assert_eq!(stats.rows_scanned, 0, "no row was decoded");
+
+        // 3. Boundary, inclusive: `>= 200 AND <= 300` sits exactly on A's max and B's min. Both rows
+        //    must come back and both segments must be read; only C is skipped. An off-by-one in
+        //    `RangeProbe::excludes` would silently lose one of these rows.
+        prune_counters::reset();
+        let (rows, _) = run(
+            segs(),
+            r#"SELECT body FROM logs
+               WHERE CAST("time" AS BIGINT) >= 200 AND CAST("time" AS BIGINT) <= 300"#,
+        )
+        .await;
+        assert_eq!(
+            rows,
+            vec!["row-200", "row-300"],
+            "rows sitting exactly on an inclusive bound are returned"
+        );
+        assert_eq!(
+            prune_counters::read(),
+            2,
+            "A and B each hold a boundary row"
+        );
+        assert_eq!(prune_counters::pruned(), 1, "only C is out of range");
+
+        // 4. Boundary, exclusive: `> 200 AND < 300` admits neither boundary row — and therefore no
+        //    segment, since A's max is 200 and B's min is 300.
+        prune_counters::reset();
+        let (rows, _) = run(
+            segs(),
+            r#"SELECT body FROM logs
+               WHERE CAST("time" AS BIGINT) > 200 AND CAST("time" AS BIGINT) < 300"#,
+        )
+        .await;
+        assert!(rows.is_empty(), "the exclusive bounds admit no row");
+        assert_eq!(prune_counters::pruned(), 3);
+
+        // 5. No time bound at all: nothing may be pruned — every segment is read in full.
+        prune_counters::reset();
+        let (rows, stats) = run(segs(), "SELECT body FROM logs").await;
+        assert_eq!(rows.len(), 6, "all six rows come back");
+        assert_eq!(prune_counters::read(), 3, "every segment is read");
+        assert_eq!(prune_counters::pruned(), 0, "nothing is pruned");
+        assert_eq!(stats.rows_scanned, 6);
+
+        // 6. A non-range predicate is not a probe either: a `body` equality prunes no segment.
+        prune_counters::reset();
+        let (rows, _) = run(segs(), "SELECT body FROM logs WHERE body = 'row-500'").await;
+        assert_eq!(rows, vec!["row-500"]);
+        assert_eq!(prune_counters::read(), 3, "a text equality prunes nothing");
+        assert_eq!(prune_counters::pruned(), 0);
+    }
+
+    /// A segment with several row groups is narrowed to the surviving ones rather than skipped or
+    /// read whole: the segment is read (it *does* hold matching rows) but only the in-range row
+    /// group's rows are materialized. The production writer emits one row group per segment, so this
+    /// covers the `RowGroups::Subset` arm a single-row-group segment never reaches.
+    #[tokio::test(flavor = "current_thread")]
+    #[allow(clippy::await_holding_lock)] // single-thread runtime; the guard serializes the global counter asserts
+    async fn multi_row_group_segment_reads_only_the_surviving_groups() {
+        let _serial = prune_counters::SERIAL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        // Six rows, two per row group → groups [0,100], [200,300], [400,500].
+        let seg = write_time_segment(
+            dir.path(),
+            "multi.parquet",
+            &[0, 100, 200, 300, 400, 500],
+            Some(2),
+        );
+
+        prune_counters::reset();
+        let (rows, stats) = run(
+            vec![seg],
+            r#"SELECT body FROM logs
+               WHERE CAST("time" AS BIGINT) >= 200 AND CAST("time" AS BIGINT) <= 300"#,
+        )
+        .await;
+        assert_eq!(rows, vec!["row-200", "row-300"]);
+        assert_eq!(prune_counters::read(), 1, "the segment itself is read");
+        assert_eq!(prune_counters::pruned(), 0);
+        assert_eq!(
+            stats.rows_scanned, 2,
+            "only the middle row group's rows are decoded, not all six"
+        );
+    }
+
+    /// The `RowGroups::Subset` + Tantivy-`RowSelection` combination, driven through `open_segment`
+    /// directly (the selection is handed in rather than derived from a `.tidx`, so this runs without
+    /// the `search` feature too). The selection is in **whole-file** row ordinals; handing the
+    /// surviving row groups to `with_row_groups` would re-base it onto the kept groups and return the
+    /// wrong rows, so the two must be intersected instead. Rows 0..5 hold times 0,100,…,500 in three
+    /// two-row groups; the selection picks rows {1,3,4} and the range keeps group 1 (rows {2,3}) — so
+    /// exactly row 3 (time 300) must come back.
+    #[test]
+    fn row_group_subset_intersects_a_row_selection_instead_of_rebasing_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let seg = write_time_segment(
+            dir.path(),
+            "combo.parquet",
+            &[0, 100, 200, 300, 400, 500],
+            Some(2),
+        );
+        let selection = RowSelection::from(vec![
+            RowSelector::skip(1),   // row 0
+            RowSelector::select(1), // row 1
+            RowSelector::skip(1),   // row 2
+            RowSelector::select(2), // rows 3, 4
+            RowSelector::skip(1),   // row 5
+        ]);
+        let probe = |op, value| ColumnRangeProbe {
+            column: "time".to_owned(),
+            probe: RangeProbe { op, value },
+        };
+        let probes = vec![probe(RangeOp::GtEq, 200), probe(RangeOp::LtEq, 300)];
+        let reader = open_segment(&seg.parquet_path, Some(selection), &[], &probes)
+            .unwrap()
+            .expect("the segment holds matching rows");
+        let mut bodies: Vec<String> = Vec::new();
+        for batch in reader {
+            let batch = batch.unwrap();
+            let c = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .clone();
+            for i in 0..c.len() {
+                bodies.push(c.value(i).to_owned());
+            }
+        }
+        assert_eq!(
+            bodies,
+            vec!["row-300"],
+            "the intersection of the selection {{1,3,4}} with the surviving group {{2,3}}"
+        );
+    }
+
+    /// A segment carrying no statistics for the probed column must be read, never skipped —
+    /// statistics may only ever rule a row group *out*. Guards older/foreign segments.
+    #[tokio::test(flavor = "current_thread")]
+    #[allow(clippy::await_holding_lock)] // single-thread runtime; the guard serializes the global counter asserts
+    async fn a_segment_without_statistics_is_always_read() {
+        use datafusion::parquet::file::properties::EnabledStatistics;
+        let _serial = prune_counters::SERIAL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let schema = logs_test_schema();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(TimestampNanosecondArray::from(vec![100i64, 200]).with_timezone("UTC"))
+                    as ArrayRef,
+                Arc::new(StringArray::from(vec!["row-100", "row-200"])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let path = dir.path().join("nostats.parquet");
+        let props = WriterProperties::builder()
+            .set_statistics_enabled(EnabledStatistics::None)
+            .build();
+        let mut w =
+            ArrowWriter::try_new(std::fs::File::create(&path).unwrap(), schema, Some(props))
+                .unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+
+        prune_counters::reset();
+        let (rows, _) = run(
+            vec![SegmentInput {
+                parquet_path: path,
+                index_path: None,
+                rows: 2,
+                time_range: None,
+            }],
+            r#"SELECT body FROM logs WHERE CAST("time" AS BIGINT) > 1000"#,
+        )
+        .await;
+        assert!(rows.is_empty(), "the filter above the scan still applies");
+        assert_eq!(
+            prune_counters::read(),
+            1,
+            "no statistics ⇒ the segment must be read"
+        );
+        assert_eq!(prune_counters::pruned(), 0);
+    }
+
+    /// `RangeProbe::excludes` is the one place correctness rests: it must answer `true` only when
+    /// *no* value in `[min, max]` can satisfy the comparison. Checked against the inclusive edges of
+    /// a `[10, 20]` row group, where every off-by-one shows up.
+    #[test]
+    fn excludes_is_the_exact_dual_of_the_operator() {
+        let p = |op, value| RangeProbe { op, value };
+        // col > v: impossible iff max <= v.
+        assert!(p(RangeOp::Gt, 20).excludes(10, 20));
+        assert!(!p(RangeOp::Gt, 19).excludes(10, 20));
+        // col >= v: impossible iff max < v.
+        assert!(p(RangeOp::GtEq, 21).excludes(10, 20));
+        assert!(!p(RangeOp::GtEq, 20).excludes(10, 20));
+        // col < v: impossible iff min >= v.
+        assert!(p(RangeOp::Lt, 10).excludes(10, 20));
+        assert!(!p(RangeOp::Lt, 11).excludes(10, 20));
+        // col <= v: impossible iff min > v.
+        assert!(p(RangeOp::LtEq, 9).excludes(10, 20));
+        assert!(!p(RangeOp::LtEq, 10).excludes(10, 20));
+        // col = v: impossible iff v falls outside [min, max] — both edges are inside.
+        assert!(p(RangeOp::Eq, 9).excludes(10, 20));
+        assert!(p(RangeOp::Eq, 21).excludes(10, 20));
+        assert!(!p(RangeOp::Eq, 10).excludes(10, 20));
+        assert!(!p(RangeOp::Eq, 20).excludes(10, 20));
+        // A single-valued row group (min == max) behaves the same.
+        assert!(p(RangeOp::Gt, 5).excludes(5, 5));
+        assert!(!p(RangeOp::GtEq, 5).excludes(5, 5));
+    }
+
+    /// Which expression shapes are claimed as a range probe — and, just as important, which are not.
+    #[test]
+    fn stats_range_probe_claims_only_value_preserving_shapes() {
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("time", ts_type(), false),
+            Field::new("body", DataType::Utf8, false),
+            Field::new("n", DataType::Int64, false),
+            Field::new("f", DataType::Float64, false),
+        ]));
+        let probe = |e: Expr| stats_range_probe(&e, &schema);
+        let want = |c: &str, op, value| {
+            Some(ColumnRangeProbe {
+                column: c.to_owned(),
+                probe: RangeProbe { op, value },
+            })
+        };
+        let ts = |v: i64| {
+            lit(ScalarValue::TimestampNanosecond(
+                Some(v),
+                Some("UTC".into()),
+            ))
+        };
+        let as_i64 = |e: Expr| Expr::Cast(Cast::new(Box::new(e), DataType::Int64));
+
+        // The bare timestamp comparison…
+        assert_eq!(
+            probe(col("time").gt_eq(ts(5))),
+            want("time", RangeOp::GtEq, 5)
+        );
+        // …and the `CAST("time" AS BIGINT) >= 5` form every typed query builder emits.
+        assert_eq!(
+            probe(as_i64(col("time")).gt_eq(lit(5i64))),
+            want("time", RangeOp::GtEq, 5)
+        );
+        // A literal on the left mirrors the operator rather than being dropped.
+        assert_eq!(
+            probe(lit(5i64).lt(as_i64(col("time")))),
+            want("time", RangeOp::Gt, 5)
+        );
+        // A plain Int64 column and an equality both qualify.
+        assert_eq!(probe(col("n").lt(lit(7i64))), want("n", RangeOp::Lt, 7));
+        assert_eq!(probe(col("n").eq(lit(7i64))), want("n", RangeOp::Eq, 7));
+
+        // NOT claimed: `!=` (min/max prove nothing about it), a non-INT64 column, an unknown column,
+        // and a non-literal operand.
+        assert_eq!(probe(col("n").not_eq(lit(7i64))), None);
+        assert_eq!(probe(col("f").gt(lit(1.5f64))), None);
+        assert_eq!(probe(col("body").gt(lit("x"))), None);
+        assert_eq!(probe(col("nope").gt(lit(1i64))), None);
+        assert_eq!(probe(col("n").gt(col("n"))), None);
+        // A unit-changing cast rescales the value, so a statistics bound in the source unit does not
+        // transfer — not claimed.
+        assert_eq!(
+            probe(
+                Expr::Cast(Cast::new(
+                    Box::new(col("time")),
+                    DataType::Timestamp(TimeUnit::Millisecond, None),
+                ))
+                .gt(lit(ScalarValue::TimestampMillisecond(Some(5), None)))
+            ),
+            None
+        );
+        // A literal outside the column's own domain yields no sound bound either, in either
+        // direction.
+        assert_eq!(probe(col("time").gt(lit(5i64))), None);
+        assert_eq!(probe(col("n").gt(ts(5))), None);
+    }
+
+    /// Option (a), the **manifest-range skip**: a segment whose declared `[min, max]` cannot satisfy
+    /// the pushed time predicate must be ruled out with *no file access at all*.
+    ///
+    /// The assertion is deliberately brutal — the out-of-range segments' Parquet files are **deleted**
+    /// before the query runs. Any code path that opens them (a `File::open`, a footer read, a `.tidx`
+    /// search) fails loudly instead of quietly costing I/O, so this test cannot pass vacuously the way
+    /// a counter assertion could if the skip merely moved earlier.
+    #[tokio::test(flavor = "current_thread")]
+    #[allow(clippy::await_holding_lock)] // single-thread runtime; the guard serializes the global counter asserts
+    async fn manifest_range_skip_never_opens_the_file() {
+        let _serial = prune_counters::SERIAL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let mut segs = vec![
+            write_time_segment(dir.path(), "a.parquet", &[100, 200], None),
+            write_time_segment(dir.path(), "b.parquet", &[300, 400], None),
+            write_time_segment(dir.path(), "c.parquet", &[500, 600], None),
+        ];
+        // Declare each segment's bounds the way the manifest does: inclusive on both ends.
+        segs[0].time_range = Some((100, 200));
+        segs[1].time_range = Some((300, 400));
+        segs[2].time_range = Some((500, 600));
+        // A and C must never be touched. Make that physically true.
+        std::fs::remove_file(dir.path().join("a.parquet")).unwrap();
+        std::fs::remove_file(dir.path().join("c.parquet")).unwrap();
+
+        prune_counters::reset();
+        let (rows, stats) = run_with_time_column(
+            segs,
+            "SELECT body FROM logs WHERE CAST(\"time\" AS BIGINT) >= 300 \
+             AND CAST(\"time\" AS BIGINT) < 500",
+        )
+        .await;
+        assert_eq!(rows, vec!["row-300", "row-400"]);
+        assert_eq!(stats.segments_scanned, 1, "only B is opened");
+        assert_eq!(stats.segments_pruned, 2, "A and C skipped unopened");
+        assert_eq!(prune_counters::read(), 1);
+        assert_eq!(prune_counters::pruned(), 2);
+    }
+
+    /// The manifest bounds are **inclusive**, so a row sitting exactly on a half-open range's `start`
+    /// keeps its segment. Guards the off-by-one that would silently drop boundary rows — the failure
+    /// mode a range skip is most likely to introduce and least likely to be noticed.
+    #[tokio::test(flavor = "current_thread")]
+    #[allow(clippy::await_holding_lock)]
+    async fn manifest_range_skip_honors_inclusive_bounds() {
+        let _serial = prune_counters::SERIAL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let segs = || {
+            let mut v = vec![
+                write_time_segment(dir.path(), "a.parquet", &[100, 200], None),
+                write_time_segment(dir.path(), "b.parquet", &[300, 400], None),
+            ];
+            v[0].time_range = Some((100, 200));
+            v[1].time_range = Some((300, 400));
+            v
+        };
+
+        // [200, 300) — A's max is exactly 200 and must survive; B's min is 300, outside the half-open
+        // end, so B is prunable.
+        prune_counters::reset();
+        let (rows, stats) = run_with_time_column(
+            segs(),
+            "SELECT body FROM logs WHERE CAST(\"time\" AS BIGINT) >= 200 \
+             AND CAST(\"time\" AS BIGINT) < 300",
+        )
+        .await;
+        assert_eq!(rows, vec!["row-200"], "the boundary row is returned");
+        assert_eq!(stats.segments_pruned, 1, "only B is skipped");
+
+        // No predicate at all → nothing may be skipped.
+        prune_counters::reset();
+        let (rows, stats) = run_with_time_column(segs(), "SELECT body FROM logs").await;
+        assert_eq!(rows.len(), 4);
+        assert_eq!(stats.segments_pruned, 0, "no predicate → no skip");
+    }
+
+    /// The skip must consult **only** probes on `time_column`. A range predicate on a different
+    /// INT64 column describes nothing about event time, so testing it against the manifest bounds
+    /// would skip segments that really do contain matching rows.
+    #[tokio::test(flavor = "current_thread")]
+    #[allow(clippy::await_holding_lock)]
+    async fn manifest_range_skip_ignores_probes_on_other_columns() {
+        let _serial = prune_counters::SERIAL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let mut segs = vec![
+            write_time_segment(dir.path(), "a.parquet", &[100, 200], None),
+            write_time_segment(dir.path(), "b.parquet", &[300, 400], None),
+        ];
+        // Bounds that a `severity_number`-shaped predicate would "exclude" if wrongly applied.
+        segs[0].time_range = Some((100, 200));
+        segs[1].time_range = Some((300, 400));
+
+        prune_counters::reset();
+        let (rows, _stats) =
+            run_with_time_column(segs, "SELECT body FROM logs WHERE length(body) > 0").await;
+        assert_eq!(rows.len(), 4, "a non-time predicate prunes nothing");
+        assert_eq!(prune_counters::pruned(), 0);
     }
 }

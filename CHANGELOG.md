@@ -13,6 +13,170 @@ release aborts if it is missing or duplicated.
 
 ## [Unreleased]
 
+### Added
+
+- **`compaction` Cargo feature (on by default) — segment rewriting is now droppable.** Turning it off
+  (`--no-default-features --features ingest,query,search`) removes `Db::compact` and
+  `prepare_pending`, leaving an embedded host with only `Db::commit_pending`: validate a record a
+  housekeeper prepared, one manifest delta, unlink. Measured honestly — **no dependency leaves the
+  graph** (381 crates either way, because seal already writes Parquet and builds the Tantivy sidecar)
+  and 110,434 B of code goes, 2.5% of `libimbh.rlib` in release. The value is the API-surface
+  guarantee rather than the bytes: a host that does not link the rewrite cannot start an unbounded one
+  on its own thread. `housekeeper` implies `compaction`.
+- **Pending housekeeping records are committed at `open()` and `close()`.** The default
+  `Maintenance::Manual` means a host may never call `maintain()`, which would have left a
+  housekeeper's prepared rewrites on disk indefinitely — and the preparer, seeing nothing land, would
+  re-prepare the same partitions on every pass. Costs one `read_dir` of a usually-empty directory on
+  paths already doing recovery work. Commit at open runs *after* the promoted set is applied, since
+  records are validated against it; failure at close is swallowed, leaving the records for the next
+  open.
+
+- **Out-of-process segment housekeeping** (ARCHITECTURE.md §7.2). An embedded host
+  cannot run compaction from a second process — `writer.lock` is exclusive — and has no `imbhd` to
+  drive. So the work is split along its own seam instead of splitting the lock: `prepare_pending`
+  does the expensive rewrite against a **read-only** view (no lock, no manifest edit, no deletion) and
+  leaves a record under `<db>/pending/`; `Db::commit_pending` performs the part only the writer may —
+  validate, one manifest delta, unlink the inputs. `Db::maintain` calls it automatically, and
+  `MaintenanceReport` gained `pending_applied` / `pending_discarded`.
+  - Records are framed like manifest edits (`len` + `xxh3` + payload), so a torn write is discarded
+    rather than half-applied. Every record is validated against the live manifest, the live promoted
+    key set, and the output's digest; a stale one is discarded, which is always safe because the
+    inputs are untouched until the swap.
+  - New `imbh-housekeeper` binary, behind the off-by-default `housekeeper` feature so a library
+    consumer never builds it. `--commit` gives an offline mode (take the writer lock and commit too)
+    that falls out of the same design rather than being a second implementation.
+  - `cleanup_orphans` now treats a file named by a valid pending record as referenced, so a prepared
+    rewrite is not destroyed by a writer restart.
+
+- **`Db::set_promote` — change the promoted attribute keys on a live database.** Seals first, so no
+  buffered batch straddles the change: batches are encoded at ingest against the set in effect then,
+  and the buffer is later concatenated against the *current* schema by `concat_batches`, which takes
+  columns positionally without validating them against the schema it is handed. Without the barrier a
+  buffer holding both widths can panic, silently truncate, or silently concatenate two
+  differently-named promoted columns into one. `Db::promote()` reports the set in effect, and
+  `BlockingDb` mirrors both. Rejected on read-only handles.
+
+- **Time-range segment pruning.** A comparison against a `Timestamp`/`Int64` column — `time`,
+  `start_time`, `observed_time`, written bare or as the `CAST(col AS BIGINT)` form the typed query
+  builders emit — is now claimed as an `Inexact` filter pushdown and tested against each sealed
+  segment's Parquet row-group statistics. A segment whose statistics prove it holds nothing in range
+  is skipped without reading a row (counted in `ScanStats`/`QueryStats` `segments_pruned`); a segment
+  with several row groups is narrowed to the surviving ones. Previously `WHERE time > now() - 5m`
+  read every segment in the database and discarded the out-of-range rows in the filter above the
+  scan. Applies to `Db::sql` as well as the typed logs/traces/metrics APIs. Statistics can only ever
+  rule a row group *out*, and the predicate is still re-checked above the scan, so results are
+  unchanged.
+- **Manifest-range segment skip**, layered ahead of the statistics path above. Each sealed segment now
+  carries its manifest `[min, max]` event-time bounds into the query layer, so a time predicate that
+  cannot intersect them skips the segment **without opening the file at all** — no `File::open`, no
+  Parquet footer read, no Tantivy `.tidx` search. Measured on a 60-segment corpus, a one-segment time
+  window went from 8.71 ms (before either change) to 2.09 ms (statistics only) to **0.73 ms**; the
+  footer opens were the dominant remaining cost, and that fraction grows with segment count. Both
+  mechanisms are kept: segments with no declared range, and row-group narrowing within a segment that
+  is read, still go through the statistics path.
+- **Trace search now uses its bloom filters.** `TracesApi::search`'s phase-2 fetch bound
+  `hex(trace_id)` strings, a shape no bloom filter can probe, so it read every span segment in the
+  database. It now binds raw `trace_id` bytes, and the provider recognizes raw-binary membership in
+  three forms: `col = X'…'`, `col IN (X'…', …)`, and the `OR` chain DataFusion rewrites a short `IN`
+  into before filter pushdown. A segment is skipped only when its blooms prove *every* candidate
+  absent. Measured 7.26 ms → 2.23 ms for a two-id fetch across 60 segments; results are unchanged.
+
+### Changed
+
+- **Breaking (`imbh`, `imbh-storage`): the retention policy is now durable database state**, recorded
+  in `db.info` beside the promoted key set and read at open. Omitting `DbBuilder::retention` inherits
+  the database's policy instead of resetting it to "keep everything"; passing one sets it. Two handles
+  on one directory could previously disagree about when data is deleted, and a housekeeper process
+  applying retention had no way to learn the host's policy at all — it would have had to invent one
+  from its own flags. `Db::retention()` and `Storage::retention()` report the policy in effect;
+  `Retention::from_parts` reconstructs one; `Retention` gained `PartialEq`/`Eq`. `MaintenanceReport`
+  also gained `pending_segments_replaced`.
+  - **Retention is deliberately *not* a pending-record job.** Its scan is segment metadata plus one
+    `stat()` per segment, so there is no expensive half to move off-process — the writer computes the
+    drop list faster than it could read a record describing one. A "drop A" record racing a
+    "merge A,B -> C" record would also add a conflict the single-record design does not have, and
+    dissolve the deliberate `commit_pending()`-before-`retain()` ordering in `maintain()`. The
+    housekeeper's offline `--commit` mode instead runs `maintain()`, applying the database's own
+    policy.
+
+- **Breaking (`imbh`): `CompactionReport` gains `segments_converged`, and `compact()` now rewrites a
+  single-segment partition whose schema lags the promote set.** Previously a day partition holding one
+  segment was skipped outright — nothing to merge — so a partition that never gains a second segment
+  (an old day, a low-volume signal, a database that seals rarely) never converged after a
+  `set_promote` and kept answering through the JSON fallback forever. Merging and converging are the
+  same rewrite with different triggers, and are done in one pass: splitting them would rewrite the
+  same bytes twice. The new counter keeps `segments_merged` literally true, since a 1 -> 1 rewrite is
+  not a merge. Note the first `compact()` after promoting a key rewrites every segment lacking the new
+  column — a one-off burst per segment, not a repeated cost.
+
+- **Compaction now projects promoted columns from the retained `attributes` JSON instead of
+  null-filling them.** A segment sealed before a key was promoted has no column for it, and
+  normalising it to the live schema null-filled that column. Answers were correct either way — the
+  query layer emits a `CASE` whose NULL arm reads the key back out of the JSON — but compaction is
+  the one operation that rewrites those rows, so null-filling there made the fallback permanent and
+  every query on the key kept paying a JSON parse over that data. A merged segment is now what it
+  would have been had the key been promoted from the start. Only columns the *source* lacked are
+  derived; a column the source had is kept as-is, since a NULL there means the row genuinely carried
+  no string value. Visible change: reading such a column directly (rather than through the `CASE`)
+  now returns the value instead of NULL after compaction.
+
+- **Breaking (`imbh`, `imbh-storage`): the promoted key set is now durable database state, not
+  per-handle configuration.** It is recorded in `db.info` and read at open.
+  - Omitting `DbBuilder::promote` now **inherits** the database's set instead of resetting it to
+    empty. Passing an explicitly empty `Promote` still demotes everything — only *omitting* the call
+    inherits, which is why the builder field became `Option<Promote>` internally.
+  - A **read-only** handle always adopts the durable set and ignores anything passed to its builder.
+    Previously a writer opened with `promote(["k"])` and a reader opened without it disagreed about
+    the column layout of the very same segments.
+  - `Storage::promote()` returns an owned `Promote` rather than `&Promote`, because the set is now
+    mutable at runtime; `Storage::set_promote` and `Storage::persist_promote` are new.
+  Existing segments are never rewritten: ones sealed before a key was promoted are null-filled at
+  read time and the query layer reads that key from the JSON blob on exactly those rows, so history
+  stays queryable across a change in either direction.
+
+- **Breaking (`imbh`)**: `Db::segment_files` returns `Result<Vec<PathBuf>>` instead of
+  `Vec<PathBuf>`, and `BlockingDb` gains the mirroring `segment_files` it was missing. Callers add a
+  `?`. The signature had to change because the accessor is now correct on **read-only handles**: see
+  the `Fixed` entry below. A reader has to be able to report an I/O failure rather than mask it as an
+  empty database, which the infallible signature could not express.
+- **Breaking (`imbh-query`)**: `SegmentInput` gains a public `time_range: Option<(i64, i64)>` field,
+  `TableInput` gains `time_column: Option<&'static str>`, and `SegmentTableProvider::new` takes one
+  more argument. Both structs expose public fields, so struct-literal construction must be updated.
+  The `imbh` facade populates them; embedders driving `imbh-query` directly are affected.
+- **Unpromoted attribute access no longer parses the whole record to read one field.**
+  `imbh_core::json_get` — the hot path behind the `json_get_str`/`json_get_num` UDFs, evaluated once
+  per row for any attribute that is not a promoted column — built a `Vec<(String, AnyValue)>` of the
+  entire blob (one allocation per key and per string value) and then linear-searched it. It now walks
+  the object skipping non-matching values without allocating, borrowing keys out of the input, and
+  falls back to the full parse whenever that cannot apply (an escaped key, malformed input), so the
+  answer is unchanged by construction. Measured per 100k rows, filter cost above a `count(*)` floor:
+  2 attributes/record 18.9 → 12.4 ms, 10 attributes 75.1 → 31.7 ms, 40 attributes **326.7 → 101.5 ms**
+  (3.2x). The win grows with how many attributes a record carries, and it applies to every signal —
+  including the metric tables, which have no Tantivy index and so had no other acceleration at all.
+
+### Fixed
+
+- **`Db::segment_files` reported an empty database on read-only handles.** `Storage::open_read_only`
+  deliberately leaves the in-RAM segment lists empty — a reader derives its view per call from the
+  on-disk manifest — but `segment_files` read those lists, so it returned `[]` for a fully populated
+  database. Nothing errored: `[]` is indistinguishable from "this table has no segments", so a host
+  handing the paths to an external tool (DuckDB `read_parquet`, the documented use in
+  ARCHITECTURE.md §10.11) silently got no data. It now reads a fresh `read_disk_snapshot`, the same
+  source the reader's query path and `Db::stats` already used. `Db::stats` was already correct on
+  readers, and `Db::snapshot` already refuses explicitly with `Error::read_only`, so this was the
+  only accessor affected.
+
+- **Promoting an attribute key no longer hides pre-promotion history.** `promote` is not retroactive:
+  segments sealed before a key was added lack its column and are null-filled at read time, but the
+  query layer emitted only the column form — so a filter or group-by on a newly promoted key silently
+  matched **nothing** on every older segment, and `Promote`'s own documentation called this
+  "backward-compatible". Any host that edited its `promote` list between runs lost history. A promoted
+  key now compiles to `CASE WHEN "k" IS NOT NULL THEN CAST("k" AS VARCHAR) ELSE
+  json_get_str(attributes, $k) END`, falling back to the JSON blob exactly on the rows where the column
+  is absent; the numeric matchers get the same treatment via `json_get_num`. Measured cost on the
+  promoted path is +0.04–0.11 ms per 100k rows: batches never span segments, so a post-promotion
+  segment takes a whole-batch fast path with the JSON arm never invoked.
+
 ## [0.7.0] - 2026-08-08
 
 ### Added

@@ -99,7 +99,10 @@ pub use imbh_core::{
     TraceId, WalMode, canonical_json_value, parse_bytes, parse_duration, parse_json,
 };
 
-pub use imbh_storage::{CompactionReport, FlushGauges, SnapshotInfo, TableStats};
+pub use imbh_storage::pending::PendingRewrite;
+#[cfg(feature = "compaction")]
+pub use imbh_storage::{CompactionReport, prepare_pending};
+pub use imbh_storage::{FlushGauges, PendingReport, SnapshotInfo, TableStats};
 #[cfg(feature = "ingest")]
 use ingest_queue::{IngestChannel, IngestJob};
 
@@ -204,12 +207,12 @@ impl Db {
             memory_budget: MemoryBudget::default(),
             compression: Compression::default(),
             wal: WalMode::default(),
-            retention: Retention::default(),
+            retention: None,
             maintenance: Maintenance::default(),
             flush: None,
             ingest: Ingest::default(),
             access: Access::ReadWrite,
-            promote: Promote::default(),
+            promote: None,
             allow_stale_reads: false,
             refresh: Refresh::default(),
             duplicates: Duplicates::default(),
@@ -236,12 +239,12 @@ impl Db {
             memory_budget: MemoryBudget::default(),
             compression: Compression::default(),
             wal: WalMode::Off,
-            retention: Retention::default(),
+            retention: None,
             maintenance: Maintenance::default(),
             flush: None,
             ingest: Ingest::default(),
             access: Access::ReadWrite,
-            promote: Promote::default(),
+            promote: None,
             allow_stale_reads: false,
             refresh: Refresh::default(),
             duplicates: Duplicates::default(),
@@ -504,11 +507,17 @@ impl Db {
     pub async fn maintain(&self) -> Result<MaintenanceReport> {
         self.ensure_writable()?;
         let sealed = self.storage.seal()?.is_some();
+        // Commit before retention: a pending rewrite whose inputs retention is about to drop should
+        // land first, so the merged output survives instead of the record going stale.
+        let pending = self.storage.commit_pending()?;
         let retention = self.storage.retain()?;
         Ok(MaintenanceReport {
             sealed,
             segments_dropped: retention.segments_dropped,
             bytes_freed: retention.bytes_freed,
+            pending_applied: pending.applied,
+            pending_discarded: pending.discarded,
+            pending_segments_replaced: pending.segments_replaced,
         })
     }
 
@@ -564,8 +573,61 @@ impl Db {
         self.storage.snapshot(dir.as_ref())
     }
 
+    /// Apply any pending housekeeping records a separate process left behind.
+    ///
+    /// The writer's half of the out-of-process handoff in ARCHITECTURE.md §7.2: a
+    /// housekeeper did the expensive segment rewrite against a read-only view, and this performs the
+    /// part only the writer may — validate, one manifest delta, unlink the inputs. Cheap and
+    /// synchronous; the merge itself already happened elsewhere.
+    ///
+    /// Called automatically by [`Db::maintain`], so a host on the background maintenance scheduler
+    /// picks records up without arranging anything. Every record is validated and a stale or corrupt
+    /// one is discarded, which is always safe: the inputs are untouched until the swap.
+    pub async fn commit_pending(&self) -> Result<PendingReport> {
+        self.ensure_writable()?;
+        self.ensure_open()?;
+        self.storage.commit_pending()
+    }
+
+    /// Change the promoted attribute keys on a live database (ARCHITECTURE.md §6.1).
+    ///
+    /// **Seals first.** Batches are encoded at ingest against the set in effect then, and the buffer
+    /// is later concatenated against the *current* schema — `concat_batches` takes columns
+    /// positionally without validating them against the schema it is handed, so a buffer holding
+    /// batches from both sides of a change can panic, silently truncate, or silently concatenate two
+    /// differently-named promoted columns into one. Sealing before the swap is what makes the set
+    /// mutable at all.
+    ///
+    /// The new set is persisted, so it survives restart and every other handle on the directory sees
+    /// it. Existing segments are **not** rewritten: ones sealed before a key was promoted lack its
+    /// column and are null-filled at read time, and the query layer falls back to reading that key
+    /// out of the JSON blob exactly on those rows — so history stays queryable either way. Demotion
+    /// is the safe direction (the key never left the JSON); promotion is the one that needed the
+    /// read-side fallback shipped in 0.7.0.
+    ///
+    /// Returns an error on a read-only handle, and after several attempts if ingest is busy enough
+    /// that the buffer refills between every seal and the swap.
+    pub async fn set_promote(&self, promote: Promote) -> Result<()> {
+        self.ensure_writable()?;
+        self.ensure_open()?;
+        self.storage.set_promote(promote)
+    }
+
+    /// The promoted attribute keys currently in effect — the database's durable set, not whatever
+    /// this handle's builder asked for.
+    pub fn promote(&self) -> Promote {
+        self.storage.promote()
+    }
+
+    /// The retention policy currently in effect — likewise the database's durable policy, so a
+    /// housekeeper process applies the host's rules rather than its own.
+    pub fn retention(&self) -> Retention {
+        self.storage.retention()
+    }
+
     /// Compact small segments within each UTC-day partition into one, rebuilding the search index
     /// (ARCHITECTURE.md §7/§10.11). Optional maintenance — a DB that never compacts is still correct.
+    #[cfg(feature = "compaction")]
     pub async fn compact(&self) -> Result<CompactionReport> {
         self.ensure_writable()?;
         self.storage.compact()
@@ -599,12 +661,34 @@ impl Db {
 
     /// Absolute Parquet paths of a table's sealed segments — a zero-copy handoff for external
     /// tools (e.g. DuckDB `read_parquet`), ARCHITECTURE.md §10.11.
-    pub fn segment_files(&self, table: Table) -> Vec<PathBuf> {
-        match table {
+    ///
+    /// A **read-only** handle keeps no live segment lists — its view is derived per call from the
+    /// on-disk manifest (ARCHITECTURE.md §5) — so this reads a fresh
+    /// [`read_disk_snapshot`](imbh_storage::read_disk_snapshot), the same source the reader's query
+    /// path and [`stats`](Self::stats) use. Before 0.7.0 it returned the empty in-RAM list instead,
+    /// which is indistinguishable from "this table has no segments": a wrong answer with no signal.
+    /// That is why this is fallible — a reader must be able to report an I/O failure rather than
+    /// mask it as an empty database.
+    ///
+    /// Only sealed segments appear. Rows still in the writer's buffer or the unsealed WAL tail are
+    /// in no file yet; `flush()` first if a handoff must include them.
+    pub fn segment_files(&self, table: Table) -> Result<Vec<PathBuf>> {
+        if self.access == Access::ReadOnly {
+            let dir = self.storage.dir().ok_or_else(|| {
+                Error::storage_msg("read-only segment_files on a DB with no directory")
+            })?;
+            let snap = imbh_storage::read_disk_snapshot(dir)?;
+            return Ok(match table {
+                Table::Logs => snap.abs_paths(&snap.logs_segments),
+                Table::Spans => snap.abs_paths(&snap.spans_segments),
+                other => snap.abs_paths(&snap.metric(other)),
+            });
+        }
+        Ok(match table {
             Table::Logs => self.storage.segment_paths(),
             Table::Spans => self.storage.segment_paths_spans(),
             other => self.storage.segment_paths_metric(other),
-        }
+        })
     }
 
     /// A blocking mirror of the async API for sync hosts (ARCHITECTURE.md §10.2/§10.12). Methods drop the
@@ -664,6 +748,14 @@ impl Db {
             None => {}
         }
         self.storage.seal()?;
+        // Land any housekeeper work prepared during this handle's lifetime. A long-running embedded
+        // host that opens once and never calls `maintain()` would otherwise pick records up only at
+        // its *next* open, leaving a preparer re-doing the same partitions in the meantime. Failure
+        // here must not fail the close — the records stay on disk for the next open, which is exactly
+        // the state a crash would have left.
+        if self.access == Access::ReadWrite {
+            let _ = self.storage.commit_pending();
+        }
         Ok(())
     }
 
@@ -694,7 +786,9 @@ pub struct DbBuilder {
     memory_budget: MemoryBudget,
     compression: Compression,
     wal: WalMode,
-    retention: Retention,
+    /// `None` means the host did not call [`DbBuilder::retention`], which inherits the database's
+    /// own policy; `Some` sets it. Same distinction as `promote`.
+    retention: Option<Retention>,
     maintenance: Maintenance,
     /// When the opt-in scheduler seals the buffer (ARCHITECTURE.md §5/§7). `None` = the host never
     /// chose one, in which case open resolves it to `FlushPolicy::default().or_interval(maintenance
@@ -705,7 +799,10 @@ pub struct DbBuilder {
     /// Attribute keys promoted to typed columns (ARCHITECTURE.md §6.1). Fixed at open; must match a
     /// read-write DB's prior promotion for on-disk consistency (segments written under a different set
     /// are reconciled by the query layer's `coerce` null-fill, so a superset stays readable).
-    promote: Promote,
+    /// `None` means the host did not call [`DbBuilder::promote`] at all, which is different from
+    /// calling it with an empty set: the first adopts whatever the database already has, the second
+    /// is an explicit request to demote everything.
+    promote: Option<Promote>,
     /// Read-only opens only: accept a WAL-off writer's seal-interval freshness instead of being
     /// rejected. Ignored for read-write / in-memory opens.
     allow_stale_reads: bool,
@@ -763,7 +860,7 @@ impl DbBuilder {
 
     /// Retention policy applied by [`Db::maintain`] (ARCHITECTURE.md §7/§10.2). Ignored for in-memory DBs.
     pub fn retention(mut self, r: Retention) -> Self {
-        self.retention = r;
+        self.retention = Some(r);
         self
     }
 
@@ -810,11 +907,23 @@ impl DbBuilder {
     /// Promote attribute keys to typed columns (ARCHITECTURE.md §6.1). Each key becomes a nullable
     /// dictionary column on every signal, materialized from the record `attributes` → `resource` →
     /// `scope` JSON at ingest; the key also stays in the JSON, so `json_get_str` and existing queries
-    /// are unaffected while a promoted-label filter can hit the column instead of a JSON scan. Set
-    /// once at open, before any ingest. Re-opening a read-write DB with a different set stays readable
-    /// (older segments are null-filled for keys they predate), but for stable pushdown keep it fixed.
+    /// are unaffected while a promoted-label filter can hit the column instead of a JSON scan.
+    ///
+    /// **The set is durable database state, not per-handle configuration** (since 0.7.0). Calling
+    /// this on a read-write handle *sets* the database's set and records it; **not** calling it
+    /// adopts whatever the database already has. That distinction matters: before, reopening without
+    /// this call silently reverted to no promotion, so a writer and a reader could disagree about the
+    /// schema of the very same segments. Passing an explicitly empty [`Promote`] still means "demote
+    /// everything" — it is only *omitting* the call that inherits.
+    ///
+    /// On a **read-only** handle the durable set always wins and anything passed here is ignored: a
+    /// reader cannot change database state, and a reader that disagreed with the writer is the bug
+    /// this replaced.
+    ///
+    /// To change the set on a live database use [`Db::set_promote`], which seals first so no buffered
+    /// batch straddles the change.
     pub fn promote(mut self, promote: Promote) -> Self {
-        self.promote = promote;
+        self.promote = Some(promote);
         self
     }
 
@@ -850,9 +959,10 @@ impl DbBuilder {
         } else {
             self.duplicates
         });
+        // An in-memory DB has nothing durable to inherit from, so an unset builder means empty.
         let storage = if self.in_memory {
             Storage::in_memory(self.compression, self.memory_budget)
-                .with_promote(self.promote.clone())
+                .with_promote(self.promote.clone().unwrap_or_default())
         } else {
             let path = self.path.ok_or_else(Error::missing_database_path)?;
             match access {
@@ -864,18 +974,35 @@ impl DbBuilder {
                     if !self.allow_stale_reads && imbh_storage::writer_wal_disabled(&path) {
                         return Err(Error::reader_wal_disabled());
                     }
+                    // The durable set wins outright on a reader: it cannot write one, and a reader
+                    // disagreeing with the writer about column layout is the defect this replaced.
+                    let durable = imbh_storage::read_promote(&path);
                     Storage::open_read_only(path, self.compression, self.memory_budget)?
-                        .with_promote(self.promote.clone())
+                        .with_promote(durable)
                 }
                 Access::ReadWrite => {
+                    // Omitting `promote()` inherits the database's own set; calling it sets one. At
+                    // open the buffer is empty by construction, so a change here needs no seal
+                    // barrier — `Db::set_promote` is the path that does.
+                    let durable = imbh_storage::read_promote(&path);
+                    let effective = self.promote.clone().unwrap_or_else(|| durable.clone());
+                    // Retention is durable state too, for the same reason: a housekeeper applying it
+                    // must apply the *host's* policy, and two handles on one directory must not
+                    // disagree about when data is deleted. Omitting `retention()` inherits.
+                    let durable_retention = imbh_storage::read_retention(&path);
+                    let retention = self.retention.unwrap_or(durable_retention);
+                    let changed = effective != durable || retention != durable_retention;
                     let storage = Storage::open(
                         path,
                         self.compression,
                         self.wal,
-                        self.retention,
+                        retention,
                         self.memory_budget,
                     )?
-                    .with_promote(self.promote.clone());
+                    .with_promote(effective);
+                    if changed {
+                        storage.persist_promote()?;
+                    }
                     // Idempotent replay: re-ingest WAL records not yet captured in a segment
                     // (`lsn > watermark`), decoding each by its signal tag (ARCHITECTURE.md §7).
                     // Decoding the raw OTLP payload needs the `ingest` decoder; a query-only build
@@ -896,6 +1023,17 @@ impl DbBuilder {
                         #[cfg(feature = "tracing")]
                         tracing::debug!(records = replayed, "WAL replay complete");
                     }
+                    // Pick up anything a housekeeper process prepared while this database was closed
+                    // (ARCHITECTURE.md §7.2). Without this a host on the default
+                    // `Maintenance::Manual` that never calls `maintain()` would leave prepared
+                    // rewrites on disk forever — and the preparer, seeing nothing land, would keep
+                    // re-preparing the same partitions. Costs one `read_dir` of a directory that is
+                    // usually empty, on a path that is already doing recovery work.
+                    //
+                    // Only after `with_promote` above: `commit_pending` validates each record against
+                    // the *live* promoted set, so committing before the set is applied would discard
+                    // every record as stale.
+                    storage.commit_pending()?;
                     storage
                 }
             }
@@ -1144,6 +1282,7 @@ fn writer_tables(storage: &Storage, snap: &imbh_storage::QuerySnapshot) -> Vec<T
             segments: seg(&snap.logs_segments),
             text_column: Some("body"),
             bloom_columns: &[],
+            time_column: Some("time"),
         },
         TableInput {
             name: "spans",
@@ -1156,6 +1295,7 @@ fn writer_tables(storage: &Storage, snap: &imbh_storage::QuerySnapshot) -> Vec<T
             // Spans segments carry Parquet bloom filters on these id columns; a `trace_id`/
             // `span_id` point lookup skips segments whose bloom proves the id absent (§8).
             bloom_columns: &["trace_id", "span_id"],
+            time_column: Some("start_time"),
         },
     ];
     for table in SCALAR_METRIC_TABLES {
@@ -1168,6 +1308,7 @@ fn writer_tables(storage: &Storage, snap: &imbh_storage::QuerySnapshot) -> Vec<T
             segments: seg(&snap.metric(table)),
             text_column: None,
             bloom_columns: &[],
+            time_column: Some("time"),
         });
     }
     tables.push(TableInput {
@@ -1177,6 +1318,7 @@ fn writer_tables(storage: &Storage, snap: &imbh_storage::QuerySnapshot) -> Vec<T
         segments: seg(&snap.metric(Table::MetricsHistogram)),
         text_column: None,
         bloom_columns: &[],
+        time_column: Some("time"),
     });
     tables.push(TableInput {
         name: Table::MetricsExpHistogram.as_str(),
@@ -1185,6 +1327,7 @@ fn writer_tables(storage: &Storage, snap: &imbh_storage::QuerySnapshot) -> Vec<T
         segments: seg(&snap.metric(Table::MetricsExpHistogram)),
         text_column: None,
         bloom_columns: &[],
+        time_column: Some("time"),
     });
     tables.push(TableInput {
         name: Table::MetricsSummary.as_str(),
@@ -1193,6 +1336,7 @@ fn writer_tables(storage: &Storage, snap: &imbh_storage::QuerySnapshot) -> Vec<T
         segments: seg(&snap.metric(Table::MetricsSummary)),
         text_column: None,
         bloom_columns: &[],
+        time_column: Some("time"),
     });
     tables
 }
@@ -1700,6 +1844,7 @@ fn build_reader_tables(
             segments: seg(&snap.logs_segments),
             text_column: Some("body"),
             bloom_columns: &[],
+            time_column: Some("time"),
         },
         TableInput {
             name: "spans",
@@ -1708,6 +1853,7 @@ fn build_reader_tables(
             segments: seg(&snap.spans_segments),
             text_column: Some("name"),
             bloom_columns: &["trace_id", "span_id"],
+            time_column: Some("start_time"),
         },
     ];
     for table in SCALAR_METRIC_TABLES {
@@ -1718,6 +1864,7 @@ fn build_reader_tables(
             segments: seg(&snap.metric(table)),
             text_column: None,
             bloom_columns: &[],
+            time_column: Some("time"),
         });
     }
     tables.push(TableInput {
@@ -1727,6 +1874,7 @@ fn build_reader_tables(
         segments: seg(&snap.metric(Table::MetricsHistogram)),
         text_column: None,
         bloom_columns: &[],
+        time_column: Some("time"),
     });
     tables.push(TableInput {
         name: Table::MetricsExpHistogram.as_str(),
@@ -1735,6 +1883,7 @@ fn build_reader_tables(
         segments: seg(&snap.metric(Table::MetricsExpHistogram)),
         text_column: None,
         bloom_columns: &[],
+        time_column: Some("time"),
     });
     tables.push(TableInput {
         name: Table::MetricsSummary.as_str(),
@@ -1743,6 +1892,7 @@ fn build_reader_tables(
         segments: seg(&snap.metric(Table::MetricsSummary)),
         text_column: None,
         bloom_columns: &[],
+        time_column: Some("time"),
     });
     Ok(tables)
 }
@@ -1778,6 +1928,9 @@ fn segment_inputs(segments: Vec<SegmentRef>, paths: Vec<PathBuf>) -> Vec<Segment
                 parquet_path,
                 index_path: idx.is_dir().then_some(idx),
                 rows: sref.rows,
+                // Straight from the manifest: the query layer skips a segment whose declared range
+                // cannot satisfy a pushed time predicate, without opening the file (§9.2).
+                time_range: Some((sref.min_time_unix_nano, sref.max_time_unix_nano)),
             }
         })
         .collect()
@@ -1863,11 +2016,27 @@ impl BlockingDb {
     pub fn maintain(&self) -> Result<MaintenanceReport> {
         self.rt.block_on(self.db.maintain())
     }
+    #[cfg(feature = "compaction")]
     pub fn compact(&self) -> Result<CompactionReport> {
         self.rt.block_on(self.db.compact())
     }
     pub fn snapshot(&self, dir: impl AsRef<Path>) -> Result<SnapshotInfo> {
         self.rt.block_on(self.db.snapshot(dir))
+    }
+    pub fn set_promote(&self, promote: Promote) -> Result<()> {
+        self.rt.block_on(self.db.set_promote(promote))
+    }
+    /// Mirrors [`Db::commit_pending`].
+    pub fn commit_pending(&self) -> Result<PendingReport> {
+        self.rt.block_on(self.db.commit_pending())
+    }
+    pub fn promote(&self) -> Promote {
+        self.db.promote()
+    }
+    /// Mirrors [`Db::segment_files`]. Synchronous on both handle kinds — the read-only path reads
+    /// the manifest directly rather than going through the runtime.
+    pub fn segment_files(&self, table: Table) -> Result<Vec<PathBuf>> {
+        self.db.segment_files(table)
     }
     pub fn stats(&self) -> Result<DbStats> {
         self.rt.block_on(self.db.stats())
@@ -1915,6 +2084,12 @@ pub struct MaintenanceReport {
     pub sealed: bool,
     pub segments_dropped: u64,
     pub bytes_freed: u64,
+    /// Pending housekeeping records committed this pass (see [`Db::commit_pending`]).
+    pub pending_applied: u64,
+    /// Pending records rejected as stale, corrupt, or built against a different promoted key set.
+    pub pending_discarded: u64,
+    /// Input segments the applied records replaced.
+    pub pending_segments_replaced: u64,
 }
 
 /// JSON round-trip coverage for the `serde` feature: the query builders and result DTOs must
@@ -2375,6 +2550,240 @@ mod tests {
         assert_eq!(pb.rows_returned, 1);
         assert_eq!(pb.elapsed_ns, stats.elapsed.0);
         assert_eq!(pb.used_index, stats.used_index);
+    }
+
+    /// **The promoted set is durable database state.** Reopening without calling `promote()` must
+    /// inherit it, and a read-only handle must adopt it rather than whatever its own builder said.
+    ///
+    /// Before 0.7.0 the set was per-handle configuration, so a writer opened with `promote(["k"])`
+    /// and a reader opened without it disagreed about the column layout of the very same segments.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_promoted_set_is_durable_db_state() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let db = Db::builder(dir.path())
+                .promote(Promote::new(["k"]))
+                .open()
+                .unwrap();
+            db.ingest_otlp_logs(&otlp_log("svc", "one", 1))
+                .await
+                .unwrap();
+            db.close().await.unwrap();
+        }
+        // Reopened WITHOUT promote(): the set is inherited, not silently reset to empty.
+        {
+            let db = Db::builder(dir.path()).open().unwrap();
+            assert_eq!(db.promote(), Promote::new(["k"]), "inherited from the DB");
+            db.close().await.unwrap();
+        }
+        // A reader adopts it too, even though its builder asked for something else entirely.
+        {
+            let writer = Db::builder(dir.path()).wal(WalMode::Always).open().unwrap();
+            let reader = Db::builder(dir.path())
+                .access(Access::ReadOnly)
+                .promote(Promote::new(["ignored"]))
+                .open()
+                .unwrap();
+            assert_eq!(
+                reader.promote(),
+                Promote::new(["k"]),
+                "a reader cannot set the DB's promoted columns"
+            );
+            writer.close().await.unwrap();
+        }
+        // An explicitly empty set is a real request to demote, distinct from omitting the call.
+        {
+            let db = Db::builder(dir.path())
+                .promote(Promote::new(Vec::<String>::new()))
+                .open()
+                .unwrap();
+            assert!(db.promote().is_empty(), "explicit empty demotes");
+            db.close().await.unwrap();
+        }
+        let db = Db::builder(dir.path()).open().unwrap();
+        assert!(db.promote().is_empty(), "the demotion persisted");
+        db.close().await.unwrap();
+    }
+
+    /// **The retention policy is durable database state**, like the promoted key set.
+    ///
+    /// It was per-handle builder config, so two handles on one directory could disagree about when
+    /// data is deleted — and a housekeeper process applying retention had no way to learn the host's
+    /// policy, so it would have had to invent one from its own flags. Omitting `retention()` now
+    /// inherits the database's policy; passing one sets it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_retention_policy_is_durable_db_state() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let db = Db::builder(dir.path())
+                .retention(Retention::days(7).max_disk_bytes(1_234_567))
+                .open()
+                .unwrap();
+            db.close().await.unwrap();
+        }
+        // Reopened WITHOUT retention(): inherited, not silently reset to "keep everything".
+        {
+            let db = Db::builder(dir.path()).open().unwrap();
+            let r = db.retention();
+            assert_eq!(
+                r.max_age(),
+                Some(std::time::Duration::from_secs(7 * 86_400))
+            );
+            assert_eq!(r.disk_budget(), Some(1_234_567));
+            db.close().await.unwrap();
+        }
+        // An explicit policy still overrides, and persists in turn.
+        {
+            let db = Db::builder(dir.path())
+                .retention(Retention::none())
+                .open()
+                .unwrap();
+            assert_eq!(db.retention(), Retention::none());
+            db.close().await.unwrap();
+        }
+        let db = Db::builder(dir.path()).open().unwrap();
+        assert_eq!(db.retention(), Retention::none(), "the change persisted");
+        db.close().await.unwrap();
+    }
+
+    /// **`set_promote` seals before swapping**, so no buffered batch straddles the change.
+    ///
+    /// Batches are encoded at ingest against the set in effect then; `concat_buffer` later
+    /// concatenates them against the *current* schema, and `concat_batches` takes columns
+    /// positionally without validating them. A buffer holding both widths is the hazard §6.1 records
+    /// for compaction, and this is the barrier that keeps it out of the buffer. The check is
+    /// behavioural: rows ingested on both sides of the change must all still be queryable, and rows
+    /// from before it must survive with the pre-change history intact.
+    #[tokio::test(flavor = "current_thread")]
+    async fn set_promote_seals_before_swapping_so_no_batch_straddles() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::builder(dir.path()).open().unwrap();
+        assert!(db.promote().is_empty());
+
+        // Rows encoded under the EMPTY set, deliberately left unsealed in the buffer.
+        for i in 1..=3 {
+            db.ingest_otlp_logs(&otlp_log("svc", "before", i))
+                .await
+                .unwrap();
+        }
+        assert_eq!(count_logs(&db).await, 3);
+
+        // The change must seal those rows out of the buffer before widening the schema.
+        db.set_promote(Promote::new(["service.name"]))
+            .await
+            .unwrap();
+        assert_eq!(db.promote(), Promote::new(["service.name"]));
+        assert!(
+            !db.segment_files(Table::Logs).unwrap().is_empty(),
+            "the barrier must have sealed the buffered rows"
+        );
+        assert_eq!(count_logs(&db).await, 3, "no row lost to the seal");
+
+        // Rows encoded under the WIDE set now land in the same buffer the narrow ones left.
+        for i in 4..=6 {
+            db.ingest_otlp_logs(&otlp_log("svc", "after", i))
+                .await
+                .unwrap();
+        }
+        assert_eq!(count_logs(&db).await, 6, "both widths queryable together");
+
+        // Sealing again concatenates only wide batches — the case that would panic or truncate if
+        // the barrier had not run.
+        db.flush().await.unwrap();
+        assert_eq!(count_logs(&db).await, 6);
+
+        // Demotion goes through the same barrier, and history stays readable because the key never
+        // left the JSON blob.
+        db.ingest_otlp_logs(&otlp_log("svc", "wide", 7))
+            .await
+            .unwrap();
+        db.set_promote(Promote::new(Vec::<String>::new()))
+            .await
+            .unwrap();
+        assert!(db.promote().is_empty());
+        assert_eq!(count_logs(&db).await, 7);
+        db.ingest_otlp_logs(&otlp_log("svc", "narrow", 8))
+            .await
+            .unwrap();
+        assert_eq!(count_logs(&db).await, 8, "narrow and wide segments coexist");
+
+        // A no-op change must not seal a quiet database.
+        db.flush().await.unwrap();
+        let before = db.segment_files(Table::Logs).unwrap().len();
+        db.set_promote(Promote::new(Vec::<String>::new()))
+            .await
+            .unwrap();
+        assert_eq!(db.segment_files(Table::Logs).unwrap().len(), before);
+
+        db.close().await.unwrap();
+    }
+
+    /// A read-only handle must refuse to change database state.
+    #[tokio::test(flavor = "current_thread")]
+    async fn set_promote_is_rejected_on_a_read_only_handle() {
+        let dir = tempfile::tempdir().unwrap();
+        let writer = Db::builder(dir.path()).wal(WalMode::Always).open().unwrap();
+        let reader = Db::open_read_only(dir.path()).unwrap();
+        assert!(reader.set_promote(Promote::new(["k"])).await.is_err());
+        assert!(reader.promote().is_empty(), "and nothing changed");
+        writer.close().await.unwrap();
+    }
+
+    /// A read-only handle must report the writer's **sealed segment files**, not an empty list.
+    ///
+    /// Before 0.7.0 `segment_files` read the in-RAM segment lists, which `Storage::open_read_only`
+    /// deliberately leaves empty (a reader derives its view per call). The accessor therefore
+    /// returned `[]` for a populated database — indistinguishable from "this table has no
+    /// segments", so a caller handing the paths to DuckDB got an empty result with no error. It now
+    /// reads the same on-disk snapshot the reader's query path and `stats()` use.
+    #[tokio::test(flavor = "current_thread")]
+    async fn read_only_segment_files_sees_the_writers_segments() {
+        let dir = tempfile::tempdir().unwrap();
+        let writer = Db::builder(dir.path()).wal(WalMode::Always).open().unwrap();
+        let reader = Db::open_read_only(dir.path()).unwrap();
+
+        // Nothing sealed yet: both handles agree the table has no files.
+        assert!(writer.segment_files(Table::Logs).unwrap().is_empty());
+        assert!(reader.segment_files(Table::Logs).unwrap().is_empty());
+
+        writer
+            .ingest_otlp_logs(&otlp_log("svc", "one", 1))
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+
+        let from_writer = writer.segment_files(Table::Logs).unwrap();
+        let from_reader = reader.segment_files(Table::Logs).unwrap();
+        assert_eq!(from_writer.len(), 1, "one sealed logs segment");
+        assert_eq!(
+            from_reader, from_writer,
+            "the reader must see the same paths as the writer, not an empty list"
+        );
+        assert!(from_reader[0].is_file(), "the path must actually exist");
+
+        // A second seal must be visible to the reader too — the view is per call, not cached at open.
+        writer
+            .ingest_otlp_logs(&otlp_log("svc", "two", 2))
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+        assert_eq!(
+            reader.segment_files(Table::Logs).unwrap(),
+            writer.segment_files(Table::Logs).unwrap(),
+        );
+        assert_eq!(reader.segment_files(Table::Logs).unwrap().len(), 2);
+
+        // Metric tables go through the same branch, and a table with no segments stays empty
+        // rather than erroring.
+        assert!(
+            reader
+                .segment_files(Table::MetricsGauge)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(reader.segment_files(Table::Spans).unwrap().is_empty());
+
+        writer.close().await.unwrap();
     }
 
     /// A read-only handle in a *separate* handle (standing in for a separate process) sees the
@@ -4413,7 +4822,7 @@ mod tests {
                 .iter()
                 .any(|t| t.table == Table::Logs && t.segment_rows == 1)
         );
-        assert_eq!(db.segment_files(Table::Logs).len(), 1);
+        assert_eq!(db.segment_files(Table::Logs).unwrap().len(), 1);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -4900,7 +5309,7 @@ mod tests {
             assert!(cat.iter().any(|m| m.metric == "lat" && m.kind == "summary"));
 
             db.flush().await.unwrap();
-            assert!(!db.segment_files(Table::MetricsSummary).is_empty());
+            assert!(!db.segment_files(Table::MetricsSummary).unwrap().is_empty());
             assert_eq!(
                 count(
                     &db,
@@ -5080,7 +5489,11 @@ mod tests {
 
             // Seal → Parquet segment (List columns), re-query the segment.
             db.flush().await.unwrap();
-            assert!(!db.segment_files(Table::MetricsExpHistogram).is_empty());
+            assert!(
+                !db.segment_files(Table::MetricsExpHistogram)
+                    .unwrap()
+                    .is_empty()
+            );
             assert_eq!(
                 count(
                     &db,
@@ -5136,7 +5549,7 @@ mod tests {
         .unwrap();
         db.flush().await.unwrap();
         assert_eq!(
-            db.segment_files(Table::MetricsHistogram).len(),
+            db.segment_files(Table::MetricsHistogram).unwrap().len(),
             2,
             "two segments before compaction"
         );
@@ -5147,7 +5560,7 @@ mod tests {
             "histogram segments were merged"
         );
         assert_eq!(
-            db.segment_files(Table::MetricsHistogram).len(),
+            db.segment_files(Table::MetricsHistogram).unwrap().len(),
             1,
             "compacted to a single segment"
         );
@@ -5205,7 +5618,9 @@ mod tests {
             // Seal → Parquet segment with List columns, then re-query the segment path.
             db.flush().await.unwrap();
             assert!(
-                !db.segment_files(Table::MetricsHistogram).is_empty(),
+                !db.segment_files(Table::MetricsHistogram)
+                    .unwrap()
+                    .is_empty(),
                 "histogram buffer should have sealed a segment"
             );
             assert_eq!(
@@ -5453,7 +5868,7 @@ mod tests {
             .collect_with_schema()
             .await
             .unwrap();
-        let seg_paths = db.segment_files(Table::Logs);
+        let seg_paths = db.segment_files(Table::Logs).unwrap();
         assert!(!seg_paths.is_empty(), "rows should be in a sealed segment");
 
         // Retention (budget 0) unlinks every segment the query read.
@@ -5513,7 +5928,7 @@ mod tests {
             .collect_with_schema()
             .await
             .unwrap();
-        let seg_paths = db.segment_files(Table::Logs);
+        let seg_paths = db.segment_files(Table::Logs).unwrap();
         assert!(!seg_paths.is_empty());
 
         // Build the C Data Interface export a binding would hand to a foreign runtime: an
@@ -5975,6 +6390,129 @@ mod tests {
             "the RowSelection pruned the segment to the single matching row"
         );
         assert!(page.stats.bytes_scanned > 0);
+    }
+
+    /// A key promoted **after** some data was already sealed must not change any answer.
+    ///
+    /// This is a live defect, not a hypothetical: `Promote`'s own doc claims "changing the set is
+    /// backward-compatible ... segments sealed before a key was promoted simply lack the column and
+    /// are null-filled at query time". The null-fill is real, but `SqlParams::attr_field` emits the
+    /// *column* form for a promoted key, so those null-filled rows fail the predicate and the pre-
+    /// promotion segment silently contributes nothing. Any embedder who edits their `promote` list
+    /// between runs loses history, guided by a doc that says it is safe.
+    ///
+    /// Asserts the three spellings agree: the same filter must return the same rows whether `k` was
+    /// promoted before the data (the trivially-correct case), promoted after it, or never promoted.
+    #[tokio::test(flavor = "current_thread")]
+    async fn promoting_a_key_after_sealing_does_not_change_answers() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Segment A: sealed with NO promotion, so it has no `env` column at all.
+        {
+            let db = Db::builder(dir.path()).open().unwrap();
+            db.ingest_otlp_logs(&otlp_rich("cart", "early", 100, 9, &[("env", "prod")]))
+                .await
+                .unwrap();
+            db.flush().await.unwrap();
+            db.close().await.unwrap();
+        }
+        // Segment B: sealed with `env` promoted, so it does have the column.
+        let db = Db::builder(dir.path())
+            .promote(Promote::new(["env"]))
+            .open()
+            .unwrap();
+        db.ingest_otlp_logs(&otlp_rich("cart", "late", 200, 9, &[("env", "prod")]))
+            .await
+            .unwrap();
+        db.flush().await.unwrap();
+
+        let page = db
+            .logs()
+            .query(LogQuery::new().attr_eq("env", "prod"))
+            .await
+            .unwrap();
+        let mut bodies: Vec<&str> = page.entries.iter().map(|e| e.body.as_str()).collect();
+        bodies.sort_unstable();
+        assert_eq!(
+            bodies,
+            vec!["early", "late"],
+            "the pre-promotion segment must still match; promoting a key is not a data change"
+        );
+
+        // The JSON spelling is the ground truth the column form must agree with, on the same DB.
+        let rows = db
+            .sql("SELECT body FROM logs WHERE json_get_str(attributes, 'env') = 'prod' ORDER BY body")
+            .collect()
+            .await
+            .unwrap();
+        let n: usize = rows.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(n, 2, "json_get_str sees both rows regardless of promotion");
+    }
+
+    /// End-to-end proof that a typed query's **time range** skips out-of-range segments, through the
+    /// real path the provider unit tests cannot cover: `LogQuery` → `CAST("time" AS BIGINT) >= $1`
+    /// SQL → `$N` parameter binding → the DataFusion optimizer → `supports_filters_pushdown` →
+    /// per-segment Parquet row-group statistics. Before this pruning existed, `segments_pruned` was
+    /// structurally 0 for `logs` (which carries no bloom columns) no matter how narrow the range, and
+    /// a 5-minute query over a month of data read the month.
+    #[tokio::test(flavor = "current_thread")]
+    async fn query_stats_report_time_range_segment_pruning() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::builder(dir.path()).open().unwrap();
+        // Three sealed segments, one per flush, at disjoint (nanosecond) event times.
+        for (body, t) in [("first", 100u64), ("second", 300), ("third", 500)] {
+            db.ingest_otlp_logs(&otlp_log("cart", body, t))
+                .await
+                .unwrap();
+            db.flush().await.unwrap();
+        }
+        assert_eq!(db.segments().len(), 3);
+
+        // A half-open range covering only the middle segment: the other two must not be read.
+        let page = db
+            .logs()
+            .query(LogQuery::new().range(TimeRange::between(Timestamp(200), Timestamp(400))))
+            .await
+            .unwrap();
+        let bodies: Vec<&str> = page.entries.iter().map(|e| e.body.as_str()).collect();
+        assert_eq!(bodies, vec!["second"]);
+        assert_eq!(page.stats.segments_scanned, 1, "only the in-range segment");
+        assert_eq!(
+            page.stats.segments_pruned, 2,
+            "the two out-of-range segments are skipped without being read"
+        );
+        assert_eq!(page.stats.rows_scanned, 1);
+
+        // The bound is honored exactly: `range` is half-open, so a row on `start` is in and a row on
+        // `end` is out. Asking for [300, 500) keeps `second` (300) and drops `third` (500) — and the
+        // pruning must agree with the filter, not merely be aggressive.
+        let page = db
+            .logs()
+            .query(LogQuery::new().range(TimeRange::between(Timestamp(300), Timestamp(500))))
+            .await
+            .unwrap();
+        let bodies: Vec<&str> = page.entries.iter().map(|e| e.body.as_str()).collect();
+        assert_eq!(bodies, vec!["second"], "start inclusive, end exclusive");
+        assert_eq!(page.stats.segments_pruned, 2);
+
+        // `range_inclusive` closes the upper bound, so the row exactly on `end` comes back — and its
+        // segment is read rather than pruned.
+        let page = db
+            .logs()
+            .query(LogQuery::new().range_inclusive(Timestamp(300), Timestamp(500)))
+            .await
+            .unwrap();
+        let mut bodies: Vec<&str> = page.entries.iter().map(|e| e.body.as_str()).collect();
+        bodies.sort_unstable();
+        assert_eq!(bodies, vec!["second", "third"]);
+        assert_eq!(page.stats.segments_scanned, 2);
+        assert_eq!(page.stats.segments_pruned, 1, "only the first segment");
+
+        // No range at all: every segment must still be read.
+        let page = db.logs().query(LogQuery::new()).await.unwrap();
+        assert_eq!(page.entries.len(), 3);
+        assert_eq!(page.stats.segments_scanned, 3);
+        assert_eq!(page.stats.segments_pruned, 0, "no bound ⇒ no pruning");
     }
 
     /// The `StringPredicate::Matches` term predicate (what the LogQL `|?` dialect operator lowers to)

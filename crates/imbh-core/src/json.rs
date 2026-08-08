@@ -18,7 +18,9 @@
 
 use std::fmt;
 
-use serde::de::{Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
+use serde::de::{
+    Deserialize, DeserializeSeed, Deserializer, IgnoredAny, MapAccess, SeqAccess, Visitor,
+};
 
 use crate::value::AnyValue;
 
@@ -33,6 +35,77 @@ pub fn parse_object(input: &str) -> Option<Vec<(String, AnyValue)>> {
     match parse(input)? {
         AnyValue::Map(pairs) => Some(pairs),
         _ => None,
+    }
+}
+
+/// Pull **one** key's value out of a JSON object without materializing the rest of it.
+///
+/// This is the hot path behind the `json_get_*` UDFs: an unpromoted attribute filter evaluates it
+/// once per row, so what it *avoids* matters more than what it does. [`parse_object`] builds a
+/// `Vec<(String, AnyValue)>` — one allocation per key and per string value — and then linear-searches
+/// it for a single field. Measured, that costs roughly 8 ms per attribute per 100k rows, so a record
+/// carrying 40 attributes made an unpromoted filter ~36x its own `count(*)` floor.
+///
+/// Two properties do the work. Non-matching values are skipped with `IgnoredAny`, which walks their
+/// tokens without allocating anything; and keys are borrowed out of the input rather than copied.
+///
+/// **It deliberately walks the whole object even after finding the key**, for two separate reasons,
+/// and both were learned the hard way:
+///
+/// 1. Returning early from `visit_map` leaves `serde_json`'s parser positioned mid-object, so its
+///    `deserialize_map` then fails to find the closing brace and errors — which silently routes the
+///    caller into the full-parse fallback. Matching an *early* key would then cost the aborted scan
+///    **plus** the full parse, making a hit on the first key ~3x slower than a hit on the last. That
+///    is the opposite of the intended behaviour and it does not fail loudly, it just gets slow.
+/// 2. Stopping once the keys pass `key` lexicographically would be valid for canonical JSON, which
+///    sorts them (§6.1) — but this is reachable from the public `json_get` and hence from the
+///    `json_get_*` UDFs, which a caller can point at any text column. An unsorted object would then
+///    report a key it does contain as missing.
+///
+/// Skipping value allocation is where the win is anyway; early termination was never the point.
+///
+/// Returns `Err` rather than `None` when the fast path cannot apply — notably a key containing an
+/// escape, which `serde_json` cannot hand back as a borrowed `&str`. Callers fall back to
+/// [`parse_object`], which is why correctness never rests on this function's cleverness.
+pub(crate) fn pick_field_public(input: &str, key: &str) -> Result<Option<AnyValue>, ()> {
+    let mut de = serde_json::Deserializer::from_str(input);
+    Pick { key }.deserialize(&mut de).map_err(|_| ())
+}
+
+/// The seed carrying the key being looked for. Doubles as its own [`Visitor`].
+struct Pick<'k> {
+    key: &'k str,
+}
+
+impl<'de> DeserializeSeed<'de> for Pick<'_> {
+    type Value = Option<AnyValue>;
+
+    fn deserialize<D: Deserializer<'de>>(self, d: D) -> Result<Self::Value, D::Error> {
+        d.deserialize_map(self)
+    }
+}
+
+impl<'de> Visitor<'de> for Pick<'_> {
+    type Value = Option<AnyValue>;
+
+    fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "a JSON object")
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+        let mut found = None;
+        // `&str` keys borrow from the input; an escaped key makes this fail, and the caller falls
+        // back to the full parse.
+        while let Some(k) = map.next_key::<&str>()? {
+            // Keep the *first* match, mirroring `parse_object(..).find(..)` on a document with
+            // duplicate keys.
+            if found.is_none() && k == self.key {
+                found = Some(map.next_value::<Parsed>()?.0);
+            } else {
+                map.next_value::<IgnoredAny>()?;
+            }
+        }
+        Ok(found)
     }
 }
 

@@ -362,6 +362,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
+name = "attr-stats"
+version = "0.7.0"
+dependencies = [
+ "arrow",
+ "imbh-core",
+ "imbh-storage",
+ "parquet",
+ "serde_json",
+ "tempfile",
+ "xxhash-rust",
+]
+
+[[package]]
 name = "autocfg"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -451,10 +464,12 @@ checksum = "3a8241f3ebb85c056b509d4327ad0358fbbba6ffb340bf388f26350aeda225b1"
 name = "bench"
 version = "0.7.0"
 dependencies = [
+ "futures",
  "imbh",
  "opentelemetry-proto",
  "prost 0.14.4",
  "tempfile",
+ "tokio",
 ]
 
 [[package]]
