@@ -18,9 +18,9 @@ every Rust change runs section 1.
 > **Applicability.** The Cargo workspace (`ARCHITECTURE.md` §12) now exists: `crates/imbh-{core,otlp,
 > storage,index,query}`, the `imbh` facade, `imbh-server` (`imbhd`), `examples/`, and the dev-only
 > `imbh-test-support` E2E harness crate. The full gate below applies. As of M0–M6 it is green:
-> `fmt`/`build`/`clippy -D warnings`/`test` all pass (**159 tests** in the default `--workspace`
-> path, plus the opt-in `fault-injection` and `--ignored` soak runs below) and the footprint gate is
-> OK. The Layer-3 E2E suite is described in [TESTING.md](./TESTING.md).
+> `fmt`/`build`/`clippy -D warnings`/`test` all pass (**711 tests** across 76 suites in the default
+> `--workspace` path, plus the opt-in `fault-injection` and `--ignored` soak runs below) and the
+> footprint gate is OK. The Layer-3 E2E suite is described in [TESTING.md](./TESTING.md).
 
 ## 1. Rust gate (always, once code exists)
 
@@ -84,8 +84,8 @@ continues splitting itself into sub-crates. All four presence checks are fed fro
 pipes — see the `grep -q` / `pipefail` pitfall in §1; it made the DataFusion check falsely report a
 missing query engine on ~16% of runs.
 
-Latest measured (2026-08-08 for v0.7.0, aarch64-glibc, release-small profile): **275** unique crates
-(≤ 275 target, ≤ 300 hard) and **33.3 MiB** for the `imbhd` binary (≤ 42 MB musl target — a glibc
+Latest measured (2026-08-09 for v0.8.0, aarch64-glibc, release-small profile): **275** unique crates
+(≤ 275 target, ≤ 300 hard) and **33.5 MiB** for the `imbhd` binary (≤ 42 MB musl target — a glibc
 floor, not the musl number). Both are within budget; the v0.1 footprint exit criterion is met on this
 axis.
 

@@ -6882,3 +6882,143 @@ requests), and convergence of already-sealed segments at seal time rather than o
 which would turn a bounded buffer write into an unbounded one, so it needs a decision rather than an
 implementation. `cargo clippy -p imbh-storage --no-default-features --all-targets` remains broken on a
 test module this work did not touch (pre-existing; every *library* configuration is clean).
+
+## Preparing v0.8.0: the first bump the signatures justify, and a shipped binary that was over budget for two releases (2026-08-09)
+
+Bump the shared workspace version and close the changelog. One PR since v0.7.0 (#45, the segment
+housekeeping + attribute statistics work) plus a docs commit, but it is the largest release the
+project has cut: 70 files, +17,399 lines, two new workspace members.
+
+### The changelog was complete, and that is the notable part
+
+v0.7.0's entry recorded that PR #43 shipped a user-facing feature with no changelog entry, caught by
+diffing `v0.6.2..HEAD --stat` against the sections present rather than by reading the changelog. The
+same check was run here (`v0.7.0..HEAD`, 70 files) and found nothing missing — every user-visible
+change in the diff has an entry, including the ones that landed as follow-up commits inside the PR.
+Worth recording as the counter-example: the check is cheap and it is the only thing that can tell you
+what is *absent* from a document.
+
+What it did have was a structural defect the stamp would have frozen. `[Unreleased]` had accumulated
+entries at both ends over the PR's life, so the closed section read
+`### Fixed` / `### Added` / `### Changed` / `### Fixed` — two `Fixed` headings in one release. Merged
+into the Keep a Changelog order (Added / Changed / Fixed), with the maintenance-loop fix moved down
+beside the other two. Nothing was reworded; only the headings moved.
+
+### Why a minor bump — and why the reasoning is the opposite of last time
+
+v0.7.0 needed an argument: the public surface was purely additive and a signature audit alone would
+have said 0.6.3, so the minor was chosen for what the *number communicates* about a stored-data
+change semver has no vocabulary for. v0.8.0 needs no such argument. The release breaks the published
+API in five distinct places, all already written up under `### Changed`:
+
+- the promoted key set and the retention policy both became **durable database state**, so omitting
+  `DbBuilder::promote` / `DbBuilder::retention` now *inherits* where it used to reset;
+- `Db::segment_files` returns `Result<Vec<PathBuf>>`;
+- `CompactionReport` gained `segments_converged`;
+- `imbh-query`'s `SegmentInput` / `TableInput` gained public fields and
+  `SegmentTableProvider::new` takes another argument.
+
+Under the 0.x rule the last five releases have used — a minor means something broke — 0.8.0 is what
+the diff computes, not a judgement call.
+
+### `imbh-attrstats` is a first-time publish
+
+The workspace goes from 20 packaged members to 22: `imbh-attrstats` (published) and the
+`attr-stats` example (`publish = false` + `[package.metadata.release] release = false`, so it stays
+out of cargo-release's plan). The crates.io name is **free** — checked against the API rather than
+assumed — and only two things depend on it: the `imbh` facade, optionally, behind its off-by-default
+`attrstats` feature, and the unpublished example. So it needs a publish slot after
+`imbh-core`/`imbh-storage` and before `imbh`. The crate-count gate does not move (275, unchanged),
+because an off-by-default feature is not in the graph `cargo tree -p imbh` measures.
+
+### The finding: the shipped x86_64 `imbhd` has been over the §2 target since v0.6.0
+
+TODO.md has carried a projection since 2026-08-06 — the `docker-remap` VRL subtree would push the
+x86_64-linux `imbhd` to ≈45.1 MB against a 42 MB target — flagged as needing a CD dry run to confirm.
+No dry run was needed: three releases have shipped since, so the bytes exist. Downloading
+`imbh-0.7.0-x86_64-unknown-linux-gnu.tar.gz` and unpacking it gives an `imbhd` of **45,691,560 B =
+45.7 MB**, i.e. **3.7 MB over target** and comfortably under the 55 MB hard limit.
+
+Against CD's v0.5.0 x86_64 baseline of 41,112,104 B that is **+4,579,456 B (+4.37 MiB)** for
+`docker-remap`, versus the **+4,024,312 B (+3.84 MiB)** measured locally on aarch64. The item's own
+caveat — "the projection is conservative in the wrong direction, x86_64 codegen is demonstrably
+fatter" — held exactly: the real overage is larger than the projected one.
+
+Two things follow. It is a **standing overage, not a v0.8.0 regression** — it first shipped in v0.6.0,
+the first release whose Linux legs carried VRL — so it does not block this release. And the local
+footprint gate structurally cannot see it: the same binary is ~5 MB smaller on aarch64, where the gate
+reads 33.5 MiB and passes. The decision (raise the target, trim VRL, or split `docker-remap` into its
+own artifact) is now unblocked, with a measurement under it instead of an estimate.
+
+### The binary moved this time
+
+`imbhd` 34,916,248 → **35,112,856 B (+196,608 B)**, ending the two-release streak of byte-identical
+output that both previous entries had to disprove as a stale-artifact bug. The plugin feature set
+moved by all but sixteen bytes of the same amount: 40,128,880 → **40,325,504 B (+196,624 B)**. Two
+binaries with different feature sets, one release's worth of code, and near-identical deltas — the
+added code is almost entirely in the part both builds share, which is what a storage/query release
+should look like.
+
+Steady RSS improved: 104.9 → **93.8 MB** on the rss-probe's 20k-record loop (idle 14.9 → 15.0 MB,
+noise). Not investigated; the attribute work touched the JSON reader's allocation behaviour
+(`json_get` no longer builds a `Vec` per row), which is the plausible source.
+
+### A published crate whose trimmed test build did not compile
+
+The previous session flagged, as pre-existing and out of scope, that
+`cargo clippy -p imbh-storage --no-default-features --all-targets` was broken. It is a published
+crate and this is a release, so it was fixed rather than carried: the unit tests referenced
+`Storage::compact`, `read_parquet_file`, `coerce_to_schema` and `reconcile_segments`, all of which the
+*library* already gates behind the new `compaction` feature, while the tests did not. Four tests gated
+on `compaction`, one already gated on `search` widened to `all(search, compaction)`, and the
+`ParquetRecordBatchReaderBuilder` import widened to `any(feature = "compaction", test)` — the bloom-filter
+test reads a segment back to assert on what *seal* wrote, which has nothing to do with whether
+rewriting is compiled in. Test-only; no library code changed, and no changelog entry, since nothing a
+consumer links behaves differently.
+
+All six combinations now lint clean under `-D warnings`: `--no-default-features`, `+compaction`,
+`+search`, `+search,compaction`, default, `--all-features`. Only the default configuration was ever
+covered before, which is why a feature added mid-cycle could break the others unnoticed.
+
+### Still by hand, for the sixth time
+
+`README.md` (3 strings) and `docs/DOCKER_LOG_DRIVER.md` (2) moved to 0.8.0 by hand again, for the two
+reasons TODO.md has recorded since v0.5.0 — the `pre-release-replacements` for them sit under
+`[workspace.metadata.release]` where cargo-release does not read them, and the `pre-release-hook`
+would still run `git cliff -o CHANGELOG.md` with no `cliff.toml` in the repo, replacing this
+hand-written file with a commit digest. Deliberately **not** fixed here: changing the release tooling
+in the same change that prepares a release means the first thing exercising the fix is the release
+itself. The item's count goes from five to six.
+
+`THIRD-PARTY-NOTICES.txt` is regenerated; its only delta is the workspace crates moving to 0.8.0 and
+`imbh-attrstats` joining them — 14 entries to 15, and Apache-2.0's count 343 → 344. **No third-party
+crate is added or removed**, which independently confirms the release's claim that `imbh-attrstats`
+adds no dependency subtree of its own.
+
+`QUALITY_GATE.md` §2's binary-size line and its applicability blockquote are refreshed. The latter
+still claimed **159 tests** in the default `--workspace` path, a number from around M6 that survived
+five releases; it is 711 across 76 suites now.
+
+### Verified
+
+`fmt --all --check` clean; `build --workspace`, `clippy --workspace --all-targets -D warnings` and
+`test --workspace` all clean (**76 suites, 711 passed, 0 failed, 4 ignored** — up from v0.7.0's
+64 / 615). Crash-injection E2E (`-p imbh --features fault-injection --test crash_points`) passes, run
+because this release rewrites the seal/pending/recovery paths. `./scripts/license-gate.sh` OK.
+Footprint gate **OK**: 275 crates (target 275), `imbhd` 33.5 MiB, plugin feature set 398 crates /
+38.5 MiB (informational), idle RSS 15.0 MB, steady RSS 93.8 MB, search-off lever 275 → 218 → 76 —
+all three lever rows unchanged from v0.7.0. §3b notices regenerated. §3c packaging dry-run staged and
+verified **all 22 members at 0.8.0**, exit 0, with `--allow-dirty` because the bump is uncommitted
+(the real release runs it on a committed tree, so the flag changes nothing it verifies). §4 local
+half: `cargo build --release -p imbh-server --features docker,grpc,tracing` OK and
+`./scripts/build-image.sh` builds an image whose `imbhd` passes the documented "nothing to serve"
+smoke test.
+
+One §4 gotcha worth recording, since it looks like a release defect and is not: the locally built
+image's `imbh-tui` dies with ``GLIBC_2.39' not found``. `build-image.sh` compiles on the host and
+copies the result into `debian:bookworm-slim` (glibc 2.36), so a host newer than bookworm produces an
+image that cannot run its own binaries. CD is unaffected — its Linux legs build on `ubuntu-22.04`
+(glibc 2.35) precisely to stay under the base image's floor. The local script validates the
+**context layout and the Dockerfile**, not the binaries' portability.
+
+Nothing committed, tagged or published.

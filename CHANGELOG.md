@@ -13,17 +13,7 @@ release aborts if it is missing or duplicated.
 
 ## [Unreleased]
 
-### Fixed
-
-- **A running writer now picks up prepared segment rewrites on its own.** The background maintenance
-  loop commits pending records on each maintenance tick, immediately before retention. Before this the
-  only in-process triggers were `open()` and `close()`, so a long-running `imbhd` applied an external
-  `imbh-housekeeper`'s work **only at restart** — and a preparer kept re-preparing partitions that
-  never landed, which is the failure the open/close pickup was added to prevent, displaced from "a
-  host that never calls `maintain()`" to "a host that never restarts". Costs one `read_dir` of a
-  usually-empty directory per maintenance interval. The loop still decides *when* to seal by the
-  flush policy — it performs `maintain()`'s order rather than calling it, since `maintain()` seals
-  unconditionally and `FlushPolicy::manual` means "seal only on `/admin/flush` and shutdown".
+## [0.8.0] - 2026-08-09
 
 ### Added
 
@@ -264,6 +254,16 @@ release aborts if it is missing or duplicated.
   including the metric tables, which have no Tantivy index and so had no other acceleration at all.
 
 ### Fixed
+
+- **A running writer now picks up prepared segment rewrites on its own.** The background maintenance
+  loop commits pending records on each maintenance tick, immediately before retention. Before this the
+  only in-process triggers were `open()` and `close()`, so a long-running `imbhd` applied an external
+  `imbh-housekeeper`'s work **only at restart** — and a preparer kept re-preparing partitions that
+  never landed, which is the failure the open/close pickup was added to prevent, displaced from "a
+  host that never calls `maintain()`" to "a host that never restarts". Costs one `read_dir` of a
+  usually-empty directory per maintenance interval. The loop still decides *when* to seal by the
+  flush policy — it performs `maintain()`'s order rather than calling it, since `maintain()` seals
+  unconditionally and `FlushPolicy::manual` means "seal only on `/admin/flush` and shutdown".
 
 - **`Db::segment_files` reported an empty database on read-only handles.** `Storage::open_read_only`
   deliberately leaves the in-RAM segment lists empty — a reader derives its view per call from the
@@ -1128,6 +1128,7 @@ release aborts if it is missing or duplicated.
   All 12 crates published to crates.io (`imbh-test-support` is dev-only and stays unpublished).
 
 <!-- next-url -->
+[0.8.0]: https://github.com/moriyoshi/imbh/releases/tag/v0.8.0
 [0.7.0]: https://github.com/moriyoshi/imbh/releases/tag/v0.7.0
 [0.6.2]: https://github.com/moriyoshi/imbh/releases/tag/v0.6.2
 [0.6.1]: https://github.com/moriyoshi/imbh/releases/tag/v0.6.1
