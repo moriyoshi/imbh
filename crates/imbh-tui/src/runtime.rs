@@ -52,6 +52,9 @@ async fn run_backend(backend: Backend, options: Options) -> io::Result<()> {
     // A host (or the CLI `--from/--to`) may seed an initial absolute window; adopt it so the first
     // query and the header indicator reflect it.
     app.abs_window = options.window;
+    // Promotion writes, so it exists only against a daemon. Recorded here rather than re-derived per
+    // frame: `draw` holds no backend, and this cannot change during a session.
+    app.can_promote = backend.can_promote();
     request_refresh(&mut app, backend.clone(), options.clone(), sender.clone());
 
     let outcome: io::Result<()> = async {
@@ -186,6 +189,31 @@ async fn run_backend(backend: Backend, options: Options) -> io::Result<()> {
                             {
                                 app.metric_exemplars = markers;
                             }
+                        }
+                        Update::Promoted(result) => match result {
+                            // A change lands as the set the daemon actually holds; the pane is
+                            // re-measured so its `on` column reflects it rather than what was asked
+                            // for. `attr_stats = None` forces that even within the reuse interval.
+                            Ok(keys) => {
+                                let changed = keys != app.promoted;
+                                app.promoted = keys;
+                                app.last_error = None;
+                                if changed {
+                                    app.attr_stats = None;
+                                    request_refresh(
+                                        &mut app,
+                                        backend.clone(),
+                                        options.clone(),
+                                        sender.clone(),
+                                    );
+                                }
+                            }
+                            Err(error) => app.last_error = Some(error),
+                        },
+                        Update::AttributeStats { key, pane } => {
+                            // Guarded inside: the measurement and the snapshot it belongs under
+                            // arrive independently, and either may be stale.
+                            app.take_attr_stats(key, pane);
                         }
                         Update::Waterfall { generation, trace_id, detail, trace } => {
                             // Apply only if still current: same query generation and the selection has

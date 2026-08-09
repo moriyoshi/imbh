@@ -5697,3 +5697,1188 @@ plan belongs deleted with its residue extracted, not left to be found.
 `fmt --all --check` clean; `clippy --workspace --all-targets -D warnings` clean; `test --workspace` at
 **669 passing**, unchanged — this entry moves prose, not behaviour. `.agents/docs` no longer contains
 either file. Nothing committed.
+
+## `attr-stats` becomes a component: one measurement, four callers (2026-08-09)
+
+`examples/attr-stats` was 2,785 lines of measurement locked inside a binary. It is now
+**`crates/imbh-attrstats`**, and the same measurement backs four callers: the CLI (unchanged in
+behaviour), `Db::attribute_stats`, `POST /api/head/attributes/stats`, and a new Attributes screen in
+the TUI. ARCHITECTURE gained **§10.20** for the measurement and a paragraph in §10.19 for the
+operation.
+
+### What moved, and what the split forced me to decide
+
+`accum.rs` and `scan.rs` moved verbatim (`git mv`). `main.rs` split three ways: the report model and
+the two verdicts to `report.rs`, the fixed-width renderer to `text.rs` (returning `Vec<String>` rather
+than printing, so a pane or a test can take it), and `Options` + `analyze()` to `lib.rs`. What was
+left of the binary is 120 lines of argument parsing. The four end-to-end tests moved to
+`tests/end_to_end.rs` and now drive the public entry point rather than a private `Config`.
+
+Three decisions the extraction forced, none of which the binary had to make:
+
+**`--last <minutes>` became `Options::range: Option<(i64, i64)>`.** A CLI can ask for "the last N
+minutes"; a head asking for statistics over the window it is *displaying* cannot — its window is
+absolute, and often historical. Generalizing to an absolute range made the CLI flag a two-line
+convenience (`with_last_minutes`) and gave the TUI its cost bound for free: the Attributes screen
+measures the segments overlapping the selected time range, so pan/zoom/range changes are the throttle.
+This is the change that makes the screen viable at all — an unbounded scan on every screen switch
+would not be.
+
+**A mistyped path was silently an empty database.** `read_disk_snapshot` answers "no segments" for a
+directory with no manifest, which is correct for a database before its first seal and wrong for
+`./demo-dbb`. Both read as a clean measurement of nothing. `analyze` now refuses a path that is not a
+directory, and the test pins *both* halves — the refusal, and that an existing empty directory still
+measures as empty. Pre-existing behaviour of the old tool; it surfaced only because writing a library
+test made me ask what the error cases were.
+
+**The report needed serde derives *and* the hand-written JSON.** The derived `Serialize` is the wire
+form (lossless, what the head API sends); `report::to_json` stays as the `--json` document, because it
+is flattened for `jq` — verdicts inlined per key, the cardinality curve carrying both endpoints — and
+its field names are the ones the write-ups quote. Making the wire form the documented one would have
+broken every recorded reading of it.
+
+### The head operation is the first one that scans
+
+Twelve head operations answer a query; this one reads the attribute columns of every sealed segment in
+range. Three consequences, all recorded in §10.19: the request body **is** `imbh_attrstats::Options`
+(not a wire type describing it, so local and remote measure the same thing under the same caps); the
+response is the whole `Report` (a head ranks it itself); and `offload` stops mattering
+"for consistency" and starts mattering for real — a multi-second scan on a connection's runtime worker
+is a different thing from a 2 ms one. The client sets only a *connect* timeout, so an accepted request
+waits as long as the scan takes; I had written the opposite in the doc comment before reading
+`HeadClient::new`.
+
+`head_e2e` needed its first **on-disk** database. Every other case there runs on `Db::in_memory()` —
+which has no segments, so it cannot measure anything. That is now an asserted behaviour rather than a
+gap: an in-memory daemon answers `400` naming the reason, because "no segments to measure" and "no
+attributes" are different claims and an empty report would state the wrong one.
+
+### The TUI screen, and two bugs adding a screen exposed
+
+Fifth screen (`5`), no query pane — like Overview it is a report over the database, not an answer to a
+query. The table puts **both verdicts immediately after the key**, ahead of the evidence they are
+derived from, because a narrow terminal clips the rightmost columns and clipping the conclusion would
+leave the screen saying nothing. Caveats that no column can carry — unsealed WAL frames, skipped
+segments, engaged caps, "no sealed segments in this range" — go in the detail pane below.
+
+Adding the screen surfaced two latent bugs, and the difference between them is the point:
+
+- **`focus_ring` hard-coded `Menu(0..3)`.** Five screens, four reachable by Tab. The existing test
+  looped `1..Screen::ORDER.len()`, so it *caught* it immediately. Fixed by deriving the ring from
+  `ORDER` rather than restating it.
+- **`App::query` was `[String; 4]`** and `menu_cursor_wraps_over_screens_and_the_range_item` walked the
+  screens by name. The array became `[String; Screen::ORDER.len()]`; the test now walks
+  `ORDER[Traces+1..]`.
+
+Both were "a constant restated where a constant already existed". The tests that caught them were the
+ones written against `ORDER`; the one that had to be edited was the one written against the screen
+names. That is a usable rule for a fixed enumeration: assert against the enumeration, not against
+today's members of it.
+
+### Feature placement, and the trap I had already hit twice
+
+`imbh-attrstats` is a crate beside the engine crates (`core ← storage ← attrstats`), not a module in
+`imbh-storage` and not a layer above the facade — because the CLI must measure a *directory* without
+opening a `Db`, while the facade wants a `Db` method. It reaches it through an **off-by-default
+`attrstats` feature**: a diagnostic, not part of ingest or query, so an embedded host that never asks
+should not carry the scanner.
+
+`imbh-head`, `imbh-server` and `imbh-tui` each name `imbh/attrstats` **explicitly** rather than
+inheriting it from a sibling's copy of the dependency. This is the third time in two sessions that a
+Cargo feature has broken a build I was not running (the `query`-gated `crate::sql`, then
+`imbh-storage`'s `compaction` missing from `default`), and the shape is always the same: `cargo build
+--workspace` unifies features, so a crate that *needs* a feature compiles anyway as long as some
+sibling turns it on. The standalone build is the one that tells the truth. Same reason
+`imbh-attrstats` has `default = ["serde"]` — a standalone `cargo test -p imbh-attrstats` must compile
+the JSON view its tests assert on — while the workspace dependency pins `default-features = false` so
+consumers still opt in. That combination is exactly how `imbh-storage`'s `search` is arranged, and it
+was already the answer.
+
+`--no-default-features` on the new crate then failed on its own test file, which imported `to_json`
+unconditionally. The library was fine; only the test was wrong. Gated the import and the two
+assertions.
+
+### Measured
+
+| axis | before | after |
+|---|---|---|
+| `imbh` facade, unique crates (footprint gate) | 275 | **275** (unchanged — feature is off) |
+| `imbh` with `--features attrstats` | — | 276 (+1: the crate itself) |
+| `imbh-server` unique crates | 297 | **298** (+1) |
+| workspace tests | 668 | **683** |
+
+No third-party subtree enters anywhere: imbh-core, imbh-storage, arrow, parquet, xxhash-rust,
+serde and serde_json are all already compiled in any build that has storage.
+
+### Verified
+
+`fmt --all --check` clean. `clippy --workspace --all-targets -D warnings` clean, plus, standalone:
+producer (`ingest`), consumer (`query`), storage-only, `attrstats` alone, `attrstats,serde`,
+`housekeeper`, no-compaction, `imbh-attrstats` with and without default features, `imbh-head` full and
+`dto`-only, `imbh-tui`, `imbh-server`. `test --workspace` **683 passing, 0 failing**; `cargo test -p
+imbh-attrstats` and `-p imbh --features attrstats --test attribute_stats` green standalone. Smoke-run
+against a `gen-demo-db` corpus produces the same report as before the extraction. Nothing committed.
+
+## Addendum: the attribute block belongs on the Overview, and must not block it (2026-08-09)
+
+Two corrections to the entry above, both from the user, and both about the same thing: an expensive
+measurement should not get its own screen, and should never be on the critical path of a render.
+
+### The fifth screen is gone
+
+`Screen::Attributes` is reverted — `ORDER` is back to four, the `5` binding and the menu item with
+it — and the block now lives at the bottom of the **Overview**, under the database gauges it belongs
+with. That is the honest placement: it is a *report about the database*, which is what the Overview
+already is, and it was never a fifth peer of Metrics/Traces/Logs (all three answer a query; this
+answers none). The screen-count churn from the entry above stays useful anyway — `focus_ring` is
+still derived from `ORDER` rather than restating it, which is a latent bug fixed regardless of how
+many screens there are.
+
+### Two answers, one pane, arriving independently
+
+The Overview is now the only pane whose content comes from **two requests on different time scales**:
+the gauges are a query (milliseconds), the attribute statistics are a scan of every sealed segment's
+attribute columns (seconds, on a real corpus). Blocking the first on the second — which the first
+implementation did, by making them one `load_snapshot` arm — makes the whole screen as slow as the
+scan.
+
+The split needed three pieces:
+
+- **`Snapshot::attr_from`** — the index in `lines` where the asynchronous half begins. The refresh
+  ships the gauges plus a placeholder from there down; the measurement *replaces* everything from that
+  index rather than appending, so a re-arrival cannot stack two blocks. Modelled on the existing
+  `list_from`, which is the same idea (lines below this index are special).
+- **`Update::AttributeStats`**, delivered like `Update::Waterfall` — the pattern was already there for
+  a fetch that fills a pane after the fact.
+- **`App::compose_attr_stats`**, called from *both* arrivals. Order is not guaranteed: an empty
+  database measures faster than the gauges query answers. Composing from either side, with the same
+  guard, makes the order irrelevant instead of unlikely — and the test drives both.
+
+### The guard is the range *selection*, not the generation
+
+First cut keyed the measurement on the refresh generation, which is what every other async fetch here
+uses. That is wrong for this one, and the reason is the cost: auto-refresh bumps the generation every
+5 s, so a generation-keyed measurement is invalidated every tick and the corpus is rescanned
+**continuously**. Correct behaviour and cheap behaviour turn out to be the same thing here — reuse the
+measurement whenever the answer would not differ.
+
+So the key is `(abs_window, lookback)`: the user's *range selection*, not the computed `[start, end]`.
+A rolling window's absolute bounds move every tick even though the user has not touched anything;
+the selection changes exactly when the answer should. On top of that a 60 s staleness bound (numbers
+do drift as segments seal) and `r` clearing the cache outright, so an explicit refresh means "measure
+now" rather than "show me the cached minute".
+
+Worth stating as a rule: **a cache key should name what the user chose, not what the code computed
+from it.** The computed window is a function of the selection *and the clock*, and the clock is
+exactly the part that must not invalidate a corpus scan.
+
+### Verified
+
+`fmt --all --check` clean; `clippy --workspace --all-targets -D warnings` clean; `test --workspace`
+**686 passing**. `imbh-tui` alone at 152, including both arrival orders, the wrong-range drop, and the
+reuse-across-ticks rule. Footprint gate OK — facade 275 crates (target), `imbhd` 33.4 MiB (target
+42 MB), idle RSS 14.9 MB, steady 104.7 MB. Nothing committed.
+
+## Addendum: the attribute block gets its own time range (2026-08-09)
+
+The Overview's attribute statistics now take a window independent of the query range (`a`), because
+the two answer different questions over different horizons: a `promote` list is chosen from days of
+data, while the panels beside it are read over the last fifteen minutes. Tying the measurement to the
+query range meant one of the two was always wrong.
+
+**Reuse the form, add a destination.** The absolute-range form already exists — two UTC datetime
+fields, a shared caret, its own parse errors — so it gained an `AbsTarget` (`Query` | `Attributes`)
+rather than a second form. `commit_absolute` branches only at the point where the parsed window is
+stored, and the attribute branch deliberately does *not* reset the row cursor: it changes one block
+inside a pane the user is already reading, not what the pane is showing.
+
+**Clearing both fields is the way back.** An independent window needs an off switch, and an empty form
+is already the natural spelling of "no window of my own" — so it means "follow the query range" under
+`AbsTarget::Attributes`, and stays a parse error under `Query`, which has no follow state to fall back
+to. The hint line says so; nothing else would have suggested an empty field meant anything.
+
+**The block states its window.** Once the two can differ, a reader cannot infer which one produced the
+numbers, so the header names the span and says whether it is following the query range or measuring
+its own. `Report::range` already carried the window — the caller only has to say which kind it is.
+
+**The cache key needed nothing new.** `attr_key` was already the *selection* rather than the computed
+window (the previous addendum's correction), so an independent window simply becomes the selection:
+`(Some(window), Duration::ZERO)`. Setting, changing, or clearing it invalidates the measurement for
+free, and two identical windows reached by different routes compare equal — which is right, since they
+measure the same thing.
+
+### Verified
+
+`fmt --all --check` clean; `clippy --workspace --all-targets -D warnings` clean; `test --workspace`
+**688 passing** (`imbh-tui` 154, including the independent-window round trip, the empty-form clear,
+and `a` staying inert off the Overview). Nothing committed.
+
+## Addendum: the attribute statistics become a pane, and their range belongs to it (2026-08-09)
+
+Two more corrections from the user, and they turn out to be the same correction: **the attribute
+statistics are a thing, so they should have a pane, and their controls should live on it.**
+
+### A pane, not a block appended to the gauges
+
+`Snapshot::attr_from` — the index into `lines` where the asynchronously-filled block began — is gone,
+and with it the whole idea of splicing two answers into one list. The Overview now renders two panes,
+and the machinery that already existed for that (`Snapshot::detail`) does the work: the measurement
+replaces a whole pane rather than a slice of a line vector, so "a re-arrival cannot stack two blocks"
+stops being an invariant to maintain and becomes a consequence of assignment.
+
+`DetailPane` gained a `DetailStyle` because the two users of it want opposite things:
+
+- `Preview` (the Traces waterfall) — bare title line, no borders so bars sit flush, no scroll,
+  overflow reported in the title, full view one Enter away.
+- `Pane` (the attribute statistics) — bordered like the primary, and **it** takes the screen's scroll,
+  because it is the long content while the pane above it is a fixed ten lines.
+
+That last point also fixed the split. The old 55/45 gave half the screen to the gauges and cropped the
+list that actually needed the room; a `Pane` detail now sizes the primary to its own content and takes
+everything else.
+
+### The range control belongs on the pane, not on the global key map
+
+The first cut bound `a` globally and dropped the form under the header's time indicator. Both were
+wrong for the same reason: that indicator *is* the query window, and a form appearing there says it
+edits the query window whatever its title claims. A global key says the same thing — `t` is global
+because the query range is global.
+
+So the attribute pane became a **focus stop** (`Focus::Attributes`, appended to the ring when the pane
+is shown), Enter on it opens its range form, and the form is anchored over **the pane**. `a` is gone.
+The anchor is passed in rather than hardcoded, and `draw_absolute_range` now hangs the popup from the
+anchor's near edge — right-aligned under a narrow header strip, left-aligned inside a full-width pane,
+where its title is.
+
+The general rule this is an instance of: **a control that changes one pane belongs to that pane** —
+in its focus ring, in its title, and positioned over it. A global binding is for something global, and
+the giveaway that this one was not is that it needed a screen guard (`a` only on the Overview) to be
+safe.
+
+### Verified
+
+`fmt --all --check` clean; `clippy --workspace --all-targets -D warnings` clean; `test --workspace`
+**688 passing**, `imbh-tui` 154 — including the focus ring gaining and losing the stop with the pane,
+Enter on a stale `Attributes` focus doing nothing, and `a` no longer being a binding at all. Nothing
+committed.
+
+## Addendum: the attribute pane renders as a table again, and the header stops lying (2026-08-09)
+
+Two small corrections, both about the same failure mode as the previous round: making something
+*look* like what it is.
+
+### A result set should render as a table
+
+Folding the dedicated screen into a pane had quietly downgraded the keys from a `TableData` — column
+widths measured by display width, a cyan/bold/underlined header row — to preformatted text inside a
+`Paragraph`. Same characters, but it reads like a log line rather than a result set, and the column
+alignment was mine to maintain by hand in a `format!` string.
+
+So `DetailPane` gained an optional `table: Option<TableData>`, and a `Pane`-style detail now renders
+as **prose above a table**: the pane's own block, then the notes, then the table with a real header
+row. The width and header styling were lifted out of `draw_metric_table` into `column_constraints` /
+`table_header` and shared, so the two panes cannot drift apart.
+
+The split of what goes where is deliberate: the prose is what *qualifies* the numbers — the window
+measured, unsealed WAL frames, skipped segments — so it sits above the table and does **not** scroll.
+A caveat that scrolls out of a long table is a caveat nobody reads. Only the rows scroll, which also
+made the scroll arithmetic honest: `max_scroll` is now row count minus viewport minus the header row,
+rather than a wrapped-line estimate over the whole pane.
+
+No row selection. The old dedicated screen had one because it was the primary pane, but there is no
+per-row action here, and a highlighted row that Enter does nothing with is a false affordance —
+Enter on this pane opens its range.
+
+### The header highlighted a window the form was not editing
+
+Opening the attribute range lit up the menu bar's time indicator, because both forms are
+`Mode::AbsoluteRange` and the highlight tested only the mode. That indicator *is* the query window, so
+it was announcing a change to something the form would not touch — the same category of error as
+anchoring the form there in the first place, which the previous round fixed.
+
+The predicate is now `editing_query_window(app)`: the mode **and** `abs_target == Query`. It gates
+both the bar-wide focus colour and the range item's cursor chip.
+
+**The general shape, three rounds running: a control's chrome must follow what it changes, not merely
+that it is open.** Position, focus stop, highlight — each of them was defaulting to "the query
+window" because that used to be the only window there was.
+
+### Verified
+
+`fmt --all --check` clean; `clippy --workspace --all-targets -D warnings` clean; `test --workspace`
+**689 passing**, `imbh-tui` 155 — including the pane's table header and row contents, the caveats
+staying in the prose above it, and the header highlight distinguishing the two form targets. Nothing
+committed.
+
+## Addendum: the attribute pane's range defaults to all of time, and its form drops from its own range line (2026-08-09)
+
+### All of time, and one fewer state
+
+The pane's window no longer follows the query range when unset — `None` now means **every sealed
+segment**, and that is the default. Which is the right default for the question: a `promote` list is
+chosen from everything the database holds, not from whatever fifteen-minute window the panels beside
+it happen to be showing. Following the query range was inherited thinking from when the statistics
+were part of a panel.
+
+The pleasant part is what it deleted. `AttrWindow` was `(Option<(i64,i64)>, Duration)` — the absolute
+window *and* the relative preset, because "follow the query range" made the answer depend on both.
+It is now just `Option<(i64,i64)>`: the window measured **is** the cache key. Three consequences fall
+out for free:
+
+- Moving the query range no longer invalidates the measurement, so the corpus is rescanned strictly
+  less often.
+- The three-state model (all / follow / fixed) collapses to two (all / fixed).
+- The form's empty state and the range's unbounded state became the same thing in both directions:
+  opening the form on an unbounded range shows empty fields, and submitting empty fields sets an
+  unbounded range. Nothing extra to learn, and no third spelling to explain in the hint line.
+
+### The form drops from the value it edits
+
+Anchoring it over the *pane* was still one level too coarse. The pane displays its window on its first
+line, so that line is what the form edits, and that is now what it hangs from — `attr_area` publishes
+the range line's rect (one row) rather than the whole pane, and the existing "narrow anchor → drop
+below it" branch in `draw_absolute_range` does the rest without a special case.
+
+That completes the set from the previous round: **position, focus stop, and highlight all follow what
+the control changes.** The last of the three landed here too — the menu bar's time indicator no longer
+lights up for a form editing the attribute window, since both forms share `Mode::AbsoluteRange` and
+only the target tells them apart.
+
+### Verified
+
+`fmt --all --check` clean; `clippy --workspace --all-targets -D warnings` clean; `test --workspace`
+**689 passing**, `imbh-tui` 155 — including the unbounded default, the empty-form round trip in both
+directions, and that a query-range change leaves the measurement cached while a pane-range change
+invalidates it. Nothing committed.
+
+## An explicit promotion API, and the one place the explorer writes (2026-08-09)
+
+The attribute pane measured what *should* be promoted and could do nothing about it; changing the set
+meant restarting the daemon with a different `DbBuilder::promote` list. `GET`/`POST /admin/promote`
+closes that loop, and the TUI's attribute pane gained an `on` column and a `p` key.
+
+### Not a head operation, deliberately
+
+`/api/head` is documented read-only, and this writes: `Db::set_promote` seals the buffer so no batch
+straddles the change, and every segment sealed afterwards carries the new column set. So it went on
+`/admin/*` beside `flush` and `compact`. The point is not taxonomy — it is that a deployment gates a
+*prefix*. One read-only prefix and one write prefix is a rule someone can apply; "read-only except one
+route" is a rule someone gets wrong.
+
+The client is the exception to the exception: `HeadClient` carries `promoted`/`set_promoted` anyway,
+because the transport, the base-URL parsing and the error mapping are all already there and a second
+client beside it would be worse. The crate docs name it as the one write, and the path constant lives
+next to the head paths with the reason attached.
+
+### The whole set, not a delta
+
+Promotion is a **list** whose order is the column order. `{"keys": [...]}` replaces it wholesale, for
+two reasons that are easy to miss: a delta would ask the server to guess *where* in the order a new key
+goes, and two concurrent callers each sending "add mine" would each silently lose the other's change.
+
+The response is the set **now in effect**, not an echo. The daemon filters keys that collide with a
+built-in column name at schema construction, so what was asked for and what is in force can differ — a
+head that assumed its own request had been applied would show a key as promoted that is not. The TUI
+re-measures on the answer rather than on the request.
+
+### Disabled where it cannot work, and for a structural reason
+
+A TUI session that opened the directory itself holds a `Db::open_read_only` view: no writer lock, every
+write refused by construction. So `Backend::can_promote()` is `matches!(self, Remote(_))` — not a
+permission check bolted onto a UI, but the observation that there is no local implementation to call.
+Three consequences, all of them the honest version:
+
+- `p` is advertised in the pane title only where it exists.
+- Pressed anyway, it reports *what would work* (`imbh-tui --url http://host:4318`) rather than
+  surfacing the storage layer's read-only error, which would describe the mechanism instead of the fix.
+- `Backend::set_promoted` refuses on the local arm up front rather than attempting and failing, so the
+  message is not a race between two explanations.
+
+### The pane's cursor exists now, because there is finally something to do with it
+
+Two rounds ago I left the attribute table unselectable, on the grounds that a highlighted row Enter
+does nothing with is a false affordance. `p` is that something, so the pane took a cursor — and only
+while focused, since an unfocused pane's highlight would act on nothing. `selectable_bounds` checks the
+focused pane first, which is also what routes ↑/↓ to it.
+
+The `on` column sits immediately after the key, ahead of the `promote` verdict: the verdict is only
+useful *next to the current state*, and `p` acts on exactly that column. Both are read from the same
+task as the measurement, so the two halves of one screen cannot disagree about what is promoted.
+
+### Verified
+
+`fmt --all --check` clean; `clippy --workspace --all-targets -D warnings` clean; `test --workspace`
+**691 passing**, `imbh-server`'s `head_e2e` 7 — including the read/replace round trip over a real
+socket, the daemon's live set matching the response, demotion, and a malformed body answering `400`
+rather than `500`. `imbh-tui` 156, including the local-session refusal naming `--url` and the `p`
+paging binding staying intact off the pane. Nothing committed.
+
+## Addendum: the attribute pane breaks down per scan unit (2026-08-09)
+
+The per-table measurement had existed since the CLI — `Report.tables` carries a `UnitReport` per
+`logs`/`spans`/the five metric tables — and the pane was showing only `Report.global`. The reasoning
+was sound and the omission was not: `promote` is DB-wide, so the roll-up is what the *decision* is made
+against, but it is not where the numbers are *defined*, and it silently hides which signal a key even
+belongs to.
+
+So the table is now grouped: `ALL TABLES` first, then one section per table with segments in range,
+empty tables left out. Three things this gets right that the flat view could not:
+
+- **Sigma is per table by definition** — its denominator is that table's segment count. The roll-up's
+  `index@` is a best case *across* tables, which is fine as a summary and misleading as a measurement.
+  Each section now answers for itself.
+- **Which signal carries the key.** A key on `logs` and on `metrics_gauge` appears in both sections,
+  which is the answer to a question the roll-up cannot express.
+- **The promote verdict stays DB-wide.** Per-table rows leave it blank rather than repeating a
+  judgement made against different totals — a key can look cheap in one table and not in the roll-up,
+  and showing both as "promote: yes" would imply a per-table decision that does not exist.
+
+`index_scale` grew a per-unit sibling in `imbh-attrstats` (`index_scale_in`) and became the fold over
+it, rather than the TUI re-deriving the `INDEX_MAX_SIGMA` rule with the library's constant.
+
+### Two kinds of row, and `p` has to tell them apart
+
+A grouped table holds section headers as well as key rows, and `p` acts on the row under the cursor.
+"Is this a key" therefore has to be a *fact about the row*, not a guess from its text: a header leaves
+the **scope** cell empty, and a key row's scope is always one of three non-empty names. One helper,
+`attr_row_key`, is the single reader of that invariant — used by the promotion toggle, by the renderer
+(which styles headers as chrome), and by the tests. The alternative, a parallel `Vec<Option<String>>`
+aligned with the rows like the Metrics catalog's `tree_rows`, would have worked too; this is smaller
+and the invariant is genuinely structural rather than incidental.
+
+### Verified
+
+`fmt --all --check` clean; `clippy --workspace --all-targets -D warnings` clean; `test --workspace`
+**692 passing**, `imbh-tui` 157 — including a fixture with logs *and* metrics asserting the roll-up
+leads, both signals get sections, an empty table gets none, a cross-signal key appears under both, and
+no per-table row carries a promote verdict. Nothing committed.
+
+## Addendum: the attribute pane's two focus stops, and per-section headers (2026-08-09)
+
+### One pane, two things to act on, two stops
+
+`Focus::Attributes` became `Focus::AttrRange` and `Focus::AttrTable`. The pane has two things to act
+on — the window it was measured over, and the key under the cursor — and one stop made Enter ambiguous
+between them: it opened the range while the cursor sat on a row, which is exactly the kind of "acts on
+something the screen never marked as selected" the earlier rounds were about.
+
+Split, everything lines up: the range line is highlighted when the ring is on it (so Enter has a
+visible target), the row cursor exists only on the table stop, each stop advertises only its own action
+in the pane title, and Enter on the table does nothing rather than guessing. `p` is guarded on
+`AttrTable` for the same reason.
+
+### Every section is its own table
+
+Each section now carries a title *and its own column header*, rather than one header pinned above all
+of them. That is the honest rendering of what a section is: coverage is against **that unit's** rows
+and sigma against **that unit's** segments, so a single header floating over every section implies one
+set of totals that does not exist.
+
+This is what forced the row-kind question. With headers repeated inside the table, "is this row a key"
+could no longer be read off the scope cell — a header row's scope cell says `Scope`. So `PaneTable`
+now carries `kinds: Vec<AttrRow>` beside its rows: one struct rather than two fields, so "aligned with
+`data.rows`" is a property of the type instead of a comment two call sites have to honour. The
+renderer styles by kind, `p` reads it to know whether there is a key under the cursor, and the tests
+assert against it.
+
+A width bug fell out of the same change: column widths were measured over *every* row, so a section
+title — one long banner cell — stretched the key column to its own length and squeezed the numbers off
+the right edge. Widths now come from the key rows only.
+
+### Ordering: verified rather than changed
+
+"The order of the table must follow that in the header" turned out to already hold: `Db::stats()`
+(which the gauges pane lists) and `Report.tables` (which the sections follow) are both `Table::ALL`
+order, on both the writer and the read-only reader path. "Already holds" is not the same as "cannot
+drift", though — they are two independent lists in two crates that do not know about each other, and a
+reader scanning down the screen matches them by position. So it is now a test rather than a
+coincidence.
+
+### Verified
+
+`fmt --all --check` clean; `clippy --workspace --all-targets -D warnings` clean; `test --workspace`
+**693 passing**, `imbh-tui` 158 — including the two stops in reading order, both snapping to `Primary`
+off the Overview, Enter doing nothing on the table stop, every section title being followed by its own
+column header, and the section order matching the gauges list. Nothing committed.
+
+## Addendum: a banner is not a table cell (2026-08-09)
+
+Two rendering corrections, and the first one is the interesting one because I caused it two changes
+earlier and only the user could see it.
+
+### Titles were being clipped to the key column
+
+The section titles live in the first cell of their row, and a ratatui `Table` clips every cell to its
+column. So `metrics_gauge - 1 segment, 488 rows, 2 keys` rendered as `metrics_gauge - 1 s>`. I had
+*made this worse* in the same round it appeared: measuring widths over key rows only was right (a title
+would otherwise stretch the key column to its own length and push the numbers off the pane), but it
+also shrank the column the title was being clipped to.
+
+Both constraints are real and a cell-based table cannot satisfy them at once — a cell is clipped to its
+column, and there is no column span. So the pane's body is now a `List` of styled `Line`s with columns
+padded by hand: same alignment, same header styling, and a title that spans the pane because it is not
+in a column at all. Selection and scrolling come from `ListState` exactly as they did from
+`TableState`.
+
+The general form: **a banner and a cell want opposite things from a layout, so one of them is not a
+cell.** Reaching for the table widget was right for the rows and wrong for the titles, and the fix is
+not a wider column.
+
+### Titles are bold, not coloured
+
+Colour in this pane is already doing two jobs — cyan for the column header, cyan-on-black for the
+cursor — and a third would compete without meaning anything. A section title marks *structure*, not a
+category, so intensity is the right signal and the yellow is gone.
+
+### Verified
+
+`fmt --all --check` clean; `clippy --workspace --all-targets -D warnings` clean; `test --workspace`
+**694 passing**, `imbh-tui` 159 — including a regression test on the exact clipping (a title reaching
+the pane whole, while the key column stays sized to its data). Nothing committed.
+
+## MCP gets the attribute legs, and a write whose capability follows the handle (2026-08-09)
+
+Three tools: `attribute_stats`, `list_promoted_attributes`, `set_promoted_attributes`. The first two
+are ordinary reads. The third is the first **write** on a surface whose crate doc opened with "Nothing
+here can write", so it needed the same care the head API's did — and the answer turned out better here
+than a prefix split.
+
+### The capability follows the handle, not a flag
+
+`tools/list` is now built from `tools::visible(db)`, which drops write tools when `db.is_read_only()`.
+That is not a permission check bolted onto the surface: a read-only handle holds no writer lock and
+refuses every write by construction, so the tool has **nothing to call** there. Hiding it means an
+agent is never offered an action that cannot succeed, and a client that caches the list never learns
+it exists.
+
+The check is repeated inside the tool anyway, because a client may be working from a list it cached
+before the server was restarted read-only — and the message it gets then says *why the action is
+absent* and what would have it, rather than surfacing the storage layer's read-only error.
+
+`Db::is_read_only()` is new on the facade for this. It is the same question the TUI's
+`Backend::can_promote()` answers, and both are better than "try it and see": a UI that knows what it
+is connected to beats one that finds out by failing.
+
+### The read is shaped for an agent, and says what it could not cover
+
+`attribute_stats` returns a purpose-built document rather than the report verbatim — MCP results are
+deliberately lossy (§10.16.1) and the full report is large. What survives is what a decision needs:
+per key, the current promoted state, both verdicts, and the four numbers behind them, capped by `top`
+with `truncated` set per unit. `unsealed_wal_frames` and `segments_skipped` ride along, because a
+measurement that reads like full coverage when it is not is worse than no measurement.
+
+Its window defaults to **every sealed segment**, unlike every other tool here, which default to an
+hour. That is not an oversight to be normalised: a `promote` list is chosen from the whole corpus, and
+the window arguments exist to bound the scan, not because a window is the natural unit of the question.
+
+### Verified
+
+`fmt --all --check` clean; `clippy --workspace --all-targets -D warnings` clean. `imbh-server`'s
+`mcp_e2e` at 12 — the loop end to end (measure → promote → the measurement now reporting it promoted),
+per-table sections giving no promote verdict, and the write tool absent from a read-only server's
+`tools/list` while its reads stay. Nothing committed.
+
+## Session consolidation: `attr-stats` from example to product surface (2026-08-09)
+
+Eleven entries above log this session as it happened. This one is the summary a future reader wants
+first: what shipped, what it cost, and the findings that outlive the feature.
+
+### What shipped
+
+A measurement that lived inside one example binary is now a component with **five callers**:
+
+| Surface | What it does |
+|---|---|
+| `crates/imbh-attrstats` | the measurement: sigma, the cardinality curve, run structure, the two verdicts. No third-party dependency; `serde` behind a feature |
+| `examples/attr-stats` | unchanged CLI, now ~120 lines of argument parsing |
+| `Db::attribute_stats` | facade method behind the off-by-default `attrstats` feature, mirrored on `BlockingDb` |
+| `POST /api/head/attributes/stats` | so a head measures the daemon's database |
+| `imbh-tui` Overview | a second pane, measured asynchronously, with its own time range |
+
+Plus the action the measurement implies: `GET`/`POST /admin/promote`, `p` on the TUI pane, and three
+MCP tools (`attribute_stats`, `list_promoted_attributes`, `set_promoted_attributes`). Reading the
+verdicts and acting on them are now one loop instead of a report and a daemon restart.
+
+### Measured
+
+| axis | before | after |
+|---|---|---|
+| `imbh` facade, unique crates (footprint gate) | 275 | **275** — unchanged, the feature is off |
+| `imbh` with `--features attrstats` | — | 276 (+1: the crate itself) |
+| `imbh-server` unique crates | 297 | **298** (+1) |
+| `imbhd` release binary | — | 33.4 MiB against a 42 MB target |
+| workspace tests | 668 | **697** |
+| MCP tools | 15 | 18 (17 read-only) |
+
+40 files, +3,614/−1,658. No third-party subtree enters anywhere: imbh-core, imbh-storage, arrow,
+parquet, xxhash-rust, serde and serde_json are already compiled in any build that has storage.
+
+### Findings that generalize
+
+**A cache key should name what the user chose, not what the code computed from it.** The attribute
+measurement was first keyed on the resolved `[start, end]`. A rolling window's bounds move every tick,
+so an auto-refreshing Overview rescanned the whole corpus every five seconds. Keyed on the *selection*
+instead, it invalidates exactly when the answer would differ. The computed window is a function of the
+selection **and the clock**, and the clock is the part that must not invalidate a scan.
+
+**A control's chrome must follow what it changes, not merely that it is open.** This cost four rounds
+of correction, one per aspect: the range form's *position* (anchored under the header's query-range
+indicator, then over the pane, finally on the range line it edits), its *key* (a global `a`, then a
+focus stop on the pane), the header's *highlight* (lit for a form that did not touch it), and finally
+the *focus stop itself* splitting in two once the pane had two things to act on. Each defaulted to
+"the query window" because that used to be the only window there was. The tell for the global key was
+that it needed a screen guard to be safe.
+
+**A banner and a cell want opposite things from a layout, so one of them is not a cell.** Section
+titles were clipped to the key column because a table cell is clipped to its column and there is no
+column span — and measuring widths over key rows only (right for the columns) shrank the column doing
+the clipping. Both constraints are real; the widget was wrong. Styled lines with hand-padded columns
+satisfy both.
+
+**Selection is an affordance, so it should exist only where there is something to select.** The pane
+had no cursor while nothing acted on a row; `p` arrived and it got one — and once the table grew
+section titles, per-section headers and spacers, the cursor had to step *key-to-key* rather than by row
+index. A cursor that can land on structure offers an action with nothing to act on.
+
+**Where a capability comes from the handle, derive it — do not add a flag.** Promotion writes, and a
+read-only handle has no writer lock, so there is no local implementation to call: `Backend::can_promote`
+is `matches!(self, Remote(_))` and MCP's `tools/list` drops write tools when `db.is_read_only()`. Both
+are structural facts rather than policy someone must remember to configure. The corollary is the error
+message: refuse up front and say *what would work* (`--url …`, "point the client at the process that
+writes"), not what the storage layer would have said.
+
+**Read-only is a property of a prefix, not of a route.** `/api/head` stays read-only and promotion went
+to `/admin/*` beside `flush` and `compact`. "One read-only prefix, one write prefix" is a rule a
+deployment can apply; "read-only except one route" is a rule someone gets wrong.
+
+**Send the whole set, not a delta**, for anything whose *order* is meaningful. Promotion is a list and
+its order is the column order: a delta would ask the server to guess placement, and two concurrent
+callers would each silently lose the other's change. And answer with the state now in effect rather
+than an echo — the daemon filters keys colliding with built-in column names, so request and result can
+differ.
+
+**Assert against the enumeration, not against today's members of it.** Adding a fifth screen (later
+reverted) broke two things: `focus_ring` hard-coded `Menu(0..3)`, and a nav test walked the screens by
+name. The tests written against `Screen::ORDER` caught their bug immediately; the one written against
+the names had to be edited. Same lesson in the ordering check: the attribute sections and the Overview
+gauges already agreed, but they are two independent lists in two crates, so agreement is now a test
+rather than a coincidence.
+
+**The standalone build is the one that tells the truth.** Third time this session that a Cargo feature
+broke a build I was not running — `cargo build --workspace` unifies features, so a crate that *needs* a
+feature compiles anyway as long as some sibling enables it. Every consumer now names `imbh/attrstats`
+explicitly rather than inheriting it, and `imbh-attrstats` carries `default = ["serde"]` so a
+standalone `cargo test -p imbh-attrstats` compiles the JSON view its tests assert on — the same
+arrangement as `imbh-storage`'s `search`.
+
+### Open
+
+Nothing committed. The branch still carries the earlier housekeeping work; the CHANGELOG entries are
+under `[Unreleased]`. Two UI details landed after this summary was written and have their own addenda
+below: a blank line between sections with the cursor skipping it, and a Tab stop per section. `examples/attr-stats` remains the only caller pointed at real data — the TODO
+item asking for that is now cheaper to satisfy, since the measurement can be read off a running daemon
+or the TUI without shipping a CLI to the machine holding the data.
+
+## Addendum: a Tab stop per section (2026-08-09)
+
+`Focus::AttrTable` became `Focus::AttrTable(usize)` — one stop per section rather than one for the
+whole table. The reason is the one that made the sections worth having in the first place: each
+section *is* a table, with its own totals and its own sigma, and a single stop made the third one
+reachable only by scrolling past every key of the first two.
+
+Three things follow, and each is the honest version of something that was previously implicit:
+
+- **The cursor belongs to a section**, so `attr_key_indices` takes one and `move_attr_cursor` stops at
+  that section's ends rather than walking into the next. Tab moves between sections; the arrows move
+  within one. Two motions, two keys, no overlap.
+- **Tab snaps the cursor into what it focused**, so the pane scrolls to the section the ring landed on
+  instead of leaving the highlight somewhere off screen. That is `focus_advance` calling
+  `snap_attr_cursor`, which is also what a fresh measurement calls — the same need, one implementation.
+- **A section index can outlive its measurement.** A refresh can return fewer sections (a table that
+  emptied out of the range), so `effective_focus` maps an out-of-range `AttrTable(n)` to `Primary`,
+  exactly as it already did for a stop on a pane that is not shown. Without that, Tab would hand the
+  cursor and `p` to a section that no longer exists.
+
+The pane title now names the focused section, because with several stops on one pane the border
+highlight alone no longer says *which*.
+
+A test fixture caught the shape change usefully: the promotion-refusal test built a table of one key
+row with no section, which used to work and now cannot — the cursor belongs to a section, so a table
+without one has no cursor. Shaping the fixture like a real pane (section, header, key) fixed it, and
+the failure was the design telling the test it had been under-specified all along.
+
+### Verified
+
+`fmt --all --check` clean; `clippy --workspace --all-targets -D warnings` clean; `imbh-tui` **160
+passing**, including one stop per section, every section's cursor staying inside it, Tab landing the
+cursor on a key, and a stale section index reading as `Primary`. Nothing committed.
+
+## Addendum: the section edge is a pause, not a wall (2026-08-09)
+
+The arrows now **hop** to the next section when the cursor is already at a section's edge, instead of
+stopping there. The previous entry argued for the opposite ("Tab is what moves between sections"), and
+that was wrong for a plain reason: it made the arrows unable to reach the pane's second table at all.
+A list should not have a dead end that a second key is the only way out of.
+
+The two motions now compose instead of competing — the arrows walk the whole pane top to bottom, Tab
+jumps a section at a time — and the focus follows the cursor across a boundary, so `p` and the pane
+title stay attached to the section actually being read.
+
+Two details worth their own lines:
+
+- **An overshoot is not a hop.** `PageDown` from the middle of a section lands on that section's last
+  key; only a press with nowhere left to go inside the section crosses. Clamping first and hopping
+  only when the clamp changed nothing is what gets both, and it is the behaviour every other list in
+  the program already has at *its* end.
+- **Empty sections are stepped over, not focused.** A stop whose cursor has nowhere to land would
+  swallow a keypress and read as the arrows having stopped working.
+
+### A test fixture that could not exercise the rule
+
+Writing the test found that `sealed()` produced scan units with a *single* attribute key, so "moving
+within a section" and "hopping between sections" were indistinguishable — every press was a hop. The
+fixture now ingests record attributes as well as resource ones. Worth noting as a pattern: a fixture
+minimal enough to be readable can be too minimal to tell two behaviours apart, and the test passes
+either way until someone asks it the right question.
+
+### Verified
+
+`fmt --all --check` clean; `clippy --workspace --all-targets -D warnings` clean; `imbh-tui` **160
+passing**, including a full walk down the pane asserting the visited rows are exactly the key rows in
+order, the same walk back up, the focus ending on the last section and then the first, and the
+overshoot stopping at a section end before crossing. Nothing committed.
+
+## Closing summary: what the attribute work became, and what the iteration taught (2026-08-09)
+
+The consolidation entry above was written mid-stream and its "Open" section is now stale. This closes
+the session: the final state, and the findings that only became visible once the UI work was done.
+
+### Final state
+
+Fifteen entries cover this session. What exists at the end of it:
+
+**A measurement, with five callers.** `crates/imbh-attrstats` holds sigma, the cardinality curve, run
+structure and the two verdicts; `examples/attr-stats` is ~120 lines of argument parsing over it;
+`Db::attribute_stats` is the facade method behind an off-by-default feature; `POST
+/api/head/attributes/stats` is the head operation; the TUI Overview is a second pane.
+
+**An action, with three callers.** `GET`/`POST /admin/promote` on `imbhd`, `p` on the TUI's attribute
+pane, and `set_promoted_attributes` over MCP. Reading a verdict and acting on it is one loop now,
+where before it was a report and a daemon restart with a different `DbBuilder::promote` list.
+
+| axis | before | after |
+|---|---|---|
+| `imbh` facade, unique crates (footprint gate) | 275 | **275** — unchanged, the feature is off |
+| `imbh` with `--features attrstats` | — | 276 (+1: the crate itself) |
+| `imbh-server` unique crates | 297 | **298** (+1) |
+| `imbhd` release binary | — | 33.4 MiB against a 42 MB target |
+| workspace tests | 668 | **697** (`imbh-tui` 146 → 160) |
+| MCP tools | 15 read-only | 18, of which 17 read-only |
+
+47 files, +6,007/−1,658. No third-party subtree enters anywhere.
+
+### The finding the UI rounds produced
+
+Eight user corrections landed on one pane, and in hindsight they are all the same correction:
+**folding a screen into a pane turns every implicit "there is only one of these" into a bug.** The
+codebase had exactly one time range, one focus stop per pane, one table per screen, one place a range
+form could drop from, one header that owned the range highlight. Each of those was true until this
+pane existed, and each failed in its own way:
+
+| implicit singular | how it surfaced |
+|---|---|
+| one time range | the attribute window followed the query window, so one of the two was always wrong |
+| one place a form drops from | the range form appeared under the header's *query*-range indicator |
+| one range highlight | the header lit up for a form that would not touch it |
+| one focus stop per pane | Enter meant "change the range" while the cursor sat on a row |
+| one table per pane | a single Tab stop made the third section reachable only by scrolling |
+| one kind of row | `p` had to guess whether the cursor was on a key or on a title |
+| one column layout | a section title was clipped to the key column |
+| one list, contiguous | the cursor could land on structure, and then stopped dead at section edges |
+
+None of these were visible from the code — every one arrived as "this looks wrong" from someone
+running it. That is worth recording plainly: **a pane that is genuinely new invalidates assumptions
+the rest of the UI never had to name, and the only reliable detector is a person using it.**
+
+### Two reversals, recorded as reversals
+
+Twice I wrote a justification and then had to undo it, and both are more useful as pairs than as
+conclusions:
+
+- **"Selection is a false affordance here"** → the pane had no cursor because nothing acted on a row.
+  Correct at the time; wrong the moment `p` existed. The rule survives, the conclusion did not.
+- **"Tab is what moves between sections"** → written one entry before the arrows had to hop at section
+  edges. The reasoning was tidy and the result was a dead end: a list whose only exit is a *different*
+  key. Tidy separation of concerns is not worth a dead end.
+
+The general form: a UI decision justified by a property of *today's* feature set needs re-deriving
+when the feature set moves, and the justification is what tells you whether it still holds.
+
+### Method notes
+
+**A fixture minimal enough to read can be too minimal to discriminate.** `sealed()` produced scan
+units with a single attribute key, so "move within a section" and "hop between sections" were
+indistinguishable — every press was a hop, and the test passed either way. It only failed once the
+test asked the right question. Minimal fixtures are good; minimal fixtures that collapse two
+behaviours into one are a silent gap.
+
+**Assert against the enumeration, not today's members of it.** Two tests written against
+`Screen::ORDER` caught their own bug when a screen was added; the one written against screen names had
+to be edited. Same shape held for section ordering: the attribute sections and the Overview gauges
+already agreed, but they are two independent lists in two crates, so agreement is now a test.
+
+**The standalone build tells the truth.** Three feature breakages this session, all the same shape:
+`cargo build --workspace` unifies features, so a crate that *needs* one compiles as long as some
+sibling enables it. Every consumer now names `imbh/attrstats` explicitly, and `imbh-attrstats` carries
+`default = ["serde"]` so its own tests compile standalone — the arrangement `imbh-storage`'s `search`
+already used.
+
+### Open
+
+Nothing committed; the branch still carries the earlier housekeeping work and the CHANGELOG entries
+sit under `[Unreleased]`. The one TODO this makes cheaper is pointing the measurement at production
+data: it can now be read off a running daemon (`POST /api/head/attributes/stats`), off the TUI, or by
+an agent over MCP, so no CLI has to be shipped to the machine holding the data and no database
+directory has to leave it.
+
+## Queued housekeeping on `imbhd`: the first endpoint whose answer is a handle (2026-08-09)
+
+`POST /admin/housekeeping` returns `202` with a job id; `GET /admin/housekeeping/<id>` reports the
+job; `GET /admin/housekeeping` lists the retained ones. A pass is seal → commit pending rewrites →
+retention (`Db::maintain`), plus `Db::compact` under `{"compact": true}`. ARCHITECTURE §10.16.2.
+
+### Why this one and not `/admin/flush`
+
+Every other endpoint on this server answers a question whose cost follows the **answer**; a
+housekeeping pass costs the **corpus**. Over a long retention window compaction runs for minutes,
+which outlasts what a proxy will hold a connection open for and is far longer than a caller should
+wait to learn its request was *accepted*. `/admin/flush` and `/admin/compact` stay synchronous
+deliberately — they are the small immediate versions and existing tooling drives them that way. Making
+them all async would have been symmetry for its own sake.
+
+The consequence worth stating: **a `200` here would be a lie.** The work has not run when the response
+is written, so the status has to be `202` and the body has to be a handle rather than a report.
+
+### Design decisions, and what each is defending against
+
+- **One permit for all passes.** Two concurrent passes over one database contend for the same disk
+  and, worse, can each seal or compact segments the other had planned around. Serializing them is what
+  makes "housekeeping is running" a state the database is in rather than a race to describe. It also
+  means the queue is a queue: a second submission is *accepted* and waits, which is the behaviour a
+  caller on a timer needs.
+- **Maintenance before compaction inside a pass.** `maintain` commits pending rewrites and applies
+  retention, so compaction afterwards works on the segment set that survives instead of merging
+  segments retention is about to drop. Same ordering argument as `maintain`'s own internals.
+- **Ids carry the process's start time.** Otherwise a restart resets a counter and an id from the old
+  process describes somebody else's job. Now it is a `404` — and the message says ids do not survive a
+  restart, because "not found" alone would read as "your job vanished".
+- **Nothing is resumed across a restart, by design.** Seal, commit and retention are each individually
+  crash-safe (§7), so an interrupted pass leaves no partial state to resume and the honest answer is
+  "submit it again". A durable queue would add a recovery path for a problem that does not exist.
+- **History is bounded, and eviction is oldest-*finished*-first.** A daemon running housekeeping on a
+  timer for a year must not accumulate a year of records; but dropping a queued or running job would
+  leave a client polling an id that answers `404` while the work it names is still happening. Those
+  two requirements together are what makes the eviction rule specific rather than "drop the oldest".
+- **Refused on a read-only handle.** A reader holds no writer lock, so the pass could never do
+  anything: `400` with the reason beats a job that exists only to fail. Third instance of the same
+  rule this session, after the promoted-set write and the TUI's `p`.
+
+### The state change that was not free
+
+The router had no state but `Arc<Db>`, and the queue has to live somewhere. It went into an
+`AppState { db, jobs }` rather than a process global, because the queue's whole job is to serialize
+passes over *one* database — a global would serialize them across every mounted router while handing
+out ids that mean nothing to the others.
+
+That rippled once: `head::routes()` returned `Router<Arc<Db>>` and a `merge` needs both halves to
+agree on the state type. Making it generic over `S where Arc<Db>: FromRef<S>` is the idiomatic axum
+answer and left every handler in it unchanged — they still ask for `State<Arc<Db>>`.
+
+It also exposed a **latent trap in the test helper**: `imbh_server::route` builds a fresh router per
+call, so a job submitted through one call cannot be polled through the next — the second call's
+registry never issued that id. Harmless while the server was stateless, silently confusing now. It is
+documented on `route` itself, and the e2e test uses a real `serve()` for the polling sequence.
+
+### Verified
+
+`fmt --all --check` clean; `clippy --workspace --all-targets -D warnings` clean; `imbh-server` **67
+passing** — the submit/poll round trip over a real socket (`202`, a non-terminal state at submission,
+a terminal one after polling, a report carrying both halves, timestamps that bracket the work), the
+listing, a `404` for an unissued id, a `400` for a malformed body, an empty body meaning the defaults,
+the read-only refusal queueing nothing, and the registry's own bookkeeping (bounded history, live jobs
+never evicted, unique process-scoped ids). Nothing committed.
+
+## Addendum: `max_jobs` on the housekeeping endpoint, and the bound it needed underneath (2026-08-09)
+
+The endpoint had no equivalent of `imbh-housekeeper --max-jobs`, and the reason is that
+**`Db::compact()` had no bound to expose**: it rewrites every eligible partition across every table in
+one call. So a submitted pass could run for as long as the corpus takes, and the only choice was that
+or not compacting.
+
+`Storage::compact_bounded(max_partitions)` / `Db::compact_bounded` are the missing half; `compact()`
+is now `compact_bounded(usize::MAX)`, so nothing existing changed. `{"max_jobs": N}` on the endpoint
+caps the pass.
+
+### Partitions, not segments
+
+The bound counts **partitions rewritten**, because a partition is the unit compaction works in — it
+reads a day's segments, concatenates, sorts, and writes one. A segment-count bound would have to stop
+*inside* a partition, which is exactly the state the design avoids: the deferred-delete ordering in
+§7 is what makes a compaction pass crash-safe, and a half-merged partition is not a state the manifest
+can describe.
+
+That is also why partitions past the bound are passed through **untouched** rather than partially
+processed. A capped pass is a *slice*, not a partial one: the segments it did not reach are still
+listed, still queryable, still exactly as they were. There is nothing to resume, so resuming is
+submitting again — and a pass that rewrites nothing is how a drain loop learns it is done.
+
+### Two small decisions that keep the API honest
+
+- **`compaction_complete` rather than a silent truncation.** A capped pass and a pass that finished
+  are indistinguishable from the counters alone, and the difference decides whether the caller loops.
+  Derived from whether the pass reached its own cap, so it cannot drift from the bound that produced
+  it.
+- **`max_jobs: 0` is a `400`.** It would otherwise mean "compact, but do no compaction" — which
+  `compact: false` already says — and the job would report success for having done nothing under a
+  name that promised otherwise.
+
+### Not done, and worth flagging
+
+There is a *second* thing `max_jobs` could have meant: a cap on the **queue depth**. Nothing today
+stops a client submitting a thousand passes, and since passes are serialized and housekeeping is
+close to idempotent, everything after the second is waste. Coalescing ("a pass is already queued —
+here is its id") is probably the better answer than a cap, and both are a different feature from the
+one asked for. Recorded rather than guessed at.
+
+### A pre-existing breakage this surfaced
+
+`cargo clippy -p imbh-storage --no-default-features --all-targets` does not build, and did not before
+this change either: `pending.rs`'s test module calls `write`, which is `#[cfg(feature = "compaction")]`
+while the tests are not, and `lib.rs`'s test module names `ParquetRecordBatchReaderBuilder`, whose
+import is feature-gated. CI never runs that combination — it builds `-p imbh --no-default-features` and
+`cargo test -p imbh-storage` with defaults — so nothing caught it.
+
+The `pending.rs` half is gated now (its tests write a record in order to read one back, so they need
+the feature that produces one). The `lib.rs` half is left alone: it is a test module this change does
+not touch, and fixing it properly means auditing which of its tests need which feature, which is a
+different task from the one asked for. Every *library* configuration builds clean, which is what a
+consumer sees.
+
+### Verified
+
+`fmt --all --check` clean; `clippy --workspace --all-targets -D warnings` clean; **704 passing**
+overall. New coverage: at the facade, three day-partitions with two segments each, asserting a bound
+of one rewrites exactly one partition, loses no rows, leaves the rest intact, and drains over repeated
+calls; through the endpoint, that the bound is reported back, `compaction_complete` distinguishes a
+capped pass from a finished one, and zero is refused. Nothing committed.
+
+## Coalescing, and housekeeping over MCP (2026-08-09)
+
+Two additions to the queued endpoint, and one finding about the daemon that came out of a question
+while doing them.
+
+### Duplicate submissions join the queued job
+
+A submission matching a job still **queued** answers `200` with that job's id and
+`"coalesced": true`, rather than `202` and a second pass. The motivating case is a caller on a timer:
+passes are serialized, so a pile-up is pure wait, and every pass after the first does nothing the one
+before it did not.
+
+The line is drawn at the queue, and that is the whole design:
+
+- **A queued job has not looked at the database yet**, so it will see everything a submission arriving
+  now wants covered. Joining it is exact, not approximate.
+- **A running job snapshotted before this submission arrived** and may already be past the segments
+  the caller cares about. Joining it would answer a request the pass cannot have covered — so a
+  running job is deliberately not a match, and neither is a finished one.
+
+Matching is an **exact parameter match** rather than a subsumption test. A queued `compact: true` pass
+would in fact cover a new `compact: false` request, but that rule has to be explained every time
+someone reads back a job id they did not expect, and the case that motivates coalescing is the *same*
+request repeatedly. Predictable beats clever.
+
+The search and the insert happen under one lock acquisition, because two submissions arriving together
+must not both find nothing and both queue a pass — which is precisely the pile-up being prevented.
+
+`coalesced` rides in the response rather than on `Job`: it describes *this submission*, not the job.
+
+### MCP drives the same queue, not one of its own
+
+`run_housekeeping` and `housekeeping_status` are the tools. The interesting part is placement: the
+queue is server wiring, and `imbh-mcp` sits **below** `imbh-server` so the stdio transport can share
+the tool surface. So the host hands its queue in — `imbh_mcp::Housekeeping`, a three-method sync trait,
+implemented by `imbh-server`'s `AppState` — and `handle_with` takes it. `handle` keeps its old
+signature and passes `None`.
+
+That falls straight into the rule the surface already had: **a tool is offered only where it can
+work.** `visible()` already dropped write tools on a read-only handle; it now also drops
+queue-dependent tools when the host runs no queue. `imbh-tui --mcp-stdio` therefore advertises
+neither, without a flag anyone has to set.
+
+The alternative — MCP running housekeeping synchronously — was rejected for the reason the endpoint
+exists: a pass costs the corpus, and a tool call that waits for one reintroduces exactly the timeout
+problem, this time against a model's client rather than a proxy.
+
+### The trap, twice
+
+The MCP e2e test failed on the first run: `call_tool` builds a fresh `app(db)` per call, so each call
+got a fresh queue and the second could not find the first's job. This is the same hazard already
+documented on `imbh_server::route` — and it had been harmless for as long as the server was stateless.
+Fixed by holding one `Router` and cloning it per call (clones share the state `Arc`). Worth the note:
+**adding state to something previously stateless invalidates every helper that quietly rebuilds it**,
+and the failure mode is a 404 rather than a compile error.
+
+### Finding: `Db::maintain()` is never called by the running daemon
+
+Asked in passing, and the answer is more interesting than expected. `imbhd` configures
+`Maintenance::Background(interval)`, whose loop (`FlushScheduler::advance`) calls the *storage*
+primitives directly — `seal()`, `sync_wal()`, `retain()`. It does **not** call `Db::maintain()`, and
+in particular it never calls `commit_pending()`.
+
+So before this endpoint, the only in-process triggers for `commit_pending` were `open()` and
+`close()`. A long-running `imbhd` with an external `imbh-housekeeper` preparing rewrites would apply
+them **only at restart** — the prepare/commit handoff of §7.2 works on a daemon that restarts and not
+on one that stays up. The new endpoint is the first thing that closes that loop while running.
+
+That is arguably a gap in the scheduler rather than a feature of the endpoint: `advance`'s retention
+step could call `commit_pending()` alongside `retain()`. It changes engine behaviour for every
+embedder on `Maintenance::Background`, so it is recorded here and left for a decision rather than
+taken unilaterally.
+
+### Verified
+
+`fmt --all --check` clean; `clippy --workspace --all-targets -D warnings` clean; **709 passing**. New
+coverage: coalescing at the registry (queued joins, running/finished/different-parameters do not, and
+the search-and-insert is one critical section), coalescing over HTTP (a burst of identical submissions
+where every one is accepted and far fewer passes exist), and over MCP the submit → poll → list round
+trip against one router, an unknown id explaining itself, `max_jobs: 0` refused, and a host with no
+queue advertising neither tool. Nothing committed.
+
+## The background loop commits pending rewrites — and why it does not call `maintain()` (2026-08-09)
+
+`FlushScheduler::advance` now calls `commit_pending()` on the maintenance interval, immediately before
+`retain()`. That closes the gap the previous entry recorded: with only `open()`/`close()` pickup, a
+long-running `imbhd` applied an external preparer's rewrites **at restart and at no other time**, so
+the preparer kept re-preparing partitions that never landed — which is precisely the failure the
+open/close pickup was added to prevent, displaced from "a host that never calls `maintain()`" to "a
+host that never restarts".
+
+### Why not just call `maintain()` from the loop
+
+It was the obvious suggestion and it is wrong for one specific reason: **`maintain()` seals
+unconditionally**, and deciding whether to seal is the loop's entire job. `FlushPolicy` exists to
+answer that — by interval, buffer bytes, row count, WAL bytes, or idle time — and `manual` means "seal
+only on `/admin/flush` and shutdown". A loop that called `maintain()` every tick would seal every
+tick, producing a tiny segment per second and breaking the one policy whose contract is *not* to.
+
+So the loop performs `maintain()`'s **order** rather than calling it: seal (policy-decided), commit,
+retain. That is one ordering rule in two places, which is a real cost — but the alternative is either
+breaking the flush policy or splitting `maintain()` into a sealless half whose only caller would be
+this loop.
+
+The seal/commit order turns out not to be load-bearing either way: sealing appends a segment and never
+removes one, so it cannot invalidate a record, and a record's validation is against the input segments
+and the promoted set, neither of which a seal touches. **Commit before retention is** load-bearing,
+for the reason `maintain()` documents — retention drops segments, and a rewrite whose inputs it is
+about to drop should land first. That is the constraint the placement honours.
+
+### The test is the interesting part
+
+Asserting "the loop did it" means asserting that *nobody else* did. The test prepares a rewrite from
+outside against a live writer, then calls nothing at all — no `maintain()`, no `commit_pending()`, no
+`flush()` — and waits for the segment count to drop. `FlushPolicy::manual()` is what makes it precise:
+the loop's seal step can never fire, so the only thing that can change the manifest is the commit under
+test.
+
+### Verified
+
+`fmt --all --check` clean; `clippy --workspace --all-targets -D warnings` clean; **710 passing**.
+Nothing committed.
+
+## Closing summary: the housekeeping surface, and what asking "what does it really do" was worth (2026-08-09)
+
+Five entries above cover the second half of this session — the `imbhd` housekeeping work that grew out
+of the attribute/promotion arc. This closes it.
+
+### What shipped
+
+| Surface | What it does |
+|---|---|
+| `POST /admin/housekeeping` | queue a pass; `202` + a job id, never the outcome |
+| `GET /admin/housekeeping/<id>` · `GET /admin/housekeeping` | poll one job; list the retained ones |
+| `{"compact": true, "max_jobs": N}` | compaction, bounded to N partitions |
+| `run_housekeeping` · `housekeeping_status` | the same queue, over MCP |
+| `Db::compact_bounded` / `Storage::compact_bounded` | the bound the endpoint needed underneath |
+| the background maintenance loop | now commits prepared rewrites, before retention |
+
+Tests: **704 → 711** over this half (668 at the session's start). 53 files changed overall,
++7,971/−1,675. Twenty MCP tools now, eighteen of them read-only.
+
+### Findings
+
+**A response status has to describe what happened, not what was asked.** The work has not run when a
+submission is answered, so `202` and a *handle* — a `200` with a report would be a lie. The same rule
+produced the `200` on a coalesced submission (nothing was created) and the `400` on a read-only
+handle (nothing could be). Each time the status fell out of the truth rather than out of a convention.
+
+**Capability follows the handle.** Fourth and fifth instances this session: the housekeeping endpoint
+refuses a read-only handle, and MCP hides queue-dependent tools from a host that runs no queue. Both
+are structural facts — a reader holds no writer lock; a host without a queue has nothing for the tool
+to call — rather than policy someone must remember to configure. The corollary is the error message:
+refuse up front and say *what would work*, never surface the layer below's complaint.
+
+**Bound the unit the work is actually done in.** `max_jobs` counts **partitions**, not segments,
+because a partition is what compaction reads, sorts and writes as one. A segment bound would have to
+stop *inside* a partition, and a half-merged partition is not a state the manifest can describe. That
+also made "capped" mean *slice*, not *partial*: everything past the bound is untouched, so there is
+nothing to resume and resuming is submitting again.
+
+**Coalescing's whole design is where the line is drawn.** A **queued** job has not looked at the
+database, so it will cover a request arriving now; a **running** one snapshotted before that request
+existed and may already be past what it wants. So queued coalesces and running does not — and matching
+is an exact parameter match rather than a subsumption test, because a rule that has to be explained
+every time someone reads back an unexpected job id is a worse rule than one they can predict.
+
+**One ordering rule in two places beat the alternatives.** The maintenance loop performs `maintain()`'s
+order — seal, commit, retain — rather than calling it, because `maintain()` seals *unconditionally*
+and deciding whether to seal is the loop's entire job (`FlushPolicy::manual` means "seal only on
+`/admin/flush` and shutdown"). Duplication is a real cost; breaking the flush policy, or splitting
+`maintain()` into a sealless half whose only caller is this loop, were worse.
+
+**Adding state invalidates every helper that quietly rebuilt it.** `imbh_server::route` and the MCP
+test's `call_tool` both construct a fresh router per call. Harmless for as long as the server was
+stateless; the moment a queue lived in router state, a job submitted through one call could not be
+polled through the next — and the failure mode is a `404`, not a compile error. Documented on `route`,
+and the tests now hold one router.
+
+### The finding that came from a question, not from code
+
+Two exchanges did more than any refactor here.
+
+**"I should've asked what `commit_pending()` really does."** It does no rewriting: it validates a
+record (inputs still present, promote set unchanged, output digest matches) and swaps an
+already-produced file into the manifest. The rewrite — including the projection of promoted columns —
+happens in `compact_partition`/`backfill_promoted`, in-process or in a preparer. Which means moving
+the commit earlier in the loop would have changed **nothing** for a daemon with no preparer running:
+`commit_pending` finds an empty directory forever. A scheduling change aimed at the wrong mechanism.
+
+**"We should want to see the attributes promoted in the next seal."** I believed it already worked and
+could have said so. Writing the test instead was the right call and it passed first run — a segment
+sealed after `set_promote` carries the column, the one before it does not, and both answer the same
+query through the JSON fallback. The belief was right; the *evidence* is now a regression guard that
+did not exist, since the existing promotion tests covered the barrier and the compaction projection but
+not the seal path.
+
+The transferable form: **"X should happen sooner" is answerable only once you know which mechanism
+produces X.** Promotion reaches new rows through append-time encoding (immediate, at the next seal) and
+reaches old segments through a rewrite (needs compaction or a preparer). Those are different clocks,
+and the fix for one does nothing for the other.
+
+### Open
+
+Nothing committed. Still unbuilt, and recorded rather than guessed at: a **queue-depth** bound
+(coalescing removes the common pile-up, but nothing stops a client submitting a thousand *differing*
+requests), and convergence of already-sealed segments at seal time rather than only in a rewrite pass —
+which would turn a bounded buffer write into an unbounded one, so it needs a decision rather than an
+implementation. `cargo clippy -p imbh-storage --no-default-features --all-targets` remains broken on a
+test module this work did not touch (pre-existing; every *library* configuration is clean).

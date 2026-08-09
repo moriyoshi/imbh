@@ -589,9 +589,23 @@ Two subtleties the implementation depends on:
   digest check would reject the record) but would lose a preparer's work to every writer restart.
 
 **Pickup.** Records are committed at `maintain()`, at `open()` (after the promoted set is applied,
-since records validate against it, and after `cleanup_orphans`) and at `close()`. The default
-`Maintenance::Manual` means a host may never call `maintain()`, and without the open/close pickup a
-preparer would re-prepare the same partitions forever because nothing it produced ever landed.
+since records validate against it, and after `cleanup_orphans`), at `close()`, and — for a host that
+runs one — on each tick of the **background maintenance loop**, immediately before retention. The
+default `Maintenance::Manual` means a host may never call `maintain()`, and without the open/close
+pickup a preparer would re-prepare the same partitions forever because nothing it produced ever
+landed.
+
+The loop's pickup is what makes the handoff work on a daemon that **stays up**. With only open/close,
+a long-running writer applied an external preparer's rewrites at restart and at no other time, so the
+preparer kept re-preparing partitions that never landed — the exact failure the open/close pickup was
+added to prevent, displaced from "a host that never calls `maintain()`" to "a host that never
+restarts". The loop cannot simply *call* `maintain()` instead: `maintain()` seals unconditionally,
+while deciding whether to seal is the loop's entire job (`FlushPolicy`, including `manual`, which
+means "seal only on `/admin/flush` and shutdown"). So the loop performs the same order —
+seal, commit, retain — with the seal being the policy's decision rather than an unconditional one.
+Commit sits before retention for the reason `maintain()` gives: a rewrite whose inputs retention is
+about to drop should land first. The cost is one `read_dir` of a usually-empty directory per
+maintenance interval, on a thread that woke to do I/O anyway.
 
 **One job, two triggers.** Merging (`|inputs| > 1`) and converging (`|inputs| == 1`, rewritten because
 its schema lags the promoted set) are the *same* record shape and the same rewrite. They are
@@ -1314,7 +1328,8 @@ result — see §10.16 and `docs/EMBEDDING.md`.
 `imbh-server` / `imbhd` is a worked example, not the product: an HTTP/1.1 server on **axum over
 hyper** exposing OTLP/HTTP ingest on `/v1/{logs,traces,metrics}` (protobuf, `Content-Encoding: gzip`
 accepted), a SQL query endpoint `POST /api/query` (JSON rows or Arrow IPC out), an MCP endpoint
-`POST /mcp` (§10.16.1), `GET /stats`, admin `POST /admin/{flush,compact}`, and `GET /health`.
+`POST /mcp` (§10.16.1), `GET /stats`, admin `POST /admin/{flush,compact}`, `GET`/`POST
+/admin/promote` (§6.1), queued housekeeping at `/admin/housekeeping` (§10.16.2), and `GET /health`.
 
 **Why a framework here does not cost the footprint claim.** The §11 crate budget is written against
 the *library* graph, and `scripts/footprint-gate.sh` measures exactly that (`cargo tree -p imbh`).
@@ -1394,11 +1409,28 @@ query is blocking parquet/tantivy I/O from start to finish, so concurrent reques
 the same disk rather than overlap, and the blocking `std::io` handles are sound precisely because
 nothing else shares that runtime.
 
-The 15 tools are **read-only** wrappers over §10.5–§10.9: `db_stats`, `list_attribute_keys` /
+The tools are wrappers over §10.5–§10.9: `db_stats`, `list_attribute_keys` /
 `list_attribute_values`, `search_logs` / `count_logs` / `log_volume`, `search_traces` / `get_trace` /
 `span_metrics`, `list_metrics` / `metric_series` / `query_metric_range` / `query_metric_instant` /
-`histogram_quantile`, and `query_sql`. Nothing ingests, flushes, compacts, or applies retention, so
-the endpoint is safe to hand an agent that is only meant to *look*. Every tool answers with one JSON
+`histogram_quantile`, `query_sql`, and — closing the loop on the promoted set — `attribute_stats`
+(§10.20), `list_promoted_attributes`, `set_promoted_attributes`, plus `run_housekeeping` /
+`housekeeping_status` over the host's queue (§10.16.2).
+
+**Eighteen of the twenty are read-only**; nothing ingests, flushes, compacts, or applies retention.
+`set_promoted_attributes` and `run_housekeeping` are the exceptions.
+`set_promoted_attributes` it seals the buffer and
+changes the schema every segment written afterwards carries (§6.1). It is marked on the tool and
+**hidden from `tools/list` on a read-only handle** — a reader holds no writer lock, so the action has
+nothing to call, and an agent should never be offered one that cannot succeed. That makes the
+capability follow the handle rather than a flag someone has to remember to set; a deployment serving
+`/mcp` from the *writer* is granting an agent that action and should gate the endpoint as it gates
+`/admin/*`. `run_housekeeping` writes in the same sense and is gated twice over: it needs a writable
+handle *and* a host that runs a queue, and it answers a **job id** rather than an outcome, so an agent
+polls `housekeeping_status` exactly as an operator polls the endpoint.
+
+`attribute_stats` is the one read that **scans** rather than queries, so its window
+defaults to every sealed segment (a `promote` list is chosen from the whole corpus, not a recent
+slice) and its arguments exist to bound that cost on a large database. Every tool answers with one JSON
 document in a `text` content block; argument and query failures come back as tool-execution errors
 (`isError: true`) rather than JSON-RPC errors, which is what lets a model self-correct rather than
 see a transport failure. Time windows default to a 1h look-back with `since` / explicit
@@ -1584,6 +1616,70 @@ operator guide is `docs/DOCKER_LOG_DRIVER.md`.
 > language are not worth the footprint), and follow mode advances by timestamp, so two records sharing
 > one nanosecond would be reported once.
 
+#### 10.16.2 Queued housekeeping
+
+`POST /admin/housekeeping` answers **`202` with a job id**, not the outcome; `GET
+/admin/housekeeping/<id>` reports the job, and `GET /admin/housekeeping` lists the retained ones.
+One pass is seal → commit pending rewrites → apply retention (`Db::maintain`), plus compaction when
+the body says `{"compact": true}`.
+
+**`max_jobs` bounds the work of one pass**, the way `imbh-housekeeper --max-jobs` bounds a preparer's:
+it caps the **partitions** compaction rewrites (`Db::compact_bounded`), so a corpus too large to
+compact in one call is drained a slice at a time instead of forcing a choice between an hour-long pass
+and never compacting. Partitions past the bound are left exactly as they were — untouched, still
+listed, still queryable — so a capped pass is a *slice*, not a partial one, and there is nothing to
+resume: submit again. The report carries `compaction_complete`, and a pass that rewrites nothing is
+what a drain loop stops on. Zero is refused rather than accepted: "compact nothing" is what
+`compact: false` already says, and a job named after compaction that does none of it would be lying
+about what it did.
+
+**Why this one is submitted rather than performed.** Every other endpoint here answers a question
+whose cost follows the *answer*; a housekeeping pass costs the **corpus**. On a database with a long
+retention window a compaction pass runs for minutes — longer than a proxy holds a connection open,
+and far longer than a caller should wait to learn its request was accepted. `/admin/flush` and
+`/admin/compact` stay synchronous because they are the small, immediate versions and existing tooling
+drives them that way; this is the one that had to grow a handle.
+
+**Duplicate submissions coalesce.** A submission matching a job still *queued* answers `200` with
+that job's id and `"coalesced": true`, instead of `201`-style `202` and a second pass. A caller on a
+timer, or two operators reaching for the same button, would otherwise queue passes that each do
+nothing the one before them did not — and since passes are serialized, the pile-up is pure wait.
+Coalescing stops at the queue: a **running** job is not a match, because it snapshotted the database
+before this submission arrived and may already be past the segments the caller wants covered; a queued
+one has not looked yet. Matching is an exact parameter match rather than a subsumption test — a queued
+`compact: true` pass would in fact cover a new `compact: false` request, but that rule has to be
+explained every time someone reads back a job id they did not expect, while an exact match is the one
+a caller can predict and it covers the case that motivates coalescing at all.
+
+**One at a time.** All jobs take a single permit, so a second submission waits rather than running
+beside the first. Two concurrent passes over one database would contend for the same disk and could
+each seal or compact segments the other had planned around; serializing them is what makes
+"housekeeping is running" a state the database is in rather than a race to describe. Maintenance runs
+before compaction within a pass for the same class of reason — it commits pending rewrites and applies
+retention, so compaction then works on the segment set that survives instead of merging segments
+retention is about to drop.
+
+**The registry is in memory, and says so.** A job id carries the registry's creation time, so an id
+from a previous `imbhd` answers `404` rather than colliding with a fresh counter and describing
+somebody else's job. Nothing is resumed across a restart, and nothing needs to be: seal, commit and
+retention are each individually crash-safe (§7), so the honest answer is "submit it again". History is
+bounded (the last 32 records), evicting oldest-*finished*-first so a queued or running job is never
+dropped out from under a client polling it.
+
+**Refused where it could not run.** A read-only handle holds no writer lock, so a pass could never do
+anything: the submission is a `400` naming the reason rather than a job that exists only to fail —
+the same rule the promoted-set write and the TUI's `p` follow.
+
+**Over MCP too.** `run_housekeeping` and `housekeeping_status` (§10.16.1) drive the *same* queue, so
+an agent and an operator see one set of passes rather than two. The queue is server wiring and
+`imbh-mcp` sits below the server, so the host hands it in as a `Housekeeping` capability; a host that
+runs none — `imbh-tui --mcp-stdio` — simply does not offer those tools, the same rule the write tools
+follow.
+
+The queue lives in the router's state, not in a process global, so two mounted routers over two
+databases keep two queues. That is also why `imbh_server::route` — which builds a fresh router per
+call — cannot carry a job between calls, and says so.
+
 ### 10.17 Query-binding surface (`proto` feature)
 
 The scaffolding for out-of-process language bindings (a Go binding is the motivating case), gated
@@ -1721,11 +1817,11 @@ trace-window narrowing all happen in the same code either way, so the two modes 
 same question differently. `crates/imbh-server/tests/head_e2e.rs` asserts exactly that, operation by
 operation, over a real loopback socket.
 
-The twelve operations are the ones a head cannot synthesize from anything else `imbhd` serves:
+The thirteen operations are the ones a head cannot synthesize from anything else `imbhd` serves:
 `stats`, `metrics/catalog`, `metrics/dimensions`, `metrics/promql`, `metrics/exemplars`,
 `traces/search`, `traces/get`, `logs/query`, `logs/volume`, `logs/logql`, `attributes/keys`,
-`attributes/values`. Four of those have no counterpart anywhere else in the server: nothing else
-**evaluates** PromQL, LogQL, or TraceQL (`query_metric_range`/`search_traces` are the *typed-builder*
+`attributes/values`, `attributes/stats`. Four of those have no counterpart anywhere else in the
+server: nothing else **evaluates** PromQL, LogQL, or TraceQL (`query_metric_range`/`search_traces` are the *typed-builder*
 path — they cannot express `sum by (svc) (rate(x[5m]))`), and nothing else surfaces exemplars.
 `logs/query` additionally carries the `PageCursor` and span-id correlation that the viewer's paging
 and trace drill-down need.
@@ -1737,6 +1833,38 @@ and evaluating a bare selector to read its labels back — which is how `imbh-tu
 to do it — is impossible for a cumulative histogram, whose buckets PromQL reaches only through
 `histogram_quantile(…)`. Reading the tables is kind-agnostic, exact, independent of the picker's time
 range, and unbounded by any evaluation cap.
+
+`attributes/stats` is the one operation that **scans** rather than queries (§10.20): it reads the
+attribute columns of every sealed segment in range, so its cost follows the corpus rather than the
+answer. Three consequences shape the wiring. Its request body *is* `imbh_attrstats::Options` — the
+same value a local caller passes to `Db::attribute_stats`, so the two modes measure the same thing
+under the same caps rather than through a wire type that describes them approximately. Its response
+is the whole `Report`, losslessly, because a head does its own ranking over it. And `imbhd` runs it
+under `offload` like every other operation, which keeps a multi-second scan on a blocking thread
+instead of a connection's runtime worker; the client sets only a *connect* timeout, so an accepted
+request waits as long as the scan takes. A head is expected to send a `range` — that is what bounds
+the work — and to drive it from a task it can abandon rather than from a redraw path.
+
+**Changing the promoted set is not a head operation.** `GET`/`POST /admin/promote` reads and replaces
+the promoted attribute keys (§6.1), and it lives on `imbhd`'s `/admin/*` surface beside `flush` and
+`compact` rather than under this prefix, because it **writes**: `Db::set_promote` seals the buffer so
+no batch straddles the change, and every segment sealed afterwards carries the new column set. Keeping
+it out of `/api/head` is what lets a deployment gate the read-only surface and the write surface
+separately — one prefix each — instead of having to pick a single write out of a prefix documented as
+read-only. `imbh_head::client::HeadClient` carries the two methods anyway, since the transport is the
+same and reimplementing base-URL parsing and error mapping beside it would be worse; the crate docs
+name it as the one exception.
+
+The body is the **whole set**, not a delta. Promotion is a list whose order is the column order, so a
+delta would ask the server to guess placement, and two concurrent callers would each silently lose the
+other's change. The response is the set now in effect — the daemon filters keys colliding with a
+built-in column name at schema construction, so what was asked for and what is in force can differ,
+and a caller that assumed otherwise would show a key as promoted that is not.
+
+Only a writer can serve it. A head reading a directory itself (`imbh-tui <dir>`, a `Db::open_read_only`
+view) holds no writer lock and refuses every write by construction, so the TUI offers promotion only
+in `--url` mode — not as a permission check bolted onto a UI, but because there is no local
+implementation for it to call.
 
 **Why not `/mcp`.** The MCP endpoint (§10.16.1) answers the same database for an *agent*: its tools
 are shaped for a model (`since` windows, prose descriptions, one JSON document per call) and are
@@ -1793,6 +1921,59 @@ alternative was a hand-written HTTP client in a terminal program.
 
 Read-only throughout: nothing below `/api/head` ingests, flushes, compacts, or applies retention.
 Like the rest of `imbhd` it is unauthenticated, so a real deployment gates the prefix.
+
+### 10.20 Attribute statistics (`imbh-attrstats`)
+
+`promote = [...]` (§6.1) is a hand-authored list, and picking it needs knowledge of the data that no
+part of the engine had. `imbh-attrstats` is that knowledge, measured: for every attribute key, how
+many distinct values it has, how much of that value space lives inside a single segment, how the
+count grows with the query window, and what a promoted column would cost per row.
+
+**Sigma is the number.** For one `(key, value)` pair it is the fraction of a table's segments holding
+at least one matching row; a segment-granularity index prunes `1 - sigma`. Sigma near 1 (`env`, a
+label every segment carries) means such an index buys nothing; sigma near `1/N` (a trace id, a
+short-lived pod name) means it prunes nearly everything. Sigma answers that at exactly one
+granularity — the segment — but the same key can be localized against a day and interleaved against a
+minute, so cardinality is reported as a **curve** `C(w)` over a ladder of window widths. Flat means
+interleaved (nothing prunes at any scale, and a promoted column is the only lever); rising means
+localized, and the width at which it flattens is the horizon beyond which pruning stops paying.
+
+**Cost is two terms, not cardinality.** A promoted column is a Parquet dictionary *plus a per-row
+`Int32` index array*, and the index array's compressed size tracks the entropy of the value sequence
+within a segment. The same session population, ~25 events each, emitted contiguously versus
+interleaved across 200 concurrent sessions measured **9,079 B against 64,252 B** on disk with
+near-identical distinct counts and postings (`examples/bench --bin archetype-bench`). So the scanner
+counts **runs** — how often a key's value differs from the previous row's — which is why it walks rows
+in order rather than tallying dictionary entries, and why the verdict gates on estimated bytes per row
+rather than on distinct values.
+
+**Bounded memory, order-independent.** Both map levels (key → value → segment count) are bottom-k
+sketches: they retain the `cap` entries whose names hash smallest, which is a property of the *set* of
+names and not of the order they arrived in, so two runs over one database report the same numbers even
+where the caps engaged. Folding is exact — the bottom-`cap` of a union is the bottom-`cap` of the
+parts' bottoms — which is what makes a per-segment sketch a viable basis for the ladder. Whenever a cap
+engages the sample rate is reported and the affected figures are marked as estimates; a truncated
+result that reads like full coverage would be worse than no result.
+
+**It reads and changes nothing.** The segment set comes from the manifest via `read_disk_snapshot` —
+no writer lock — and each segment is opened read-only with just its attribute columns projected. No
+new column, no sidecar, no manifest edit. That is what lets one measurement serve three callers: the
+`attr-stats` CLI over a directory, `imbhd` over the database it is *writing* (`POST
+/api/head/attributes/stats`, §10.19), and `imbh-tui`'s Overview over either. Only *sealed*
+segments are covered — buffered rows are in no segment and so cannot be selective within one — and the
+report says how many unsealed WAL frames it skipped rather than counting them as absent.
+
+**Two verdicts, not one.** A promoted column and a segment index answer different questions and a key
+can want both: on the `prune-bench` corpus `shard` has 60 distinct values *and* sigma 0.017. So the
+report gives `promote` and `index@` (the widest window width at which pruning still pays)
+independently, rather than as branches of one classifier.
+
+**Placement.** A crate of its own between storage and the facade (`core ← storage ← attrstats ←
+imbh`), reached through the facade's off-by-default `attrstats` feature. Off by default because it is
+a diagnostic rather than part of the ingest or query path — an embedded host that never asks should
+not carry the scanner — and a crate of its own because the CLI must be able to measure a directory
+without opening a `Db` at all. It adds no third-party subtree: imbh-core, imbh-storage, arrow,
+parquet and xxhash-rust are already in every build that has storage.
 
 ## 11. Footprint engineering (continuous, not a phase)
 
@@ -1851,10 +2032,12 @@ imbh/
                            # compaction; owns the Arrow schemas
     imbh-index/            # tantivy schema/build/search + row-ordinal bridge (only Tantivy crate)
     imbh-query/            # DataFusion: providers, UDFs, session config (only DataFusion crate)
+    imbh-attrstats/        # attribute cardinality / per-segment selectivity (sigma) over a database
+                           # directory — the measurement behind `promote` (§10.20)
     imbh-lgtm/             # LGTM-stack (Loki/Tempo/Mimir) query languages: expression models +
                            # reference evaluators (`model`), P1/L1/T1 parsers/lowering (`syntax`),
                            # and the optional native-IMBH `source` adapter (feature-gated)
-    imbh-mcp/              # the MCP server: protocol dispatch, the read-only tool surface, and the
+    imbh-mcp/              # the MCP server: protocol dispatch, the agent tool surface, and the
                            # stdio transport (shared by imbh-server's HTTP endpoint and imbh-tui)
     imbh-tui/              # optional read-only local companion TUI; its binary also hosts the
                            # MCP stdio transport (`imbh-tui --mcp-stdio`)
@@ -1872,7 +2055,11 @@ imbh/
   .agents/docs/            # OVERVIEW.md, ARCHITECTURE.md (this file), JOURNAL.md, TODO.md, …
 ```
 
-Dependency direction: `core ← {otlp, storage, index, query} ← imbh ← {exporter, server}`. The
+Dependency direction: `core ← {otlp, storage, index, query, attrstats} ← imbh ← {exporter, server}`.
+`imbh-attrstats` sits beside the engine crates rather than above the facade because the `attr-stats`
+CLI measures a *directory* without opening a `Db`; the facade reaches it through its off-by-default
+`attrstats` feature, and `imbh-head`/`imbh-server`/`imbh-tui` each name that feature explicitly
+rather than inheriting it (§10.20). The
 LGTM query languages live in `imbh-lgtm`, whose `syntax` (parsers) depends on its own `model`
 (expression types + evaluators); the optional `imbh-lgtm/source` adapter depends on `imbh`, and
 `tui` depends on `imbh` and `imbh-lgtm` with that feature. `imbh` never depends on `imbh-lgtm` or

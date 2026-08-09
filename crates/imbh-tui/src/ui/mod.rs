@@ -22,12 +22,14 @@ use crate::app::App;
 use crate::chart::ascii_chart;
 use crate::format::wrapped_rows;
 use crate::mascot::{MASCOT_ART_HEIGHT, MASCOT_BOTTOM_MARGIN, mascot_art, mascot_phase};
-use crate::model::{Focus, MENU_LEN, Mode, Options, Route, Screen};
+use crate::model::{
+    AbsTarget, AttrRow, DetailStyle, Focus, MENU_LEN, Mode, Options, PaneTable, Route, Screen,
+};
 use crate::syntax::{highlight_caret, highlight_query};
 use crate::time::format_datetime_ns;
 use crate::ui::glyphs::Glyphs;
 use crate::ui::logs::draw_log_detail;
-use crate::ui::metrics::{draw_metric_detail, draw_metric_table};
+use crate::ui::metrics::{column_widths, draw_metric_detail, draw_metric_table, pad_cell};
 use crate::ui::overlays::{draw_absolute_range, draw_completion_popup, draw_time_range_picker};
 use crate::ui::traces::{draw_span_detail, draw_trace_detail};
 use crate::waterfall::{WATERFALL_NAME_W, WATERFALL_SUFFIX_W, render_waterfall};
@@ -170,7 +172,7 @@ pub(crate) fn draw(frame: &mut ratatui::Frame<'_>, app: &App, options: &Options)
     // muted grey while one is in flight.
     let menubar_focused = menu_active
         || app.mode == Mode::TimeRange
-        || app.mode == Mode::AbsoluteRange
+        || editing_query_window(app)
         || matches!(focus, Focus::Menu(_) | Focus::TimeRange);
     let bar_bg = if menubar_focused {
         Color::Cyan
@@ -252,7 +254,7 @@ pub(crate) fn draw(frame: &mut ratatui::Frame<'_>, app: &App, options: &Options)
     let range_focused = if menu_active {
         app.menu_cursor == MENU_LEN - 1
     } else {
-        app.mode == Mode::TimeRange || app.mode == Mode::AbsoluteRange || focus == Focus::TimeRange
+        app.mode == Mode::TimeRange || editing_query_window(app) || focus == Focus::TimeRange
     };
     let range_style = if range_focused { cursor_chip } else { bar };
     let span_width = |spans: &[Span]| -> usize {
@@ -330,8 +332,9 @@ pub(crate) fn draw(frame: &mut ratatui::Frame<'_>, app: &App, options: &Options)
         return;
     }
 
-    // List views: query pane (except Overview) + main + status, within the content area.
-    let has_query = app.screen() != Screen::Overview;
+    // List views: query pane (only on the screens that take one) + main + status, within the
+    // content area.
+    let has_query = app.has_query();
     let rows = if has_query {
         Layout::default()
             .direction(Direction::Vertical)
@@ -421,6 +424,19 @@ pub(crate) fn draw(frame: &mut ratatui::Frame<'_>, app: &App, options: &Options)
     // A snapshot with a detail pane (the Traces waterfall) splits the results region vertically:
     // the primary list on top, the detail below. Both keep full width — waterfall bars are wide.
     let (primary_area, detail) = match &app.snapshot.detail {
+        // A `Pane`-style detail is a peer, not a preview strip. The primary above it is a short fixed
+        // block (the Overview's gauges), so it is sized to its own content and the pane takes
+        // everything else — a 55/45 split would waste half the screen on ten lines and crop the list
+        // that actually needs the room. Both are floored so a small terminal still shows some of each.
+        Some(detail) if detail.style == DetailStyle::Pane => {
+            let content = app.snapshot.lines.len().saturating_add(2) as u16;
+            let primary_rows = content.clamp(3, list_area.height.saturating_sub(4).max(3));
+            let parts = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(primary_rows), Constraint::Min(3)])
+                .split(list_area);
+            (parts[0], Some((parts[1], detail)))
+        }
         Some(detail) => {
             let parts = Layout::default()
                 .direction(Direction::Vertical)
@@ -430,6 +446,8 @@ pub(crate) fn draw(frame: &mut ratatui::Frame<'_>, app: &App, options: &Options)
         }
         None => (list_area, None),
     };
+    // The scroll belongs to whichever pane holds the long content: a `Pane` detail, else the primary.
+    let detail_scrolls = matches!(detail, Some((_, pane)) if pane.style == DetailStyle::Pane);
 
     let viewport = primary_area.height.saturating_sub(2);
     app.page_rows.set(viewport.max(1));
@@ -501,8 +519,13 @@ pub(crate) fn draw(frame: &mut ratatui::Frame<'_>, app: &App, options: &Options)
             .sum::<u32>()
             .min(u16::MAX as u32) as u16;
         let max_scroll = total_rows.saturating_sub(viewport);
-        app.max_scroll.set(max_scroll);
-        let scroll = app.scroll.min(max_scroll);
+        let scroll = if detail_scrolls {
+            // The pane below owns the scroll; this one is sized to its content and never needs it.
+            0
+        } else {
+            app.max_scroll.set(max_scroll);
+            app.scroll.min(max_scroll)
+        };
         let list_title = if max_scroll > 0 {
             format!(
                 "{}  [{}/{} {}]",
@@ -527,7 +550,115 @@ pub(crate) fn draw(frame: &mut ratatui::Frame<'_>, app: &App, options: &Options)
         );
     }
 
-    if let Some((detail_area, detail)) = detail {
+    if let Some((detail_area, detail)) = detail
+        && detail.style == DetailStyle::Pane
+    {
+        // A pane in its own right: bordered like the primary, focusable, and the one that scrolls.
+        // Its rect is published so the range form can be anchored over it rather than under the
+        // header's time indicator, which belongs to the *query* window.
+        // The pane holds two focus stops; either lights its border, and each lights its own half.
+        let range_focused = focus == Focus::AttrRange;
+        let table_focused = matches!(focus, Focus::AttrTable(_));
+        let focused = range_focused || table_focused;
+        // The prose sits above the table and does **not** scroll: it qualifies everything below it,
+        // and a caveat that scrolls out of a long table is a caveat nobody reads.
+        let notes_rows = detail.lines.len().min(6) as u16;
+        let body = Rect {
+            x: detail_area.x.saturating_add(1),
+            y: detail_area.y.saturating_add(1),
+            width: detail_area.width.saturating_sub(2),
+            height: detail_area.height.saturating_sub(2),
+        };
+        let parts = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(notes_rows), Constraint::Min(1)])
+            .split(body);
+        // Every row is one list item, headers included — there is no sticky header to subtract.
+        let table_lines = detail.table.as_ref().map(attr_pane_lines);
+        let table_rows = table_lines.as_ref().map_or(0, Vec::len) as u16;
+        let viewport = parts[1].height;
+        app.page_rows.set(viewport.max(1));
+        let max_scroll = table_rows.saturating_sub(viewport);
+        app.max_scroll.set(max_scroll);
+        let scroll = app.scroll.min(max_scroll);
+
+        let mut title = detail.title.clone();
+        if max_scroll > 0 {
+            title = format!("{title}  [{scroll}/{max_scroll} {}]", g.scroll());
+        }
+        // Each stop advertises only its own action, and a section stop names the section it is on —
+        // Tab moves between them, so the title is what says where the ring has landed.
+        if range_focused {
+            title = format!("{title}  {} enter: change the range", g.sep);
+        } else if let Focus::AttrTable(section) = focus
+            && let Some(name) = app.attr_section_label(section)
+        {
+            title = format!("{title}  {} {name}", g.sep);
+        }
+        if table_focused && app.can_promote {
+            // `p` is offered only where it can work. A local session opened the database read-only,
+            // so there is no promotion to advertise — see `Backend::can_promote`.
+            title = format!("{title}  {} p: promote/demote", g.sep);
+        }
+        frame.render_widget(
+            g.block().border_style(focus_border(focused)).title(title),
+            detail_area,
+        );
+        // The range form is anchored to the *range line* — the pane's first note, which is where the
+        // window it edits is displayed — so the form drops from the value it changes rather than from
+        // the pane's corner or, worse, from the header's query-range indicator.
+        app.attr_area.set(Rect {
+            height: 1,
+            ..parts[0]
+        });
+        // The range line is a focus stop in its own right, so it has to *look* like one when the ring
+        // is on it — otherwise Enter would act on something the screen never marked as selected.
+        let mut notes: Vec<Line> = detail
+            .lines
+            .iter()
+            .map(|line| {
+                Line::from(Span::styled(
+                    line.clone(),
+                    Style::default().fg(Color::DarkGray),
+                ))
+            })
+            .collect();
+        if range_focused && let Some(first) = notes.first_mut() {
+            *first = Line::from(Span::styled(
+                detail.lines[0].clone(),
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        frame.render_widget(Paragraph::new(notes).wrap(Wrap { trim: false }), parts[0]);
+        // Styled *lines* rather than a `Table` widget, for one reason a cell-based table cannot give:
+        // a section title has to span the pane. In a `Table` it sits in column 0 and is clipped to the
+        // key column's width. Columns are padded here instead — same alignment, same header styling,
+        // and titles at full width.
+        if let Some(lines) = table_lines {
+            // Selectable only while focused, and only because there is something to do with the
+            // selection: `p` promotes the key under it. An unfocused pane shows no cursor rather than
+            // a highlight that acts on nothing.
+            let selection = table_focused
+                .then(|| app.selectable_bounds())
+                .flatten()
+                .map(|(first, last)| app.selected.clamp(first, last));
+            let mut state = ListState::default().with_offset(scroll as usize);
+            state.select(selection);
+            frame.render_stateful_widget(
+                List::new(lines).highlight_style(
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                parts[1],
+                &mut state,
+            );
+        }
+    } else if let Some((detail_area, detail)) = detail {
         // The bare title line costs the pane's first row; the rest is where waterfall rows land.
         let visible = detail_area.height.saturating_sub(1) as usize;
         let mut title = detail.title.clone();
@@ -580,6 +711,9 @@ pub(crate) fn draw(frame: &mut ratatui::Frame<'_>, app: &App, options: &Options)
         // footer is purely the key legend now.
         let sep = g.sep;
         let detail_hint = match app.screen() {
+            // The attribute pane's actions are reached through the pane (tab to it), so what the
+            // legend has to say is that the pane is a focus stop at all.
+            Screen::Overview => format!(" {sep} tab attributes pane"),
             Screen::Logs => format!(" {sep} enter detail"),
             Screen::Traces => format!(" {sep} enter trace detail {sep} L logs"),
             Screen::Metrics if app.active_query().trim().is_empty() => {
@@ -589,7 +723,6 @@ pub(crate) fn draw(frame: &mut ratatui::Frame<'_>, app: &App, options: &Options)
                 " {sep} enter series detail {sep} bksp catalog {sep} {}/esc back",
                 g.left
             ),
-            _ => String::new(),
         };
         // The mascot toggle is only advertised on terminals that can render it.
         let mascot_hint = if options.ascii {
@@ -626,6 +759,75 @@ pub(crate) fn draw(frame: &mut ratatui::Frame<'_>, app: &App, options: &Options)
 
 /// The route-independent overlays: the time-range dropdown and the absolute-range form, both anchored
 /// to the menu bar's range selector, so they can appear over any route (including the detail views).
+/// One styled line per row of an attribute pane's table.
+///
+/// Columns are padded by hand rather than handed to a `Table` widget, because a section title must
+/// span the pane: a table cell is clipped to its column, and the title lives in the first one. The
+/// header styling matches the other result panes, so this still reads as the same kind of thing.
+fn attr_pane_lines(table: &PaneTable) -> Vec<Line<'static>> {
+    // Widths over the **key rows only**: a title is a banner whose one long cell would otherwise
+    // stretch the key column to its length and squeeze every number out of the pane.
+    let widths = column_widths(
+        &table.data.header,
+        table
+            .data
+            .rows
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| table.key_at(*index).is_some())
+            .map(|(_, row)| row),
+    );
+    let columns = |row: &[String]| {
+        let last = row.len().saturating_sub(1);
+        row.iter()
+            .enumerate()
+            .map(|(index, cell)| {
+                if index == last {
+                    cell.clone()
+                } else {
+                    format!(
+                        "{}  ",
+                        pad_cell(cell, widths.get(index).copied().unwrap_or(0))
+                    )
+                }
+            })
+            .collect::<String>()
+    };
+    table
+        .data
+        .rows
+        .iter()
+        .zip(&table.kinds)
+        .map(|(row, kind)| match kind {
+            // Full width, unclipped: this names the unit every row below it is measured against.
+            // Bold, not coloured: the pane already spends colour on the header row and the cursor,
+            // and a title is structure rather than a category.
+            AttrRow::Section => Line::from(Span::styled(
+                row[0].clone(),
+                Style::default().add_modifier(Modifier::BOLD),
+            )),
+            AttrRow::Header => Line::from(Span::styled(
+                columns(row),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+            )),
+            AttrRow::Key(_) => Line::from(columns(row)),
+            AttrRow::Blank => Line::default(),
+        })
+        .collect()
+}
+
+/// Whether the open range form is editing the **query** window — the one this menu bar's indicator
+/// shows.
+///
+/// The same form also edits the Overview attribute pane's window, and lighting up the header for that
+/// would say the query range is about to change when it is not. The highlight follows what is being
+/// edited, not merely that a form is open.
+fn editing_query_window(app: &App) -> bool {
+    app.mode == Mode::AbsoluteRange && app.abs_target == AbsTarget::Query
+}
+
 pub(crate) fn draw_global_overlays(
     frame: &mut ratatui::Frame<'_>,
     app: &App,
@@ -643,7 +845,14 @@ pub(crate) fn draw_global_overlays(
         draw_time_range_picker(frame, app, indicator_area, area, &g);
     }
     if app.mode == Mode::AbsoluteRange {
-        draw_absolute_range(frame, app, indicator_area, area, &g);
+        // The form drops from whatever it edits: the header's time indicator for the query window,
+        // the attribute pane for the attribute window. Same form, and the anchor is what says which
+        // window is about to change.
+        let anchor = match app.abs_target {
+            AbsTarget::Query => indicator_area,
+            AbsTarget::Attributes => app.attr_area.get(),
+        };
+        draw_absolute_range(frame, app, anchor, area, &g);
     }
 }
 
@@ -657,6 +866,70 @@ mod tests {
     use crate::model::{DetailPane, LogRecord, MetricDetail, Snapshot};
     use crate::testutil::{ascii_trace, nested_trace};
     use crate::waterfall::build_trace_detail;
+
+    /// A section title spans the pane; only the key columns are padded to a width.
+    ///
+    /// The regression this pins is specific: rendered as a `Table`, the title lives in column 0 and is
+    /// clipped to the key column — so a title reading `metrics_gauge - 1 segment, 488 rows, 2 keys`
+    /// came out as `metrics_gauge - 1 s>`. Lines have no columns to be clipped to.
+    #[test]
+    fn a_section_title_is_not_clipped_to_the_key_column() {
+        use crate::model::{AttrRow, PaneTable, TableData};
+
+        let table = PaneTable {
+            data: TableData {
+                header: vec!["Key".to_owned(), "Rows".to_owned()],
+                rows: vec![
+                    vec![
+                        "metrics_gauge - 1 segment, 488 rows, 2 keys".to_owned(),
+                        String::new(),
+                    ],
+                    vec!["Key".to_owned(), "Rows".to_owned()],
+                    vec!["env".to_owned(), "488".to_owned()],
+                ],
+            },
+            kinds: vec![
+                AttrRow::Section,
+                AttrRow::Header,
+                AttrRow::Key("env".to_owned()),
+            ],
+        };
+        let lines = attr_pane_lines(&table);
+        let text = |line: &Line| {
+            line.spans
+                .iter()
+                .map(|span| span.content.to_string())
+                .collect::<String>()
+        };
+        assert_eq!(
+            text(&lines[0]),
+            "metrics_gauge - 1 segment, 488 rows, 2 keys",
+            "the title is whole, not cut to the width of the `Key` column"
+        );
+        // The key column is sized by the *key rows*, so a long title cannot stretch it either.
+        assert!(
+            text(&lines[2]).starts_with("env  "),
+            "columns are padded to the data, not to the banner: {:?}",
+            text(&lines[2])
+        );
+    }
+
+    /// The header's time indicator shows the **query** window, so it must not light up for a form
+    /// that edits something else. Both are `Mode::AbsoluteRange`; only the target tells them apart.
+    #[test]
+    fn the_header_highlights_only_for_the_window_it_shows() {
+        let mut app = App::new();
+        app.mode = Mode::AbsoluteRange;
+        app.abs_target = AbsTarget::Query;
+        assert!(editing_query_window(&app));
+        app.abs_target = AbsTarget::Attributes;
+        assert!(
+            !editing_query_window(&app),
+            "the attribute pane's range does not change the query window, so the header must stay put"
+        );
+        app.mode = Mode::Normal;
+        assert!(!editing_query_window(&app));
+    }
 
     #[test]
     fn ascii_mode_renders_only_ascii_across_the_ui() {
@@ -782,6 +1055,8 @@ mod tests {
                     list_from: Some(1),
                     // A deeper trace than the short preview pane fits, so the truncation note renders.
                     detail: Some(DetailPane {
+                        table: None,
+                        style: DetailStyle::Preview,
                         title: "Waterfall".to_owned(),
                         lines: Vec::new(),
                         waterfall: Some(detail.waterfall.clone()),

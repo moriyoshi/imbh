@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 publish = false
-description = "Measure per-attribute cardinality and per-segment selectivity (sigma) over an existing imbh database, to size a segment-granularity attribute index and to pick `promote` keys."
+description = "Command line over imbh-attrstats: measure per-attribute cardinality and per-segment selectivity (sigma) over an existing imbh database, to size a segment-granularity attribute index and to pick `promote` keys."
 
 # Keep this crate out of the cargo-release plan entirely (same rationale as examples/gen-demo-db):
 # `publish = false` stops the crates.io upload, but a plan member still shows up in `cargo release`'s
@@ -15,21 +15,11 @@ description = "Measure per-attribute cardinality and per-segment selectivity (si
 [package.metadata.release]
 release = false
 
-# All of these are already compiled in the workspace graph (imbh-storage depends on arrow + parquet +
-# xxhash-rust directly; serde_json arrives via arrow-json). Nothing here reaches the `imbh` facade:
-# this is an example binary, so its edges live only in its own package.
+# The measurement itself lives in the library; this binary only parses arguments and renders. `serde`
+# is what `--json` needs (the documented flattened document, `imbh_attrstats::report::to_json`).
 [dependencies]
-imbh-core.workspace = true
-# `default-features = false` at the workspace level already drops the tantivy/`search` subtree; this
-# tool only needs `read_disk_snapshot` (manifest replay), not the term index.
-imbh-storage.workspace = true
-arrow.workspace = true
-parquet.workspace = true
+imbh-attrstats = { workspace = true, features = ["serde"] }
 serde_json.workspace = true
-xxhash-rust.workspace = true
-
-[dev-dependencies]
-tempfile.workspace = true
 
 [[bin]]
 name = "attr-stats"

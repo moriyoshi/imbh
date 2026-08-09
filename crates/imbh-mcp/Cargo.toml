@@ -9,7 +9,10 @@ publish.workspace = true
 description = "Model Context Protocol server for imbh: read-only telemetry tools over a transport-agnostic JSON-RPC dispatch, plus a stdio transport."
 
 [dependencies]
-imbh.workspace = true
+# `attrstats` backs the `attribute_stats` tool (`Db::attribute_stats`), named explicitly rather than
+# inherited from a sibling's copy of the dependency: a standalone `cargo check -p imbh-mcp` must turn
+# it on by itself.
+imbh = { workspace = true, features = ["attrstats"] }
 # The head API's DTOs — `dto` only, never `exec` or `client`. `stats_json` (which backs both
 # `GET /stats` and the `db_stats` tool) converts a `DbStats` into `imbh_head::dto::Stats` and
 # serializes *that* derive, so the plain endpoint, the tool, and `GET /api/head/stats` cannot

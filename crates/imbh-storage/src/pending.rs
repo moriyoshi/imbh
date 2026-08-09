@@ -245,7 +245,10 @@ fn read_one(path: &Path) -> Option<PendingRewrite> {
     PendingRewrite::decode(payload)
 }
 
-#[cfg(test)]
+/// Reading a record — decode, framing, digests — is always compiled; *writing* one is the preparer's
+/// half and lives behind `compaction`. Three of these tests write a record to read it back, so the
+/// module needs the feature that produces one.
+#[cfg(all(test, feature = "compaction"))]
 mod tests {
     use super::*;
 

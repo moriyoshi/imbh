@@ -240,6 +240,70 @@ impl Backend {
         .map(|result| result.names)
     }
 
+    /// Attribute cardinality and per-segment selectivity over `range` — the Overview attribute pane's
+    /// whole content. `None` measures every sealed segment, which is the pane's default: a `promote`
+    /// list is chosen from everything the database holds.
+    ///
+    /// The one operation here that **scans**: it reads the attribute columns of every sealed segment
+    /// in the window, so its cost follows the corpus rather than the answer. Narrowing `range` is how
+    /// a caller bounds that cost.
+    ///
+    /// A local backend measures the directory it opened; a remote one measures the *daemon's*
+    /// database, which is the only side that has the segments. Neither sees the writer's unsealed
+    /// buffer, however fresh — those rows are in no segment yet (`Report::pending_wal_frames` counts
+    /// them), so this is the one pane where `--url` is not more current than a local open.
+    pub(crate) async fn attribute_stats(
+        &self,
+        range: Option<(i64, i64)>,
+    ) -> Result<dto::AttrStats, HeadError> {
+        let request = dto::AttrStatsRequest {
+            range,
+            ..Default::default()
+        };
+        match self {
+            Backend::Local(db) => exec::attribute_stats(db, &request).await,
+            Backend::Remote(client) => client.attribute_stats(&request).await,
+        }
+    }
+
+    /// Whether this session can change the promoted attribute keys.
+    ///
+    /// Only a daemon can: promotion **writes** — it seals the buffer and changes the schema every
+    /// subsequent segment is written with — and a local session opened the directory with
+    /// `Db::open_read_only`, which holds no writer lock and refuses every write by construction. So
+    /// this is not a permission check bolted on a UI, it is the shape of the two backends: there is no
+    /// local implementation to offer.
+    pub(crate) fn can_promote(&self) -> bool {
+        matches!(self, Backend::Remote(_))
+    }
+
+    /// The promoted attribute keys now in effect, or `None` where this session cannot ask (a local
+    /// read-only open answers about a database it does not own).
+    pub(crate) async fn promoted(&self) -> Result<Vec<String>, HeadError> {
+        match self {
+            Backend::Local(db) => Ok(db.promote().keys().to_vec()),
+            Backend::Remote(client) => client.promoted().await.map(|state| state.keys),
+        }
+    }
+
+    /// Replace the promoted attribute keys, answering with the set now in effect.
+    ///
+    /// Refused outright on a local session rather than attempted and failed: the message a person
+    /// needs is *why* it cannot work here and what would, not the storage layer's read-only error.
+    pub(crate) async fn set_promoted(&self, keys: Vec<String>) -> Result<Vec<String>, HeadError> {
+        match self {
+            Backend::Local(_) => Err(HeadError::bad_request(
+                "promotion changes what the writer writes, and this session opened the database \
+                 read-only. Point the explorer at the daemon that owns it (`imbh-tui --url \
+                 http://host:4318`) to change the promoted keys.",
+            )),
+            Backend::Remote(client) => client
+                .set_promoted(&dto::PromoteRequest { keys })
+                .await
+                .map(|state| state.keys),
+        }
+    }
+
     pub(crate) async fn attribute_values(&self, key: &str) -> Result<Vec<String>, HeadError> {
         let request = dto::AttributeValuesRequest {
             key: key.to_owned(),

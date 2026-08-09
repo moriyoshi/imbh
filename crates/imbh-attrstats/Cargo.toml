@@ -1,0 +1,36 @@
+[package]
+name = "imbh-attrstats"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Attribute cardinality and per-segment selectivity (sigma) statistics over an imbh database — the measurement behind `promote` and segment-index sizing."
+
+[dependencies]
+# The attribute model (`AnyValue`/`Attributes`, the canonical JSON codec) and the manifest types.
+imbh-core.workspace = true
+# `read_disk_snapshot` (manifest replay) only — no writer lock, so this reads a live database.
+# `default-features = false` at the workspace level already drops the tantivy/`search` subtree.
+imbh-storage.workspace = true
+# Reading the attribute columns out of a segment. Both are already compiled in every build that has
+# imbh-storage, which depends on them directly; this crate adds no third-party subtree of its own.
+arrow.workspace = true
+parquet.workspace = true
+xxhash-rust.workspace = true
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+
+[features]
+# On by default so a standalone `cargo test -p imbh-attrstats` compiles the whole crate, including
+# the JSON view its tests assert on. The workspace dependency pins `default-features = false`, so
+# every *consumer* still opts in deliberately (same arrangement as imbh-storage's `search`).
+default = ["serde"]
+# Serialize/deserialize the report, so it can cross a process boundary (the head API sends one over
+# HTTP; the `attr-stats` CLI's `--json` renders one). Adds no crate to the graph — serde and
+# serde_json are already compiled transitively (ARCHITECTURE.md §10.13).
+serde = ["dep:serde", "dep:serde_json"]
+
+[dev-dependencies]
+tempfile.workspace = true

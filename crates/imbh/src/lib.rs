@@ -99,6 +99,12 @@ pub use imbh_core::{
     TraceId, WalMode, canonical_json_value, parse_bytes, parse_duration, parse_json,
 };
 
+/// The attribute-statistics measurement ([`Db::attribute_stats`], `attrstats` feature), re-exported
+/// whole so a host names [`imbh::attrstats::Options`](imbh_attrstats::Options) and the report types
+/// off the facade rather than taking a second dependency — and so the two cannot drift in version.
+#[cfg(feature = "attrstats")]
+pub use imbh_attrstats as attrstats;
+
 pub use imbh_storage::pending::PendingRewrite;
 #[cfg(feature = "compaction")]
 pub use imbh_storage::{CompactionReport, prepare_pending};
@@ -633,6 +639,20 @@ impl Db {
         self.storage.compact()
     }
 
+    /// [`Db::compact`], stopping after `max_partitions` partitions have been rewritten.
+    ///
+    /// A compaction pass costs the **corpus**, not the request: over a database with hundreds of
+    /// day-partitions it rewrites every one. A bound makes it incremental — do a slice now, the rest
+    /// later — instead of forcing a choice between an hour-long call and never compacting. Partitions
+    /// past the bound are untouched rather than half-done, so a capped pass is not a partial one and
+    /// there is nothing to resume: call it again. A pass that rewrites nothing is how a caller learns
+    /// there is nothing left to do.
+    #[cfg(feature = "compaction")]
+    pub async fn compact_bounded(&self, max_partitions: usize) -> Result<CompactionReport> {
+        self.ensure_writable()?;
+        self.storage.compact_bounded(max_partitions)
+    }
+
     /// Export a table's rows over `range` as **Arrow-IPC stream** bytes (ARCHITECTURE.md §10.11). The
     /// result is a self-describing Arrow IPC stream (schema followed by record batches) that
     /// DuckDB, polars, or pandas/`pyarrow` load directly — the copy-out companion to
@@ -689,6 +709,54 @@ impl Db {
             Table::Spans => self.storage.segment_paths_spans(),
             other => self.storage.segment_paths_metric(other),
         })
+    }
+
+    /// Attribute **cardinality** and per-segment **selectivity** over this database — the
+    /// measurement behind a `promote` list (ARCHITECTURE.md §6.1).
+    ///
+    /// Answers, per attribute key: how many distinct values it has, how much of that value space
+    /// lives inside a single segment (sigma, so how much a segment index could prune), how the count
+    /// grows with the query window, and what a promoted column would cost per row. Two independent
+    /// verdicts come out of it — *promote this key* and *index it, up to this window width* — because
+    /// a key can want both.
+    ///
+    /// **Reads and changes nothing.** It replays the manifest and opens each sealed segment read-only
+    /// with just its attribute columns projected: no lock, no new column, no sidecar, no manifest
+    /// edit. So it is safe on a read-only handle and safe while a writer is running — including this
+    /// one. It is, though, a **full scan of the attribute columns** in range: bound the work with
+    /// [`Options::range`](imbh_attrstats::Options::range) rather than running it per keystroke.
+    ///
+    /// Only *sealed* segments are covered: rows still in the buffer or the unsealed WAL tail are in
+    /// no segment yet, so they cannot be selective within one. [`Report::pending_wal_frames`] says
+    /// how many were skipped; [`flush`](Self::flush) first to include them.
+    ///
+    /// Requires an on-disk database. An in-memory one has no segments to measure, which is reported
+    /// as an error rather than as an empty report — the two are not the same answer.
+    ///
+    /// [`Report::pending_wal_frames`]: imbh_attrstats::Report::pending_wal_frames
+    #[cfg(feature = "attrstats")]
+    pub async fn attribute_stats(
+        &self,
+        options: &imbh_attrstats::Options,
+    ) -> Result<imbh_attrstats::Report> {
+        self.ensure_open()?;
+        let dir = self.storage.dir().ok_or_else(|| {
+            Error::config_msg(
+                "attribute statistics need an on-disk database — this handle is in-memory, so no \
+                 segment exists to measure selectivity within",
+            )
+        })?;
+        imbh_attrstats::analyze(dir, options)
+    }
+
+    /// Whether this handle opened the database **read-only** (ARCHITECTURE.md §5): it holds no writer
+    /// lock and every write path refuses.
+    ///
+    /// Exposed so a host can offer a write action only where it would work, rather than offering it
+    /// everywhere and reporting a read-only error afterwards — the difference between a UI that knows
+    /// what it is connected to and one that finds out by failing.
+    pub fn is_read_only(&self) -> bool {
+        self.access == Access::ReadOnly
     }
 
     /// A blocking mirror of the async API for sync hosts (ARCHITECTURE.md §10.2/§10.12). Methods drop the
@@ -1439,9 +1507,25 @@ impl FlushScheduler {
             let _ = db.storage.sync_wal();
         }
 
-        // 3. Retention, on the maintenance interval.
+        // 3. Commit prepared rewrites, then retention — both on the maintenance interval.
+        //
+        // **Commit before retention**, for the reason [`Db::maintain`] gives: a pending rewrite whose
+        // inputs retention is about to drop should land first, so the merged output survives instead
+        // of the record going stale. Together with the seal above, that makes this tick the same
+        // order `maintain()` performs — seal, commit, retain — with the difference that the seal here
+        // is the *policy's* decision rather than unconditional, which is the whole reason the loop
+        // cannot simply call `maintain()`.
+        //
+        // Committing here is what makes the out-of-process handoff (ARCHITECTURE.md §7.2) work on a
+        // daemon that stays up. Before this, the only in-process triggers were `open()` and `close()`,
+        // so a long-running writer picked up an external housekeeper's rewrites *only at restart*.
+        // The cost is one `read_dir` of a usually-empty directory per maintenance interval, on a
+        // thread that just woke to do I/O anyway.
         if self.since_retention >= self.retention_interval {
             self.since_retention = std::time::Duration::ZERO;
+            // Swallowed like the rest of this loop's work: there is nowhere to report to, and a
+            // record that fails to commit is left on disk for the next tick rather than lost.
+            let _ = db.storage.commit_pending();
             let _ = db.storage.retain();
         }
     }
@@ -1449,8 +1533,8 @@ impl FlushScheduler {
 
 /// The background-maintenance loop (ARCHITECTURE.md §5), on an owned thread. Sleeps in slices of at
 /// most a second to notice a close / drop promptly, and on each slice lets the [`FlushScheduler`] do
-/// what has come due: seal per `flush`, fsync an interval-mode WAL, and apply retention every
-/// `interval`. Exits when the last `Db` handle is dropped (the `Weak` fails to upgrade) or the DB is
+/// what has come due: seal per `flush`, fsync an interval-mode WAL, and — every `interval` — commit
+/// prepared rewrites and apply retention. Exits when the last `Db` handle is dropped (the `Weak` fails to upgrade) or the DB is
 /// closed.
 fn run_maintenance(weak: Weak<Db>, interval: std::time::Duration, flush: FlushPolicy) {
     let mut sched = FlushScheduler::new(flush, interval);
@@ -2040,6 +2124,15 @@ impl BlockingDb {
     }
     pub fn stats(&self) -> Result<DbStats> {
         self.rt.block_on(self.db.stats())
+    }
+    /// Mirrors [`Db::attribute_stats`]. A full scan of the attribute columns in range — bound it
+    /// with [`Options::range`](imbh_attrstats::Options::range).
+    #[cfg(feature = "attrstats")]
+    pub fn attribute_stats(
+        &self,
+        options: &imbh_attrstats::Options,
+    ) -> Result<imbh_attrstats::Report> {
+        self.rt.block_on(self.db.attribute_stats(options))
     }
     /// Export a table's rows over `range` as Arrow-IPC stream bytes ([`Db::export`]).
     #[cfg(feature = "query")]

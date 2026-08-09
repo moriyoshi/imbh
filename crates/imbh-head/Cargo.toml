@@ -13,7 +13,7 @@ description = "The head API for imbh: the read-only query surface a terminal (or
 # (`LogQuery`/`LogPage`/`Trace`/`MetricMeta`), so a head sends the *same* value the local path would
 # have passed to `Db` rather than a parallel description of it. `serde` adds no crate to the graph
 # (ARCHITECTURE.md §10.13).
-imbh = { workspace = true, optional = true, features = ["serde"] }
+imbh = { workspace = true, optional = true, features = ["serde", "attrstats"] }
 # The semantic layer the `exec` feature executes against: PromQL/LogQL/TraceQL translation and the
 # `*SemanticsExt` execution traits. Pulled only by `exec`, so a client-only consumer carries none of
 # it.

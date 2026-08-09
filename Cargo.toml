@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = [
+    "crates/imbh-attrstats",
     "crates/imbh-core",
     "crates/imbh-head",
     "crates/imbh-lgtm",
@@ -62,6 +63,12 @@ pre-release-hook = ["git", "cliff", "-o", "CHANGELOG.md", "--tag", "{{version}}"
 # path deps to crates.io version requirements; cargo-release keeps these in lockstep with the
 # shared workspace version on every bump (see [workspace.metadata.release]).
 imbh = { path = "crates/imbh", version = "0.7.0" }
+# Attribute cardinality/selectivity statistics over a database directory. Reads the manifest and the
+# segments' attribute columns and writes nothing, so it runs against a live writer's database — which
+# is what lets the same measurement back the `attr-stats` CLI, `imbhd`'s head endpoint, and the TUI's
+# Attributes screen. `default-features = false`: each consumer opts into `serde` when it needs the
+# report to cross a process boundary.
+imbh-attrstats = { path = "crates/imbh-attrstats", version = "0.7.0", default-features = false }
 imbh-core = { path = "crates/imbh-core", version = "0.7.0" }
 imbh-lgtm = { path = "crates/imbh-lgtm", version = "0.7.0" }
 # The head API (ARCHITECTURE.md §10.19): the JSON wire types a read-only head drives a running

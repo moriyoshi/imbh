@@ -150,6 +150,43 @@ pub struct AttributeValuesRequest {
     pub key: String,
 }
 
+/// `POST /api/head/attributes/stats`: attribute cardinality and per-segment selectivity.
+///
+/// The body *is* [`imbh::attrstats::Options`], the same value a local caller passes to
+/// [`Db::attribute_stats`](imbh::Db::attribute_stats) — so the two modes measure the same thing under
+/// the same caps, rather than a wire type describing the options approximately.
+///
+/// Unlike every other head operation this one **scans**: it reads the attribute columns of every
+/// sealed segment in range. A head should set `range` to the window it is displaying rather than
+/// asking for the whole database on a keystroke; `imbhd` runs it under `offload`, so a long scan
+/// occupies a blocking thread rather than the connection's runtime.
+pub type AttrStatsRequest = imbh::attrstats::Options;
+
+/// `POST /admin/promote`: replace the promoted attribute keys.
+///
+/// The whole set, not a delta. Promotion is a *list* — it decides the column order every subsequent
+/// segment is written with — so a caller that sends "add `k`" would be asking the server to guess
+/// where in that order `k` goes, and two concurrent callers would each lose the other's change
+/// without noticing. Sending the full set makes the intended end state explicit and the result
+/// checkable.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PromoteRequest {
+    pub keys: Vec<String>,
+}
+
+/// The promoted attribute keys now in effect, in column order. Answered by both the `GET` and the
+/// `POST`, so a caller never has to re-read to find out what it ended up with.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PromoteState {
+    pub keys: Vec<String>,
+}
+
+/// The result of [`AttrStatsRequest`] — the whole [`imbh::attrstats::Report`], losslessly.
+///
+/// Reusing the report rather than flattening it is what lets a head do its own ranking: the same
+/// value the `attr-stats` CLI renders, delivered to a process that has no database of its own.
+pub type AttrStats = imbh::attrstats::Report;
+
 // ── responses ───────────────────────────────────────────────────────────────────────────────────
 
 /// One evaluated series, from either PromQL or LogQL. Labels are a sorted `(name, value)` list — the

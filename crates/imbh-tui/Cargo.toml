@@ -9,7 +9,10 @@ publish.workspace = true
 description = "Read-only terminal explorer for IMBH metrics, traces, and logs."
 
 [dependencies]
-imbh.workspace = true
+# `attrstats` is the Overview's attribute measurement (`Db::attribute_stats`), named explicitly rather
+# than inherited from imbh-head's copy of the dependency: a standalone `cargo check -p imbh-tui` must
+# turn it on by itself.
+imbh = { workspace = true, features = ["attrstats"] }
 # `imbh-tui --mcp-stdio` serves the Model Context Protocol on stdin/stdout — the transport MCP
 # clients "SHOULD support whenever possible", and the one an agent that spawns its own server
 # speaks. The protocol, the tools, and the loop all live in imbh-mcp, shared with the HTTP endpoint
@@ -34,6 +37,9 @@ rand = { version = "0.9", features = ["small_rng"] }
 # OTLP fixture builders for the local-backend tests, which drive every screen against an in-process
 # `Db` to hold the direct-query path (`imbh-tui <directory>`) intact.
 imbh-test-support.workspace = true
+# The Overview's attribute measurement covers *sealed segments*, so its tests need a database on disk
+# rather than the in-memory one every other screen's tests use.
+tempfile.workspace = true
 
 [[bin]]
 name = "imbh-tui"

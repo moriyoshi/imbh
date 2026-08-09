@@ -120,8 +120,9 @@ git history); this file tracks only what is still open.
       So the index would cost a Tantivy build at seal on the **highest-volume signal** — which §8
       deliberately avoids — to help only selective filters on un-promoted keys, while promotion helps
       every filter on promoted keys with infrastructure that already exists. **Recommendation: do not
-      build a metrics index.** Use `promote`, now that `Db::attr_access_stats` + `attr-stats` make the
-      key set choosable from data instead of guesswork.
+      build a metrics index.** Use `promote`, now that `imbh-attrstats` makes the key set choosable
+      from data instead of guesswork. (`Db::attr_access_stats` was cut 2026-08-09 — it contributed to
+      no push-down and conflated filters with projections; see the demand-signal item below.)
 
       Residual, and it is the honest limit: promotion is curated, so an *arbitrary* metric label still
       pays the +26 ms JSON scan (down from ~78 ms before the targeted extractor). Fully serving "any
@@ -830,7 +831,11 @@ git history); this file tracks only what is still open.
       a handful of parameters answers without the data leaving anywhere. Two are already known from
       the operator: request- and session-scoped identifiers do appear as attributes, and concurrent
       pods number under 50. Note `attr-stats` output contains no attribute values at all — the
-      bottom-k sketch only ever hashes them — so what it emits is key names plus aggregates.)* The tool is built and green
+      bottom-k sketch only ever hashes them — so what it emits is key names plus aggregates.
+      **Reach extended 2026-08-09:** the measurement is now the `imbh-attrstats` crate rather than an
+      example binary, so it can be read off a *running* `imbhd` (`POST /api/head/attributes/stats`) or
+      off the TUI Overview's attribute block — no CLI to ship to the machine holding the data, and no
+      database directory to hand over.)* The tool is built and green
       (`cargo run -p attr-stats -- <db-dir> [--scope all|attributes] [--last <min>] [--windows 1m,1h,24h]
       [--top N] [--json]`),
       and it is the input to *two* open decisions: whether a segment-granularity attribute index is

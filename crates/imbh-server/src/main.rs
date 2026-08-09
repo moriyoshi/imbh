@@ -368,6 +368,9 @@ fn banner(
                 tracing::info!("OTLP/HTTP: POST /v1/logs, /v1/traces, /v1/metrics");
                 tracing::info!("query: POST /api/query (SQL body -> JSON)");
                 tracing::info!("mcp: POST /mcp (Model Context Protocol, read-only tools)");
+                tracing::info!(
+                    "housekeeping: POST /admin/housekeeping (queued; poll the job id it returns)"
+                );
             }
             None => tracing::info!(%dir, "imbhd started with no HTTP listener"),
         }
@@ -394,6 +397,9 @@ fn banner(
                 println!("  OTLP/HTTP: POST /v1/logs · /v1/traces · /v1/metrics");
                 println!("  query:     POST /api/query  (SQL body → JSON)");
                 println!("  mcp:       POST /mcp  (Model Context Protocol, read-only tools)");
+                println!(
+                    "  cleanup:   POST /admin/housekeeping  (queued → job id; poll it for the result)"
+                );
             }
             None => println!("imbhd started, no HTTP listener  (data dir: {dir})"),
         }

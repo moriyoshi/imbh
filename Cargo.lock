@@ -365,13 +365,8 @@ checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 name = "attr-stats"
 version = "0.7.0"
 dependencies = [
- "arrow",
- "imbh-core",
- "imbh-storage",
- "parquet",
+ "imbh-attrstats",
  "serde_json",
- "tempfile",
- "xxhash-rust",
 ]
 
 [[package]]
@@ -2510,6 +2505,7 @@ version = "0.7.0"
 dependencies = [
  "arrow",
  "datafusion",
+ "imbh-attrstats",
  "imbh-core",
  "imbh-index",
  "imbh-otlp",
@@ -2526,6 +2522,20 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "imbh-attrstats"
+version = "0.7.0"
+dependencies = [
+ "arrow",
+ "imbh-core",
+ "imbh-storage",
+ "parquet",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "xxhash-rust",
 ]
 
 [[package]]
@@ -2714,6 +2724,7 @@ dependencies = [
  "imbh-test-support",
  "rand 0.9.5",
  "ratatui",
+ "tempfile",
  "tokio",
  "unicode-width 0.2.2",
 ]

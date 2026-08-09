@@ -1,9 +1,15 @@
-//! The read-only tool surface an MCP client sees.
+//! The tool surface an MCP client sees.
 //!
 //! Each tool is a thin wrapper over one imbh library call (ARCHITECTURE.md §10.5–§10.9): the typed
-//! log/trace/metric query builders, attribute discovery, DB stats, and raw SQL. Nothing here can
-//! write — no ingest, no flush/compact, no retention — so the endpoint is safe to expose to an agent
-//! that is only meant to *look* at telemetry.
+//! log/trace/metric query builders, attribute discovery and statistics, DB stats, and raw SQL. All
+//! but one are reads — no ingest, no flush/compact, no retention.
+//!
+//! The exception is `set_promoted_attributes`, which replaces the promoted attribute keys (§6.1): it
+//! seals the buffer and changes the schema every segment written afterwards carries. It is marked
+//! [`Tool::writes`] and [`visible`] hides it from a **read-only** handle, so a client driving a
+//! reader is never offered it — a handle that holds no writer lock has nothing for it to call. A
+//! deployment serving `/mcp` from the *writer* is granting an agent that action, and should gate the
+//! endpoint accordingly.
 //!
 //! Every tool answers with a JSON document in a single `text` content block. Argument problems and
 //! query failures come back as tool-execution errors (`isError: true`) rather than JSON-RPC errors,
@@ -19,13 +25,21 @@ use imbh::{
 use serde_json::{Value, json};
 
 use crate::json::{Args, attributes, labels, number};
-use crate::{batches_to_json, offload, stats_json};
+use crate::{Housekeeping, batches_to_json, offload, stats_json};
 
 /// One tool as `tools/list` describes it.
 pub(crate) struct Tool {
     pub(crate) name: &'static str,
     pub(crate) title: &'static str,
     pub(crate) description: &'static str,
+    /// Whether the tool **changes the database**. Read-only tools are the rule and this is the
+    /// exception, so it is a field rather than a naming convention: [`visible`] hides a write tool
+    /// from a read-only handle, and a client is never offered something that cannot work.
+    pub(crate) writes: bool,
+    /// Whether the tool needs the host's **housekeeping queue**. Hosts that run one (`imbhd`) offer
+    /// these; hosts that do not (`imbh-tui --mcp-stdio`) do not, for the same reason a read-only
+    /// handle is not offered the writes — there is nothing for the tool to call.
+    pub(crate) queue: bool,
     /// The tool's JSON Schema as text. Kept as a literal because a schema reads far better written
     /// out than assembled from `json!` calls; [`Tool::schema`] parses it for the wire.
     pub(crate) input_schema: &'static str,
@@ -55,6 +69,8 @@ pub(crate) const TOOLS: &[Tool] = &[
              `json_get_str(attributes, 'http.route')`. Use this when \
              no purpose-built tool fits; prefer the typed tools otherwise, since they apply the \
              indexes.",
+        writes: false,
+        queue: false,
         input_schema: r#"{"type":"object","properties":{
             "sql":{"type":"string","description":"The SQL query to run."},
             "max_rows":{"type":"integer","minimum":1,"description":"Row cap for the response (default 200, max 5000). Rows beyond it are dropped and `truncated` is set."}
@@ -67,6 +83,8 @@ pub(crate) const TOOLS: &[Tool] = &[
              newest first by default. `matches` is a tokenized term-AND full-text search accelerated \
              by the Tantivy index and is the cheapest way to find a phrase in log bodies; \
              `body_contains` is a literal substring match with no index behind it.",
+        writes: false,
+        queue: false,
         input_schema: r#"{"type":"object","properties":{
             "service":{"type":"string","description":"Exact `service.name` to match."},
             "severity_at_least":{"type":["string","integer"],"description":"Minimum severity: trace|debug|info|warn|error|fatal, or an OTel severity number (1-24)."},
@@ -87,6 +105,8 @@ pub(crate) const TOOLS: &[Tool] = &[
         description: "Count the log records matching a filter, without materializing any of them. \
              Takes the same filter arguments as `search_logs` (minus `limit`/`direction`). Use it to \
              size a query before running it, or to answer \"how many errors\" directly.",
+        writes: false,
+        queue: false,
         input_schema: r#"{"type":"object","properties":{
             "service":{"type":"string"},
             "severity_at_least":{"type":["string","integer"],"description":"trace|debug|info|warn|error|fatal, or an OTel severity number (1-24)."},
@@ -105,6 +125,8 @@ pub(crate) const TOOLS: &[Tool] = &[
         description: "Count matching log records per time bucket — the shape you want for \"is this \
              spiking?\". Optionally break the volume down by attribute keys, which yields one series \
              per label set. Takes the same filter arguments as `search_logs`.",
+        writes: false,
+        queue: false,
         input_schema: r#"{"type":"object","properties":{
             "service":{"type":"string"},
             "severity_at_least":{"type":["string","integer"],"description":"trace|debug|info|warn|error|fatal, or an OTel severity number (1-24)."},
@@ -125,6 +147,8 @@ pub(crate) const TOOLS: &[Tool] = &[
         description: "Find traces by service, span name, status, duration, and attributes. Returns \
              one summary per trace (root service/name, start, duration, span count, error flag) — \
              call `get_trace` with a returned `trace_id` for the spans.",
+        writes: false,
+        queue: false,
         input_schema: r#"{"type":"object","properties":{
             "service":{"type":"string","description":"Exact `service.name` on any span in the trace."},
             "name":{"type":"string","description":"Exact span name to match."},
@@ -146,6 +170,8 @@ pub(crate) const TOOLS: &[Tool] = &[
         description: "Fetch every span of one trace by id, with attributes, status, and parent \
              links, ordered as stored. Returns `found: false` when the trace is outside retention or \
              was never ingested.",
+        writes: false,
+        queue: false,
         input_schema: r#"{"type":"object","properties":{
             "trace_id":{"type":"string","description":"32-character hex trace id."}
         },"required":["trace_id"]}"#,
@@ -157,6 +183,8 @@ pub(crate) const TOOLS: &[Tool] = &[
              count, error rate, and p50/p95/p99 latency in nanoseconds. Group by attribute keys \
              (e.g. `http.route`) for one series per label set. This is the fastest way to find what \
              is slow or failing.",
+        writes: false,
+        queue: false,
         input_schema: r#"{"type":"object","properties":{
             "service":{"type":"string"},
             "name":{"type":"string","description":"Exact span name."},
@@ -176,6 +204,8 @@ pub(crate) const TOOLS: &[Tool] = &[
         description: "List every metric name in the database with its kind (gauge, sum, histogram, \
              exponential histogram), unit, and aggregation temporality. Start here before querying a \
              metric — the `kind` decides which query tool applies.",
+        writes: false,
+        queue: false,
         input_schema: r#"{"type":"object","additionalProperties":false}"#,
     },
     Tool {
@@ -183,6 +213,8 @@ pub(crate) const TOOLS: &[Tool] = &[
         title: "List a metric's series",
         description: "List the distinct label sets (series) reported for one metric, so you know \
              what you can filter or group by.",
+        writes: false,
+        queue: false,
         input_schema: r#"{"type":"object","properties":{
             "metric":{"type":"string","description":"Metric name, as returned by `list_metrics`."}
         },"required":["metric"]}"#,
@@ -193,6 +225,8 @@ pub(crate) const TOOLS: &[Tool] = &[
         description: "Aggregate a gauge or sum metric into a time series, one value per `step` \
              bucket. Set `rate` for the per-second rate of a counter (sum metrics). Returns one \
              series per group-by label set.",
+        writes: false,
+        queue: false,
         input_schema: r#"{"type":"object","properties":{
             "metric":{"type":"string","description":"Metric name, as returned by `list_metrics`."},
             "kind":{"type":"string","enum":["gauge","sum"],"description":"Which metric table to read (default \"gauge\"). Use `list_metrics` to check."},
@@ -211,6 +245,8 @@ pub(crate) const TOOLS: &[Tool] = &[
         title: "Query a metric's latest value",
         description: "One value per series for a gauge or sum metric — the latest bucket in the \
              window. The instant-query counterpart of `query_metric_range`.",
+        writes: false,
+        queue: false,
         input_schema: r#"{"type":"object","properties":{
             "metric":{"type":"string"},
             "kind":{"type":"string","enum":["gauge","sum"],"description":"Which metric table to read (default \"gauge\")."},
@@ -230,6 +266,8 @@ pub(crate) const TOOLS: &[Tool] = &[
         description: "Quantile (e.g. p95 latency) over time from a histogram metric. Set \
              `exponential` for an exponential-histogram metric — `list_metrics` reports which kind a \
              metric is.",
+        writes: false,
+        queue: false,
         input_schema: r#"{"type":"object","properties":{
             "metric":{"type":"string","description":"Histogram metric name."},
             "quantile":{"type":"number","minimum":0,"maximum":1,"description":"Quantile in [0,1] (default 0.95)."},
@@ -247,6 +285,8 @@ pub(crate) const TOOLS: &[Tool] = &[
         title: "List attribute keys",
         description: "List every attribute key present on any signal (logs, spans, metrics), plus \
              `service.name`. Use it to discover what you can filter or group by.",
+        writes: false,
+        queue: false,
         input_schema: r#"{"type":"object","additionalProperties":false}"#,
     },
     Tool {
@@ -254,6 +294,8 @@ pub(crate) const TOOLS: &[Tool] = &[
         title: "List attribute values",
         description: "List the distinct string values of one attribute key across every signal — \
              e.g. the set of `service.name`s, or every `http.route` seen.",
+        writes: false,
+        queue: false,
         input_schema: r#"{"type":"object","properties":{
             "key":{"type":"string","description":"Attribute key, e.g. \"service.name\"."}
         },"required":["key"]}"#,
@@ -264,13 +306,115 @@ pub(crate) const TOOLS: &[Tool] = &[
         description: "Operational stats for the database: per-table segment/row counts and time \
              span, buffered rows, WAL bytes, and the durable LSN. Use it to see what data exists and \
              over what period before querying.",
+        writes: false,
+        queue: false,
         input_schema: r#"{"type":"object","additionalProperties":false}"#,
+    },
+    Tool {
+        name: "attribute_stats",
+        title: "Attribute statistics",
+        description: "Measure attribute keys: how many distinct values each has, how much of that \
+             value space sits inside one segment (sigma — a segment index prunes `1 - sigma`), what a \
+             promoted column would cost per row, and two independent verdicts — whether to promote \
+             the key, and the widest query window over which segment pruning still pays. Reported \
+             DB-wide and per table, since sigma is only defined against a table's own segments. Use \
+             it to choose a `promote` list from data instead of guesswork. This **scans** every \
+             sealed segment's attribute columns in range, so it costs the corpus rather than the \
+             answer — narrow the window on a large database. Buffered rows are in no segment yet and \
+             are excluded; `unsealed_wal_frames` says how many were skipped.",
+        writes: false,
+        queue: false,
+        input_schema: r#"{"type":"object","properties":{
+            "since":{"type":"string","description":"Measure segments overlapping the last duration (`15m`, `24h`, `7d`). Omit all three window arguments to measure every sealed segment, which is the default and usually what a `promote` list should be chosen from."},
+            "start_unix_nano":{"type":"integer","description":"Window start, epoch nanoseconds. Overrides `since`."},
+            "end_unix_nano":{"type":"integer","description":"Window end, epoch nanoseconds."},
+            "top":{"type":"integer","minimum":1,"description":"Keys reported per scan unit, most expensive promoted column first (default 20, max 200). `truncated` is set on a unit whose keys were cut."}
+        },"additionalProperties":false}"#,
+    },
+    Tool {
+        name: "list_promoted_attributes",
+        title: "List promoted attributes",
+        description: "The attribute keys currently promoted to columns, in column order. A promoted \
+             key is stored as a real column as well as in the JSON attribute blob, so filters on it \
+             hit a column instead of a JSON scan. Read this before changing the set —              `set_promoted_attributes` replaces it wholesale.",
+        writes: false,
+        queue: false,
+        input_schema: r#"{"type":"object","additionalProperties":false}"#,
+    },
+    Tool {
+        name: "set_promoted_attributes",
+        title: "Set promoted attributes",
+        description: "Replace the promoted attribute keys, answering with the set now in effect. \
+             **This writes.** It seals the buffer and changes the schema every segment written \
+             afterwards carries; segments already on disk keep theirs and stay queryable either way. \
+             Send the whole set, not a delta — the order is the column order. Use \
+             `attribute_stats` to choose it: promote keys it rates cheap and widely present, and \
+             demote by sending the set without them. Demotion is always safe (the key never left the \
+             JSON blob); promotion is the direction worth being slow about, since it is a schema \
+             change.",
+        writes: true,
+        queue: false,
+        input_schema: r#"{"type":"object","properties":{
+            "keys":{"type":"array","items":{"type":"string"},"description":"The complete set of attribute keys to promote, in the column order wanted. An empty array promotes nothing."}
+        },"required":["keys"],"additionalProperties":false}"#,
+    },
+    Tool {
+        name: "run_housekeeping",
+        title: "Run housekeeping",
+        description: "Queue a housekeeping pass and return its **job id** — the work has not run \
+             when this answers. A pass seals the write buffer, commits any prepared segment \
+             rewrites, applies retention, and (with `compact: true`) merges each day's segments. \
+             Poll `housekeeping_status` with the id until `state` is `succeeded` or `failed`. A pass \
+             costs the size of the database rather than the size of an answer, which is why it is \
+             queued rather than performed. Submitting the same request twice while one is still \
+             waiting returns the waiting job's id rather than queueing a second pass.",
+        writes: true,
+        queue: true,
+        input_schema: r#"{"type":"object","properties":{
+            "compact":{"type":"boolean","description":"Also merge each day-partition's segments. The expensive half; false by default."},
+            "max_jobs":{"type":"integer","minimum":1,"description":"Cap the partitions this pass rewrites, so a large database can be compacted a slice at a time. Omit for no cap; the report's `compaction_complete` says whether anything was left."}
+        },"additionalProperties":false}"#,
+    },
+    Tool {
+        name: "housekeeping_status",
+        title: "Housekeeping status",
+        description: "What a housekeeping job did, by the id `run_housekeeping` returned. `state` \
+             is `queued`, `running`, `succeeded` or `failed`; `report` carries the counts on \
+             success and `error` the reason on failure. Omit `job_id` to list the recent jobs, \
+             newest first — ids do not survive a restart of the server.",
+        writes: false,
+        queue: true,
+        input_schema: r#"{"type":"object","properties":{
+            "job_id":{"type":"string","description":"The id to look up. Omitted, the recent jobs are listed instead."}
+        },"additionalProperties":false}"#,
     },
 ];
 
+/// The tools a client is offered against `db`.
+///
+/// A read-only handle holds no writer lock and refuses every write by construction, so a tool that
+/// writes is not merely disallowed there — it has nothing to call. Hiding it is the honest answer: an
+/// agent should not be offered an action that cannot succeed, and a client that caches `tools/list`
+/// then never learns it exists.
+pub(crate) fn visible(
+    db: &Arc<Db>,
+    housekeeping: Option<&Arc<dyn Housekeeping>>,
+) -> impl Iterator<Item = &'static Tool> {
+    let read_only = db.is_read_only();
+    let queued = housekeeping.is_some();
+    TOOLS
+        .iter()
+        .filter(move |tool| !(tool.writes && read_only) && !(tool.queue && !queued))
+}
+
 /// Run one tool. `None` means the tool name is unknown, which is a *protocol* error (`-32602`), not
 /// a tool-execution error. `Some(Err(message))` is a tool-execution error the model should see.
-pub(crate) async fn call(db: &Arc<Db>, name: &str, args: &Args) -> Option<Result<Value, String>> {
+pub(crate) async fn call(
+    db: &Arc<Db>,
+    housekeeping: Option<&Arc<dyn Housekeeping>>,
+    name: &str,
+    args: &Args,
+) -> Option<Result<Value, String>> {
     Some(match name {
         "query_sql" => query_sql(db, args).await,
         "search_logs" => search_logs(db, args).await,
@@ -287,6 +431,11 @@ pub(crate) async fn call(db: &Arc<Db>, name: &str, args: &Args) -> Option<Result
         "list_attribute_keys" => list_attribute_keys(db).await,
         "list_attribute_values" => list_attribute_values(db, args).await,
         "db_stats" => db_stats(db).await,
+        "attribute_stats" => attribute_stats(db, args).await,
+        "list_promoted_attributes" => Ok(promoted_json(db)),
+        "set_promoted_attributes" => set_promoted_attributes(db, args).await,
+        "run_housekeeping" => run_housekeeping(db, housekeeping, args),
+        "housekeeping_status" => housekeeping_status(housekeeping, args),
         _ => return None,
     })
 }
@@ -822,6 +971,179 @@ async fn db_stats(db: &Arc<Db>) -> Result<Value, String> {
     // `stats_json` is the same serializer `GET /stats` answers with, so the two surfaces cannot
     // describe one database differently; it renders to text, hence the parse back into a value.
     serde_json::from_str(&stats_json(&stats)).map_err(|e| e.to_string())
+}
+
+/// Measure the attribute keys (ARCHITECTURE.md §10.20).
+///
+/// The window defaults to **every sealed segment**, unlike every other tool here: a `promote` list is
+/// chosen from everything the database holds, not from a recent slice. The narrowing arguments are
+/// there because this scans, so a large corpus can be bounded — not because a window is the natural
+/// unit of the question.
+async fn attribute_stats(db: &Arc<Db>, args: &Args) -> Result<Value, String> {
+    use imbh::attrstats::AttrScope;
+
+    let top = args.limit("top", 20, 200)?;
+    // Explicit bounds win, then `since`; all absent means unbounded, which `Options::range = None` is.
+    let range = match (
+        args.i64("start_unix_nano")?,
+        args.i64("end_unix_nano")?,
+        args.duration("since")?,
+    ) {
+        (None, None, None) => None,
+        (start, end, since) => {
+            let now = Timestamp::now().0;
+            let start = start.or_else(|| {
+                since.map(|d| now.saturating_sub(d.as_nanos().min(i64::MAX as u128) as i64))
+            });
+            Some((start.unwrap_or(i64::MIN), end.unwrap_or(i64::MAX)))
+        }
+    };
+    let options = imbh::attrstats::Options {
+        range,
+        ..Default::default()
+    };
+    let report = offload(db.attribute_stats(&options))
+        .await
+        .map_err(|e| e.to_string())?;
+    let promote = db.promote();
+    let promoted = promote.keys();
+
+    let unit = |unit: &imbh::attrstats::UnitReport, db_wide: bool| {
+        let mut keys: Vec<&imbh::attrstats::KeyReport> = unit.keys.iter().collect();
+        // Most expensive promoted column first: the keys worth arguing about, not the ones that
+        // merely occur most often.
+        keys.sort_by(|a, b| {
+            b.est_bytes_per_row
+                .partial_cmp(&a.est_bytes_per_row)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.name.cmp(&b.name))
+        });
+        let truncated = keys.len() > top;
+        json!({
+            "unit": if db_wide { "all_tables" } else { unit.label.as_str() },
+            "segments": unit.segments,
+            "rows": unit.rows,
+            "keys_measured": unit.keys.len(),
+            "truncated": truncated,
+            "keys": keys.iter().take(top).map(|key| json!({
+                "key": key.name,
+                "scope": key.scope.column(),
+                "promoted": promoted.contains(&key.name),
+                // `promote` is DB-wide configuration, so only the roll-up gives a verdict: a
+                // per-table one would judge it against one table's totals.
+                "promote": (db_wide && key.scope == AttrScope::Attributes)
+                    .then(|| report.promote_verdict(key)),
+                // Sigma is defined against a *table's* segment count, so each unit answers for
+                // itself and the roll-up reports the best case across them.
+                "index_scale": if db_wide {
+                    report.index_scale(&key.name)
+                } else {
+                    report.index_scale_in(unit, &key.name)
+                },
+                "coverage": number(key.coverage(unit.rows)),
+                "distinct_values_estimated": number(key.distinct_est),
+                "sigma_p50": key.sigma.as_ref().map(|sigma| number(sigma.p50)),
+                "estimated_bytes_per_row": number(key.est_bytes_per_row),
+                "rows_present": key.rows_present,
+                "sampled": key.is_sampled(),
+            })).collect::<Vec<_>>(),
+        })
+    };
+
+    Ok(json!({
+        "range_unix_nanos": report.range.map(|(start, end)| json!([start, end])),
+        "promoted": promoted,
+        // Anything the measurement could not cover, stated rather than left to be inferred from a
+        // short list: a truncated result that reads like full coverage is worse than no result.
+        "unsealed_wal_frames": report.pending_wal_frames,
+        "segments_skipped": report.segments_skipped,
+        "all_tables": unit(&report.global, true),
+        "tables": report.tables.iter().filter(|unit| unit.segments > 0)
+            .map(|u| unit(u, false)).collect::<Vec<_>>(),
+    }))
+}
+
+/// The promoted set as both tools answer it, so the read and the write cannot describe it
+/// differently.
+fn promoted_json(db: &Arc<Db>) -> Value {
+    json!({ "promoted": db.promote().keys() })
+}
+
+/// Replace the promoted attribute keys — the one tool here that writes (ARCHITECTURE.md §6.1).
+///
+/// Hidden from `tools/list` on a read-only handle ([`visible`]), but re-checked here: a client may
+/// have cached an older list, and the message it gets should say why the action does not exist rather
+/// than surface the storage layer's read-only error.
+async fn set_promoted_attributes(db: &Arc<Db>, args: &Args) -> Result<Value, String> {
+    if db.is_read_only() {
+        return Err(
+            "this server opened the database read-only, so it cannot change the promoted \
+                    set. Point the MCP client at the process that writes the database."
+                .to_owned(),
+        );
+    }
+    let keys = args.string_list("keys")?;
+    offload(db.set_promote(imbh::Promote::new(keys)))
+        .await
+        .map_err(|e| e.to_string())?;
+    // The set now in effect, not the set requested: keys colliding with a built-in column name are
+    // filtered at schema construction, so the two can differ.
+    Ok(promoted_json(db))
+}
+
+/// Queue a housekeeping pass and answer with its job id.
+///
+/// Synchronous by design: submitting is the fast part, and the record it returns is a *handle*. A tool
+/// that waited for the pass would be the thing the queue exists to avoid.
+fn run_housekeeping(
+    db: &Arc<Db>,
+    housekeeping: Option<&Arc<dyn Housekeeping>>,
+    args: &Args,
+) -> Result<Value, String> {
+    let Some(queue) = housekeeping else {
+        return Err("this server runs no housekeeping queue".to_owned());
+    };
+    if db.is_read_only() {
+        return Err(
+            "this server opened the database read-only, so it cannot run housekeeping. \
+                    Point the client at the process that writes the database."
+                .to_owned(),
+        );
+    }
+    let compact = args.bool("compact")?.unwrap_or(false);
+    // Zero would mean "compact, but compact nothing", which `compact: false` already says.
+    let max_jobs = match args.i64("max_jobs")? {
+        None => None,
+        Some(n) if n > 0 => Some(n as usize),
+        Some(_) => {
+            return Err(
+                "`max_jobs` must be a positive integer — the number of partitions this pass \
+                        may rewrite. Omit it for an unbounded pass, or set `compact` to false to \
+                        skip compaction."
+                    .to_owned(),
+            );
+        }
+    };
+    Ok(queue.submit(compact, max_jobs))
+}
+
+/// One housekeeping job, or the recent ones when no id is given.
+fn housekeeping_status(
+    housekeeping: Option<&Arc<dyn Housekeeping>>,
+    args: &Args,
+) -> Result<Value, String> {
+    let Some(queue) = housekeeping else {
+        return Err("this server runs no housekeeping queue".to_owned());
+    };
+    match args.str("job_id")? {
+        Some(id) => queue.get(id).ok_or_else(|| {
+            format!(
+                "no housekeeping job {id}. Ids do not survive a restart of the server, and only the \
+                 most recent jobs are retained."
+            )
+        }),
+        None => Ok(json!({ "jobs": queue.recent() })),
+    }
 }
 
 // ── result rendering ────────────────────────────────────────────────────────────────────────────

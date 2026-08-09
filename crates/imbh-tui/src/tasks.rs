@@ -8,8 +8,10 @@ use tokio::sync::mpsc;
 use crate::app::App;
 use crate::backend::Backend;
 use crate::completion::LogCompletionRequest;
-use crate::fetch::{build_waterfall_detail, discover_dims, load_snapshot};
-use crate::model::{ExemplarMarker, Options, QueryResult, Screen, Update};
+use crate::fetch::{attribute_pane, build_waterfall_detail, discover_dims, load_snapshot};
+use crate::model::{
+    AttrWindow, DetailPane, DetailStyle, ExemplarMarker, Options, QueryResult, Screen, Update,
+};
 use crate::promql::metric_name_from_detail;
 
 pub(crate) fn request_refresh(
@@ -44,6 +46,13 @@ pub(crate) fn request_refresh(
     let query = app.active_query().to_owned();
     let after = app.log_cursor_stack.last().copied();
     let correlation = app.log_correlation.clone();
+    // The Overview's attribute statistics are a *scan* of every sealed segment's attribute columns,
+    // not a query, so they are issued as their own task and land separately (`Update::AttributeStats`)
+    // — the gauges are on screen in milliseconds whatever the corpus costs to measure. `loading` is
+    // cleared by the query below, so a scan still running never blocks the next refresh either.
+    if screen == Screen::Overview && app.needs_attr_measure() {
+        request_attribute_stats(app.attr_key(), backend.clone(), sender.clone());
+    }
     tokio::spawn(async move {
         let result = load_snapshot(backend, screen, &query, &options, after, correlation).await;
         let _ = sender.send(Update::Query(QueryResult {
@@ -51,6 +60,52 @@ pub(crate) fn request_refresh(
             screen,
             result,
         }));
+    });
+}
+
+/// Measure the attribute statistics for the pane's window off the event-loop thread.
+///
+/// Failures are delivered as the pane's own text rather than as a panel error: the Overview above it
+/// is a valid answer, and replacing the whole screen with "attribute statistics unavailable" would
+/// lose it. `key` is the window measured and travels with the result, so a measurement for a range the
+/// user has since left is dropped instead of shown under the current one.
+pub(crate) fn request_attribute_stats(
+    key: AttrWindow,
+    backend: Backend,
+    sender: mpsc::UnboundedSender<Update>,
+) {
+    tokio::spawn(async move {
+        // The promoted set is read with the measurement rather than separately: the pane shows the
+        // verdict *next to* the current state, and two independently-timed reads could disagree.
+        let promoted = backend.promoted().await.unwrap_or_default();
+        let _ = sender.send(Update::Promoted(Ok(promoted.clone())));
+        let pane = match backend.attribute_stats(key).await {
+            Ok(report) => attribute_pane(&report, &promoted),
+            Err(error) => DetailPane {
+                title: "Attributes".to_owned(),
+                lines: vec![format!("not measured - {error}")],
+                waterfall: None,
+                table: None,
+                style: DetailStyle::Pane,
+            },
+        };
+        let _ = sender.send(Update::AttributeStats { key, pane });
+    });
+}
+
+/// Replace the daemon's promoted attribute keys off the event-loop thread.
+///
+/// The set the daemon ends up with comes back as [`Update::Promoted`] — not the set that was sent, so
+/// a key the daemon dropped (one colliding with a built-in column name) shows as dropped rather than
+/// as promoted-and-mysteriously-absent. A failure travels with it and lands in the status bar.
+pub(crate) fn request_promotion(
+    keys: Vec<String>,
+    backend: Backend,
+    sender: mpsc::UnboundedSender<Update>,
+) {
+    tokio::spawn(async move {
+        let result = backend.set_promoted(keys).await;
+        let _ = sender.send(Update::Promoted(result.map_err(|error| error.to_string())));
     });
 }
 

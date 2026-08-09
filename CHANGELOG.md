@@ -13,7 +13,116 @@ release aborts if it is missing or duplicated.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A running writer now picks up prepared segment rewrites on its own.** The background maintenance
+  loop commits pending records on each maintenance tick, immediately before retention. Before this the
+  only in-process triggers were `open()` and `close()`, so a long-running `imbhd` applied an external
+  `imbh-housekeeper`'s work **only at restart** — and a preparer kept re-preparing partitions that
+  never landed, which is the failure the open/close pickup was added to prevent, displaced from "a
+  host that never calls `maintain()`" to "a host that never restarts". Costs one `read_dir` of a
+  usually-empty directory per maintenance interval. The loop still decides *when* to seal by the
+  flush policy — it performs `maintain()`'s order rather than calling it, since `maintain()` seals
+  unconditionally and `FlushPolicy::manual` means "seal only on `/admin/flush` and shutdown".
+
 ### Added
+
+- **Queued housekeeping on `imbhd`: `POST /admin/housekeeping`.** Answers `202` with a job id rather
+  than the outcome; `GET /admin/housekeeping/<id>` reports the job and `GET /admin/housekeeping` lists
+  the retained ones. A pass is seal + commit pending rewrites + retention, plus compaction with
+  `{"compact": true}`. It is submitted rather than performed because its cost follows the *corpus*,
+  not the answer — a compaction pass over a long retention window outlasts what a proxy will hold a
+  connection open for. Passes run **one at a time**, so "housekeeping is running" is a state the
+  database is in rather than a race between two of them. The registry is in memory and job ids carry
+  the process's start time, so an id from a previous `imbhd` is a `404` rather than somebody else's
+  job; history is bounded at 32 records, evicting oldest-finished-first so a job still being polled is
+  never dropped. Refused with a `400` on a read-only handle, where a pass could never do anything.
+  `{"max_jobs": N}` bounds the **partitions** the compaction half rewrites — `imbh-housekeeper
+  --max-jobs` for the endpoint — so a corpus too large for one call is drained a slice at a time;
+  partitions past the bound are untouched rather than half-done, and the report's
+  `compaction_complete` says whether anything was left. **Duplicate submissions coalesce**: a request
+  matching a job still *queued* answers `200` with that job's id and `"coalesced": true` rather than
+  queueing a second pass — a running job is deliberately not a match, since it snapshotted the
+  database before the new request arrived.
+- **Housekeeping over MCP**: `run_housekeeping` and `housekeeping_status`, driving the same queue the
+  HTTP endpoint does, so an agent and an operator see one set of passes. Offered only by a host that
+  runs a queue — `imbh_mcp::handle_with` takes it as a `Housekeeping` capability, and
+  `imbh-tui --mcp-stdio`, which runs none, does not advertise them.
+- **`Db::compact_bounded(max_partitions)`** (and `Storage::compact_bounded`), the bounded form of
+  `compact()`. Additive: `compact()` is unchanged and is now `compact_bounded(usize::MAX)`.
+- **`GET`/`POST /admin/promote` — change the promoted attribute keys on a running `imbhd`.** The
+  measurement now has an action beside it: read the verdicts, then act on them without restarting the
+  daemon with a different `DbBuilder::promote` list. On `/admin/*` beside `flush` and `compact`, *not*
+  under the read-only `/api/head` prefix, because it writes — `Db::set_promote` seals the buffer and
+  changes the schema every subsequent segment is written with. The body carries the whole set rather
+  than a delta (promotion is a list, and its order is the column order, so a delta would ask the
+  server to guess placement and would let two callers silently lose each other's change), and the
+  answer is the set now in effect. `HeadClient::promoted`/`set_promoted` drive it.
+- **Three MCP tools closing the loop on promotion**: `attribute_stats` (the same measurement, DB-wide
+  and per table, with both verdicts), `list_promoted_attributes`, and `set_promoted_attributes`.
+  The last is **the only tool on the MCP surface that writes**, and it is hidden from `tools/list`
+  when the server holds the database read-only — a reader has no writer lock, so the action has
+  nothing to call and an agent is never offered one that cannot succeed. `attribute_stats` defaults to
+  every sealed segment rather than a recent window, since a `promote` list is chosen from the whole
+  corpus; its window arguments exist to bound the scan on a large database.
+- **Promote and demote from the TUI**, on the Overview's attribute pane: an `on` column showing the
+  live promoted set beside the `promote` verdict, and `p` on the row under the cursor to toggle it.
+  **Each section is its own Tab stop**, so a reader reaches the third table without scrolling past the
+  first two, and the pane title names the section the ring is on. Within a section the cursor steps
+  key-to-key, skipping titles, per-section headers and the blank lines between sections — structure
+  `p` would have nothing to act on — and **hops to the next section at a section's edge**, so the
+  arrows walk the whole pane while Tab jumps a section at a time. An overshoot (`PageDown` from
+  mid-section) lands on that section's last key first: the edge is a pause, not a wall.
+  **Only against a daemon** (`imbh-tui --url …`): a local session opened the database read-only and
+  holds no writer lock, so there is no local implementation to offer — `p` says what would work
+  instead of surfacing a read-only error, and the pane advertises the key only where it exists.
+- **`imbh-attrstats` — attribute cardinality and per-segment selectivity, as a reusable crate**
+  (ARCHITECTURE.md §10.20). The measurement that used to live inside the `attr-stats` example is now a
+  library: per key, the distinct-value count, sigma (the fraction of segments a value occupies, so how
+  much a segment index could prune), the cardinality curve over a ladder of window widths, the run
+  structure a promoted column's index array pays for, and the two independent verdicts — *promote this
+  key* and *index it, up to this window width*. Bounded memory via bottom-k sketches, so a run reports
+  the same numbers whatever order it read the data in, and says so whenever a cap engaged. Reads and
+  changes nothing — no writer lock, no new column, no manifest edit — so it runs against a database a
+  writer has open. Adds no third-party dependency: everything it needs is already in any build with
+  storage.
+- **`Db::attribute_stats`** behind the facade's off-by-default `attrstats` feature, mirrored on
+  `BlockingDb`. Works on read-only and read-write handles alike; an in-memory database is refused with
+  a reason rather than reported as empty, since "no segments to measure" and "no attributes" are
+  different answers. It is a full scan of the attribute columns in range — pass `Options::range`.
+- **`POST /api/head/attributes/stats`** (ARCHITECTURE.md §10.19), so a head can measure the daemon's
+  database. The request body *is* `imbh_attrstats::Options` and the response the whole `Report`, so the
+  local and remote paths measure the same thing under the same caps; `imbhd` runs it under `offload`,
+  which keeps a long scan off the connection's runtime.
+- **Attribute statistics on the `imbh-tui` Overview**, over the selected time range: one line per key
+  with both verdicts immediately after the key — where a narrow terminal cannot truncate the
+  conclusion — plus the caveats no column can carry (unsealed WAL frames, skipped segments, engaged
+  caps). It is measured **asynchronously**: the database gauges answer in milliseconds and the block
+  fills in when the scan lands, in either arrival order. The measurement is reused across
+  auto-refresh ticks and re-run only when the range changes, when it goes a minute stale, or on `r` —
+  a corpus scan every few seconds would cost far more than it tells anyone.
+  - It is **its own pane**, below the gauges and sized to take what they do not need — bordered,
+    focusable, and the one that scrolls, since it is the long content. The keys render as a real
+    column-aligned table with a styled header, the same one the Metrics panes use; the prose that
+    qualifies them (the window measured, unsealed WAL frames, skipped segments) sits above it and does
+    not scroll away.
+  - The table is **grouped per scan unit**: the DB-wide roll-up first — the scope `promote` is decided
+    at — then one section per table that has segments in range, in the same order the gauges pane above
+    lists them. That is where the numbers are actually defined (sigma's denominator is a table's
+    segment count, so the roll-up's sigma is a best case over the per-table ones), and it answers what
+    the roll-up hides: whether a key is a log attribute, a span attribute, or a metric label. Tables
+    with no segments are left out rather than shown as zeroes. Each section is its own table: a
+    full-width title with that unit's totals, then its **own column header**, then its keys.
+  - The pane has **its own time range**, unrelated to the query range every panel is evaluated over,
+    and it defaults to **all sealed segments** — a `promote` list is chosen from everything the
+    database holds, not from the last fifteen minutes. Tab to the pane and press Enter to narrow it;
+    the range belongs to the pane, so it is reached through the line that displays it — its own focus
+    stop, highlighted when the ring is on it, separate from the table's stop so Enter and the row
+    cursor never have to guess which of the pane's two things was meant — rather than through a global
+    key, and the form drops from that line rather than from the header's time indicator (which edits
+    the *query* window, and no longer highlights for a form that does not). Submitting it empty
+    measures all of time again — the same spelling the form shows when the range is unbounded. The
+    pane always leads with the window it measured.
 
 - **`compaction` Cargo feature (on by default) — segment rewriting is now droppable.** Turning it off
   (`--no-default-features --features ingest,query,search`) removes `Db::compact` and

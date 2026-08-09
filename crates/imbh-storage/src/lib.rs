@@ -1651,9 +1651,26 @@ impl Storage {
     )]
     #[cfg(feature = "compaction")]
     pub fn compact(&self) -> Result<CompactionReport> {
+        self.compact_bounded(usize::MAX)
+    }
+
+    /// [`Storage::compact`], stopping after `max_partitions` partitions have been rewritten.
+    ///
+    /// A pass over a database with hundreds of day-partitions rewrites every one of them, and its
+    /// duration is the corpus rather than the request. A bound turns that into **incremental
+    /// progress**: an operator (or a scheduler) does a slice now and the rest later, instead of
+    /// choosing between an hour-long call and never compacting.
+    ///
+    /// Partitions past the bound are left exactly as they were — untouched, still listed, still
+    /// queryable — so a capped pass is not a partial one. There is nothing to resume: run it again
+    /// and the next slice is done. A pass that rewrites **nothing** is how a caller learns there was
+    /// nothing left to do, which is what a drain loop stops on.
+    #[cfg(feature = "compaction")]
+    pub fn compact_bounded(&self, max_partitions: usize) -> Result<CompactionReport> {
         let Some(dir) = self.dir.clone() else {
             return Ok(CompactionReport::default());
         };
+        let mut budget = max_partitions;
 
         // 1. Snapshot the segment lists under the lock (a cheap `Vec<SegmentRef>` clone — the segment
         //    *metadata*, not the Parquet data), then release. The read/concat/sort/write below runs
@@ -1680,6 +1697,7 @@ impl Storage {
             logs_snap,
             &mut report,
             &mut deferred_deletes,
+            &mut budget,
         )?;
         let new_spans = self.compact_partition(
             &dir,
@@ -1689,6 +1707,7 @@ impl Storage {
             spans_snap,
             &mut report,
             &mut deferred_deletes,
+            &mut budget,
         )?;
         let mut new_metrics: Vec<(Table, Vec<SegmentRef>)> = Vec::new();
         for (table, segs) in metrics_snap {
@@ -1700,6 +1719,7 @@ impl Storage {
                 segs,
                 &mut report,
                 &mut deferred_deletes,
+                &mut budget,
             )?;
             new_metrics.push((table, merged));
         }
@@ -1750,6 +1770,9 @@ impl Storage {
         segs: Vec<SegmentRef>,
         report: &mut CompactionReport,
         deferred_deletes: &mut Vec<SegmentRef>,
+        // Partitions this pass may still rewrite, shared across every table so the bound is on the
+        // *pass* rather than on each table's share of it.
+        budget: &mut usize,
     ) -> Result<Vec<SegmentRef>> {
         let mut by_day: BTreeMap<String, Vec<SegmentRef>> = BTreeMap::new();
         for s in segs {
@@ -1762,6 +1785,13 @@ impl Storage {
         let mut result = Vec::new();
         let promote = self.promote_keys();
         for group in by_day.into_values() {
+            // Out of budget: pass the rest through untouched, so this table's segment list stays
+            // complete and the partitions are exactly as they were. `continue` rather than `break`
+            // because every remaining group still has to reach `result`.
+            if *budget == 0 {
+                result.extend(group);
+                continue;
+            }
             // A partition with one segment is normally nothing to merge — but it is still rewritten
             // when its schema **lags the live promote set**, because that rewrite is the only way
             // such a partition ever converges. A day that will never gain a second segment (an old
@@ -1840,6 +1870,7 @@ impl Storage {
                 report.segments_merged += group.len() as u64;
             }
             report.segments_created += 1;
+            *budget -= 1;
             // Defer deleting the merged-away sources until the manifest that points at the new
             // merged segment is durable (see `compact`). Deleting them now would risk losing every
             // row if a crash struck before the manifest was persisted.

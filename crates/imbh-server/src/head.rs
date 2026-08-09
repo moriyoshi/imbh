@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use axum::Router;
 use axum::body::Bytes;
-use axum::extract::State;
+use axum::extract::{FromRef, State};
 use axum::routing::{get, post};
 use imbh::Db;
 use imbh::arrow::array::RecordBatch;
@@ -35,7 +35,15 @@ use crate::{Response, offload};
 /// Split out of [`app`](crate::app) so a host that wants only this surface — a UI's backing daemon
 /// with no ingest and no admin actions — can mount it alone, and so a deployment that wants none of
 /// it can leave it out.
-pub fn routes() -> Router<Arc<Db>> {
+///
+/// Generic over the router's state rather than fixed to `Arc<Db>`: the outer router carries the
+/// housekeeping queue as well, and a `merge` needs both halves to agree on the state type. Every
+/// handler below still asks for `State<Arc<Db>>`, which is what the `FromRef` bound provides.
+pub fn routes<S>() -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+    Arc<Db>: FromRef<S>,
+{
     Router::new()
         .route(path::STATS, get(stats))
         .route(path::METRICS_CATALOG, get(metric_catalog))
@@ -49,6 +57,7 @@ pub fn routes() -> Router<Arc<Db>> {
         .route(path::LOGS_LOGQL, post(logql))
         .route(path::ATTRIBUTES_KEYS, get(attribute_keys))
         .route(path::ATTRIBUTES_VALUES, post(attribute_values))
+        .route(path::ATTRIBUTES_STATS, post(attribute_stats))
 }
 
 // ── handlers ────────────────────────────────────────────────────────────────────────────────────
@@ -145,6 +154,17 @@ async fn attribute_values(State(db): State<Arc<Db>>, body: Bytes) -> Response {
         Err(response) => return response,
     };
     respond(offload(exec::attribute_values(&db, &request)).await)
+}
+
+/// The one head operation that scans. [`offload`] is doing real work here: the measurement reads
+/// every sealed segment's attribute columns in range, so running it inline would hold a runtime
+/// worker for the duration instead of a blocking thread.
+async fn attribute_stats(State(db): State<Arc<Db>>, body: Bytes) -> Response {
+    let request: dto::AttrStatsRequest = match decode(&body) {
+        Ok(request) => request,
+        Err(response) => return response,
+    };
+    respond(offload(exec::attribute_stats(&db, &request)).await)
 }
 
 // ── shared plumbing ─────────────────────────────────────────────────────────────────────────────

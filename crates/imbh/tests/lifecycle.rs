@@ -703,3 +703,211 @@ fn prepared_work_lands_without_the_host_ever_calling_maintain() {
         db.close().await.unwrap();
     });
 }
+
+/// **A bounded compaction pass is a slice, not a partial one.**
+///
+/// `compact_bounded(n)` rewrites at most `n` partitions and leaves the rest exactly as they were —
+/// untouched, still listed, still queryable — so an operator can make incremental progress on a
+/// corpus too large to compact in one call. Draining is repeated calls; the pass that rewrites
+/// nothing is how a caller learns it is done.
+///
+/// Three day-partitions, two segments each, built by sealing twice per day. A bound of one therefore
+/// has strictly more work available than it may do, which is the only way to tell a bound that works
+/// from a bound that happens to be larger than the corpus.
+#[test]
+fn a_bounded_compaction_does_a_slice_and_leaves_the_rest_intact() {
+    const DAY: u64 = 24 * 3_600 * 1_000_000_000;
+    let tmp = tempfile::tempdir().unwrap();
+    let rt = ct_rt();
+    let db: Arc<Db> = Db::builder(tmp.path()).open().unwrap();
+
+    rt.block_on(async {
+        // Two segments in each of three day-partitions: six segments, three merges available.
+        for day in 1..=3u64 {
+            for n in 0..2u64 {
+                db.ingest_otlp_rich_ok("cart", "hello", day * DAY + n, &[])
+                    .await;
+                db.flush().await.unwrap();
+            }
+        }
+        let before = db.segments().len();
+        assert_eq!(before, 6, "two segments per day-partition");
+
+        // One partition's worth of work, and no more.
+        let first = db.compact_bounded(1).await.unwrap();
+        assert_eq!(first.segments_created, 1, "exactly one partition rewritten");
+        assert_eq!(first.segments_merged, 2, "the two segments of that day");
+        assert_eq!(
+            db.segments().len(),
+            before - 1,
+            "one partition collapsed 2 -> 1; the other two are untouched"
+        );
+        assert_eq!(
+            count_sql(&db, "SELECT count(*) AS c FROM logs").await,
+            6,
+            "a bounded pass loses no rows"
+        );
+
+        // Draining: each call takes another slice, and the one that finds nothing says so.
+        let second = db.compact_bounded(1).await.unwrap();
+        assert_eq!(second.segments_created, 1);
+        let third = db.compact_bounded(8).await.unwrap();
+        assert_eq!(
+            third.segments_created, 1,
+            "a bound larger than the work left does the work left"
+        );
+        let drained = db.compact_bounded(8).await.unwrap();
+        assert_eq!(
+            drained.segments_created, 0,
+            "nothing left to rewrite — what a drain loop stops on"
+        );
+        assert_eq!(db.segments().len(), 3, "one segment per day-partition");
+        assert_eq!(count_sql(&db, "SELECT count(*) AS c FROM logs").await, 6);
+
+        // And the unbounded call is the same thing with no ceiling.
+        assert_eq!(db.compact().await.unwrap().segments_created, 0);
+        db.close().await.unwrap();
+    });
+}
+
+/// **A running writer picks up a preparer's rewrites on its own**, without anyone calling
+/// `maintain()`.
+///
+/// The prepare/commit handoff (ARCHITECTURE.md §7.2) is only useful on a daemon that stays up, and
+/// until the background loop committed, the in-process triggers were `open()` and `close()` — so a
+/// long-running writer applied an external housekeeper's work *only at restart*. This drives the
+/// gap: prepare against a live writer, touch nothing else, and wait for the loop.
+///
+/// `Maintenance::Background` with a short interval is what `imbhd` runs, at a cadence a test can
+/// wait out.
+#[test]
+fn the_background_loop_commits_a_preparers_rewrite_without_maintain() {
+    use std::time::{Duration, Instant};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let rt = ct_rt();
+    let db: Arc<Db> = Db::builder(dir)
+        .wal(WalMode::Always)
+        // Short enough to wait out; `Manual` flush so the loop's *seal* never fires and the only
+        // thing under test is the commit step.
+        .maintenance(imbh::Maintenance::Background(Duration::from_millis(50)))
+        .flush(imbh::FlushPolicy::manual())
+        .open()
+        .unwrap();
+
+    rt.block_on(async {
+        // Two same-day segments for the preparer to merge.
+        db.ingest_otlp_rich_ok("cart", "alpha", 1, &[]).await;
+        db.flush().await.unwrap();
+        db.ingest_otlp_rich_ok("cart", "beta", 2, &[]).await;
+        db.flush().await.unwrap();
+        assert_eq!(db.segment_files(Table::Logs).unwrap().len(), 2);
+    });
+
+    // The housekeeper's half, from outside: no lock, no manifest edit, no deletion.
+    let prepared = prepare_pending(dir, Compression::default(), 4).unwrap();
+    assert!(
+        prepared.iter().any(|r| r.table == Table::Logs),
+        "a logs rewrite was prepared"
+    );
+
+    // Nobody calls `maintain()` or `commit_pending()` from here on — the loop is the only actor.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if db.segment_files(Table::Logs).unwrap().len() == 1 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the background loop never committed the prepared rewrite"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    rt.block_on(async {
+        assert_eq!(
+            count_sql(&db, "SELECT count(*) AS c FROM logs").await,
+            2,
+            "the swap preserved every row"
+        );
+        db.close().await.unwrap();
+    });
+}
+
+/// **Promotion takes effect at the next seal.**
+///
+/// `set_promote` seals as a barrier, so no buffered batch straddles the change; every row ingested
+/// afterwards is encoded against the new set and reaches disk in the *very next* segment — not on a
+/// maintenance tick, and not only after a compaction pass. Segments sealed before the change keep
+/// their old schema, which reads correctly through the JSON fallback until something rewrites them.
+#[test]
+fn promotion_reaches_the_next_seal_not_a_later_pass() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let rt = ct_rt();
+    let db: Arc<Db> = Db::builder(dir).open().unwrap();
+
+    let promoted_columns = |db: &Arc<Db>| -> Vec<Vec<String>> {
+        db.segment_files(Table::Logs)
+            .unwrap()
+            .iter()
+            .map(|path| {
+                let file = std::fs::File::open(path).expect("segment");
+                let builder =
+                    imbh::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(
+                        file,
+                    )
+                    .expect("parquet");
+                builder
+                    .schema()
+                    .fields()
+                    .iter()
+                    .map(|f| f.name().clone())
+                    .collect()
+            })
+            .collect()
+    };
+
+    rt.block_on(async {
+        // A segment sealed *before* promotion: no column, and none is expected.
+        db.ingest_otlp_rich_ok("cart", "before", 1, &[("env", "prod")])
+            .await;
+        db.flush().await.unwrap();
+        assert!(
+            !promoted_columns(&db)[0].iter().any(|c| c == "env"),
+            "nothing is promoted yet"
+        );
+
+        // Promote. The barrier seals whatever is buffered under the old schema.
+        db.set_promote(Promote::new(["env"])).await.unwrap();
+        assert_eq!(db.promote().keys(), ["env"]);
+
+        // The very next seal carries the column — no tick, no compaction, no housekeeper.
+        db.ingest_otlp_rich_ok("cart", "after", 2, &[("env", "prod")])
+            .await;
+        db.flush().await.unwrap();
+        let schemas = promoted_columns(&db);
+        assert!(
+            schemas.iter().any(|cols| cols.iter().any(|c| c == "env")),
+            "the segment sealed after promotion has the column: {schemas:?}"
+        );
+        assert!(
+            schemas.iter().any(|cols| !cols.iter().any(|c| c == "env")),
+            "and the one sealed before it still does not: {schemas:?}"
+        );
+
+        // Both answer the same question, because the SQL builder falls back to the JSON blob
+        // wherever the column is absent.
+        assert_eq!(
+            count_sql(
+                &db,
+                "SELECT count(*) AS c FROM logs WHERE json_get_str(attributes, 'env') = 'prod'"
+            )
+            .await,
+            2,
+            "the promoted and unpromoted segments both answer"
+        );
+        db.close().await.unwrap();
+    });
+}

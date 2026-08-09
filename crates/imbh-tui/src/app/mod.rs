@@ -22,8 +22,9 @@ use crate::chart::ChartGeometry;
 use crate::completion::Completion;
 use crate::mascot::Mascot;
 use crate::model::{
-    ExemplarMarker, Focus, LogCorrelation, MetricNode, Mode, NavEntry, QueryResult, Route, Screen,
-    Snapshot, TreeRowRef,
+    ATTR_MEASURE_INTERVAL, AbsTarget, AttrRow, AttrStats, AttrWindow, DetailPane, DetailStyle,
+    ExemplarMarker, Focus, LogCorrelation, MetricNode, Mode, NavEntry, PaneTable, QueryResult,
+    Route, Screen, Snapshot, TreeRowRef,
 };
 use crate::textfield::{TextField, caret_in};
 use crate::waterfall::TraceDetail;
@@ -31,7 +32,9 @@ use crate::waterfall::TraceDetail;
 pub(crate) struct App {
     /// The current view (single source of truth); the `screen` is derived from it.
     pub(crate) route: Route,
-    pub(crate) query: [String; 4],
+    /// One query buffer per screen, indexed by [`App::query_index`]. A screen without a query pane
+    /// (Overview) keeps an unused empty slot rather than a special case.
+    pub(crate) query: [String; Screen::ORDER.len()],
     /// The edit caret in the active query buffer, as a byte offset. Only meaningful in
     /// [`Mode::Editing`], which is only ever entered through `begin_editing` (it parks the caret at the
     /// end of the buffer). Every read goes through [`App::query_caret`], which clamps into the *current*
@@ -50,6 +53,12 @@ pub(crate) struct App {
     /// When `Some`, an absolute query window `(start_ns, end_ns)` overriding the rolling preset; set
     /// from the absolute-time form and cleared by picking any relative preset.
     pub(crate) abs_window: Option<(i64, i64)>,
+    /// The window the Overview's attribute statistics are measured over, independent of `abs_window`.
+    /// `None` — the default — measures **all sealed segments**; set from the same absolute-range form
+    /// under [`AbsTarget::Attributes`].
+    pub(crate) attr_window: AttrWindow,
+    /// Which window the absolute-range form is currently editing.
+    pub(crate) abs_target: AbsTarget,
     /// Editable buffers for the absolute-range form (UTC `YYYY-MM-DD HH:MM:SS`) and which field has
     /// focus (0 = start, 1 = end), plus the last parse error to surface in the form.
     pub(crate) abs_start: String,
@@ -59,6 +68,19 @@ pub(crate) struct App {
     /// end of whichever field takes focus (`focus_abs_field`); reads clamp, like `query_cursor`.
     pub(crate) abs_cursor: usize,
     pub(crate) abs_error: Option<String>,
+    /// The Overview's most recent attribute measurement. Held separately from the snapshot because
+    /// the two halves of the Overview arrive independently and in either order — see
+    /// [`App::compose_attr_stats`] — and because it outlives a refresh: re-scanning the corpus every
+    /// auto-refresh tick would cost far more than it tells anyone.
+    pub(crate) attr_stats: Option<AttrStats>,
+    /// The promoted attribute keys in effect, as last read from the backend. Held so `p` can send the
+    /// *whole* set (promotion is a list, and its order is the column order) rather than a delta the
+    /// server would have to guess the placement of.
+    pub(crate) promoted: Vec<String>,
+    /// Whether this session can change the promoted set — i.e. whether it is driving a daemon rather
+    /// than reading a directory (see `Backend::can_promote`). Recorded once at startup so `draw`,
+    /// which has no backend, can offer the action only where it exists.
+    pub(crate) can_promote: bool,
     /// Background auto-refresh, off by default; toggled with space. Manual/query/switch refreshes
     /// always run regardless.
     pub(crate) auto_refresh: bool,
@@ -76,6 +98,11 @@ pub(crate) struct App {
     /// clamp scrolling without re-deriving the wrapped row count.
     pub(crate) max_scroll: Cell<u16>,
     pub(crate) page_rows: Cell<u16>,
+    /// The Overview attribute pane's rectangle, published by `draw` (which alone knows the geometry)
+    /// so the range form can be anchored **over that pane**. The query window's form drops from the
+    /// header's time indicator; putting the attribute one in the same place would say it edits the
+    /// same thing.
+    pub(crate) attr_area: Cell<ratatui::layout::Rect>,
     /// Metric names from the catalog, used as PromQL completion vocabulary. Filled asynchronously.
     pub(crate) metric_names: Vec<String>,
     /// The open completion popup, or `None` when nothing is being suggested.
@@ -182,11 +209,16 @@ impl App {
             range_cursor: range_index,
             menu_cursor: 0,
             abs_window: None,
+            attr_window: None,
+            abs_target: AbsTarget::Query,
             abs_start: String::new(),
             abs_end: String::new(),
             abs_field: 0,
             abs_cursor: 0,
             abs_error: None,
+            attr_stats: None,
+            promoted: Vec::new(),
+            can_promote: false,
             auto_refresh: false,
             loading: false,
             pending_refresh: false,
@@ -198,6 +230,7 @@ impl App {
             scroll: 0,
             max_scroll: Cell::new(0),
             page_rows: Cell::new(1),
+            attr_area: Cell::new(ratatui::layout::Rect::default()),
             metric_names: Vec::new(),
             completion: None,
             detail_trace_id: None,
@@ -346,6 +379,57 @@ impl App {
         self.abs_cursor = self.abs_text().len();
     }
 
+    /// The window an attribute measurement made now would belong to — which *is* the cache key, since
+    /// the pane's window is its own and depends on nothing else.
+    pub(crate) fn attr_key(&self) -> AttrWindow {
+        self.attr_window
+    }
+
+    /// Whether the attribute statistics need measuring again: never measured, the user moved the
+    /// range, or the last measurement has gone stale ([`ATTR_MEASURE_INTERVAL`]). Everything else
+    /// reuses the block already held, which is what keeps an auto-refreshing Overview from scanning
+    /// the corpus every few seconds.
+    pub(crate) fn needs_attr_measure(&self) -> bool {
+        match &self.attr_stats {
+            None => true,
+            Some(stats) => {
+                stats.key != self.attr_key() || stats.measured_at.elapsed() >= ATTR_MEASURE_INTERVAL
+            }
+        }
+    }
+
+    /// Record an attribute measurement and fold it into the current snapshot if it is still current.
+    pub(crate) fn take_attr_stats(&mut self, key: AttrWindow, pane: DetailPane) {
+        self.attr_stats = Some(AttrStats {
+            key,
+            measured_at: Instant::now(),
+            pane,
+        });
+        self.compose_attr_stats();
+    }
+
+    /// Put the measurement in the Overview's attribute pane, when the two belong together.
+    ///
+    /// The Overview's two panes are two independent requests answered on their own schedules, so this
+    /// is called from both arrivals and applies only when the measurement describes the range now
+    /// selected. That is what stops a scan issued for a window the user has since left from being
+    /// shown under the current one, in either arrival order. The pane is replaced wholesale, so a
+    /// re-arrival cannot stack two of them.
+    pub(crate) fn compose_attr_stats(&mut self) {
+        if self.screen() != Screen::Overview || self.route.is_detail() {
+            return;
+        }
+        let Some(stats) = &self.attr_stats else {
+            return;
+        };
+        if stats.key != self.attr_key() {
+            return;
+        }
+        self.snapshot.detail = Some(stats.pane.clone());
+        // Row 0 of a grouped table is a section title, and the rows themselves have just moved.
+        self.snap_attr_cursor();
+    }
+
     pub(crate) fn apply(&mut self, result: QueryResult) {
         self.loading = false;
         if result.generation != self.generation || result.screen != self.screen() {
@@ -393,6 +477,9 @@ impl App {
             }
             Err(error) => self.last_error = Some(error),
         }
+        // A measurement that arrived before its snapshot did (an empty database measures faster than
+        // the gauges query) is folded in now rather than dropped.
+        self.compose_attr_stats();
     }
 
     /// The inclusive `[first, last]` selection-index range the row cursor may occupy, or `None` when
@@ -400,12 +487,170 @@ impl App {
     /// for a list it is an absolute index into `lines` (`first == list_from`). A screen is only ever
     /// one of the two, so `selected` never mixes interpretations.
     pub(crate) fn selectable_bounds(&self) -> Option<(usize, usize)> {
+        // A focused attribute *table* owns the cursor: its rows are the only selectable thing on the
+        // Overview, and the pane above it is a fixed block that never needs one. Checked first so a
+        // screen that has both (none does today, but the shape allows it) sends the cursor to the
+        // pane the user is actually on. The range line is a focus stop of its own and has no rows.
+        //
+        // The bounds are the **key** rows: a section title, a repeated column header and a spacer are
+        // structure, and a cursor that can land on them offers an action (`p`) that has nothing to
+        // act on. `move_selection` steps between them; these bounds only clamp.
+        if let Focus::AttrTable(section) = self.effective_focus() {
+            let keys = self.attr_key_indices(section);
+            return match (keys.first(), keys.last()) {
+                (Some(first), Some(last)) => Some((*first, *last)),
+                _ => None,
+            };
+        }
         if let Some(table) = &self.snapshot.table {
             return (!table.rows.is_empty()).then(|| (0, table.rows.len() - 1));
         }
         let first = self.snapshot.list_from?;
         let len = self.snapshot.lines.len();
         (first < len).then(|| (first, len - 1))
+    }
+
+    /// The attribute pane's table, when one is shown.
+    pub(crate) fn attr_table(&self) -> Option<&PaneTable> {
+        self.snapshot
+            .detail
+            .as_ref()
+            .filter(|pane| pane.style == DetailStyle::Pane)?
+            .table
+            .as_ref()
+    }
+
+    /// The attribute pane's sections, each as the row index of its title. One per scan unit, in
+    /// display order — and one Tab stop apiece.
+    pub(crate) fn attr_sections(&self) -> Vec<usize> {
+        let Some(table) = self.attr_table() else {
+            return Vec::new();
+        };
+        table
+            .kinds
+            .iter()
+            .enumerate()
+            .filter(|(_, kind)| **kind == AttrRow::Section)
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    /// The scan unit a section names, for the pane title — the leading word of its title row.
+    pub(crate) fn attr_section_label(&self, section: usize) -> Option<String> {
+        let table = self.attr_table()?;
+        let row = table.data.rows.get(*self.attr_sections().get(section)?)?;
+        row.first()
+            .and_then(|title| title.split_whitespace().next())
+            .map(str::to_owned)
+    }
+
+    /// Row indices of `section`'s key rows, in display order — the only rows its cursor may land on.
+    /// Empty for a section index the current measurement no longer has.
+    pub(crate) fn attr_key_indices(&self, section: usize) -> Vec<usize> {
+        let Some(table) = self.attr_table() else {
+            return Vec::new();
+        };
+        let starts = self.attr_sections();
+        let Some(&start) = starts.get(section) else {
+            return Vec::new();
+        };
+        let end = starts
+            .get(section + 1)
+            .copied()
+            .unwrap_or(table.data.rows.len());
+        (start..end)
+            .filter(|index| table.key_at(*index).is_some())
+            .collect()
+    }
+
+    /// The section the cursor belongs to — the focused one, else the first.
+    fn focused_attr_section(&self) -> usize {
+        match self.effective_focus() {
+            Focus::AttrTable(section) => section,
+            _ => 0,
+        }
+    }
+
+    /// Move the cursor by `delta` **key rows**, skipping the structure between them and **hopping to
+    /// the next section** when it is already at the edge in that direction. Returns whether it moved.
+    ///
+    /// Two motions that compose rather than compete: the arrows walk the whole pane top to bottom,
+    /// and Tab jumps a section at a time. Stopping dead at a section boundary would have made the
+    /// arrows unable to reach the pane's second table at all without reaching for Tab, which is the
+    /// kind of dead end a list should not have.
+    ///
+    /// A move that merely *overshoots* — `PageDown` from the middle of a section — lands on that
+    /// section's last key first. Only a press with nowhere left to go inside the section crosses the
+    /// boundary, so the edge is a pause rather than a wall.
+    pub(crate) fn move_attr_cursor(&mut self, delta: isize) -> bool {
+        let section = self.focused_attr_section();
+        let keys = self.attr_key_indices(section);
+        if keys.is_empty() {
+            return self.hop_attr_section(section, delta);
+        }
+        // Where the cursor is among this section's key rows — or, if it is outside them (Tab has just
+        // moved here, or a refresh parked it at 0), the nearest one.
+        let current = keys
+            .iter()
+            .position(|index| *index == self.selected)
+            .or_else(|| keys.iter().position(|index| *index >= self.selected))
+            .unwrap_or(keys.len() - 1) as isize;
+        let next = (current + delta).clamp(0, keys.len() as isize - 1);
+        if next != current {
+            self.selected = keys[next as usize];
+            return true;
+        }
+        self.hop_attr_section(section, delta)
+    }
+
+    /// Move the focus to the nearest section in `delta`'s direction that has keys, parking the cursor
+    /// on the key next to the boundary just crossed. `false` at the pane's ends, where the cursor
+    /// stays put.
+    ///
+    /// Sections with no keys are stepped over rather than focused: a stop whose cursor has nowhere to
+    /// land would swallow a keypress and look like the arrows had stopped working.
+    fn hop_attr_section(&mut self, from: usize, delta: isize) -> bool {
+        let total = self.attr_sections().len() as isize;
+        let step = if delta >= 0 { 1 } else { -1 };
+        let mut index = from as isize + step;
+        while index >= 0 && index < total {
+            let keys = self.attr_key_indices(index as usize);
+            let landing = if step > 0 { keys.first() } else { keys.last() };
+            if let Some(&row) = landing {
+                self.focus = Focus::AttrTable(index as usize);
+                self.selected = row;
+                return true;
+            }
+            index += step;
+        }
+        false
+    }
+
+    /// Park the cursor on a key row of the focused section. Called when a fresh measurement lands
+    /// (row 0 of a grouped table is a title, and the rows have moved) and when Tab lands on a section,
+    /// so the highlight is always inside the section the ring is on.
+    pub(crate) fn snap_attr_cursor(&mut self) {
+        let Focus::AttrTable(section) = self.effective_focus() else {
+            return;
+        };
+        let keys = self.attr_key_indices(section);
+        if let Some(index) = keys
+            .iter()
+            .find(|index| **index >= self.selected)
+            .or_else(|| keys.first())
+        {
+            self.selected = *index;
+        }
+    }
+
+    /// The attribute key under the pane's cursor — what a promotion toggle acts on. `None` on a
+    /// section header, which names a scan unit rather than a key.
+    pub(crate) fn selected_attr_key(&self) -> Option<String> {
+        let table = self.attr_table()?;
+        let (first, last) = self.selectable_bounds()?;
+        table
+            .key_at(self.selected.clamp(first, last))
+            .map(str::to_owned)
     }
 }
 

@@ -58,6 +58,8 @@ fn hash(key: &str) -> u64 {
 /// `resource`/`scope` (they are different scopes). A segment index has no such restriction, so the
 /// sigma side reports all three, prefixed so they never collide.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "lowercase"))]
 pub enum AttrScope {
     Attributes,
     Resource,
@@ -491,6 +493,7 @@ pub fn value_text(v: &AnyValue) -> std::borrow::Cow<'_, str> {
 /// that value occurs. That is the right unit for "if I filter on an arbitrary value of this key,
 /// what fraction of segments must I read"; weighting by query frequency would need a query log.
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct SigmaSummary {
     pub p50: f64,
     pub p90: f64,
