@@ -13,7 +13,9 @@ name = "imbhd"
 path = "src/main.rs"
 
 [dependencies]
-imbh.workspace = true
+# `attrstats` powers `POST /api/head/attributes/stats` (through imbh-head's `exec`); named here too
+# so a standalone `cargo check -p imbh-server` turns it on rather than inheriting it.
+imbh = { workspace = true, features = ["attrstats"] }
 # The MCP server itself: protocol dispatch, the read-only tool surface, and the JSON serializers
 # `POST /api/query` and `GET /stats` share with the `query_sql`/`db_stats` tools. This crate owns only
 # the Streamable HTTP transport around it (`POST /mcp`); the stdio transport is hosted by `imbh-tui`

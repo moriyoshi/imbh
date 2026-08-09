@@ -97,9 +97,11 @@ curl -s http://127.0.0.1:4318/mcp \
 
 ## The tools
 
-All of them are **read-only**: nothing here can ingest, flush, compact, or apply retention. Time
-windows default to the last hour; pass `since` (`"15m"`, `"2h"`, `"7d"`) or explicit
-`start_unix_nano` / `end_unix_nano` to change that. Every timestamp in and out is epoch nanoseconds.
+All but two are **read-only**: nothing else here can ingest, flush, compact, or apply retention. The
+exceptions are `set_promoted_attributes` and `run_housekeeping`, and each is offered only where it can
+work — see below. Time windows default to the last hour; pass `since` (`"15m"`, `"2h"`, `"7d"`)
+or explicit `start_unix_nano` / `end_unix_nano` to change that. Every timestamp in and out is epoch
+nanoseconds.
 
 | Tool | What it answers |
 |---|---|
@@ -115,6 +117,32 @@ windows default to the last hour; pass `since` (`"15m"`, `"2h"`, `"7d"`) or expl
 | `query_metric_range` · `query_metric_instant` | Aggregate a gauge or sum metric over time, or its latest value. |
 | `histogram_quantile` | A quantile over time from an explicit-bucket or exponential histogram. |
 | `query_sql` | Raw SQL, for anything the typed tools do not cover. |
+| `attribute_stats` | Per attribute key: distinct values, how selective it is within a segment, what a promoted column would cost, and whether to promote or index it. DB-wide and per table. |
+| `list_promoted_attributes` · `set_promoted_attributes` | Read and replace the attribute keys stored as columns. |
+| `run_housekeeping` · `housekeeping_status` | Queue a seal/commit/retention (and optionally compaction) pass, and poll the job id it returns. |
+
+### The two tools that write
+
+`set_promoted_attributes` replaces the promoted attribute keys: it seals the buffer and changes the
+schema every segment written afterwards carries. Segments already on disk keep theirs and stay
+queryable, so the change is safe on a live database — but it *is* a change, and it is the only one on
+this surface.
+
+It appears in `tools/list` **only when the server opened the database read-write**. A read-only
+server — `imbh-tui --mcp-stdio <dir>` against someone else's database — holds no writer lock, so the
+tool has nothing to call and is not offered; point the client at the process that writes the database
+instead. A deployment serving `/mcp` from `imbhd` is granting an agent that action, and should gate
+the endpoint the way it gates `/admin/*`.
+
+`run_housekeeping` is the other, and it answers a **job id** rather than an outcome: a pass costs the
+size of the database, not the size of an answer, so it is queued and `housekeeping_status` reports it.
+It needs a writable server *and* one that runs a queue — `imbhd` does, `imbh-tui --mcp-stdio` does
+not, and a host without one does not advertise the tools. Submitting the same request while one is
+still queued returns the waiting job's id rather than piling up passes.
+
+Send the whole set, not a delta: the order is the column order. `attribute_stats` is what to choose it
+from — it rates each key's cost and gives a promote verdict — and demotion (sending the set without a
+key) is always safe, since a promoted key never leaves the JSON attribute blob.
 
 Prefer the typed tools over `query_sql`: they drive the time and full-text indexes, while raw SQL
 scans. `search_logs`'s `matches` argument is the Tantivy-accelerated term search — the cheapest way

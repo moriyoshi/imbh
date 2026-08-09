@@ -9,7 +9,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::app::App;
 use crate::completion::{CandidateKind, Completion};
-use crate::model::TIME_RANGES;
+use crate::model::{AbsTarget, TIME_RANGES};
 use crate::time::humanize_secs;
 use crate::ui::glyphs::Glyphs;
 
@@ -25,12 +25,25 @@ pub(crate) fn draw_time_range_picker(
     let width = 36u16.min(area.width);
     // One row per preset plus the trailing "Absolute…" row, and the two borders.
     let height = (TIME_RANGES.len() as u16 + 3).min(area.height);
-    let x = anchor
-        .right()
-        .saturating_sub(width)
-        .min(area.right().saturating_sub(width))
-        .max(area.x);
-    let y = anchor.bottom().min(area.bottom().saturating_sub(height));
+    // Hang from the anchor's near edge: under a narrow header indicator that means right-aligned to
+    // it, and over a full-width pane it means the pane's left edge, which is where its title is.
+    let x = if anchor.width > width {
+        anchor.x.min(area.right().saturating_sub(width))
+    } else {
+        anchor
+            .right()
+            .saturating_sub(width)
+            .min(area.right().saturating_sub(width))
+    }
+    .max(area.x);
+    // Below the anchor when it is a header strip, just inside it when it is a pane — the form must not
+    // land past the bottom of a pane it is meant to belong to.
+    let y = if anchor.height > height {
+        anchor.y.saturating_add(1)
+    } else {
+        anchor.bottom()
+    }
+    .min(area.bottom().saturating_sub(height));
     let popup = Rect {
         x,
         y,
@@ -68,8 +81,12 @@ pub(crate) fn draw_time_range_picker(
     );
 }
 
-/// Render the absolute-time window form as a dropdown under the indicator box: two labeled datetime
-/// fields (the focused one highlighted with a caret) and a hint/parse-error line.
+/// Render the absolute-time window form as a dropdown under `anchor`: two labeled datetime fields
+/// (the focused one highlighted with a caret) and a hint/parse-error line.
+///
+/// The anchor is the thing being edited — the header's time indicator for the query window, the
+/// attribute pane for the attribute window — so the form appears over what it changes rather than
+/// always in the header's corner.
 pub(crate) fn draw_absolute_range(
     frame: &mut ratatui::Frame<'_>,
     app: &App,
@@ -123,13 +140,23 @@ pub(crate) fn draw_absolute_range(
         }
         Line::from(spans)
     };
+    let attributes = app.abs_target == AbsTarget::Attributes;
     let hint = match &app.abs_error {
         Some(error) => Span::styled(format!(" {error}"), Style::default().fg(Color::Red)),
         None => Span::styled(
-            format!(
-                " UTC {s} YYYY-MM-DD HH:MM:SS {s} Tab: field {s} Enter: apply",
-                s = g.sep
-            ),
+            if attributes {
+                // Clearing both fields is the only way back to following the query range, so the form
+                // has to say so — nothing else would suggest an empty field means anything.
+                format!(
+                    " UTC {s} Tab: field {s} Enter: apply {s} empty: follow the query range",
+                    s = g.sep
+                )
+            } else {
+                format!(
+                    " UTC {s} YYYY-MM-DD HH:MM:SS {s} Tab: field {s} Enter: apply",
+                    s = g.sep
+                )
+            },
             Style::default().fg(Color::DarkGray),
         ),
     };
@@ -139,7 +166,11 @@ pub(crate) fn draw_absolute_range(
         Line::from(hint),
     ];
     frame.render_widget(
-        Paragraph::new(text).block(g.block().title("Absolute range (Esc: cancel)")),
+        Paragraph::new(text).block(g.block().title(if attributes {
+            "Attribute-statistics range (Esc: cancel)"
+        } else {
+            "Absolute range (Esc: cancel)"
+        })),
         popup,
     );
 }

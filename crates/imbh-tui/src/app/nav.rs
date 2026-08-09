@@ -41,45 +41,53 @@ impl App {
         Screen::ORDER.get(self.menu_cursor).copied()
     }
 
-    /// Whether the current view has a query editor pane (every list screen except Overview; the detail
-    /// routes render full-content and have none). Also decides whether `Focus::Query` is reachable.
+    /// Whether the current view has a query editor pane. Overview is a report over the whole
+    /// database rather than an answer to a query, so it takes none; the detail routes render
+    /// full-content and have none either. Also decides whether `Focus::Query` is reachable.
     pub(crate) fn has_query(&self) -> bool {
         self.screen() != Screen::Overview && !self.route.is_detail()
     }
 
-    /// The focus ring for the current view, in reading order (the four menu-bar screen items, the time
+    /// The focus ring for the current view, in reading order (every menu-bar screen item, the time
     /// selector, then the content panes). The query stop is present only when the view has a query
     /// pane; `Tab`/`Shift+Tab` cycle this order (with wraparound).
-    pub(crate) fn focus_ring(&self) -> &'static [Focus] {
+    ///
+    /// Derived from [`Screen::ORDER`] rather than written out, so adding a screen cannot leave its
+    /// menu item unreachable by `Tab` — which is exactly what the hand-written list did the first
+    /// time a fifth screen was tried.
+    pub(crate) fn focus_ring(&self) -> Vec<Focus> {
+        let mut ring: Vec<Focus> = (0..Screen::ORDER.len()).map(Focus::Menu).collect();
+        ring.push(Focus::TimeRange);
         if self.has_query() {
-            &[
-                Focus::Menu(0),
-                Focus::Menu(1),
-                Focus::Menu(2),
-                Focus::Menu(3),
-                Focus::TimeRange,
-                Focus::Query,
-                Focus::Primary,
-            ]
-        } else {
-            &[
-                Focus::Menu(0),
-                Focus::Menu(1),
-                Focus::Menu(2),
-                Focus::Menu(3),
-                Focus::TimeRange,
-                Focus::Primary,
-            ]
+            ring.push(Focus::Query);
         }
+        ring.push(Focus::Primary);
+        if self.has_attr_pane() {
+            // Reading order within the pane: the range it was measured over, then one stop per
+            // section, top to bottom.
+            ring.push(Focus::AttrRange);
+            ring.extend((0..self.attr_sections().len()).map(Focus::AttrTable));
+        }
+        ring
     }
 
-    /// The focus as it actually applies to the current view: a stored `Query` focus snaps to `Primary`
-    /// on a view with no query pane, so the highlight and `Enter` never target a pane that is not shown.
+    /// Whether the Overview's attribute pane is on screen — and so whether it is a focus stop.
+    pub(crate) fn has_attr_pane(&self) -> bool {
+        self.screen() == Screen::Overview && !self.route.is_detail()
+    }
+
+    /// The focus as it actually applies to the current view: a stored `Query` or attribute-pane focus
+    /// snaps to `Primary` on a view without that pane, so the highlight and `Enter` never target a
+    /// pane that is not shown.
     pub(crate) fn effective_focus(&self) -> Focus {
-        if self.focus == Focus::Query && !self.has_query() {
-            Focus::Primary
-        } else {
-            self.focus
+        match self.focus {
+            Focus::Query if !self.has_query() => Focus::Primary,
+            Focus::AttrRange if !self.has_attr_pane() => Focus::Primary,
+            // A section index outlives the measurement that produced it: a refresh can return fewer
+            // sections (a table emptied out of the range), and a stop pointing past the end must not
+            // take the cursor or `p` with it.
+            Focus::AttrTable(section) if section >= self.attr_sections().len() => Focus::Primary,
+            focus => focus,
         }
     }
 
@@ -93,9 +101,12 @@ impl App {
             .unwrap_or(ring.len() - 1) as isize;
         let next = (current + delta).rem_euclid(ring.len() as isize) as usize;
         self.focus = ring[next];
+        // Landing on a section puts the cursor inside it, so Tab scrolls the pane to what it focused
+        // rather than leaving the highlight somewhere off screen.
+        self.snap_attr_cursor();
     }
 
-    /// Move the focus among the menu-bar items only — the four screen items and the trailing time
+    /// Move the focus among the menu-bar items only — the screen items and the trailing time
     /// selector — wrapping over `MENU_LEN`. Bound to Left/Right while the ring is on the bar (there they
     /// select rather than navigate history). A no-op unless the focus is already on a menu-bar stop (its
     /// natural precondition), mirroring `menu_move`.
@@ -285,9 +296,11 @@ mod tests {
         // Starts on the current screen.
         assert_eq!(app.menu_cursor, Screen::Traces.index());
         assert_eq!(app.menu_screen(), Some(Screen::Traces));
-        // Right past Logs reaches the trailing range item, then wraps to Overview.
-        app.menu_move(1);
-        assert_eq!(app.menu_screen(), Some(Screen::Logs));
+        // Right walks the remaining screens, reaches the trailing range item, then wraps to Overview.
+        for expected in &Screen::ORDER[Screen::Traces.index() + 1..] {
+            app.menu_move(1);
+            assert_eq!(app.menu_screen(), Some(*expected));
+        }
         app.menu_move(1);
         assert_eq!(app.menu_screen(), None); // the range item
         app.menu_move(1);
@@ -326,17 +339,40 @@ mod tests {
 
     #[test]
     fn focus_ring_omits_the_query_stop_without_a_query_pane() {
-        // Overview has no query pane: the ring is the menu items, the time selector, then Primary.
+        // Overview has no query pane, and does have an attribute pane: the ring is the menu items,
+        // the time selector, Primary, then the attribute pane.
         let mut app = App::new();
         assert_eq!(app.route.screen(), Screen::Overview);
         assert!(!app.has_query());
+        assert!(app.has_attr_pane());
         // Step to the time selector, then one more lands on Primary (no Query stop in between).
         app.focus = Focus::TimeRange;
         app.focus_advance(1);
         assert_eq!(app.focus, Focus::Primary);
-        // Wrapping forward from Primary reaches the first menu item.
+        // Then the attribute pane: the range it was measured over, then one stop per section. The
+        // range is separate because Enter cannot mean both "change the range" and "act on this row";
+        // the sections are separate from each other because each is its own table, and Tab is how a
+        // reader reaches the third one without scrolling past the first two.
+        app.focus_advance(1);
+        assert_eq!(app.focus, Focus::AttrRange);
+        // No measurement has landed, so there are no section stops yet — and wrapping forward from
+        // the range reaches the first menu item rather than a stop with nothing behind it.
+        assert!(app.attr_sections().is_empty());
         app.focus_advance(1);
         assert_eq!(app.focus, Focus::Menu(0));
+
+        // Off the Overview both kinds of stop are gone, and a stale one reads as Primary.
+        app.route = Route::Logs;
+        assert!(!app.has_attr_pane());
+        for stale in [Focus::AttrRange, Focus::AttrTable(0)] {
+            app.focus = stale;
+            assert_eq!(app.effective_focus(), Focus::Primary);
+        }
+        app.route = Route::Overview;
+        // A section index that outlived its measurement reads as Primary too, rather than taking the
+        // cursor past the end of a table that has since shrunk.
+        app.focus = Focus::AttrTable(9);
+        assert_eq!(app.effective_focus(), Focus::Primary);
 
         // A detail route also drops the query stop, and a stale Query focus reads as Primary so the
         // highlight and Enter never target a pane that is not shown.

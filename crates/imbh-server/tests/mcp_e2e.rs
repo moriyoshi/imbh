@@ -642,3 +642,260 @@ async fn the_endpoint_defends_itself() {
         assert_eq!(response.status().as_u16(), 405, "{method} /mcp");
     }
 }
+
+/// The attribute-statistics and promotion tools, end to end through the router.
+///
+/// These need an **on-disk** database, unlike every other case here: the measurement is defined over
+/// sealed segments, and promotion is a write only a writer can serve.
+#[tokio::test]
+async fn the_attribute_and_promotion_tools_close_the_loop() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db: Arc<Db> = Db::builder(dir.path()).open().expect("open db");
+    db.ingest_otlp_logs(&otlp_rich(
+        "cart",
+        "checkout failed",
+        1,
+        17,
+        &[("http.route", "/checkout")],
+    ))
+    .await
+    .expect("ingest");
+    db.flush().await.expect("flush");
+
+    // Measure. The default window is every sealed segment, since a `promote` list is chosen from the
+    // whole corpus rather than a recent slice.
+    let stats = tool_value(&call_tool(&db, "attribute_stats", "{}").await);
+    assert_eq!(
+        stats["range_unix_nanos"],
+        Value::Null,
+        "unbounded by default"
+    );
+    assert_eq!(stats["all_tables"]["unit"], "all_tables");
+    let key = stats["all_tables"]["keys"]
+        .as_array()
+        .expect("keys")
+        .iter()
+        .find(|key| key["key"] == "http.route")
+        .unwrap_or_else(|| panic!("http.route should be measured: {stats}"));
+    assert_eq!(key["scope"], "attributes");
+    assert_eq!(key["promoted"], json!(false));
+    assert!(!key["promote"].is_null(), "the roll-up carries a verdict");
+    // Per-table sections answer for themselves; only the roll-up judges promotion, which is DB-wide.
+    let logs = stats["tables"]
+        .as_array()
+        .expect("tables")
+        .iter()
+        .find(|unit| unit["unit"] == "logs")
+        .unwrap_or_else(|| panic!("a logs section: {stats}"));
+    assert!(logs["segments"].as_u64().expect("segments") >= 1);
+    for key in logs["keys"].as_array().expect("keys") {
+        assert_eq!(
+            key["promote"],
+            Value::Null,
+            "per-table rows give no verdict"
+        );
+    }
+
+    // Act on it. The whole set is sent, and the answer is what is now in effect.
+    let promoted = tool_value(
+        &call_tool(
+            &db,
+            "set_promoted_attributes",
+            r#"{"keys":["http.route","env"]}"#,
+        )
+        .await,
+    );
+    assert_eq!(promoted["promoted"], json!(["http.route", "env"]));
+    let listed = tool_value(&call_tool(&db, "list_promoted_attributes", "{}").await);
+    assert_eq!(listed, promoted, "one description of one set");
+    assert_eq!(db.promote().keys(), ["http.route", "env"]);
+
+    // And the measurement reflects it, which is the loop closing.
+    let stats = tool_value(&call_tool(&db, "attribute_stats", "{}").await);
+    let key = stats["all_tables"]["keys"]
+        .as_array()
+        .expect("keys")
+        .iter()
+        .find(|key| key["key"] == "http.route")
+        .expect("http.route");
+    assert_eq!(key["promoted"], json!(true));
+
+    db.close().await.expect("close");
+}
+
+/// A read-only server is never *offered* the write. The tool has nothing to call there — a reader
+/// holds no writer lock — so it is absent from `tools/list` rather than present and failing.
+#[tokio::test]
+async fn the_write_tool_is_hidden_from_a_read_only_server() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let writer: Arc<Db> = Db::builder(dir.path()).open().expect("open db");
+    writer
+        .ingest_otlp_logs(&otlp_rich("cart", "hello", 1, 9, &[]))
+        .await
+        .expect("ingest");
+    writer.flush().await.expect("flush");
+
+    let names = |body: &str| -> Vec<String> {
+        let value: Value = serde_json::from_str(body).expect("response is JSON");
+        value["result"]["tools"]
+            .as_array()
+            .expect("tools")
+            .iter()
+            .map(|tool| tool["name"].as_str().expect("name").to_owned())
+            .collect()
+    };
+
+    let (_, listed) = legacy(&writer, r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#).await;
+    let listed = names(&listed);
+    assert!(listed.iter().any(|name| name == "attribute_stats"));
+    assert!(listed.iter().any(|name| name == "set_promoted_attributes"));
+
+    let reader = Db::open_read_only(dir.path()).expect("open read-only");
+    let (_, from_reader) =
+        legacy(&reader, r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#).await;
+    let from_reader = names(&from_reader);
+    assert!(
+        from_reader.iter().any(|name| name == "attribute_stats"),
+        "reads are unaffected"
+    );
+    assert!(
+        !from_reader
+            .iter()
+            .any(|name| name == "set_promoted_attributes"),
+        "the write is not offered where it cannot work: {from_reader:?}"
+    );
+
+    // A client working from a cached list gets a reason rather than a storage-layer error.
+    let refused = call_tool(&reader, "set_promoted_attributes", r#"{"keys":[]}"#).await;
+    assert!(refused.contains(r#""isError":true"#), "{refused}");
+    assert!(refused.contains("read-only"), "{refused}");
+
+    writer.close().await.expect("close");
+}
+
+/// Housekeeping over MCP: an agent submits a pass, gets a job id back, and polls it — the *same*
+/// queue `POST /admin/housekeeping` uses, not a second one of its own.
+///
+/// Unlike every other case here this drives **one router** across several calls rather than building
+/// one per call: the queue lives in the router's state, so a job submitted through one router cannot
+/// be polled through another (see `imbh_server::route`, which documents the same trap).
+#[tokio::test]
+async fn an_agent_can_queue_housekeeping_and_poll_it() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db: Arc<Db> = Db::builder(dir.path()).open().expect("open db");
+    db.ingest_otlp_logs(&otlp_rich("cart", "hello", 1, 9, &[]))
+        .await
+        .expect("ingest");
+
+    // `Router` clones share their state, so every call below reaches the same queue.
+    let router = app(db.clone());
+    let call = async |tool: &str, arguments: &str| -> String {
+        let body = format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"{tool}","arguments":{arguments},"_meta":{{"io.modelcontextprotocol/protocolVersion":"{MODERN}"}}}}}}"#
+        );
+        let request = Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("content-type", "application/json")
+            .header("mcp-protocol-version", MODERN)
+            .header("mcp-method", "tools/call")
+            .header("mcp-name", tool)
+            .body(Body::from(body))
+            .expect("request");
+        let response = router
+            .clone()
+            .oneshot(request)
+            .await
+            .expect("router is infallible");
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        String::from_utf8(body.to_vec()).expect("utf-8 body")
+    };
+
+    // Submitting answers a handle, not an outcome.
+    let submitted = tool_value(&call("run_housekeeping", "{}").await);
+    let job_id = submitted["job_id"].as_str().expect("a job id").to_owned();
+    assert!(!job_id.is_empty());
+    assert_eq!(submitted["coalesced"], json!(false));
+    assert!(
+        ["queued", "running"].contains(&submitted["state"].as_str().expect("state")),
+        "the work has not finished at submission time: {submitted}"
+    );
+
+    // The same request while that one is still queued joins it rather than queueing a second pass.
+    let again = tool_value(&call("run_housekeeping", "{}").await);
+    if again["coalesced"] == json!(true) {
+        assert_eq!(again["job_id"], job_id.as_str());
+    }
+
+    // Poll to a terminal state through the status tool.
+    let mut job = Value::Null;
+    for _ in 0..400 {
+        job = tool_value(
+            &call(
+                "housekeeping_status",
+                &format!(r#"{{"job_id":"{job_id}"}}"#),
+            )
+            .await,
+        );
+        if ["succeeded", "failed"].contains(&job["state"].as_str().expect("state")) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(job["state"], "succeeded", "{job}");
+    assert!(job["report"]["sealed"].is_boolean(), "{job}");
+
+    // No id lists the recent jobs instead.
+    let listed = tool_value(&call("housekeeping_status", "{}").await);
+    assert!(
+        listed["jobs"]
+            .as_array()
+            .expect("jobs")
+            .iter()
+            .any(|job| job["job_id"] == job_id.as_str()),
+        "{listed}"
+    );
+
+    // An unknown id says why rather than answering an empty job.
+    let missing = call("housekeeping_status", r#"{"job_id":"nope-1"}"#).await;
+    assert!(missing.contains(r#""isError":true"#), "{missing}");
+    assert!(missing.contains("restart"), "{missing}");
+
+    // Zero is refused, as it is over HTTP: "compact nothing" is what `compact: false` says.
+    let refused = call("run_housekeeping", r#"{"compact":true,"max_jobs":0}"#).await;
+    assert!(refused.contains(r#""isError":true"#), "{refused}");
+    assert!(refused.contains("positive"), "{refused}");
+
+    db.close().await.expect("close");
+}
+
+/// The housekeeping tools are offered only by a host that runs a queue. `imbh-tui --mcp-stdio` runs
+/// none, and `imbh_mcp::handle` — the entry point without one — must not advertise what it cannot do.
+#[tokio::test]
+async fn a_host_with_no_queue_does_not_offer_the_housekeeping_tools() {
+    let db: Arc<Db> = Db::in_memory().open().expect("open in-memory db");
+    let reply = imbh_mcp::handle(
+        &db,
+        br#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+        &imbh_mcp::Transport::Http(imbh_mcp::Headers {
+            protocol_version: None,
+            method: None,
+            name: None,
+        }),
+    )
+    .await;
+    let body = reply.body.expect("a result body");
+    let names: Vec<&str> = body["result"]["tools"]
+        .as_array()
+        .expect("tools")
+        .iter()
+        .map(|tool| tool["name"].as_str().expect("name"))
+        .collect();
+    assert!(names.contains(&"db_stats"), "the reads are unaffected");
+    assert!(
+        !names.contains(&"run_housekeeping") && !names.contains(&"housekeeping_status"),
+        "no queue, so no tools that need one: {names:?}"
+    );
+}

@@ -58,7 +58,7 @@ pub(crate) enum Mode {
 }
 
 /// The stop the keyboard focus ring is on. `Tab`/`Shift+Tab` cycle it in reading order (the menu bar
-/// left-to-right, then the content top-to-bottom): `Menu(0..4)` (the screen items) → `TimeRange` (the
+/// left-to-right, then the content top-to-bottom): `Menu(..)` (the screen items) → `TimeRange` (the
 /// menu-bar time selector) → `Query` → `Primary` (main list/table), wrapping. The highlight follows it
 /// and `Enter` activates the focused stop. Arrow keys are unaffected — they always drive the main list.
 /// `Query` is only reachable on views that have a query pane (see `App::has_query`).
@@ -73,6 +73,19 @@ pub(crate) enum Focus {
     Query,
     /// The main list/table (or a detail route's body).
     Primary,
+    /// The Overview attribute pane's **range line**. `Enter` opens the window it is measured over —
+    /// a property of the pane, reached through the pane rather than through a key of its own, and
+    /// through the line that displays it rather than the pane as a whole.
+    AttrRange,
+    /// One **section** of the Overview attribute pane's table, by index: the DB-wide roll-up is 0 and
+    /// each table that has segments follows. Takes the row cursor within that section, and `p`
+    /// promotes or demotes the key under it.
+    ///
+    /// A stop per section rather than one for the whole table, because each section *is* a table —
+    /// its own totals, its own sigma — and Tab is how a reader moves between them without scrolling
+    /// past every key of the one above. Separate from [`Focus::AttrRange`] for the same reason at one
+    /// level up: Enter cannot mean both "change the range" and "act on this row".
+    AttrTable(usize),
 }
 
 /// Structured fields of a log entry, kept alongside the rendered rows so the detail view can show the
@@ -150,13 +163,65 @@ impl Screen {
     }
 }
 
-/// Number of items on the menu bar: the four screens plus the trailing time-range selector. The
-/// range item is the last index.
+/// Number of items on the menu bar: every screen plus the trailing time-range selector. The range
+/// item is the last index.
 pub(crate) const MENU_LEN: usize = Screen::ORDER.len() + 1;
 
-/// A secondary result pane rendered below the primary list (the Traces screen uses it for the
-/// first result's span waterfall). Its own title and lines; it renders from the top and does not
-/// take the primary pane's scroll.
+/// How a [`DetailPane`] is drawn, which follows from what it *is*.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DetailStyle {
+    /// A preview strip: a bare title line, no borders — so waterfall bars sit flush against the pane's
+    /// edges — and no scroll of its own. Overflow is reported in the title, and the full view is one
+    /// Enter away. The Traces screen's waterfall.
+    Preview,
+    /// A pane in its own right: bordered, given whatever the primary does not need, and **it** takes
+    /// the screen's scroll — because it, not the primary, is the long content. The Overview's
+    /// attribute statistics.
+    Pane,
+}
+
+/// What one row of a [`PaneTable`] is.
+///
+/// A grouped table holds three kinds of row and they are acted on differently — `p` promotes the key
+/// under the cursor, and the other two have no key. That has to be a *fact* about the row rather than
+/// something inferred from its text, which is why it is carried alongside rather than guessed at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AttrRow {
+    /// A scan unit's name and totals — the title above a section.
+    Section,
+    /// The column names for the section above it. Repeated per section rather than pinned once at the
+    /// top: each section is its own table, and its numbers are measured against its own totals.
+    Header,
+    /// One attribute key, promotable by this name.
+    Key(String),
+    /// A blank line, separating one section from the one above it. A row of its own rather than an
+    /// extra line emitted while rendering a title, so the row indices the cursor and the scroll offset
+    /// use stay one-to-one with what is drawn.
+    Blank,
+}
+
+/// A table plus what each of its rows *is*.
+///
+/// One struct rather than two fields so "aligned with `data.rows`" is a property of the type instead
+/// of a comment two call sites have to honour.
+#[derive(Debug, Clone)]
+pub(crate) struct PaneTable {
+    pub(crate) data: TableData,
+    pub(crate) kinds: Vec<AttrRow>,
+}
+
+impl PaneTable {
+    /// The attribute key row `index` promotes, if it is a key row at all.
+    pub(crate) fn key_at(&self, index: usize) -> Option<&str> {
+        match self.kinds.get(index) {
+            Some(AttrRow::Key(key)) => Some(key.as_str()),
+            _ => None,
+        }
+    }
+}
+
+/// A secondary result pane rendered below the primary list. Its own title and lines, rendered from
+/// the top; [`DetailStyle`] decides whether it is a preview strip or a pane in its own right.
 #[derive(Debug, Clone)]
 pub(crate) struct DetailPane {
     pub(crate) title: String,
@@ -164,6 +229,11 @@ pub(crate) struct DetailPane {
     /// When set, a trace waterfall whose bars reflow to fill the pane width at draw time; `lines` is
     /// then unused. Placeholders and errors leave this `None` and fall back to `lines`.
     pub(crate) waterfall: Option<Waterfall>,
+    /// When set (a [`DetailStyle::Pane`] only), the pane's body is a column-aligned table, rendered
+    /// below `lines` and scrolled by the pane's own scroll. `lines` is then the short prose above
+    /// it — what was measured, and anything the measurement could not cover.
+    pub(crate) table: Option<PaneTable>,
+    pub(crate) style: DetailStyle,
 }
 
 /// Floor for the pan/zoom query-window span (1 second): zooming in never collapses the window below it.
@@ -327,6 +397,49 @@ pub(crate) struct Snapshot {
     pub(crate) next_cursor: Option<PageCursor>,
 }
 
+/// Which window the range form is editing.
+///
+/// One form, two destinations. The Overview's attribute statistics answer a different question from
+/// the panels — "what does this corpus look like", not "what happened just now" — and the range that
+/// makes sense for one rarely makes sense for the other: a `promote` list is chosen from a week, while
+/// a log list is read over the last fifteen minutes. So the attribute window is independent, and
+/// [`Query`](AbsTarget::Query) is what every other pane follows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AbsTarget {
+    /// The query window every panel is evaluated over.
+    Query,
+    /// The window the Overview's attribute statistics are measured over. Clearing both fields
+    /// measures all of time, which is also where it starts.
+    Attributes,
+}
+
+/// The window the Overview's attribute statistics are measured over, and the key their cached
+/// measurement is held under: an absolute `[start_ns, end_ns]`, or `None` for **all sealed segments**,
+/// which is the default.
+///
+/// All of time by default because that is the question the pane answers: a `promote` list is chosen
+/// from everything the database holds, not from the last fifteen minutes. It is deliberately *not*
+/// derived from the query range — every other pane rolls with the wall clock, and keying a corpus scan
+/// on something that moves every tick would turn it into a treadmill. This changes exactly when the
+/// user changes it, which is when the answer actually differs.
+pub(crate) type AttrWindow = Option<(i64, i64)>;
+
+/// Minimum interval between attribute measurements over one range selection.
+///
+/// The measurement is a scan of the corpus, not a gauge: at the auto-refresh cadence it would spend
+/// its time re-measuring a database that has barely changed. Up to a minute of staleness is the right
+/// trade for a diagnostic, and `r` clears the cache outright for anyone who wants it now.
+pub(crate) const ATTR_MEASURE_INTERVAL: Duration = Duration::from_secs(60);
+
+/// The Overview's most recent attribute measurement: what it was measured over, when, and the pane it
+/// rendered to.
+#[derive(Debug, Clone)]
+pub(crate) struct AttrStats {
+    pub(crate) key: AttrWindow,
+    pub(crate) measured_at: std::time::Instant,
+    pub(crate) pane: DetailPane,
+}
+
 /// A trace/span correlation filter applied on top of a Logs query — the target of a trace→log
 /// drill-down. Held in [`App`](crate::app::App) and captured by the navigation history so Back
 /// restores the drill-down.
@@ -393,6 +506,15 @@ pub(crate) enum Update {
     /// The discovered distinct values for one log label (Logs quoted-matcher completion vocabulary),
     /// fetched when the caret first enters that label's value position.
     LogLabelValues { label: String, values: Vec<String> },
+    /// The Overview's attribute statistics, measured off the event loop because the measurement is a
+    /// scan of every sealed segment's attribute columns rather than a query. `key` is the range
+    /// selection it was measured for, so a result for a window the user has since left is dropped
+    /// rather than shown under the current one.
+    AttributeStats { key: AttrWindow, pane: DetailPane },
+    /// The promoted attribute keys the daemon ended up with after a `p`, or why it would not change
+    /// them. Carried back rather than assumed: the daemon filters keys that collide with a built-in
+    /// column name, so what was asked for and what is in effect can differ.
+    Promoted(Result<Vec<String>, String>),
     /// Exemplar→trace markers for an open metric-detail view, fetched when it opens. `labels`/`query`
     /// identify the series the fetch was issued for, so a stale result (the view moved on) is dropped.
     Exemplars {
@@ -409,7 +531,7 @@ pub(crate) enum Update {
 #[derive(Clone)]
 pub(crate) struct NavEntry {
     pub(crate) route: Route,
-    pub(crate) query: [String; 4],
+    pub(crate) query: [String; Screen::ORDER.len()],
     pub(crate) metric_cursor: usize,
     pub(crate) focus_trace_id: Option<String>,
     pub(crate) selected: usize,

@@ -4336,3 +4336,2549 @@ search-off lever 275 → 218 → 76. The §3c packaging dry-run staged and verif
 0.7.0**, exit 0 — with `--allow-dirty`, because the bump is not committed and `cargo package` refuses
 a dirty tree; the real release runs it on a committed one, so the flag changes nothing it verifies.
 Nothing tagged, nothing published.
+
+## Segment pruning: three stale doc claims, 11.9x on a time-bounded query, and a plan measured into the bin (2026-08-08)
+
+This entry folds in `PROMOTED_ATTR_PUSHDOWN_PLAN.md`, which is deleted — its conclusion was "do not
+build this", so it survives here rather than as a standing plan.
+
+It started as a design question — should the backing store move to Tantivy, Quickwit-style? — and the
+answer turned out to depend on facts the canonical docs got wrong. Recommending against the migration
+was right, but the *reason* offered was wrong, and finding that out is what produced everything else.
+
+### Three things ARCHITECTURE.md asserted that the code did not do
+
+1. **§6.1 item 3 and §8: "the Tantivy `attrs` JSON field is not built."** It is built, and its
+   equality push-down is wired. `imbh-index` indexes every string-valued record attribute as
+   `attrs.<key> = <value>` with the verbatim tokenizer, `search_attr_eq` resolves it, and
+   `provider.rs` pushes it as `Inexact` into the cost-gated `RowSelection`. The design discussion that
+   opened this session read those two sections and proposed as *new work* something the tree already
+   shipped.
+2. **§9.2: "Exact: time-range predicates … segment prune via manifest, row-group/page prune via
+   Parquet stats."** Wrong twice over. Nothing in the tree ever returned
+   `TableProviderFilterPushDown::Exact`, and there was **no time pruning of any kind**:
+   `supports_filters_pushdown` never claimed a time predicate, so none reached `scan()`;
+   `Storage::query_snapshot` takes no time argument and returns every segment; the reader built no
+   row-group filter. `SegmentRef` has carried `min_time_unix_nano`/`max_time_unix_nano` all along and
+   nothing on the query path read them. A `WHERE time > now() - 5m` over 30 days of retention read all
+   30 days and threw the rest away in the filter above the scan.
+3. **§6.1 item 2: promoted columns materialize "with record `attributes` → `resource` → `scope`
+   precedence."** `lookup_promoted` is `json_get(attributes, key)` keeping `AnyValue::Str` — record
+   scope only, resource and scope deliberately excluded, and its own doc comment says so. This one was
+   load-bearing: record-scope-only is exactly what makes the promoted column and the `attrs` index
+   describe the same row set. Had the doc been right, pushing a promoted-column equality into that
+   index would have been **unsound** — a row whose value came from `resource` would have a non-null
+   column and no index term, and pruning would have silently dropped it.
+
+The pattern is worth naming: all three were *confident* prose, and two of them contradicted other
+paragraphs in the same file. §6.1's own push-down paragraph says "the column mirrors the record
+`attributes` scope only", four lines under item 2 claiming otherwise.
+
+### What DataFusion actually hands a provider (54.1.0)
+
+Pinned by a throwaway spike that dumped `filters` at both `supports_filters_pushdown` and `scan`,
+rather than by reading the optimizer. Every one of these contradicted a guess made in advance:
+
+- `CAST("k" AS VARCHAR) = $1` **survives** the optimizer as a `Cast` — no `unwrap_cast_in_comparison`
+  rewrite against a `Dictionary(Int32, Utf8)` column.
+- The cast target is **`Utf8View`**, not `Utf8` (§9.1 enables string-view preservation), and in this
+  version `Cast` carries a **`field: Field`**, not a `data_type`.
+- `Column.relation` is `Some(Bare { table })` in `supports_filters_pushdown` but `None` in `scan` —
+  match on `name` only.
+- A quoted dotted identifier (`"http.route"`) stays **one** column name; it is not split into
+  relation/column. This is the shape nearly every real promoted key takes.
+- The bare `col = $1` form arrives with a `ScalarValue::Dictionary(Int32, Utf8(..))` literal.
+- **`ShortenInListSimplifier` rewrites an `IN` of ≤ 3 values into an `OR` chain, and
+  `SimplifyExpressions` runs before `PushDownFilter`.** Handling `Expr::InList` alone therefore does
+  nothing for the common small-k case — the one that matters most for trace search.
+- Only filters a provider *claims* reach `scan()`. Verified directly: with the cast-equality
+  `Unsupported`, `scan` saw only the `matches` conjunct of a two-conjunct `WHERE`.
+
+### The measurements
+
+`examples/bench --bin prune-bench` (new): 60 segments x 2,000 log rows plus 60 single-trace span
+segments, best of 5 after a warm-up, A/B against a pristine worktree at the same commit. It runs
+everything through `BlockingDb::sql`, which is what lets one source file compile against both builds.
+
+| query | HEAD | + row-group stats | + manifest range |
+|---|---|---|---|
+| logs, 1-of-60 time window | 8.71 ms | 2.09 ms | **0.73 ms** |
+| logs, full scan | 8.58 ms | 8.82 ms | 8.23 ms |
+| trace 2-id fetch, raw `IN` | 7.26 ms | **2.23 ms** | 2.14 ms |
+| trace 2-id fetch, `hex()` | 7.35 ms | 7.17 ms | 7.21 ms |
+| trace point lookup, raw `=` | 2.16 ms | 2.36 ms | 2.14 ms |
+
+Two HEAD baselines are the diagnosis in one number each: the narrow window cost **1.015x** the full
+scan (a time bound bought literally nothing), and raw `IN` cost **0.987x** the `hex()` form, while the
+point-lookup `=` shape was already at 0.296x. So the bloom was never broken — only the `InList`/`OR`
+shapes were unrecognized, and `TracesApi::search` defeated it anyway by binding `hex(trace_id)`
+strings, which yield none of the raw bytes a bloom needs.
+
+**Footer opens were the hidden floor.** Row-group statistics cut the narrow query 4.2x, but a 60x
+reduction in rows read should have bought more. The residual was `open_segment` still opening all 60
+Parquet footers — roughly 35 us each — and skipping segments on the manifest's declared bounds took
+the same query to 0.73 ms, a further 2.9x for **11.9x overall**. Corroborated by the trace point
+lookup sitting at the same ~2.1 ms floor, because bloom pruning lives in the footer and still pays the
+open. That is the concrete next lead: a manifest-level `trace_id` digest is the same fix one level
+down, and should reach the 0.73 ms class.
+
+### The promoted-attribute push-down, measured and rejected
+
+The plan's premise: `attr_field` compiles a promoted key to `CAST("k" AS VARCHAR) = 'v'`, which no
+matcher recognized, so promoting a key made its filter **prune less** than leaving it in JSON. True,
+and the fix looked small. The conclusion drawn from it — "the un-promoted path is the faster one,
+which is the opposite of what `promote` advertises" — was never measured, and is **false**.
+
+`examples/bench --bin attr-bench` sizes it without building it: the push-down would route the column
+spelling into the *same* `attrs` index the JSON spelling already uses, so its win is exactly what that
+pruning is worth. A DB opened with `promote(["k"])` carries both spellings per row; the pruning
+component isolates by re-running with `SELECTIVITY_THRESHOLD = 0.0`.
+
+| selectivity | `count(*)` floor | json + index | json, pruning off | promoted column |
+|---|---|---|---|---|
+| 50% | 5.34 | 24.10 | 23.82 | **5.47** |
+| 10% | 5.02 | 10.47 | 21.55 | **5.53** |
+| 1% | 5.13 | 6.13 | 21.35 | **5.68** |
+| 0.1% | 5.81 | 5.90 | 21.80 | 6.25 |
+
+Index pruning is worth 11–16 ms on the JSON path, and that saving is almost entirely **avoiding the
+JSON parse** on non-matching rows — not I/O. A promoted column has no JSON parse to avoid: removing it
+is precisely what promotion already did, so the index arrives with nothing left to save. The promoted
+column sits within **0.13–0.55 ms** of the bare `count(*)` floor at every selectivity, and that is the
+whole budget the push-down could recover — under 8%, and at 1% it is already faster than the pruned
+JSON path. A wide projection (`count(body), count(attributes)`), the case the plan actually claimed,
+does not change it.
+
+The only regime where it wins needs ~1,000 distinct values on one key — a high-cardinality key, which
+§6.1 tells you not to promote. **The one measured case for the feature requires first making a
+promotion decision the design forbids.** Not built.
+
+### Structural wins can be measured on synthetic data; distributional ones cannot
+
+The thing that made all of the above decidable without production data. Time-range pruning saves in
+proportion to `segments outside the window / total`, and a bloom in proportion to `segments not
+holding the id / total`. Those ratios are set by retention depth and seal cadence, **not** by what the
+values look like, so a generated corpus gives a speedup that carries.
+
+Sigma does not have that property. Define sigma(key, value) as the fraction of segments holding at
+least one matching row; a segment-granularity index prunes `1 - sigma`. On `gen-demo-db` **every**
+sigma is exactly 1.000, across 19 keys and 5 tables — which is a fact about a generator that emits a
+fixed label set every step and flushes once per run, not a fact about telemetry. `examples/attr-stats`
+(new) measures it over any existing DB with no format change; on the `prune-bench` corpus it reports
+`shard` at 60 distinct values and sigma **0.017 = 1/60 exactly**, its first validation against real
+variance. Whether a segment-granularity attribute index pays is still open and needs production data.
+
+### Design knowledge that outlived the plan
+
+- **`promote` and a segment index want opposite key sets.** Promotion targets low-cardinality keys
+  (dictionary columns compress; promoting a high-cardinality key is the column-explosion trap §6.1
+  rejects). Segment pruning pays only for high-cardinality, time-localized values. Scoping a segment
+  index to the promote list would cover exactly the keys that cannot prune. Nor does coverage need a
+  config at all: a value set has no schema, and `imbh-index` already indexes every string attribute
+  unconfigured.
+- **Segment-level pruning is all-or-nothing, and the metric layout defeats it.** Metric segments sort
+  by time only, so each holds a time slice with every series interleaved; `service`, `env`, or a
+  metric name appears in essentially every segment and prunes nothing, forever. The lever is sort
+  order — `(series, time)` — not index granularity.
+- **`attr-stats`' `hint` column collapses two orthogonal axes.** `shard` is hinted `promote` (60 values
+  reads as low cardinality) while its sigma says `segment-index`. Both are right; a key can want a
+  promoted column *and* a segment index. It needs a pair of verdicts.
+- **Auto-promotion has an unaddressed correctness landmine.** `attr_field` emits the column form iff a
+  key is in the *live* promote set, and segments sealed before promotion are null-filled by `coerce`
+  — so auto-promoting `k` at time T makes `WHERE k = 'v'` return **nothing** for pre-T segments,
+  silently, where it previously worked via `json_get_str`. §6.1's safety argument ("compaction never
+  changes an answer") holds only because the promote set is static today. Fixing it needs per-segment
+  promote-set metadata, a read-side `coalesce`, or a compaction back-fill.
+- **Trace search is a two-phase funnel** — span candidate filter (row-granular, served by the `attrs`
+  index) → trace id set → span fetch (segment-granular, served by blooms). Phase 1 stays unpushable:
+  its id set is a subquery DataFusion decorrelates, leaving no id predicate on the outer scan.
+
+### Method notes
+
+- **A non-vacuous test for "did not open the file": delete the file.** The manifest-range skip is
+  asserted by removing the out-of-range Parquet files before querying, so any `File::open`, footer
+  read or `.tidx` search fails loudly. Confirmed to fail when the skip is neutered — where the two
+  neighbouring boundary tests still pass, because the footer path covers them.
+- **`DbStats` cannot gain a field.** Plain `#[derive(Debug, Clone)]`, no `#[non_exhaustive]`, no
+  `Default`; that file has zero such attributes. Adding a field breaks downstream struct literals
+  across 12 published crates — which is why the sigma tooling landed as an example binary.
+- **`Db::segment_files()` returns empty for read-only handles.** `Storage::open_read_only` leaves the
+  in-RAM segment lists unpopulated. A wrong answer with no signal; found, not fixed.
+
+### Verified
+
+`fmt --all --check` clean; `build --workspace`, `clippy --workspace --all-targets -D warnings`, and
+`test --workspace` all clean at **640 passing**. No `Cargo.toml`/`Cargo.lock` third-party change, so
+no footprint movement is possible. **Breaking for `imbh-query`**: `SegmentInput` gains
+`time_range: Option<(i64, i64)>`, `TableInput` gains `time_column: Option<&'static str>`, and
+`SegmentTableProvider::new` takes one more argument — public-field structs, so struct-literal
+construction breaks. Under Cargo's 0.x rules that needs the minor bump the canonical-JSON change
+already puts on the table for 0.7.0; it must not ship as a patch.
+
+## Attribute access: a shipped bug the docs called safe, a 3.2x floor, and two features measured into the bin (2026-08-08)
+
+Second entry of the day. The first ("Segment pruning: three stale doc claims, 11.9x on a time-bounded
+query, and a plan measured into the bin") covered segment-level pruning. This one covers the *row*
+level — what it costs to read an attribute — under a goal stated mid-session: **the experience should
+be decent regardless of which attribute the user picks.**
+
+That framing did most of the work. Promotion is curated by construction — a column per key is the
+explosion trap §6.1 rejects — so a demand-driven promoter helps popular keys and never the key
+someone picks first time. Optimizing for hot keys is optimizing the case that is already warm. What
+serves arbitrary keys is cheap JSON access and indexing; promotion is the last tier, not the first.
+
+### The bug that was already shipped, with a doc asserting the opposite
+
+`promote` is not retroactive: segments sealed before a key was added lack its column and are
+null-filled by `coerce`. But `attr_field` emitted only the column form, so `WHERE k = 'v'` matched
+**nothing** on every pre-promotion segment — silently, since a missing attribute is a legitimate NULL.
+`Promote`'s own doc said "changing the set is backward-compatible". Any host editing their promote
+list between runs lost history, guided by that sentence.
+
+Reproduced before fixing: a key promoted between two flushes returned `["late"]` instead of
+`["early", "late"]`. Fixed by compiling a promoted key to
+`CASE WHEN "k" IS NOT NULL THEN CAST("k" AS VARCHAR) ELSE json_get_str(attributes, $k) END`.
+
+Three things about that spelling, all measured rather than reasoned:
+
+- **`coalesce` is semantically identical** — DataFusion literally rewrites `coalesce` into this
+  `CASE` — but costs **+0.24–0.29 ms** against the hand-written form's **+0.04–0.11 ms**, because its
+  `WHEN` tests `CAST(...) IS NOT NULL` over the whole batch and the optimizer does *not*
+  common-subexpression the cast away. Test the bare dictionary column instead.
+- **It is nearly free** because `CaseExpr` takes a whole-batch fast path when the `WHEN` is uniformly
+  true or false, and batches never span segments. Post-promotion segments never invoke the JSON arm.
+- **The `CAST` itself is pure overhead for filters**: `"k" = 'v'` in dictionary space beats
+  `CAST("k" AS VARCHAR) = 'v'` by **0.20–0.31 ms**, *more* than the safety net costs. It earns its
+  keep only at projection sites, where dropping it would make a group-by result column's Arrow type
+  depend on whether the key happens to be promoted. Filed, not done.
+
+### Tier 1: the floor for any key, on any signal
+
+`imbh_core::json_get` built a `Vec<(String, AnyValue)>` of the entire blob — one allocation per key
+and per string value — then linear-searched it for one field. Cost above a `count(*)` floor per 100k
+rows: **18.9 ms at 2 attributes/record, 75.1 at 10, 326.7 at 40** — roughly 8 ms per attribute, so a
+40-attribute record made an arbitrary filter **36x its own floor**.
+
+Replaced with a targeted walk: skip non-matching values with `IgnoredAny` (no allocation), borrow keys
+from the input, fall back to the full parse when that cannot apply. **326.7 → 101.5 ms at width 40**
+(3.2x), 75.1 → 31.7 at width 10, 18.9 → 12.4 at width 2.
+
+**The bug in the first version is the durable lesson.** It returned early on finding the key, which
+leaves `serde_json`'s parser mid-object; `deserialize_map` then fails to find the closing brace and
+**errors**, silently routing into the full-parse fallback. So matching an *early* key cost the aborted
+scan *plus* the full parse. It did not fail loudly, it just got slow — a hit on the first key became
+~3x slower than a hit on the last. Caught only because the numbers were backwards from the hypothesis
+and the anomaly got chased instead of written off as noise. The benchmark was *also* confounded on the
+first pass: it varied predicate type along with key position, and `= 'v0'` is the shape the `attrs`
+index recognizes, so it carried an index search the `IS NOT NULL` comparison did not.
+
+An early exit on canonical JSON's sorted keys was also considered and rejected: `json_get` is public
+and the UDFs can be pointed at any text column, where an unsorted object would report a present key as
+missing. Correctness rests on the fallback, not on cleverness —
+`json_get_agrees_with_the_full_parse` compares both paths across 13 documents x 4 keys (escaped keys,
+surrogate pairs, the `{"$f":…}` sentinel, duplicates, unsorted keys, non-object, malformed).
+
+### What a promoted column actually costs — and the axis that turned out to be wrong
+
+Ran as a hard gate before any policy. 50k log rows + spans + gauges, keys on logs only so the six
+all-NULL columns on other signals are included, **one process per count** (sharing a process makes RSS
+meaningless: the first count absorbs ~200 MiB of first-touch pages and later ones read ~0; a warm-up
+does not fix it, since the allocator does not return pages).
+
+Low-cardinality keys are nearly free: **+1,206 B per key, +2.0% at 20 keys**, bit-exact reproducible.
+Seal time and buffer RSS are **below the noise floor** — best-of-5 seal is 487.8 ms at 0 keys versus
+**473.3 ms at 20**, and VmRSS is 210,348–210,356 kiB across all counts. (Arithmetic bounds the buffer
+cost at 4 bytes/row/key for the `Int32` index array, ~2% of the working set.) Note `DbStats::buffer_bytes`
+cannot see promoted columns at all: it sums `Row::approx_bytes()`, the pre-Arrow row size, while
+`push_log_batch` builds the batch at ingest.
+
+**Then the framing turned out to be wrong.** "Gate the budget on cardinality" is not right, because
+Parquet builds its dictionary **per column chunk** — what costs money is how much a value *repeats
+within a segment*. At a fixed 50 segments x 1,000 rows: **+1,206 B/key at 3,125x repetition, +22,067 B
+at 50x, +108,842 B at 1x**. The intermediate step is what shows it: spreading 50,000 globally-distinct
+values across 50 segments barely helped (+108,842 vs +114,284 B/key), because the values were still
+unique per row and segmenting does not reduce how many distinct strings must be stored. The original
+`card=50000` run had all 50,000 values inside one segment, so it measured both variables at once.
+
+So a gate on **global** cardinality would reject exactly the keys worth promoting: `pod.name` has
+enormous global cardinality but only the currently-running pods appear in any one segment, each on
+many rows. Time-locality is what creates the repetition. The quantity is `rows / postings`, and
+`attr-stats` already reports both terms.
+
+### `Db::attr_access_stats()` — the half no offline tool can supply
+
+Which keys queries read, how often, by which backend (`Builtin`/`Promoted`/`Json`), most-read first.
+Tallied in `attr_field` — the single chokepoint every typed API and LGTM translator funnels through —
+at query-*planning* time, once per key per query, never per row. Not persisted: demand is a property
+of how a deployment is queried, not of its data. A key accumulating `Json` reads is the promotion
+candidate. This also collapsed 21 duplicated `SqlParams::with_promote(...)` call sites onto one
+counted constructor.
+
+### Two features measured into the bin
+
+**The promoted-attribute push-down** (rejected earlier the same day, recorded in the first entry): the
+`attrs` index buys nothing on a promoted column, because its whole value on the JSON path is avoiding
+the JSON parse, and promotion already removed that.
+
+**A Tantivy index on metric segments.** Metric tables have no `.tidx`, so a label matcher is a full
+JSON scan — a gap of **+26.0 ms over floor per 100k points** (10 labels/point), *identical* at 50% and
+1% selectivity, because JSON cost is per row scanned rather than per row matched. A promoted column
+recovers **95–97% at every selectivity**; the index recovers the gap only when the matcher is
+selective, and above the ~0.5 hit-fraction gate it declines to prune and returns nothing for its
+search. PromQL selectors like `service="api"` are exactly the unselective case. So the index would buy
+a Tantivy build at seal on the **highest-volume signal** to help only selective filters on un-promoted
+keys. Use `promote` instead — now choosable from data rather than guesswork.
+
+Both rejections share a shape worth remembering: the infrastructure that already existed covered the
+case, once the right keys or the right predicate spelling were used. Neither would have been caught by
+reasoning; both took a benchmark.
+
+### Verified
+
+`fmt --all --check` clean; `build --workspace`, `clippy --workspace --all-targets -D warnings`, and
+`test --workspace` all clean at **643 passing**. No `Cargo.toml`/`Cargo.lock` movement, crate count
+unchanged at 282, so no footprint gate movement is possible. `Db::attr_access_stats` plus the
+`AttrAccess`/`AttrBackend` types are purely additive; the `CASE` change alters emitted SQL, not any
+signature. New harnesses: `examples/bench --bin {jsonattr,promote-cost,metricattr}-bench`, alongside
+the `attr-bench` and `prune-bench` from the first entry.
+
+## The spans `.tidx` earns its keep, and locality beats selectivity 5x (2026-08-08)
+
+A short follow-up to the two entries above, answering "could we drop Tantivy from traces/metrics?"
+Metrics never had an index, so the question was only about spans — and the answer is **no**, against
+a guess of mine that said otherwise.
+
+The spans sidecar measured at **56% of the Parquet it indexes** (logs: **217%**) on a synthetic
+corpus, which is what prompted the question. Caveat on those ratios: the corpus has repetitive bodies
+that zstd crushes while Tantivy's term dictionaries do not compress the same way, so the direction is
+real and the magnitude is inflated.
+
+I then argued from structure that span `name` is low-cardinality, so `matches(name, …)` would be
+unselective and the cost gate would decline — making the sidecar dead weight. **That conflated two
+different things.** Matching *one* of twenty names is 5% selective. What makes a matcher unselective
+is cardinality **1–2**, which is the metric-label shape (`service="api"` in a single-service
+deployment), not the span-name shape.
+
+Measured with `examples/bench --bin spanindex-bench`, detecting application exactly rather than by
+timing: `ScanStats::rows_scanned` counts rows materialized *after* the `RowSelection`, so
+`rows_scanned < total` proves it applied. `stream_with_stats` is the public surface, and its counters
+are complete only once the stream is drained.
+
+| scenario | names | /segment | selectivity | rows_scanned | ms | verdict |
+|---|---|---|---|---|---|---|
+| degenerate | 1 | 1 | 100% | 100,000 | 26.1 | gate declined |
+| interleaved, low card | 4 | 4 | 25% | 25,000 | 16.0 | pruned |
+| interleaved, mid card | 20 | 20 | 5% | 5,000 | 11.0 | pruned |
+| interleaved, high card | 200 | 200 | 0.5% | 500 | 16.9 | pruned |
+| localized, high card | 200 | 10 | 0.5% | 500 | **8.5** | pruned |
+| localized, very high card | 2,000 | 10 | 0.5% | 500 | **3.3** | pruned |
+
+Two findings, and the second is the one worth carrying:
+
+1. **The gate declines only at cardinality 1–2.** From four names upward the selection applies and
+   prunes to exactly the matching rows. The spans index is not dead weight.
+2. **At identical selectivity and identical `rows_scanned`, distribution moved wall-clock 5x.** 16.9
+   ms interleaved versus 3.3 ms localized, with 500 rows scanned in both. The mechanism is §8's cost
+   model: a value confined to a few segments makes the others return an *empty* hit set, so the
+   `RowSelection` selects nothing and the segment costs only its open plus index search — an effective
+   segment skip. Interleaved, every segment holds matches, so every segment is read and only per-row
+   decode is saved. **`rows_scanned` cannot distinguish these**; only time can, which is a caution for
+   every counter-based assertion in this codebase.
+
+That is the same time-locality axis that governs promoted-column cost (a key is cheap when its values
+repeat within a segment), arriving from the read side. It is also direct evidence that low sigma pays
+— constructed rather than observed, so it demonstrates the mechanism without settling whether real
+telemetry has that shape, which is still what the segment-digest idea is gated on.
+
+Method note: `examples/bench` gained `tokio` and `futures` as direct dependencies to drive the async
+`stream_with_stats` path. Both were already in the graph via `imbh`, so `Cargo.lock` gains no crate
+and the facade is untouched.
+
+## Session summary: read-path work, 2026-08-08
+
+Consolidating entry for the day. The three above hold the detail — segment pruning, attribute access,
+and the spans-index probe. This one records what shipped, what was measured and *not* built, an audit
+that had not been written down, and the method lessons, which are the part most likely to matter next
+time.
+
+The day began as a design question — should the backing store move to Tantivy, Quickwit-style? — and
+the recommendation against it was right for the wrong reason, because the canonical docs were wrong
+about what was built. Chasing that produced everything else.
+
+### Shipped
+
+| change | effect |
+|---|---|
+| Time-range pruning via Parquet row-group statistics | a 1-of-60-segment window 8.71 → 2.09 ms |
+| Manifest-range segment skip, ahead of any file open | same query → **0.73 ms** (11.9x vs baseline) |
+| Trace search binds raw `trace_id`; provider learns `IN` and the `OR` chain | 2-id fetch 7.26 → 2.23 ms |
+| Promoted keys compile to a JSON-fallback `CASE` | **fixes a shipped wrong-answer bug** |
+| `json_get` walks to the key instead of parsing the whole blob | 40-attribute record 326.7 → 101.5 ms |
+| `Db::attr_access_stats()` | the demand half of choosing a `promote` list |
+| `examples/attr-stats` | the data-shape half — per-key cardinality, coverage, sigma |
+
+Six new measurement harnesses under `examples/bench/src/bin/`: `prune-bench`, `attr-bench`,
+`jsonattr-bench`, `promote-cost`, `metricattr-bench`, `spanindex-bench`. They are the reason the
+rejections below are decisions rather than opinions, and they are what a future change should re-run
+before claiming an improvement.
+
+**Semver.** `imbh-query`'s `SegmentInput` gains `time_range`, `TableInput` gains `time_column`, and
+`SegmentTableProvider::new` takes another argument — public-field structs, so this is **breaking** and
+needs the 0.7.0 minor bump the canonical-JSON change already puts on the table. It must not ship as a
+patch. Everything else is additive: `Db::attr_access_stats` with `AttrAccess`/`AttrBackend`, and the
+`CASE` change alters emitted SQL rather than any signature. No third-party dependency moved; crate
+count is unchanged at 282.
+
+### Measured and deliberately not built
+
+- **Promoted-attribute push-down.** The `attrs` index buys nothing on a promoted column, because its
+  entire value on the JSON path is avoiding the JSON parse — which promotion already removed. The
+  promoted column sits within 0.13–0.55 ms of a bare `count(*)` floor at every selectivity, so there
+  is nothing left to recover. The plan's own framing ("the un-promoted path is faster") was retracted.
+- **A Tantivy index on metric segments.** The metrics gap is +26.0 ms over floor per 100k points and
+  is *identical* at 50% and 1% selectivity. A promoted column recovers 95–97% at every selectivity;
+  the index recovers it only when the matcher is selective, and PromQL selectors like `service="api"`
+  are exactly the unselective case. It would cost a Tantivy build at seal on the highest-volume signal.
+- **Dropping the spans `.tidx`.** Considered because it measured at 56% of the Parquet it indexes.
+  Rejected: the cost gate declines only at cardinality 1–2, and from four distinct names upward the
+  `RowSelection` prunes to exactly the matching rows.
+
+Two of the three rejections share a shape: **the infrastructure that already existed covered the case
+once the right keys, or the right predicate spelling, were used.** Neither would have been caught by
+reasoning; both took a benchmark.
+
+### Pushdown soundness audit
+
+Not previously written down, and worth having in one place because five mechanisms now prune.
+Verified by grep: **zero `TableProviderFilterPushDown::Exact` claims** in the tree. Everything is
+`Inexact`, so DataFusion keeps a `FilterExec` above the scan and re-checks every predicate — a
+pushdown can cost time, never an answer.
+
+The asymmetry: over-inclusion is always safe, so only over-*exclusion* could be unsound. Each
+mechanism excludes only on proof.
+
+- **Blooms** prove absence, never presence. A segment is skipped only when *every* candidate is proven
+  absent; `NOT IN` is not claimed, since it proves nothing about absence.
+- **Row-group statistics** exclude only when min/max make a match impossible. Value-preserving casts
+  only; `!=` never claimed; missing statistics mean read.
+- **Manifest-range skip** survives out-of-order ingest, which is what killed the promotion-epoch
+  design: overlapping ranges do not stop a segment's declared range from bounding *its own* rows. The
+  `p.column == time_column` guard keeps a `duration_ns` or `observed_time` comparison from ever being
+  tested against event-time bounds.
+- **Tantivy `RowSelection`** uses exact hit sets, with the tokenizer shared between the index and the
+  row-wise fallback so both agree byte-for-byte.
+
+**One exclusion rests on an assumption rather than a proof**: that a `.tidx` agrees with its Parquet
+file. Structural — built at seal from the same batch, rebuilt wholesale on compaction, with a
+defensive guard for out-of-range ordinals — but a genuinely stale index *would* drop rows, which
+`parameterized_matches_consults_the_logs_index` proves by building a divergent index on purpose. That
+is the sharpest edge in the system.
+
+### Method lessons
+
+The findings will age; these probably will not.
+
+1. **Separate structural wins from distributional ones.** Time-range and bloom pruning save in
+   proportion to segments-outside-the-window over total — set by retention depth and seal cadence, not
+   by what the values look like — so a synthetic corpus gives a number that carries. Sigma does not
+   have that property, which is why `gen-demo-db` reports sigma 1.000 for all 19 keys and why that
+   settles nothing. Knowing which kind of question you have decides whether you may fake the data.
+2. **Counters can show pruning firing while the query is no faster.** At identical selectivity and
+   identical `rows_scanned`, wall-clock moved 5x on distribution alone. Most of this session's tests
+   are counter-based; that is a real limit on what they assert.
+3. **Chase the anomaly.** The targeted-extractor bug — early return leaving `serde_json` mid-object,
+   erroring, and silently falling back to the full parse — showed up only as "the first key is slower
+   than the last", which is backwards. Writing it off as noise would have shipped a pessimization that
+   never fails loudly.
+4. **A benchmark can be confounded in the same way an experiment can.** The first version varied
+   predicate *type* along with key position, and `= 'v0'` is the shape the `attrs` index recognizes.
+   Two variables, one number.
+5. **Measure before implementing when the mechanism already exists somewhere.** Both rejected features
+   were sized without writing them, by exercising the existing path they would have reused.
+6. **Confident prose in a design doc is not evidence.** Three §-level claims were false, two of them
+   contradicted by other paragraphs in the same file. `ARCHITECTURE.md` now carries measured numbers
+   where it used to carry assertions.
+
+### Open, with the reasoning attached
+
+`TODO.md` gained items for: the promote set being per-handle rather than durable DB state (a reader
+and writer can disagree about the same DB); compaction baking an all-NULL promoted column and
+destroying the "predates promotion" signal; the `CAST` being pure overhead for equality filters
+(worth 0.20–0.31 ms, more than the `CASE` costs); `attr-stats`' `hint` column collapsing two
+orthogonal axes; and the auto-promotion landmine itself, which none of today's work touches.
+`AUTO_PROMOTION_PLAN.md` holds the tiered plan, whose remaining steps are gated on pointing
+`attr-stats` at production data.
+
+### Verified
+
+`fmt --all --check` clean; `build --workspace`, `clippy --workspace --all-targets -D warnings`, and
+`test --workspace` all clean at **643 passing** (from 627 at the session's first green gate). No
+dependency movement, so no footprint gate movement is possible. Nothing committed.
+
+## Cardinality is a curve: a window ladder, and a sketch that had to be replaced to make folding work (2026-08-08)
+
+Follow-on to the three read-path entries above. The prompt was a design assertion — *"we need to
+observe cardinality distribution over various buckets (short-term, mid-term, long-term) and keep them
+as statistics"* — and the work is one feature in `examples/attr-stats` plus one correctness rewrite it
+forced, both entirely offline. No shipped crate changed.
+
+### The reframing: sigma is the two-endpoint version of the thing being asked for
+
+A single global distinct-value count cannot separate the two shapes that behave completely
+differently at query time. **Interleaved** (`env`, `service`) means every segment carries every value:
+cardinality can be large and nothing prunes. **Localized** (`pod.name` across a rolling deploy, a
+session id) means cardinality is large *because* values churn, and segment pruning removes almost
+everything. Sigma already tells these apart — but at exactly one scale, the segment.
+
+So the generalization is not three separate numbers, it is filling in the middle of a curve that
+already had both endpoints. Define `C(w)` = mean distinct values of a key within one window of width
+`w`. Then `C(segment)` is `postings/segments` (the number sigma summarises), `C(all)` is the global
+distinct count, and the shape between them is the answer:
+
+- `loc = C(all)/C(seg) ~ 1` — interleaved. Nothing prunes at any scale; a promoted column is the only
+  lever.
+- `loc >> 1` — localized. Pruning removes `1 - 1/loc`, and **the width at which the curve flattens is
+  the horizon beyond which segment pruning stops paying** — which is exactly the predictive input the
+  reactive cost gate in `imbh-query` lacks.
+
+The report also grew `rep` (`rows / postings`, in-segment repetition), because the promoted-column
+cost measurement earlier in the session found that to be the real driver of a promoted dictionary
+column's bytes on disk. Cardinality and repetition now sit in one table instead of being conflated.
+
+Shipped as `--windows 1m,1h,24h` (default; `none` to opt out, arbitrary length, strictly increasing),
+report section 2, and a `cardinality_curve` array in the JSON view carrying both endpoints.
+
+### Three implementation facts worth keeping
+
+**It costs no extra passes.** Counting distinct *windows* per value reuses the same "last ordinal
+seen" dedup the segment count already uses — one `u32` pair per level per tracked value.
+
+**It required globally sorting segments by start time before scanning.** The dedup compares against
+the currently-open window rather than a set, so out-of-order feeding reopens a closed window and
+double-counts. Sorting once is also what lets the DB-wide unit — which interleaves tables — use the
+ladder at all; each per-table unit then sees a sorted subsequence, which is still sorted. A segment
+straddling a boundary is attributed to the window of its `min_time`, which only biases widths near the
+segment span, where the level is degenerate anyway.
+
+**Degenerate rungs are flagged, not printed as findings.** A width that opened one window has
+collapsed onto `C(all)`; one that opened at least as many windows as there are segments has collapsed
+onto `C(seg)`. On `gen-demo-db` (one segment per table over 15 minutes) *all three* rungs collapse and
+say so. Silently printing them would invite reading a coincidence as a measurement.
+
+### The gating question, and why the first answer was wrong
+
+Persisting this cannot be per-segment: the wider rungs aggregate *across* segments by construction.
+The shape that works is a mergeable per-`(segment, key)` sketch folded at read time, so retention
+drops a segment's statistics with the segment and no bucket is stored twice. `SampledMap` looked like
+it already was that sketch — a deterministic hash threshold that only ever tightens — so
+union-then-shrink "should" equal scan-the-union.
+
+That was recorded as unproven, then measured, and it was **half true**:
+
+- Below the cap, a k-way fold equalled a single pass exactly.
+- Above the cap the fold was *sound* — complete counters, valid sample, cap honoured — but **could not
+  be exact, because there was no single direct-scan answer to be exact to.** The scan was itself
+  order-dependent: `shrink` halved whenever the map was full *at the moment a key arrived*, so
+  different arrival orders reached different rates, kept different keys, and reported different
+  `estimated_total`s over identical input. An exhaustive permutation search over 4,800
+  (key-family, n, cap) combinations found **60,012 permutation pairs disagreeing on the estimate**.
+
+That last point was a defect in **already-shipped** behaviour, not something merging introduced:
+`distinct`/`postings` were reproducible only while the caps were disengaged — i.e. exactly when they
+print without the `~` marker. The module doc asserted "a hash sample is independent of arrival order",
+which is false as stated: *membership given a rate* is order-independent, the *rate reached* is not,
+and the rate is what reaches the report.
+
+### The fix: bottom-k
+
+`SampledMap` is now a bottom-k sketch — retain the `cap` entries with the smallest `(hash, key)`,
+tie-broken by key text so even a 64-bit collision cannot make the outcome order-sensitive. Storage is
+`HashMap<Rc<str>, V>` for lookup plus `BTreeSet<(u64, Rc<str>)>` for ordering, sharing key text through
+the `Rc` so ordering costs a pointer rather than a second copy of every key. All three properties now
+hold and are pinned by tests:
+
+1. **Counters complete** — a key in the final bottom-k was in the bottom-k of every prefix containing
+   it, so it was admitted on first sight and never evicted.
+2. **Order-independent** — 78,300 permutations, zero disagreements, on the same sweep that previously
+   found tens of thousands.
+3. **Folding exact, above the cap as well as below** — a 3-part fold and a single pass agree on keys,
+   counters, rate *and* estimate.
+
+Verified end-to-end: two runs at `--max-values 3` return byte-identical estimates at a
+non-power-of-two rate (0.27363988760093705), where the predecessor could return different numbers for
+the same database.
+
+**One deliberate deviation from textbook.** The standard bottom-k estimator divides `k - 1` rather
+than `k` by the rate, removing a `k/(k-1)` upward bias. This uses `k`: every other scaled quantity in
+the report is a sum over the sample divided by the same rate, and `locality = C(all)/C(seg)` is a
+ratio between two of them — a correction on one side only would distort that ratio more than the bias
+it fixes. 0.002% at the default 50,000-value cap, documented at the call site.
+
+### Two bugs, and what actually caught them
+
+**The first bottom-k conversion was silently wrong and all 18 tests passed.** `evict_max` did not set
+`dropped`, so a map that only ever *evicted* (never refused an arrival) still reported
+`sample_rate == 1.0` and `estimated_total == cap` — claiming exactness while discarding keys. The
+signal was not a red test: it was the *order-dependence test continuing to pass* when the conversion
+should have made it start failing. A green suite was the symptom.
+
+**`rate_note` was quietly overstating coverage.** It printed `1/{round(1/rate)}`, correct while rates
+were powers of two. Bottom-k thresholds are not — a measured 0.2736 rendered as `1/4` rather than
+`1/3.7`.
+
+Earlier in the same work, a merge that looked broken (merged rate consistently one halving tighter
+than a direct scan) turned out not to be the sketch at all: `shrink()` cuts at `len >= cap` because
+the scan path calls it *before* inserting one more key, and a merge inserts nothing afterwards.
+Reusing it cut one rate further and silently halved the sample.
+
+### Method notes
+
+1. **A clean result from a weak search is not evidence.** The first divergence sweep found nothing and
+   very nearly closed the question. The order dependence only surfaced under *exhaustive* permutations
+   at small caps; the sequential key family and larger caps I had picked happened to miss it.
+2. **When a change should break a test, check that it does.** Inverting the order-dependence
+   assertion was what exposed the `dropped` bug. Tests that only ever go green cannot report a
+   regression in the property they exist to describe.
+3. **A design assertion in the prompt can be right and still need sharpening.** "Buckets" was correct;
+   "a curve whose two endpoints already exist" is what made it implementable without new machinery.
+4. **Doc claims decay in the same file that disproves them.** As with the three stale
+   `ARCHITECTURE.md` claims earlier today, the `SampledMap` doc asserted a property the module's own
+   behaviour contradicted. Both are now corrected in place with the measurement named.
+
+### Open
+
+`TODO.md` carries the consolidated entry: what the ladder measures, the merge verification, the
+bottom-k conversion, and the two traps. Still open is the persistence itself — sketches written at
+seal, plus manifest and retention plumbing. `SampledMap::merge` stays `#[cfg(test)]`: it establishes
+the property, and nothing in the tool calls it yet. None of this should be sized before pointing
+`attr-stats` at production data — on synthetic corpora every curve is flat by construction, exactly as
+every sigma is 1.000. This is the distributional/structural split from the previous entry, unchanged:
+the ladder makes one real dataset say much more; it does not remove the need for one.
+
+### Verified
+
+`fmt --all --check` clean; `build --workspace`, `clippy --workspace --all-targets -D warnings`, and
+`test --workspace` all clean at **651 passing** (from 643 at the previous entry). Eight new tests, all
+in `examples/attr-stats`. No dependency movement, so no footprint gate movement is possible. No
+shipped crate touched, so no semver implication. Nothing committed.
+
+## Addendum: the bottom-k sketch did not need two containers (2026-08-08)
+
+Correction to the entry above, which describes a `SampledMap` built from a `HashMap<Rc<str>, V>`
+beside a `BTreeSet<(u64, Rc<str>)>`. Prompted by two questions — *how sparse is the ordering map, and
+does it need to be a map at all?* — and the answer to both was unflattering.
+
+**The ordering set was never sparse.** It held an entry for *every* retained key, always, exactly 1:1
+with the hash map. It was a full shadow index of the same population, maintained to answer one
+question — what is the maximum — at a cost of 24 bytes plus a BTree node per entry. Nothing ever
+called `range`, `contains`, or ordered iteration, so even as an ordering structure it was the wrong
+shape; a heap would have served. Describing it as an "ordering map" made a duplicate index sound like
+an index.
+
+**It did not need to be a map, because the value map did not need the key text.** Grepping every read
+settles it: every production use of `values.iter()` discards the key (`|(_, v)|` in `KeyAcc::postings`
+and in `summarize_unit`), and `values_tracked` only counts. A value's text exists solely to tell
+values apart — which the hash already does. Only the *key* map needs a name, because the report prints
+attribute keys, and that name belongs in `KeyAcc` rather than in the sketch.
+
+So `SampledMap` is now a single `BTreeMap<u64, V>` keyed by the hash: it is the lookup structure and
+the order structure at once, with `pop_last` for eviction. Three things fell out:
+
+- **~88 bytes of identity per value entry became 8.** The old per-entry cost was a 16-byte inline
+  `Rc<str>`, a 24-byte tuple in the shadow set, a 16-byte `RcBox` header, and the value text itself;
+  the new cost is one `u64` key. At the default 50,000-value cap that is roughly 4.4 MB down to 0.4 MB
+  per tracked key, plus one fewer container and one fewer allocation per entry.
+- **`MAX_VALUE_BYTES` and its digest folding are gone.** That special case existed only to bound the
+  bytes one kilobyte-sized attribute value could occupy. Not storing value text at all subsumes it,
+  and the collision bound it already accepted (~1e-10 at the 50k cap) now applies uniformly rather
+  than only to values over 128 bytes.
+- **Every lookup hashed twice and now hashes once.** `entry` used to call `contains_key` (SipHash over
+  the string) *and* `hash` (xxh3 for the sampling predicate). It now hashes once with xxh3 and
+  descends a BTree over `u64`s — on the hot path, one hash of every attribute pair of every row.
+
+Tie-breaking by key text, which the previous entry lists as a property, is no longer needed and no
+longer exists: keying by hash means a collision merges two names into one entry, which is
+deterministic rather than order-sensitive. That is the same trade the digest folding already made.
+
+### Method note
+
+Restoring six tests I deleted by accident is the lesson worth recording. A scripted splice keyed on
+"replace from this doc comment to that `#[test]`" swallowed everything between them, and the suite
+went from 18 tests to 12 while still reporting **`test result: ok`**. A passing run says nothing about
+tests that no longer exist; only the count did. Nothing was committed, so `git` could not restore
+them — they had to be rewritten. Same shape as the `dropped` bug in the entry above: the failure was
+visible in what the suite *stopped* asserting, not in anything it reported.
+
+### Verified
+
+`fmt --all --check` clean; `build --workspace`, `clippy --workspace --all-targets -D warnings`, and
+`test --workspace` clean at **651 passing**, the same 18 in `examples/attr-stats`. Report output
+re-checked against a generated demo DB, including a forced `--max-values 3` where estimates carry the
+`~` marker. No dependency movement, no shipped crate touched. Nothing committed.
+
+## Attribute archetypes: a corpus that falsified its own headline, and the cost term nobody was measuring (2026-08-08)
+
+The operator has real telemetry but may not be able to use it (contract). So instead of measuring
+their data we measured the *decision rule* against the space of shapes their data could have.
+
+### The reframe
+
+Every threshold in `attr-stats` traced back to one cost measurement plus reasoning. What had never
+been checked was whether the **verdict matches the backend that is actually fastest and the column
+that is actually cheapest**. Synthetic data cannot say what a deployment's telemetry looks like — on
+a generator every sigma is 1.000 unless the generator is written otherwise, which is a fact about
+the generator. But it *can* bound the space of shapes and test the rule across it. If the rule is
+right for every archetype, the remaining unknown shrinks from "what does the data look like" to
+"which archetypes are present" — answerable from a handful of parameters, disclosing nothing.
+
+Two parameters came back from the operator and both mattered: request-scoped **and session-scoped**
+identifiers do appear as attributes, and concurrent pods are **under 50** in most deployments.
+
+`examples/bench --bin archetype-bench` builds seven archetypes as attributes on the *same* rows, so
+the comparison between them is controlled — same segments, same row count, everything varying except
+the shape of the value: a constant (`env`), a low-cardinality enum (`http.method`), a rolling
+identity (`k8s.pod.name`, 50 live on an 8-segment lifetime), sessions in two layouts, a per-row
+unique (`request.id`), and a Zipfian tenant id.
+
+### The corpus falsified its own first result
+
+The first run reported `session.id` at **9,079 B** — cheap despite 1,920 distinct values, apparently
+a clean confirmation of the repetition-not-cardinality correction. It was an artefact: the generator
+emitted each session's ~25 events *contiguously*, which real concurrent traffic never does. Flagging
+that as provisional and fixing it was the single most valuable thing in this work.
+
+Keeping both layouts as a **controlled pair** — same session population, same ~25 events each,
+contiguous versus interleaved across 200 concurrent sessions — isolates the term exactly:
+
+| key              | distinct | postings | rep  | disk       |
+|------------------|----------|----------|------|------------|
+| `session.contig` | 1,920    | 1,920    | 25.0 | **9,079 B**  |
+| `session.id`     | 2,000    | 3,791    | 12.7 | **64,252 B** |
+
+**7.1x apart**, of which only ~2x is explained by postings. Interleaving made session ids more
+expensive than pod names (64 KB vs 42 KB) — and the gate shipped that morning gave both the identical
+verdict, because it could not see the difference at all.
+
+### The cost model was missing its larger term
+
+A promoted column is a Parquet dictionary **plus a per-row `Int32` index array**. The dictionary
+scales with distinct-values-per-segment; the index array's compressed size scales with the *entropy
+of the value sequence*, which repetition cannot see. `postings/rows` modelled only the first. Ranked
+by it, `k8s.pod.name` (42,135 B) was rated cheaper than `session.contig` (9,079 B) — an inversion.
+
+The gate is now
+
+```
+est B/row = [ C(seg) * mean_len  +  runs * log2(C(seg)) / 8 ] / rows_per_segment
+```
+
+Ranked by this, all seven archetypes come out in **exactly** their measured disk order, across a 26x
+range (4,092 B to 105,223 B). Absolute values run 2-5x high because zstd exploits structure the model
+does not — `request.id`'s strictly-increasing index compresses far better than its entropy implies —
+so it ranks keys rather than sizing budgets, which is what a verdict needs.
+
+Two implementation consequences:
+
+- **`runs` is now measured**, which required `scan.rs` to walk rows in order. The dictionary path
+  previously tallied a count per dictionary entry and discarded order entirely; it now coalesces runs
+  of equal indices, and `prev` carries across record batches so a run is not falsely restarted at
+  every batch boundary. A run starts when a *key's* value differs from the previous row's — not when
+  the blob differs, since two blobs can agree on any given key.
+- **The estimate is per row, not per segment.** The first threshold was absolute bytes and the
+  existing `the_promotion_verdict_follows_repetition_not_cardinality` test rejected it instantly: a
+  200-row segment reads as cheap whatever it holds, so `request.id` came out `yes`. Normalising by
+  rows per segment makes it scale-free.
+
+### Two harness bugs, both the same species
+
+**The agreement check was comparing the wrong things.** It validated the promote verdict against
+*which backend was fastest*. The verdict predicts **disk cost**; at low selectivity the `attrs` index
+already takes the JSON path to the floor (5.10 ms against a 5.62 ms floor at 1.18%), so promotion
+cannot win however cheap its column is. The `k8s.pod.name` "MISMATCH" was the harness's category
+error, not the classifier's. It now ranks verdicts against measured bytes.
+
+**The bench carried its own copy of the classifier.** After the real gate was fixed, the bench kept
+reporting the old inversion — because it was still evaluating the superseded rule. A harness that
+validates a *duplicate* of the rule validates nothing. It now mirrors the shipped model deliberately,
+with a comment saying why.
+
+### What else the corpus showed
+
+- **`attr-stats` recovers ground truth exactly** — distinct (48,000 / 1,000 / 1,920 / 118 / 7 / 1)
+  and postings (48,000 / 8,313 / 1,920 / 600 / 84 / 12) both match the generator's own counts, none
+  sampled. First time the estimator has been checked against known truth rather than self-consistency.
+- **Promotion's speed win is entirely at unselective filters.** `env` at 100%: 19.80 -> 6.93 ms.
+  `http.method` at 14%: 10.52 -> 6.92 ms. Everything at or below 1.7%: no win at all, the index is
+  already at the floor. That matches the cost gate declining above a ~50% hit fraction, measured
+  earlier. So the rule is **promote what is queried unselectively; let the index serve selective
+  equality** — which needs the demand signal (`Db::attr_access_stats`) crossed with cost. Cost alone
+  cannot express it, and the tiered plan's dispatch table did not say this.
+- **`request.id` is where the two verdicts must diverge**, and they do: `costly` to promote (10.26
+  est B/row, 105 KB measured) yet `index@ all` (sigma 0.083). A single-label classifier could not
+  have said this, which is what the column split earlier in the day was for.
+
+### Method notes
+
+1. **A synthetic corpus can be wrong in a way that flatters the hypothesis.** Contiguous sessions
+   were not a simplification, they were the answer the model wanted. The tell was that the result
+   was *too* clean — 1,920 distinct values for 9 KB.
+2. **Keep the falsified variant as a control.** Deleting `session.contig` once interleaving was
+   implemented would have lost the isolation; keeping both is what turned "the caveat was right" into
+   a measured 7.1x with everything else held constant.
+3. **A harness must evaluate the shipped rule, not a copy of it.** Two of this session's bugs were
+   tests or harnesses that agreed with themselves.
+4. **State the caveat before running the experiment that tests it.** The interleaving flaw was called
+   out as provisional in the same breath as the result; that is what made the follow-up obvious
+   rather than embarrassing.
+
+### Open
+
+Production data remains the gate, but a smaller one: the question is no longer "what does the data
+look like" but "which of these archetypes are present, and in what proportion". The run-structure
+term is also absent from any seal-time/manifest statistics design — the per-segment sketch discussed
+earlier stores value presence, not value *order*, so a persisted version of this statistic needs a
+run counter alongside it.
+
+### Verified
+
+`fmt --all --check` clean; `build --workspace`, `clippy --workspace --all-targets -D warnings`, and
+`test --workspace` clean at **653 passing**. No dependency movement. `attr-stats` changes are
+example-crate only; no shipped crate touched in this entry's work. Nothing committed.
+
+## Unblocking out-of-process housekeeping: two silent-answer fixes, a mutable promote set, and a design that splits prepare from commit (2026-08-09)
+
+Covers the read-only `segment_files` fix and the durable promote set (both 2026-08-08, not journalled
+at the time) plus today's compaction work. One thread: everything auto-promotion and out-of-process
+housekeeping need before they are safe to build.
+
+### `Db::segment_files` returned an empty database on read-only handles
+
+`Storage::open_read_only` deliberately leaves the in-RAM segment lists empty — a reader derives its
+view per call — but `segment_files` read those lists, so it returned `[]` for a fully populated
+database. Nothing errored: `[]` is indistinguishable from "this table has no segments", so a host
+handing the paths to DuckDB `read_parquet` (the documented use, §10.11) got no data and no error.
+
+It now reads a fresh `read_disk_snapshot`, the same source the reader's query path already used, and
+is **fallible** — `Result<Vec<PathBuf>>`, breaking, taken in the open 0.7.0 window. The signature is
+the point: on a reader the call genuinely performs I/O, and the old type could not distinguish "no
+segments" from "could not read the manifest". `BlockingDb` gained the mirror it had never had.
+
+**Scope correction worth recording.** I first reported this as a *family* of accessors — `stats()`,
+`snapshot()`, the retention scans — inferred from `inner.segments` being read by `table_stats`. That
+was wrong, and the user had already approved the wider scope on the strength of it. Reading the
+*callers* rather than the field: `Db::stats` already branches to `reader_stats()` (which uses
+`read_disk_snapshot`), and `Db::snapshot` already calls `ensure_writable()?`, so it refuses
+explicitly. `segment_files` was the only silent one. Fixing one accessor instead of three was the
+correction, not a de-scoping.
+
+### The promoted key set became durable database state
+
+It was per-handle configuration, so a writer opened with `promote(["k"])` and a reader opened without
+it disagreed about the column layout of the very same segments. The `CASE` fallback shipped earlier
+made that *correct* but never *coherent*, and auto-promotion — where the writer's set changes at run
+time and a reader could never learn it — needs coherence.
+
+Now recorded in `db.info` (one escaped `promote\t<key>` line per key, temp→rename) and read at open.
+The load-bearing design decision is distinguishing **"the builder said nothing"** from **"the builder
+said empty"**: omitting `promote()` inherits the database's set, an explicitly empty `Promote` still
+demotes everything. Without that distinction every host that stopped passing its list would have
+silently demoted its database, so `DbBuilder`'s field became `Option<Promote>` internally while the
+public signature stayed put. Read-only handles adopt the durable set and ignore their own builder.
+
+**The trap:** `Storage::open` calls `write_db_info`, which rewrote the file with `Promote::default()`
+— so *opening* a promoted database erased the marker before the facade could read it, and a reader
+then saw no promoted columns at all. Open must carry the existing set through. Caught by the
+durability test; reasoning had not.
+
+### `set_promote`, and why the barrier works
+
+Batches are encoded at ingest against the set in effect then, and `concat_buffer` later concatenates
+them against the *current* schema. `concat_batches` takes columns **positionally** and does not
+validate them against the schema it is handed, so a buffer holding both widths can panic (first batch
+wider), silently truncate (first batch narrower), or silently concatenate two differently-named
+promoted columns into one. That is the hazard §6.1 records for compaction, and making the set mutable
+would have reproduced it in the buffer.
+
+`Storage::set_promote` seals, takes the `inner` lock, verifies every buffer is empty, and swaps under
+that lock. Correctness rests on a fact checked rather than assumed: **ingest reads the promote set
+beneath the same lock it appends under** (`push_log_batch(&mut inner, rows, &self.promote_keys())`),
+so once the swap holds `inner` with empty buffers no encode can be in flight against the old set. A
+racing ingest between seal and lock costs another round; bounded at 8 attempts rather than spinning
+forever inside a public call. `promote` moved behind an `RwLock`; `Storage::promote()` returns an
+owned `Promote`, since handing out a reference would pin the lock.
+
+### The housekeeper question, and two premises that did not hold
+
+The request was "make auto compaction a fully optional feature, and let the separate housekeeper
+process take care of it". Both halves rested on premises worth checking first:
+
+1. **There is no auto compaction.** `Db::maintain()` is seal + retention only; the `Maintenance`
+   scheduler never compacts; there are zero interval/loop/scheduled references to `compact` anywhere
+   in the workspace. It runs only on an explicit `Db::compact()`. Compaction is already *stronger*
+   than optional — it is entirely manual. Nothing to make optional.
+2. **A separate process cannot compact a live database.** `Storage::open` in `ReadWrite` takes an
+   exclusive advisory `flock` on `writer.lock` for the handle's lifetime (§5). A second read-write
+   open fails outright.
+
+So the recommendation to drive `POST /admin/compact` from an external scheduler was correct for
+`imbhd` and useless for the actual case: **an embedded host has no `imbhd` to drive**, and cannot be
+asked to stop its writer to compact.
+
+### Why per-segment locks are the wrong instrument
+
+The proposal to shard the writer lock per segment targets a resource that is not contended. Segments
+are not; the **manifest** is. Two mutators holding disjoint per-segment locks still serialise their
+manifest edits, so the machinery buys nothing the manifest lock would not.
+
+The more useful observation: **the housekeeper never needs an LSN.** Compaction and retention do not
+ingest — no WAL append, no LSN allocation, no mutable buffer. So the requirement is not N concurrent
+writers but *one ingesting writer plus N non-ingesting mutators*, which is a far smaller ask.
+`writer.lock` conflates "owns the WAL and the LSN space" with "may mutate segments", and only the
+first genuinely requires exclusivity.
+
+Three properties make a split cheaper than it looks, all read out of the source:
+
+- the manifest is already a versioned replayable delta log (`CURRENT` → `MANIFEST-<N>`, framed
+  `len`/`xxh3`/payload records, torn-frame tolerance, readers re-resolving across a roll);
+- `ManifestWriter::persist` emits `diff(self.last, view)`, so a seal racing a compaction appends only
+  "add X" and replays against `{C}` to give `{C, X}` — **deltas compose**;
+- readers already pin segments by open handle, so concurrent deletion is safe (verified by the
+  existing `..._pinned_by_open_readers` test).
+
+And two that break:
+
+- **checkpoints clobber.** `write_checkpoint` (the periodic roll) writes a full reset from the
+  writer's in-RAM `self.last` and flips `CURRENT`; a roll racing a compaction drops the merged
+  segment entirely;
+- **the writer's in-RAM segment view is authoritative for its own queries.** After a housekeeper
+  merges A,B → C and unlinks them, the writer still opens A and B *by path* — `ENOENT`. Fixing that
+  reaches into query-snapshot consistency, `stats()` and `segment_files()`.
+
+Also `append_frame` uses `write_all`, which loops on a short write; `O_APPEND` makes a *single*
+`write` atomic against other appenders, not a looping one. Not a live bug, but a multi-writer design
+would have to make it a guarantee rather than an observation.
+
+### The design: split by cost profile, not by resource
+
+Compaction is ~99% expensive IO and ~1% atomic bookkeeping, and the halves have completely different
+safety requirements. **The housekeeper prepares** — opens read-only (no lock; readers already work
+against a live writer), merges, writes the output plus its `.tidx` under a scratch name, and records
+its inputs, output and the promote set it built against. **The writer commits** — at its next seal or
+`maintain()`, validates and performs the swap itself: one manifest delta, then unlink the inputs.
+
+That removes the manifest commit protocol, the checkpoint clobbering, and the stale-view problem
+outright, because the manifest stays single-mutator and the writer is the one changing it. Two things
+fall out free: the **offline** case (no writer running → the housekeeper takes `writer.lock` and
+commits its own record, same code path) and the **Cargo feature** (the merge half ships only in the
+housekeeper binary; the writer links only validate-and-swap, which is what "compaction as a fully
+optional feature" should mean).
+
+Written up as `.agents/docs/COMPACTION_HANDOFF.md`, with the costs stated — commit latency, a new
+on-disk record to version, wasted work on conflict — and four open questions left open.
+
+### The promote/compaction fix, and a claim I got wrong
+
+**It was never a wrong-answer bug.** The TODO entry always said the `CASE` fallback is immune: a
+null-filled column takes the JSON arm exactly as an absent one would. A backlog summary of mine on
+2026-08-08 called it the last remaining wrong-answer bug, which the entry itself contradicted.
+
+What it was is a **convergence** defect. `compact_partition` normalised each source batch to the live
+promote set with `coerce_to_schema`, which null-fills a column the segment predates — and compaction
+is the one operation that rewrites those rows, so null-filling there made the fallback permanent and
+every query on that key kept paying a JSON parse over that data for the life of the merged segment.
+
+`backfill_promoted` now projects the column from the retained `attributes` JSON through the same
+`build_promoted_columns` / `lookup_promoted` path seal uses, so a back-filled cell and a
+sealed-at-ingest cell cannot disagree. Only columns the *source* lacked are derived; a NULL in a
+column the source had means the row genuinely carried no string value.
+
+Two things the verification turned up:
+
+- **An existing storage test asserted the old `[None, None, Some("us")]`.** The null-fill was
+  deliberate, not accidental, so updating it was part of the change rather than collateral damage.
+- **The test written to catch a misalignment does not catch it.** `backfill_promoted` zips against
+  `promoted_columns(missing)` rather than `missing` because the former drops reserved names and could
+  offset the vectors. Reintroducing the bad zip left the test green. Chasing why: `missing` holds only
+  keys *absent* from the source schema, and the reserved names are the built-in columns, present in
+  every segment — so the two sets cannot intersect and the bug is unreachable. The guard stays for the
+  day the built-in set changes; the test's doc comment now claims only what it proves.
+
+### Method notes
+
+1. **Check whether the callers branch before concluding a field's readers are all affected.** The
+   `segment_files` "family" was inferred from `inner.segments` having many readers; two of the three
+   already handled the reader case. Reading the field's uses is not reading the code.
+2. **Correct the premise before building.** Two requests today rested on premises that did not hold
+   (auto compaction exists; a second process can compact a live DB). Building either would have
+   produced plausible, useless work.
+3. **"Verify the test fails without the fix" paid three times and failed once.** It caught nothing
+   wrong with the `segment_files`, barrier and convergence tests — and caught that the misalignment
+   test was decorative. That last one is the reason to keep doing it.
+4. **Split by cost profile when a resource is contended for two different reasons.** Prepare/commit
+   works because compaction's expensive half needs no exclusivity and its cheap half needs total
+   exclusivity, and the existing lock granted both to whoever held it.
+
+### Verified
+
+`fmt --all --check` clean; `build --workspace`, `clippy --workspace --all-targets -D warnings`, and
+`test --workspace` clean at **658 passing** (from 653 at the previous entry). No dependency movement.
+Breaking changes this entry: `Db::segment_files` → `Result`, `Storage::promote()` → owned, the
+durable promote set semantics — all recorded in `CHANGELOG.md` under `[Unreleased]`, all inside the
+un-cut 0.7.0 window. Nothing committed.
+
+## Addendum: merge and converge are one job, not two (2026-08-09)
+
+Follow-on to the entry above, which recorded the promoted-column projection landing inside
+compaction. Generalising the housekeeping design then went through a wrong turn worth recording.
+
+### The wrong turn
+
+Asked to treat the promotion backfill as a housekeeping job rather than a compaction detail, I first
+wrote it up as a **second job** alongside compaction: `compact` merges N same-day segments into 1,
+`backfill` rewrites 1 segment whose schema lags the promote set. That framing survived exactly one
+round of scrutiny.
+
+They are the same job with two triggers. The work is identical either way — read the set, project any
+promoted columns the sources lack from their retained `attributes` JSON, concat, sort, write one
+Parquet plus its `.tidx`. Merging is that with `|set| > 1`; converging is that with `|set| == 1`.
+
+Splitting them is not merely redundant, it is **incorrect under the handoff design**:
+
+1. Compaction already projects promoted columns while it rewrites (`backfill_promoted`), so a
+   separate backfill job rewrites the same bytes a second time for no gain.
+2. A backfill record for `A` and a compaction record for `A,B` both **claim `A` as an input**.
+   Whichever commits first invalidates the other, so the loser's rewrite is discarded — and a
+   scheduler that keeps re-issuing both never converges, it just burns IO.
+
+The second point only becomes visible once the pending-record commit protocol exists on paper. It is
+a good argument for writing the design note before the code: the conflict is obvious in the record
+model and invisible in the function signatures.
+
+### What the generalisation actually exposed
+
+The gap was real even though the two-job framing was not. `compact_partition` skipped any day
+partition holding a single segment — nothing to merge — so a partition that will never gain a second
+segment (an old day, a low-volume signal, a database that seals rarely) **never converged after a
+`set_promote`, however often compaction ran**. The projection that landed earlier the same day only
+ever reached segments compaction was already rewriting for other reasons.
+
+Fixed by changing the admission rule rather than adding a job: a one-segment partition is skipped only
+when its schema *already matches*, probed from the Parquet footer (`segment_schema_lags` — no row
+groups read, one small seek per segment). `CompactionReport` gained `segments_converged`, so a 1 -> 1
+rewrite is not counted as a merge and `segments_merged` stays literally true. Breaking, inside the
+open 0.7.0 window.
+
+### The consequence, stated rather than hidden
+
+Because convergence is triggered by *schema lag*, the first `compact()` after a `set_promote` rewrites
+**every segment in the database that lacks the new column**. One rewrite per segment, not a repeated
+cost — the second pass finds nothing, which the new test asserts explicitly — but a burst driven by a
+schema change rather than by data volume.
+
+In-process that burst lands on the host's own thread, which is an argument *for* the out-of-process
+handoff rather than against the behaviour. Out of process the housekeeper's planner should pace it
+(cap per pass, oldest first). Recorded as an open question whether in-process `compact()` needs a cap
+of its own; today it does not have one.
+
+### Method note
+
+**A generalisation that adds a job should be checked against the conflict model, not just the call
+graph.** "Backfill is a separate job" reads fine as a list of capabilities and falls apart the moment
+you ask which pending records could name the same input segment. The unit to reason about was the
+*claim on a segment*, not the *operation being performed*.
+
+### Verified
+
+`fmt --all --check` clean; `clippy --workspace --all-targets -D warnings` clean; `test --workspace` at
+**659 passing** (from 658). One new lifecycle test covering a lone lagging segment and the idempotence
+of a second pass. Nothing committed.
+
+## The housekeeper lands: prepare/commit implemented, and a bug only a second real run could find (2026-08-09)
+
+Implements the design from the two entries above. `.agents/docs/COMPACTION_HANDOFF.md` is updated to
+"implemented, first cut" with its remaining gaps named.
+
+### What shipped
+
+- **`crates/imbh-storage/src/pending.rs`** — the handoff record. Framed like a manifest edit
+  (`| len(4) | xxh3(8) | payload |`) so a write torn by a crash fails its checksum and is discarded
+  rather than half-applied. The payload is tab-separated text for debuggability, with **total**
+  escaping: attribute keys are arbitrary UTF-8 and a tab in a promoted key must not split a field.
+- **`imbh_storage::prepare_pending`** — the read-only half. Reads the manifest and the durable
+  promoted key set off disk, groups each table by UTC day, and rewrites a group when either trigger
+  fires (more than one segment, or a lone segment whose schema lags). Takes no lock, edits no
+  manifest, deletes nothing. `max_jobs` bounds the pass.
+- **`Storage::commit_pending` / `Db::commit_pending`** — the writer's half: validate, one manifest
+  delta, unlink the inputs. `Db::maintain` calls it, and `MaintenanceReport` grew
+  `pending_applied` / `pending_discarded`.
+- **`imbh-housekeeper`** — a bin on the `imbh` crate behind the off-by-default `housekeeper` feature
+  with `required-features`, so a library consumer never builds it. `--commit` is an offline mode that
+  takes the writer lock itself; it falls out of the same code path rather than being a second
+  implementation.
+
+To make the rewrite callable without `&self`, `write_segment_parquet` and the schema/params lookups
+were extracted as free functions (`write_segment_parquet_at`, `table_schema_for`, `rewrite_params`,
+`rewrite_segment_set`). `Storage::compact` and the out-of-process preparer now share one rewrite, which
+is the point — a divergent copy would eventually disagree about column layout or sort order.
+
+### The subtle correctness case, reasoned out during implementation
+
+Commit's ordering follows `seal`: the manifest is durable **before** the inputs are unlinked, so a
+crash in between leaves unreferenced files for `cleanup_orphans` rather than a manifest pointing at a
+deleted file. But that leaves a second window — between "manifest durable" and "record deleted" — and
+on the next pass the record looks *stale*, because its inputs are legitimately gone.
+
+Discarding a stale record deletes its output. Here that output is by then a **live committed
+segment**, so the naive discard would destroy committed data. `commit_pending` therefore removes the
+output only when the manifest does not reference it. Not found by a test; found by asking what the
+crash window looks like from the next pass's point of view.
+
+### The bug a second real run found
+
+Running the binary against a real database, twice, produced `0 applied, 2 discarded` — everything
+rejected. The cause was not the validation logic, which was correct throughout:
+
+**A prepared output is a segment no manifest points at — exactly the shape `cleanup_orphans` reaps at
+open.** So opening the writer to commit destroyed the very outputs it was about to commit. The
+offline `--commit` mode, which opens the writer *after* preparing, swept away its own work on every
+invocation; and any host restart between prepare and commit would have thrown away an
+out-of-process preparer's rewrite.
+
+The reaping was **safe** — the commit's digest check rejects a record whose output has vanished, and
+the inputs were never touched — which is exactly why nothing caught it. Every unit test passed. The
+protocol was correct and useless at the same time.
+
+`cleanup_orphans` now treats a file named by a *valid* pending record as referenced. Once the record
+is consumed the file is either a committed segment or an orphan again, so nothing leaks.
+
+### The feature gate, and what it does not do
+
+`housekeeper` keeps the **binary** out of a default build; verified both directions with a cleaned
+artifact directory, because a stale binary from the earlier example crate initially made the gate look
+broken when it was not.
+
+It does **not** drop the merge machinery from a library build, because `Db::compact` shares it.
+Separating those needs compaction itself behind a feature — the deeper split the design note
+describes. That limit is written into the feature's own comment rather than left for a reader to
+discover: a gate that implies more than it delivers is worse than no gate.
+
+### Method notes
+
+1. **Safe-but-useless is a distinct failure mode from unsafe, and unit tests do not find it.** Every
+   validation path was right; the protocol still could not make progress. The only signal was running
+   the real binary against a real database and watching the counters.
+2. **Run it twice.** The first invocation of anything idempotent-by-design proves nothing. The second
+   is where interaction with `open()`, duplicate records, and "already committed" show up — the
+   duplicate-record discard in the same run was correct behaviour, and it was the *first* record's
+   discard that pointed at the bug.
+3. **Ask what a crash window looks like from the next pass's point of view**, not just from the
+   crashing process's. The stale-record-with-live-output case is invisible from inside the commit and
+   obvious from outside it.
+4. **Extract shared machinery rather than copying it across the process boundary.** The in-process
+   compactor and the out-of-process preparer must produce byte-identical segments or the promote-set
+   validation is theatre; one `rewrite_segment_set` is what makes that structural.
+
+### Verified
+
+`fmt --all --check` clean; `clippy --workspace --all-targets -D warnings` clean, and again with
+`-p imbh --features housekeeper`; `test --workspace` at **667 passing** (from 659). End-to-end run on a
+real corpus: 3 segments merged to 1 with all 1,500 rows preserved, the duplicate record correctly
+discarded, `pending/` left empty. No dependency movement. Nothing committed.
+
+## Retention is not a handoff job — and what was actually missing (2026-08-09)
+
+Asked to make retention a handoff job alongside the segment rewrites. Checking the premise first
+changed the deliverable, for the third time today.
+
+### The claim was mine, and it was wrong
+
+`.agents/docs/COMPACTION_HANDOFF.md` said retention "has the same shape (expensive scan, cheap
+manifest edit)" and could reuse the handoff. Reading `Storage::retain` rather than trusting the note:
+the scan is segment **metadata already in RAM** (`SegmentRef` min/max time and paths) plus one
+`stat()` per segment for the disk-budget arm. Everything else is arithmetic.
+
+There is no expensive half to move off-process. A housekeeper would compute a drop list in
+microseconds and hand the writer a record the writer could have produced faster than it can read one.
+
+### It would also have added a conflict the design does not have
+
+A "drop A" record and a "merge A,B -> C" record both claim `A`. `pending::list` returns records in
+filename order, which is a hash of the output path — arbitrary. Today the ordering is deliberate:
+`maintain()` runs `commit_pending()` **before** `retain()`, so a prepared rewrite lands before
+retention can invalidate it. Turning retention into a record would dissolve that guarantee into a coin
+flip, and buy nothing for it.
+
+This is the same reasoning that collapsed "backfill" and "compact" into one job yesterday, arriving
+from the other direction: there the two records would have claimed the same input, so they had to
+merge; here the two records would claim the same input, so the second one must not exist.
+
+### What was actually missing
+
+`Retention` was **per-handle builder config, never persisted** — precisely the defect `Promote` had
+until the day before. Two handles on one directory could disagree about when data is deleted, and a
+housekeeper had no way to learn the host's policy at all: it opened with `Retention::none()` and did
+nothing, and taking a policy from its own flags would have let it delete data on rules the host never
+chose.
+
+So retention is now durable state in `db.info` beside the promoted set, with the same unset-versus-
+explicit distinction (`Option<Retention>` internally, public builder signature unchanged): omitting
+`retention()` inherits, passing one sets it. `Retention::from_parts` reconstructs a policy from its
+two bounds, and the type gained `PartialEq`/`Eq` so a change can be detected at open.
+
+The housekeeper's offline `--commit` mode now runs `maintain()` rather than `commit_pending()`, so it
+applies **the database's own** policy — seal, commit the pending rewrites, then retention. Retention
+out-of-process for free, with no record type and no new conflict.
+
+### A small honesty bug of my own making
+
+The first cut of that change shoehorned a `MaintenanceReport` into a `PendingReport` to reuse the
+printing code, which silently zeroed the replaced-segment count: the binary reported
+`0 input segment(s) replaced` while replacing three. Fixed by carrying the maintenance report through
+and adding `pending_segments_replaced` to it. Worth recording because the output *looked* plausible —
+a zero is exactly what a no-op run prints, so nothing about it invited a second look.
+
+### Method notes
+
+1. **A claim in a design note is a latent instruction.** "Retention has the same shape" sat in a doc
+   for one day and came back as a work request. Design notes get acted on, so an unverified assertion
+   in one is more dangerous than the same assertion in a chat message.
+2. **Check what a thing costs before deciding where it should run.** The whole prepare/commit split
+   exists because compaction is 99% IO; applying it to something that is 99% arithmetic inverts the
+   trade — machinery and a conflict surface bought with no saving.
+3. **When the answer is "don't build that", find what the request was actually reaching for.** The
+   underlying need — a housekeeper that can apply retention — was real; only the instrument was wrong,
+   and the fix was a defect that had nothing to do with handoffs.
+
+### Verified
+
+`fmt --all --check` clean; `clippy --workspace --all-targets -D warnings` clean, and again with
+`-p imbh --features housekeeper`; `test --workspace` at **668 passing** (from 667). End-to-end offline
+run reports `1 applied, 1 discarded, 3 input segment(s) replaced`. `db.info` carries a retention line
+only when a policy is set, so a database without one is byte-identical to before. Nothing committed.
+
+## The housekeeper reaches its actual user, and a footprint lever that measures ~0 (2026-08-09)
+
+Two follow-ups from the housekeeper landing, both from its own TODO list.
+
+### The shipped feature did not serve the user it was built for
+
+`imbh-housekeeper` exists for **embedded** hosts. The default `Maintenance::Manual` means such a host
+may never call `maintain()` — and `maintain()` was the only thing that committed pending records. So
+prepared rewrites sat on disk indefinitely, and worse, `prepare_pending` re-prepared the same
+partitions on every pass, because nothing it produced ever landed. An `--every 60` housekeeper against
+a host that never maintains is an IO treadmill.
+
+Records are now committed at **`open()`** and **`close()`**. Two ordering constraints, both
+load-bearing:
+
+- **After `with_promote`.** `commit_pending` validates each record against the *live* promoted set, so
+  committing before the set is applied would reject every record as stale — the failure would have
+  looked exactly like "the housekeeper produced nothing usable".
+- **After `cleanup_orphans`.** Both run inside open, cleanup first. That turns the restart test from
+  an assertion into a *proof*: a merged result can only happen if cleanup left the prepared output
+  alone, because a swept output fails the commit's digest check. The test asserts one thing and
+  establishes two.
+
+Failure at close is swallowed deliberately — the records stay for the next open, which is exactly the
+state a crash would leave. Cost is one `read_dir` of a usually-empty directory, on paths already doing
+recovery work.
+
+An existing test broke and deserved to: `a_prepared_rewrite_survives_a_writer_restart` asserted
+`commit_pending()` returned `applied: 1`, and it now returns 0 because `open()` already did the work.
+The intent held; the expectation was obsolete.
+
+### The `compaction` feature, and a claim of mine that measurement demolished
+
+`compaction` (on by default, like the other footprint levers) now gates `Storage::compact`,
+`compact_partition`, `rewrite_segment_set`, `prepare_pending` and helpers. `commit_pending` stays in
+every build — applying a record a housekeeper prepared is cheap bookkeeping an embedded host wants.
+`housekeeper` implies `compaction`.
+
+`.agents/docs/COMPACTION_HANDOFF.md` justified this by saying the host would stop carrying "Parquet
+write, Tantivy build, sort, JSON projection". **Two of those four are wrong**: `seal` already writes
+Parquet and already builds the Tantivy sidecar, so both subtrees stay in *any* writer build. Measured:
+
+| configuration | crates (`--edges normal`) | `libimbh.rlib`, release |
+|---|---|---|
+| default | 381 | 4,413,604 B |
+| `--no-default-features --features ingest,query,search` | **381** | 4,303,170 B |
+
+**No dependency leaves the graph.** 110,434 B of code goes — 2.5% of the rlib.
+
+The gate still earns its place, for a reason that is not bytes: a host that does not link the rewrite
+**cannot start an unbounded one on its own thread**, by accident or by a well-meaning `compact()`
+call. That is an API-surface guarantee, and it is now what the note, the feature comment and the
+CHANGELOG all claim — no more. Note this is the second time in two days that the promotion burst
+argument ("the first compact after a `set_promote` rewrites every lagging segment") turned out to be
+the strongest reason for a design decision, ahead of the one originally given.
+
+### Method notes
+
+1. **A feature that is correct and does not serve its user is still broken.** Second instance in two
+   days of the same species — the orphan-cleanup interaction was the first. Both passed every test;
+   both were found by asking "what does the intended user's actual sequence of calls look like?"
+   rather than by exercising the API.
+2. **Measure a footprint lever before claiming one.** The dependency-subtree win I wrote into a design
+   note did not exist, because the removed code shares its dependencies with a path the host needs
+   anyway. A feature gate's *justification* is as checkable as its behaviour, and I did not check it
+   until the gate existed.
+3. **Order operations so a test proves rather than asserts.** Commit-after-cleanup means one
+   assertion establishes both that cleanup respected the record and that the commit applied it. Free,
+   and only available if you notice the ordering while writing the code.
+
+### Verified
+
+`fmt --all --check` clean; `clippy --workspace --all-targets -D warnings` clean, and again for
+`-p imbh --features housekeeper` and `-p imbh --no-default-features --features ingest,query,search`;
+`test --workspace` at **669 passing** (from 668). Both feature configurations build and are linted.
+Nothing committed.
+
+## Consolidation: two design notes folded into ARCHITECTURE and TODO (2026-08-09)
+
+`.agents/docs/AUTO_PROMOTION_PLAN.md` and `.agents/docs/COMPACTION_HANDOFF.md` are **retired**.
+Earlier entries reference both by path; this entry is the forwarding address.
+
+### `COMPACTION_HANDOFF.md` -> **ARCHITECTURE.md §7.2**
+
+It described a design; that design is now an implemented subsystem, so it belongs with the rest of the
+storage engine rather than in a standalone note. §7.2 "Out-of-process housekeeping: a prepare/commit
+handoff" sits directly after §7.1 (single-writer, many-reader), which is the invariant it works
+around, and carries: why relaxing single-writer is the wrong instrument and per-segment locks wronger
+still; the prepare/commit split by cost profile; the record format and framing; the validation rules
+and why rejection is always safe; the two subtleties (discard must not delete a manifest-referenced
+output; `cleanup_orphans` respects valid records); pickup at `maintain`/`open`/`close`; one job with
+two triggers; why retention is deliberately *not* a handoff job; and the measured feature-gate
+numbers.
+
+Its three genuinely open questions went to TODO — record location (own file vs manifest frame type),
+whether a `maintain.lock` lease is worth it, and `append_frame`'s looping `write_all` versus
+`O_APPEND` atomicity.
+
+**All code and CHANGELOG references were retargeted** to ARCHITECTURE.md §7.2 (7 files). JOURNAL
+references could not be, being append-only — hence this entry.
+
+### `AUTO_PROMOTION_PLAN.md` -> **TODO** (what survives), and mostly nothing
+
+Written 2026-08-08, and the intervening two days demolished most of it. Recording *what* was
+superseded, because the plan reads authoritatively and a future reader finding it in git history
+should know it is wrong:
+
+- **§2.1(a) rejected `coalesce`** on the grounds that "DataFusion evaluates `coalesce` arms as whole
+  arrays, not lazily per row". **Refuted** by reading `datafusion-functions`: `short_circuits()` is
+  `true` and it is rewritten into a genuinely conditional `CASE`. The `CASE` form shipped.
+- **§2's correctness constraint** — promotion silently changing historical answers — **fixed** by that
+  same read-side fallback.
+- **§5's "unmeasured, and a prerequisite"** per-key cost — **measured** (`promote-cost`), and the
+  answer moved twice: not cardinality, then not repetition alone but run structure.
+- **§6 staging step 1's promotion epoch** — **rejected**: re-promotion makes a key's validity a set of
+  intervals, which an epoch cannot express.
+- **§6 step 4 compaction back-fill** — **shipped**.
+- **§8's "`attr-stats`' single `hint` column is wrong as it stands"** — **fixed**, split into
+  independent `promote` and `index@` verdicts.
+
+What survives is policy for a feature nobody has built, now one TODO item: slow to promote and willing
+to demote (demotion is correctness-free, promotion is the direction that needed the fallback);
+hysteresis, because promotion is a schema change and flapping multiplies segment schemas; manual
+`promote` staying authoritative with automation allowed only to add; the kill criteria; and the
+out-of-scope boundaries that other code depends on — record-scope `AnyValue::Str` only, and promotion
+is a *projection*, never a relocation, so the key must stay in the JSON.
+
+### Method note
+
+**A plan document ages faster than anything else in a repo, and it does not announce that it has.**
+This one contained a confidently-stated falsehood (the `coalesce` rejection) that I had already
+disproved and corrected in JOURNAL, while the plan sat unchanged asserting the opposite. Design notes
+get acted on — that was the lesson from the retention entry two entries ago, and this is the same
+lesson from the other end: an *implemented* design belongs in the canonical doc, and an *overtaken*
+plan belongs deleted with its residue extracted, not left to be found.
+
+### Verified
+
+`fmt --all --check` clean; `clippy --workspace --all-targets -D warnings` clean; `test --workspace` at
+**669 passing**, unchanged — this entry moves prose, not behaviour. `.agents/docs` no longer contains
+either file. Nothing committed.
+
+## `attr-stats` becomes a component: one measurement, four callers (2026-08-09)
+
+`examples/attr-stats` was 2,785 lines of measurement locked inside a binary. It is now
+**`crates/imbh-attrstats`**, and the same measurement backs four callers: the CLI (unchanged in
+behaviour), `Db::attribute_stats`, `POST /api/head/attributes/stats`, and a new Attributes screen in
+the TUI. ARCHITECTURE gained **§10.20** for the measurement and a paragraph in §10.19 for the
+operation.
+
+### What moved, and what the split forced me to decide
+
+`accum.rs` and `scan.rs` moved verbatim (`git mv`). `main.rs` split three ways: the report model and
+the two verdicts to `report.rs`, the fixed-width renderer to `text.rs` (returning `Vec<String>` rather
+than printing, so a pane or a test can take it), and `Options` + `analyze()` to `lib.rs`. What was
+left of the binary is 120 lines of argument parsing. The four end-to-end tests moved to
+`tests/end_to_end.rs` and now drive the public entry point rather than a private `Config`.
+
+Three decisions the extraction forced, none of which the binary had to make:
+
+**`--last <minutes>` became `Options::range: Option<(i64, i64)>`.** A CLI can ask for "the last N
+minutes"; a head asking for statistics over the window it is *displaying* cannot — its window is
+absolute, and often historical. Generalizing to an absolute range made the CLI flag a two-line
+convenience (`with_last_minutes`) and gave the TUI its cost bound for free: the Attributes screen
+measures the segments overlapping the selected time range, so pan/zoom/range changes are the throttle.
+This is the change that makes the screen viable at all — an unbounded scan on every screen switch
+would not be.
+
+**A mistyped path was silently an empty database.** `read_disk_snapshot` answers "no segments" for a
+directory with no manifest, which is correct for a database before its first seal and wrong for
+`./demo-dbb`. Both read as a clean measurement of nothing. `analyze` now refuses a path that is not a
+directory, and the test pins *both* halves — the refusal, and that an existing empty directory still
+measures as empty. Pre-existing behaviour of the old tool; it surfaced only because writing a library
+test made me ask what the error cases were.
+
+**The report needed serde derives *and* the hand-written JSON.** The derived `Serialize` is the wire
+form (lossless, what the head API sends); `report::to_json` stays as the `--json` document, because it
+is flattened for `jq` — verdicts inlined per key, the cardinality curve carrying both endpoints — and
+its field names are the ones the write-ups quote. Making the wire form the documented one would have
+broken every recorded reading of it.
+
+### The head operation is the first one that scans
+
+Twelve head operations answer a query; this one reads the attribute columns of every sealed segment in
+range. Three consequences, all recorded in §10.19: the request body **is** `imbh_attrstats::Options`
+(not a wire type describing it, so local and remote measure the same thing under the same caps); the
+response is the whole `Report` (a head ranks it itself); and `offload` stops mattering
+"for consistency" and starts mattering for real — a multi-second scan on a connection's runtime worker
+is a different thing from a 2 ms one. The client sets only a *connect* timeout, so an accepted request
+waits as long as the scan takes; I had written the opposite in the doc comment before reading
+`HeadClient::new`.
+
+`head_e2e` needed its first **on-disk** database. Every other case there runs on `Db::in_memory()` —
+which has no segments, so it cannot measure anything. That is now an asserted behaviour rather than a
+gap: an in-memory daemon answers `400` naming the reason, because "no segments to measure" and "no
+attributes" are different claims and an empty report would state the wrong one.
+
+### The TUI screen, and two bugs adding a screen exposed
+
+Fifth screen (`5`), no query pane — like Overview it is a report over the database, not an answer to a
+query. The table puts **both verdicts immediately after the key**, ahead of the evidence they are
+derived from, because a narrow terminal clips the rightmost columns and clipping the conclusion would
+leave the screen saying nothing. Caveats that no column can carry — unsealed WAL frames, skipped
+segments, engaged caps, "no sealed segments in this range" — go in the detail pane below.
+
+Adding the screen surfaced two latent bugs, and the difference between them is the point:
+
+- **`focus_ring` hard-coded `Menu(0..3)`.** Five screens, four reachable by Tab. The existing test
+  looped `1..Screen::ORDER.len()`, so it *caught* it immediately. Fixed by deriving the ring from
+  `ORDER` rather than restating it.
+- **`App::query` was `[String; 4]`** and `menu_cursor_wraps_over_screens_and_the_range_item` walked the
+  screens by name. The array became `[String; Screen::ORDER.len()]`; the test now walks
+  `ORDER[Traces+1..]`.
+
+Both were "a constant restated where a constant already existed". The tests that caught them were the
+ones written against `ORDER`; the one that had to be edited was the one written against the screen
+names. That is a usable rule for a fixed enumeration: assert against the enumeration, not against
+today's members of it.
+
+### Feature placement, and the trap I had already hit twice
+
+`imbh-attrstats` is a crate beside the engine crates (`core ← storage ← attrstats`), not a module in
+`imbh-storage` and not a layer above the facade — because the CLI must measure a *directory* without
+opening a `Db`, while the facade wants a `Db` method. It reaches it through an **off-by-default
+`attrstats` feature**: a diagnostic, not part of ingest or query, so an embedded host that never asks
+should not carry the scanner.
+
+`imbh-head`, `imbh-server` and `imbh-tui` each name `imbh/attrstats` **explicitly** rather than
+inheriting it from a sibling's copy of the dependency. This is the third time in two sessions that a
+Cargo feature has broken a build I was not running (the `query`-gated `crate::sql`, then
+`imbh-storage`'s `compaction` missing from `default`), and the shape is always the same: `cargo build
+--workspace` unifies features, so a crate that *needs* a feature compiles anyway as long as some
+sibling turns it on. The standalone build is the one that tells the truth. Same reason
+`imbh-attrstats` has `default = ["serde"]` — a standalone `cargo test -p imbh-attrstats` must compile
+the JSON view its tests assert on — while the workspace dependency pins `default-features = false` so
+consumers still opt in. That combination is exactly how `imbh-storage`'s `search` is arranged, and it
+was already the answer.
+
+`--no-default-features` on the new crate then failed on its own test file, which imported `to_json`
+unconditionally. The library was fine; only the test was wrong. Gated the import and the two
+assertions.
+
+### Measured
+
+| axis | before | after |
+|---|---|---|
+| `imbh` facade, unique crates (footprint gate) | 275 | **275** (unchanged — feature is off) |
+| `imbh` with `--features attrstats` | — | 276 (+1: the crate itself) |
+| `imbh-server` unique crates | 297 | **298** (+1) |
+| workspace tests | 668 | **683** |
+
+No third-party subtree enters anywhere: imbh-core, imbh-storage, arrow, parquet, xxhash-rust,
+serde and serde_json are all already compiled in any build that has storage.
+
+### Verified
+
+`fmt --all --check` clean. `clippy --workspace --all-targets -D warnings` clean, plus, standalone:
+producer (`ingest`), consumer (`query`), storage-only, `attrstats` alone, `attrstats,serde`,
+`housekeeper`, no-compaction, `imbh-attrstats` with and without default features, `imbh-head` full and
+`dto`-only, `imbh-tui`, `imbh-server`. `test --workspace` **683 passing, 0 failing**; `cargo test -p
+imbh-attrstats` and `-p imbh --features attrstats --test attribute_stats` green standalone. Smoke-run
+against a `gen-demo-db` corpus produces the same report as before the extraction. Nothing committed.
+
+## Addendum: the attribute block belongs on the Overview, and must not block it (2026-08-09)
+
+Two corrections to the entry above, both from the user, and both about the same thing: an expensive
+measurement should not get its own screen, and should never be on the critical path of a render.
+
+### The fifth screen is gone
+
+`Screen::Attributes` is reverted — `ORDER` is back to four, the `5` binding and the menu item with
+it — and the block now lives at the bottom of the **Overview**, under the database gauges it belongs
+with. That is the honest placement: it is a *report about the database*, which is what the Overview
+already is, and it was never a fifth peer of Metrics/Traces/Logs (all three answer a query; this
+answers none). The screen-count churn from the entry above stays useful anyway — `focus_ring` is
+still derived from `ORDER` rather than restating it, which is a latent bug fixed regardless of how
+many screens there are.
+
+### Two answers, one pane, arriving independently
+
+The Overview is now the only pane whose content comes from **two requests on different time scales**:
+the gauges are a query (milliseconds), the attribute statistics are a scan of every sealed segment's
+attribute columns (seconds, on a real corpus). Blocking the first on the second — which the first
+implementation did, by making them one `load_snapshot` arm — makes the whole screen as slow as the
+scan.
+
+The split needed three pieces:
+
+- **`Snapshot::attr_from`** — the index in `lines` where the asynchronous half begins. The refresh
+  ships the gauges plus a placeholder from there down; the measurement *replaces* everything from that
+  index rather than appending, so a re-arrival cannot stack two blocks. Modelled on the existing
+  `list_from`, which is the same idea (lines below this index are special).
+- **`Update::AttributeStats`**, delivered like `Update::Waterfall` — the pattern was already there for
+  a fetch that fills a pane after the fact.
+- **`App::compose_attr_stats`**, called from *both* arrivals. Order is not guaranteed: an empty
+  database measures faster than the gauges query answers. Composing from either side, with the same
+  guard, makes the order irrelevant instead of unlikely — and the test drives both.
+
+### The guard is the range *selection*, not the generation
+
+First cut keyed the measurement on the refresh generation, which is what every other async fetch here
+uses. That is wrong for this one, and the reason is the cost: auto-refresh bumps the generation every
+5 s, so a generation-keyed measurement is invalidated every tick and the corpus is rescanned
+**continuously**. Correct behaviour and cheap behaviour turn out to be the same thing here — reuse the
+measurement whenever the answer would not differ.
+
+So the key is `(abs_window, lookback)`: the user's *range selection*, not the computed `[start, end]`.
+A rolling window's absolute bounds move every tick even though the user has not touched anything;
+the selection changes exactly when the answer should. On top of that a 60 s staleness bound (numbers
+do drift as segments seal) and `r` clearing the cache outright, so an explicit refresh means "measure
+now" rather than "show me the cached minute".
+
+Worth stating as a rule: **a cache key should name what the user chose, not what the code computed
+from it.** The computed window is a function of the selection *and the clock*, and the clock is
+exactly the part that must not invalidate a corpus scan.
+
+### Verified
+
+`fmt --all --check` clean; `clippy --workspace --all-targets -D warnings` clean; `test --workspace`
+**686 passing**. `imbh-tui` alone at 152, including both arrival orders, the wrong-range drop, and the
+reuse-across-ticks rule. Footprint gate OK — facade 275 crates (target), `imbhd` 33.4 MiB (target
+42 MB), idle RSS 14.9 MB, steady 104.7 MB. Nothing committed.
+
+## Addendum: the attribute block gets its own time range (2026-08-09)
+
+The Overview's attribute statistics now take a window independent of the query range (`a`), because
+the two answer different questions over different horizons: a `promote` list is chosen from days of
+data, while the panels beside it are read over the last fifteen minutes. Tying the measurement to the
+query range meant one of the two was always wrong.
+
+**Reuse the form, add a destination.** The absolute-range form already exists — two UTC datetime
+fields, a shared caret, its own parse errors — so it gained an `AbsTarget` (`Query` | `Attributes`)
+rather than a second form. `commit_absolute` branches only at the point where the parsed window is
+stored, and the attribute branch deliberately does *not* reset the row cursor: it changes one block
+inside a pane the user is already reading, not what the pane is showing.
+
+**Clearing both fields is the way back.** An independent window needs an off switch, and an empty form
+is already the natural spelling of "no window of my own" — so it means "follow the query range" under
+`AbsTarget::Attributes`, and stays a parse error under `Query`, which has no follow state to fall back
+to. The hint line says so; nothing else would have suggested an empty field meant anything.
+
+**The block states its window.** Once the two can differ, a reader cannot infer which one produced the
+numbers, so the header names the span and says whether it is following the query range or measuring
+its own. `Report::range` already carried the window — the caller only has to say which kind it is.
+
+**The cache key needed nothing new.** `attr_key` was already the *selection* rather than the computed
+window (the previous addendum's correction), so an independent window simply becomes the selection:
+`(Some(window), Duration::ZERO)`. Setting, changing, or clearing it invalidates the measurement for
+free, and two identical windows reached by different routes compare equal — which is right, since they
+measure the same thing.
+
+### Verified
+
+`fmt --all --check` clean; `clippy --workspace --all-targets -D warnings` clean; `test --workspace`
+**688 passing** (`imbh-tui` 154, including the independent-window round trip, the empty-form clear,
+and `a` staying inert off the Overview). Nothing committed.
+
+## Addendum: the attribute statistics become a pane, and their range belongs to it (2026-08-09)
+
+Two more corrections from the user, and they turn out to be the same correction: **the attribute
+statistics are a thing, so they should have a pane, and their controls should live on it.**
+
+### A pane, not a block appended to the gauges
+
+`Snapshot::attr_from` — the index into `lines` where the asynchronously-filled block began — is gone,
+and with it the whole idea of splicing two answers into one list. The Overview now renders two panes,
+and the machinery that already existed for that (`Snapshot::detail`) does the work: the measurement
+replaces a whole pane rather than a slice of a line vector, so "a re-arrival cannot stack two blocks"
+stops being an invariant to maintain and becomes a consequence of assignment.
+
+`DetailPane` gained a `DetailStyle` because the two users of it want opposite things:
+
+- `Preview` (the Traces waterfall) — bare title line, no borders so bars sit flush, no scroll,
+  overflow reported in the title, full view one Enter away.
+- `Pane` (the attribute statistics) — bordered like the primary, and **it** takes the screen's scroll,
+  because it is the long content while the pane above it is a fixed ten lines.
+
+That last point also fixed the split. The old 55/45 gave half the screen to the gauges and cropped the
+list that actually needed the room; a `Pane` detail now sizes the primary to its own content and takes
+everything else.
+
+### The range control belongs on the pane, not on the global key map
+
+The first cut bound `a` globally and dropped the form under the header's time indicator. Both were
+wrong for the same reason: that indicator *is* the query window, and a form appearing there says it
+edits the query window whatever its title claims. A global key says the same thing — `t` is global
+because the query range is global.
+
+So the attribute pane became a **focus stop** (`Focus::Attributes`, appended to the ring when the pane
+is shown), Enter on it opens its range form, and the form is anchored over **the pane**. `a` is gone.
+The anchor is passed in rather than hardcoded, and `draw_absolute_range` now hangs the popup from the
+anchor's near edge — right-aligned under a narrow header strip, left-aligned inside a full-width pane,
+where its title is.
+
+The general rule this is an instance of: **a control that changes one pane belongs to that pane** —
+in its focus ring, in its title, and positioned over it. A global binding is for something global, and
+the giveaway that this one was not is that it needed a screen guard (`a` only on the Overview) to be
+safe.
+
+### Verified
+
+`fmt --all --check` clean; `clippy --workspace --all-targets -D warnings` clean; `test --workspace`
+**688 passing**, `imbh-tui` 154 — including the focus ring gaining and losing the stop with the pane,
+Enter on a stale `Attributes` focus doing nothing, and `a` no longer being a binding at all. Nothing
+committed.
+
+## Addendum: the attribute pane renders as a table again, and the header stops lying (2026-08-09)
+
+Two small corrections, both about the same failure mode as the previous round: making something
+*look* like what it is.
+
+### A result set should render as a table
+
+Folding the dedicated screen into a pane had quietly downgraded the keys from a `TableData` — column
+widths measured by display width, a cyan/bold/underlined header row — to preformatted text inside a
+`Paragraph`. Same characters, but it reads like a log line rather than a result set, and the column
+alignment was mine to maintain by hand in a `format!` string.
+
+So `DetailPane` gained an optional `table: Option<TableData>`, and a `Pane`-style detail now renders
+as **prose above a table**: the pane's own block, then the notes, then the table with a real header
+row. The width and header styling were lifted out of `draw_metric_table` into `column_constraints` /
+`table_header` and shared, so the two panes cannot drift apart.
+
+The split of what goes where is deliberate: the prose is what *qualifies* the numbers — the window
+measured, unsealed WAL frames, skipped segments — so it sits above the table and does **not** scroll.
+A caveat that scrolls out of a long table is a caveat nobody reads. Only the rows scroll, which also
+made the scroll arithmetic honest: `max_scroll` is now row count minus viewport minus the header row,
+rather than a wrapped-line estimate over the whole pane.
+
+No row selection. The old dedicated screen had one because it was the primary pane, but there is no
+per-row action here, and a highlighted row that Enter does nothing with is a false affordance —
+Enter on this pane opens its range.
+
+### The header highlighted a window the form was not editing
+
+Opening the attribute range lit up the menu bar's time indicator, because both forms are
+`Mode::AbsoluteRange` and the highlight tested only the mode. That indicator *is* the query window, so
+it was announcing a change to something the form would not touch — the same category of error as
+anchoring the form there in the first place, which the previous round fixed.
+
+The predicate is now `editing_query_window(app)`: the mode **and** `abs_target == Query`. It gates
+both the bar-wide focus colour and the range item's cursor chip.
+
+**The general shape, three rounds running: a control's chrome must follow what it changes, not merely
+that it is open.** Position, focus stop, highlight — each of them was defaulting to "the query
+window" because that used to be the only window there was.
+
+### Verified
+
+`fmt --all --check` clean; `clippy --workspace --all-targets -D warnings` clean; `test --workspace`
+**689 passing**, `imbh-tui` 155 — including the pane's table header and row contents, the caveats
+staying in the prose above it, and the header highlight distinguishing the two form targets. Nothing
+committed.
+
+## Addendum: the attribute pane's range defaults to all of time, and its form drops from its own range line (2026-08-09)
+
+### All of time, and one fewer state
+
+The pane's window no longer follows the query range when unset — `None` now means **every sealed
+segment**, and that is the default. Which is the right default for the question: a `promote` list is
+chosen from everything the database holds, not from whatever fifteen-minute window the panels beside
+it happen to be showing. Following the query range was inherited thinking from when the statistics
+were part of a panel.
+
+The pleasant part is what it deleted. `AttrWindow` was `(Option<(i64,i64)>, Duration)` — the absolute
+window *and* the relative preset, because "follow the query range" made the answer depend on both.
+It is now just `Option<(i64,i64)>`: the window measured **is** the cache key. Three consequences fall
+out for free:
+
+- Moving the query range no longer invalidates the measurement, so the corpus is rescanned strictly
+  less often.
+- The three-state model (all / follow / fixed) collapses to two (all / fixed).
+- The form's empty state and the range's unbounded state became the same thing in both directions:
+  opening the form on an unbounded range shows empty fields, and submitting empty fields sets an
+  unbounded range. Nothing extra to learn, and no third spelling to explain in the hint line.
+
+### The form drops from the value it edits
+
+Anchoring it over the *pane* was still one level too coarse. The pane displays its window on its first
+line, so that line is what the form edits, and that is now what it hangs from — `attr_area` publishes
+the range line's rect (one row) rather than the whole pane, and the existing "narrow anchor → drop
+below it" branch in `draw_absolute_range` does the rest without a special case.
+
+That completes the set from the previous round: **position, focus stop, and highlight all follow what
+the control changes.** The last of the three landed here too — the menu bar's time indicator no longer
+lights up for a form editing the attribute window, since both forms share `Mode::AbsoluteRange` and
+only the target tells them apart.
+
+### Verified
+
+`fmt --all --check` clean; `clippy --workspace --all-targets -D warnings` clean; `test --workspace`
+**689 passing**, `imbh-tui` 155 — including the unbounded default, the empty-form round trip in both
+directions, and that a query-range change leaves the measurement cached while a pane-range change
+invalidates it. Nothing committed.
+
+## An explicit promotion API, and the one place the explorer writes (2026-08-09)
+
+The attribute pane measured what *should* be promoted and could do nothing about it; changing the set
+meant restarting the daemon with a different `DbBuilder::promote` list. `GET`/`POST /admin/promote`
+closes that loop, and the TUI's attribute pane gained an `on` column and a `p` key.
+
+### Not a head operation, deliberately
+
+`/api/head` is documented read-only, and this writes: `Db::set_promote` seals the buffer so no batch
+straddles the change, and every segment sealed afterwards carries the new column set. So it went on
+`/admin/*` beside `flush` and `compact`. The point is not taxonomy — it is that a deployment gates a
+*prefix*. One read-only prefix and one write prefix is a rule someone can apply; "read-only except one
+route" is a rule someone gets wrong.
+
+The client is the exception to the exception: `HeadClient` carries `promoted`/`set_promoted` anyway,
+because the transport, the base-URL parsing and the error mapping are all already there and a second
+client beside it would be worse. The crate docs name it as the one write, and the path constant lives
+next to the head paths with the reason attached.
+
+### The whole set, not a delta
+
+Promotion is a **list** whose order is the column order. `{"keys": [...]}` replaces it wholesale, for
+two reasons that are easy to miss: a delta would ask the server to guess *where* in the order a new key
+goes, and two concurrent callers each sending "add mine" would each silently lose the other's change.
+
+The response is the set **now in effect**, not an echo. The daemon filters keys that collide with a
+built-in column name at schema construction, so what was asked for and what is in force can differ — a
+head that assumed its own request had been applied would show a key as promoted that is not. The TUI
+re-measures on the answer rather than on the request.
+
+### Disabled where it cannot work, and for a structural reason
+
+A TUI session that opened the directory itself holds a `Db::open_read_only` view: no writer lock, every
+write refused by construction. So `Backend::can_promote()` is `matches!(self, Remote(_))` — not a
+permission check bolted onto a UI, but the observation that there is no local implementation to call.
+Three consequences, all of them the honest version:
+
+- `p` is advertised in the pane title only where it exists.
+- Pressed anyway, it reports *what would work* (`imbh-tui --url http://host:4318`) rather than
+  surfacing the storage layer's read-only error, which would describe the mechanism instead of the fix.
+- `Backend::set_promoted` refuses on the local arm up front rather than attempting and failing, so the
+  message is not a race between two explanations.
+
+### The pane's cursor exists now, because there is finally something to do with it
+
+Two rounds ago I left the attribute table unselectable, on the grounds that a highlighted row Enter
+does nothing with is a false affordance. `p` is that something, so the pane took a cursor — and only
+while focused, since an unfocused pane's highlight would act on nothing. `selectable_bounds` checks the
+focused pane first, which is also what routes ↑/↓ to it.
+
+The `on` column sits immediately after the key, ahead of the `promote` verdict: the verdict is only
+useful *next to the current state*, and `p` acts on exactly that column. Both are read from the same
+task as the measurement, so the two halves of one screen cannot disagree about what is promoted.
+
+### Verified
+
+`fmt --all --check` clean; `clippy --workspace --all-targets -D warnings` clean; `test --workspace`
+**691 passing**, `imbh-server`'s `head_e2e` 7 — including the read/replace round trip over a real
+socket, the daemon's live set matching the response, demotion, and a malformed body answering `400`
+rather than `500`. `imbh-tui` 156, including the local-session refusal naming `--url` and the `p`
+paging binding staying intact off the pane. Nothing committed.
+
+## Addendum: the attribute pane breaks down per scan unit (2026-08-09)
+
+The per-table measurement had existed since the CLI — `Report.tables` carries a `UnitReport` per
+`logs`/`spans`/the five metric tables — and the pane was showing only `Report.global`. The reasoning
+was sound and the omission was not: `promote` is DB-wide, so the roll-up is what the *decision* is made
+against, but it is not where the numbers are *defined*, and it silently hides which signal a key even
+belongs to.
+
+So the table is now grouped: `ALL TABLES` first, then one section per table with segments in range,
+empty tables left out. Three things this gets right that the flat view could not:
+
+- **Sigma is per table by definition** — its denominator is that table's segment count. The roll-up's
+  `index@` is a best case *across* tables, which is fine as a summary and misleading as a measurement.
+  Each section now answers for itself.
+- **Which signal carries the key.** A key on `logs` and on `metrics_gauge` appears in both sections,
+  which is the answer to a question the roll-up cannot express.
+- **The promote verdict stays DB-wide.** Per-table rows leave it blank rather than repeating a
+  judgement made against different totals — a key can look cheap in one table and not in the roll-up,
+  and showing both as "promote: yes" would imply a per-table decision that does not exist.
+
+`index_scale` grew a per-unit sibling in `imbh-attrstats` (`index_scale_in`) and became the fold over
+it, rather than the TUI re-deriving the `INDEX_MAX_SIGMA` rule with the library's constant.
+
+### Two kinds of row, and `p` has to tell them apart
+
+A grouped table holds section headers as well as key rows, and `p` acts on the row under the cursor.
+"Is this a key" therefore has to be a *fact about the row*, not a guess from its text: a header leaves
+the **scope** cell empty, and a key row's scope is always one of three non-empty names. One helper,
+`attr_row_key`, is the single reader of that invariant — used by the promotion toggle, by the renderer
+(which styles headers as chrome), and by the tests. The alternative, a parallel `Vec<Option<String>>`
+aligned with the rows like the Metrics catalog's `tree_rows`, would have worked too; this is smaller
+and the invariant is genuinely structural rather than incidental.
+
+### Verified
+
+`fmt --all --check` clean; `clippy --workspace --all-targets -D warnings` clean; `test --workspace`
+**692 passing**, `imbh-tui` 157 — including a fixture with logs *and* metrics asserting the roll-up
+leads, both signals get sections, an empty table gets none, a cross-signal key appears under both, and
+no per-table row carries a promote verdict. Nothing committed.
+
+## Addendum: the attribute pane's two focus stops, and per-section headers (2026-08-09)
+
+### One pane, two things to act on, two stops
+
+`Focus::Attributes` became `Focus::AttrRange` and `Focus::AttrTable`. The pane has two things to act
+on — the window it was measured over, and the key under the cursor — and one stop made Enter ambiguous
+between them: it opened the range while the cursor sat on a row, which is exactly the kind of "acts on
+something the screen never marked as selected" the earlier rounds were about.
+
+Split, everything lines up: the range line is highlighted when the ring is on it (so Enter has a
+visible target), the row cursor exists only on the table stop, each stop advertises only its own action
+in the pane title, and Enter on the table does nothing rather than guessing. `p` is guarded on
+`AttrTable` for the same reason.
+
+### Every section is its own table
+
+Each section now carries a title *and its own column header*, rather than one header pinned above all
+of them. That is the honest rendering of what a section is: coverage is against **that unit's** rows
+and sigma against **that unit's** segments, so a single header floating over every section implies one
+set of totals that does not exist.
+
+This is what forced the row-kind question. With headers repeated inside the table, "is this row a key"
+could no longer be read off the scope cell — a header row's scope cell says `Scope`. So `PaneTable`
+now carries `kinds: Vec<AttrRow>` beside its rows: one struct rather than two fields, so "aligned with
+`data.rows`" is a property of the type instead of a comment two call sites have to honour. The
+renderer styles by kind, `p` reads it to know whether there is a key under the cursor, and the tests
+assert against it.
+
+A width bug fell out of the same change: column widths were measured over *every* row, so a section
+title — one long banner cell — stretched the key column to its own length and squeezed the numbers off
+the right edge. Widths now come from the key rows only.
+
+### Ordering: verified rather than changed
+
+"The order of the table must follow that in the header" turned out to already hold: `Db::stats()`
+(which the gauges pane lists) and `Report.tables` (which the sections follow) are both `Table::ALL`
+order, on both the writer and the read-only reader path. "Already holds" is not the same as "cannot
+drift", though — they are two independent lists in two crates that do not know about each other, and a
+reader scanning down the screen matches them by position. So it is now a test rather than a
+coincidence.
+
+### Verified
+
+`fmt --all --check` clean; `clippy --workspace --all-targets -D warnings` clean; `test --workspace`
+**693 passing**, `imbh-tui` 158 — including the two stops in reading order, both snapping to `Primary`
+off the Overview, Enter doing nothing on the table stop, every section title being followed by its own
+column header, and the section order matching the gauges list. Nothing committed.
+
+## Addendum: a banner is not a table cell (2026-08-09)
+
+Two rendering corrections, and the first one is the interesting one because I caused it two changes
+earlier and only the user could see it.
+
+### Titles were being clipped to the key column
+
+The section titles live in the first cell of their row, and a ratatui `Table` clips every cell to its
+column. So `metrics_gauge - 1 segment, 488 rows, 2 keys` rendered as `metrics_gauge - 1 s>`. I had
+*made this worse* in the same round it appeared: measuring widths over key rows only was right (a title
+would otherwise stretch the key column to its own length and push the numbers off the pane), but it
+also shrank the column the title was being clipped to.
+
+Both constraints are real and a cell-based table cannot satisfy them at once — a cell is clipped to its
+column, and there is no column span. So the pane's body is now a `List` of styled `Line`s with columns
+padded by hand: same alignment, same header styling, and a title that spans the pane because it is not
+in a column at all. Selection and scrolling come from `ListState` exactly as they did from
+`TableState`.
+
+The general form: **a banner and a cell want opposite things from a layout, so one of them is not a
+cell.** Reaching for the table widget was right for the rows and wrong for the titles, and the fix is
+not a wider column.
+
+### Titles are bold, not coloured
+
+Colour in this pane is already doing two jobs — cyan for the column header, cyan-on-black for the
+cursor — and a third would compete without meaning anything. A section title marks *structure*, not a
+category, so intensity is the right signal and the yellow is gone.
+
+### Verified
+
+`fmt --all --check` clean; `clippy --workspace --all-targets -D warnings` clean; `test --workspace`
+**694 passing**, `imbh-tui` 159 — including a regression test on the exact clipping (a title reaching
+the pane whole, while the key column stays sized to its data). Nothing committed.
+
+## MCP gets the attribute legs, and a write whose capability follows the handle (2026-08-09)
+
+Three tools: `attribute_stats`, `list_promoted_attributes`, `set_promoted_attributes`. The first two
+are ordinary reads. The third is the first **write** on a surface whose crate doc opened with "Nothing
+here can write", so it needed the same care the head API's did — and the answer turned out better here
+than a prefix split.
+
+### The capability follows the handle, not a flag
+
+`tools/list` is now built from `tools::visible(db)`, which drops write tools when `db.is_read_only()`.
+That is not a permission check bolted onto the surface: a read-only handle holds no writer lock and
+refuses every write by construction, so the tool has **nothing to call** there. Hiding it means an
+agent is never offered an action that cannot succeed, and a client that caches the list never learns
+it exists.
+
+The check is repeated inside the tool anyway, because a client may be working from a list it cached
+before the server was restarted read-only — and the message it gets then says *why the action is
+absent* and what would have it, rather than surfacing the storage layer's read-only error.
+
+`Db::is_read_only()` is new on the facade for this. It is the same question the TUI's
+`Backend::can_promote()` answers, and both are better than "try it and see": a UI that knows what it
+is connected to beats one that finds out by failing.
+
+### The read is shaped for an agent, and says what it could not cover
+
+`attribute_stats` returns a purpose-built document rather than the report verbatim — MCP results are
+deliberately lossy (§10.16.1) and the full report is large. What survives is what a decision needs:
+per key, the current promoted state, both verdicts, and the four numbers behind them, capped by `top`
+with `truncated` set per unit. `unsealed_wal_frames` and `segments_skipped` ride along, because a
+measurement that reads like full coverage when it is not is worse than no measurement.
+
+Its window defaults to **every sealed segment**, unlike every other tool here, which default to an
+hour. That is not an oversight to be normalised: a `promote` list is chosen from the whole corpus, and
+the window arguments exist to bound the scan, not because a window is the natural unit of the question.
+
+### Verified
+
+`fmt --all --check` clean; `clippy --workspace --all-targets -D warnings` clean. `imbh-server`'s
+`mcp_e2e` at 12 — the loop end to end (measure → promote → the measurement now reporting it promoted),
+per-table sections giving no promote verdict, and the write tool absent from a read-only server's
+`tools/list` while its reads stay. Nothing committed.
+
+## Session consolidation: `attr-stats` from example to product surface (2026-08-09)
+
+Eleven entries above log this session as it happened. This one is the summary a future reader wants
+first: what shipped, what it cost, and the findings that outlive the feature.
+
+### What shipped
+
+A measurement that lived inside one example binary is now a component with **five callers**:
+
+| Surface | What it does |
+|---|---|
+| `crates/imbh-attrstats` | the measurement: sigma, the cardinality curve, run structure, the two verdicts. No third-party dependency; `serde` behind a feature |
+| `examples/attr-stats` | unchanged CLI, now ~120 lines of argument parsing |
+| `Db::attribute_stats` | facade method behind the off-by-default `attrstats` feature, mirrored on `BlockingDb` |
+| `POST /api/head/attributes/stats` | so a head measures the daemon's database |
+| `imbh-tui` Overview | a second pane, measured asynchronously, with its own time range |
+
+Plus the action the measurement implies: `GET`/`POST /admin/promote`, `p` on the TUI pane, and three
+MCP tools (`attribute_stats`, `list_promoted_attributes`, `set_promoted_attributes`). Reading the
+verdicts and acting on them are now one loop instead of a report and a daemon restart.
+
+### Measured
+
+| axis | before | after |
+|---|---|---|
+| `imbh` facade, unique crates (footprint gate) | 275 | **275** — unchanged, the feature is off |
+| `imbh` with `--features attrstats` | — | 276 (+1: the crate itself) |
+| `imbh-server` unique crates | 297 | **298** (+1) |
+| `imbhd` release binary | — | 33.4 MiB against a 42 MB target |
+| workspace tests | 668 | **697** |
+| MCP tools | 15 | 18 (17 read-only) |
+
+40 files, +3,614/−1,658. No third-party subtree enters anywhere: imbh-core, imbh-storage, arrow,
+parquet, xxhash-rust, serde and serde_json are already compiled in any build that has storage.
+
+### Findings that generalize
+
+**A cache key should name what the user chose, not what the code computed from it.** The attribute
+measurement was first keyed on the resolved `[start, end]`. A rolling window's bounds move every tick,
+so an auto-refreshing Overview rescanned the whole corpus every five seconds. Keyed on the *selection*
+instead, it invalidates exactly when the answer would differ. The computed window is a function of the
+selection **and the clock**, and the clock is the part that must not invalidate a scan.
+
+**A control's chrome must follow what it changes, not merely that it is open.** This cost four rounds
+of correction, one per aspect: the range form's *position* (anchored under the header's query-range
+indicator, then over the pane, finally on the range line it edits), its *key* (a global `a`, then a
+focus stop on the pane), the header's *highlight* (lit for a form that did not touch it), and finally
+the *focus stop itself* splitting in two once the pane had two things to act on. Each defaulted to
+"the query window" because that used to be the only window there was. The tell for the global key was
+that it needed a screen guard to be safe.
+
+**A banner and a cell want opposite things from a layout, so one of them is not a cell.** Section
+titles were clipped to the key column because a table cell is clipped to its column and there is no
+column span — and measuring widths over key rows only (right for the columns) shrank the column doing
+the clipping. Both constraints are real; the widget was wrong. Styled lines with hand-padded columns
+satisfy both.
+
+**Selection is an affordance, so it should exist only where there is something to select.** The pane
+had no cursor while nothing acted on a row; `p` arrived and it got one — and once the table grew
+section titles, per-section headers and spacers, the cursor had to step *key-to-key* rather than by row
+index. A cursor that can land on structure offers an action with nothing to act on.
+
+**Where a capability comes from the handle, derive it — do not add a flag.** Promotion writes, and a
+read-only handle has no writer lock, so there is no local implementation to call: `Backend::can_promote`
+is `matches!(self, Remote(_))` and MCP's `tools/list` drops write tools when `db.is_read_only()`. Both
+are structural facts rather than policy someone must remember to configure. The corollary is the error
+message: refuse up front and say *what would work* (`--url …`, "point the client at the process that
+writes"), not what the storage layer would have said.
+
+**Read-only is a property of a prefix, not of a route.** `/api/head` stays read-only and promotion went
+to `/admin/*` beside `flush` and `compact`. "One read-only prefix, one write prefix" is a rule a
+deployment can apply; "read-only except one route" is a rule someone gets wrong.
+
+**Send the whole set, not a delta**, for anything whose *order* is meaningful. Promotion is a list and
+its order is the column order: a delta would ask the server to guess placement, and two concurrent
+callers would each silently lose the other's change. And answer with the state now in effect rather
+than an echo — the daemon filters keys colliding with built-in column names, so request and result can
+differ.
+
+**Assert against the enumeration, not against today's members of it.** Adding a fifth screen (later
+reverted) broke two things: `focus_ring` hard-coded `Menu(0..3)`, and a nav test walked the screens by
+name. The tests written against `Screen::ORDER` caught their bug immediately; the one written against
+the names had to be edited. Same lesson in the ordering check: the attribute sections and the Overview
+gauges already agreed, but they are two independent lists in two crates, so agreement is now a test
+rather than a coincidence.
+
+**The standalone build is the one that tells the truth.** Third time this session that a Cargo feature
+broke a build I was not running — `cargo build --workspace` unifies features, so a crate that *needs* a
+feature compiles anyway as long as some sibling enables it. Every consumer now names `imbh/attrstats`
+explicitly rather than inheriting it, and `imbh-attrstats` carries `default = ["serde"]` so a
+standalone `cargo test -p imbh-attrstats` compiles the JSON view its tests assert on — the same
+arrangement as `imbh-storage`'s `search`.
+
+### Open
+
+Nothing committed. The branch still carries the earlier housekeeping work; the CHANGELOG entries are
+under `[Unreleased]`. Two UI details landed after this summary was written and have their own addenda
+below: a blank line between sections with the cursor skipping it, and a Tab stop per section. `examples/attr-stats` remains the only caller pointed at real data — the TODO
+item asking for that is now cheaper to satisfy, since the measurement can be read off a running daemon
+or the TUI without shipping a CLI to the machine holding the data.
+
+## Addendum: a Tab stop per section (2026-08-09)
+
+`Focus::AttrTable` became `Focus::AttrTable(usize)` — one stop per section rather than one for the
+whole table. The reason is the one that made the sections worth having in the first place: each
+section *is* a table, with its own totals and its own sigma, and a single stop made the third one
+reachable only by scrolling past every key of the first two.
+
+Three things follow, and each is the honest version of something that was previously implicit:
+
+- **The cursor belongs to a section**, so `attr_key_indices` takes one and `move_attr_cursor` stops at
+  that section's ends rather than walking into the next. Tab moves between sections; the arrows move
+  within one. Two motions, two keys, no overlap.
+- **Tab snaps the cursor into what it focused**, so the pane scrolls to the section the ring landed on
+  instead of leaving the highlight somewhere off screen. That is `focus_advance` calling
+  `snap_attr_cursor`, which is also what a fresh measurement calls — the same need, one implementation.
+- **A section index can outlive its measurement.** A refresh can return fewer sections (a table that
+  emptied out of the range), so `effective_focus` maps an out-of-range `AttrTable(n)` to `Primary`,
+  exactly as it already did for a stop on a pane that is not shown. Without that, Tab would hand the
+  cursor and `p` to a section that no longer exists.
+
+The pane title now names the focused section, because with several stops on one pane the border
+highlight alone no longer says *which*.
+
+A test fixture caught the shape change usefully: the promotion-refusal test built a table of one key
+row with no section, which used to work and now cannot — the cursor belongs to a section, so a table
+without one has no cursor. Shaping the fixture like a real pane (section, header, key) fixed it, and
+the failure was the design telling the test it had been under-specified all along.
+
+### Verified
+
+`fmt --all --check` clean; `clippy --workspace --all-targets -D warnings` clean; `imbh-tui` **160
+passing**, including one stop per section, every section's cursor staying inside it, Tab landing the
+cursor on a key, and a stale section index reading as `Primary`. Nothing committed.
+
+## Addendum: the section edge is a pause, not a wall (2026-08-09)
+
+The arrows now **hop** to the next section when the cursor is already at a section's edge, instead of
+stopping there. The previous entry argued for the opposite ("Tab is what moves between sections"), and
+that was wrong for a plain reason: it made the arrows unable to reach the pane's second table at all.
+A list should not have a dead end that a second key is the only way out of.
+
+The two motions now compose instead of competing — the arrows walk the whole pane top to bottom, Tab
+jumps a section at a time — and the focus follows the cursor across a boundary, so `p` and the pane
+title stay attached to the section actually being read.
+
+Two details worth their own lines:
+
+- **An overshoot is not a hop.** `PageDown` from the middle of a section lands on that section's last
+  key; only a press with nowhere left to go inside the section crosses. Clamping first and hopping
+  only when the clamp changed nothing is what gets both, and it is the behaviour every other list in
+  the program already has at *its* end.
+- **Empty sections are stepped over, not focused.** A stop whose cursor has nowhere to land would
+  swallow a keypress and read as the arrows having stopped working.
+
+### A test fixture that could not exercise the rule
+
+Writing the test found that `sealed()` produced scan units with a *single* attribute key, so "moving
+within a section" and "hopping between sections" were indistinguishable — every press was a hop. The
+fixture now ingests record attributes as well as resource ones. Worth noting as a pattern: a fixture
+minimal enough to be readable can be too minimal to tell two behaviours apart, and the test passes
+either way until someone asks it the right question.
+
+### Verified
+
+`fmt --all --check` clean; `clippy --workspace --all-targets -D warnings` clean; `imbh-tui` **160
+passing**, including a full walk down the pane asserting the visited rows are exactly the key rows in
+order, the same walk back up, the focus ending on the last section and then the first, and the
+overshoot stopping at a section end before crossing. Nothing committed.
+
+## Closing summary: what the attribute work became, and what the iteration taught (2026-08-09)
+
+The consolidation entry above was written mid-stream and its "Open" section is now stale. This closes
+the session: the final state, and the findings that only became visible once the UI work was done.
+
+### Final state
+
+Fifteen entries cover this session. What exists at the end of it:
+
+**A measurement, with five callers.** `crates/imbh-attrstats` holds sigma, the cardinality curve, run
+structure and the two verdicts; `examples/attr-stats` is ~120 lines of argument parsing over it;
+`Db::attribute_stats` is the facade method behind an off-by-default feature; `POST
+/api/head/attributes/stats` is the head operation; the TUI Overview is a second pane.
+
+**An action, with three callers.** `GET`/`POST /admin/promote` on `imbhd`, `p` on the TUI's attribute
+pane, and `set_promoted_attributes` over MCP. Reading a verdict and acting on it is one loop now,
+where before it was a report and a daemon restart with a different `DbBuilder::promote` list.
+
+| axis | before | after |
+|---|---|---|
+| `imbh` facade, unique crates (footprint gate) | 275 | **275** — unchanged, the feature is off |
+| `imbh` with `--features attrstats` | — | 276 (+1: the crate itself) |
+| `imbh-server` unique crates | 297 | **298** (+1) |
+| `imbhd` release binary | — | 33.4 MiB against a 42 MB target |
+| workspace tests | 668 | **697** (`imbh-tui` 146 → 160) |
+| MCP tools | 15 read-only | 18, of which 17 read-only |
+
+47 files, +6,007/−1,658. No third-party subtree enters anywhere.
+
+### The finding the UI rounds produced
+
+Eight user corrections landed on one pane, and in hindsight they are all the same correction:
+**folding a screen into a pane turns every implicit "there is only one of these" into a bug.** The
+codebase had exactly one time range, one focus stop per pane, one table per screen, one place a range
+form could drop from, one header that owned the range highlight. Each of those was true until this
+pane existed, and each failed in its own way:
+
+| implicit singular | how it surfaced |
+|---|---|
+| one time range | the attribute window followed the query window, so one of the two was always wrong |
+| one place a form drops from | the range form appeared under the header's *query*-range indicator |
+| one range highlight | the header lit up for a form that would not touch it |
+| one focus stop per pane | Enter meant "change the range" while the cursor sat on a row |
+| one table per pane | a single Tab stop made the third section reachable only by scrolling |
+| one kind of row | `p` had to guess whether the cursor was on a key or on a title |
+| one column layout | a section title was clipped to the key column |
+| one list, contiguous | the cursor could land on structure, and then stopped dead at section edges |
+
+None of these were visible from the code — every one arrived as "this looks wrong" from someone
+running it. That is worth recording plainly: **a pane that is genuinely new invalidates assumptions
+the rest of the UI never had to name, and the only reliable detector is a person using it.**
+
+### Two reversals, recorded as reversals
+
+Twice I wrote a justification and then had to undo it, and both are more useful as pairs than as
+conclusions:
+
+- **"Selection is a false affordance here"** → the pane had no cursor because nothing acted on a row.
+  Correct at the time; wrong the moment `p` existed. The rule survives, the conclusion did not.
+- **"Tab is what moves between sections"** → written one entry before the arrows had to hop at section
+  edges. The reasoning was tidy and the result was a dead end: a list whose only exit is a *different*
+  key. Tidy separation of concerns is not worth a dead end.
+
+The general form: a UI decision justified by a property of *today's* feature set needs re-deriving
+when the feature set moves, and the justification is what tells you whether it still holds.
+
+### Method notes
+
+**A fixture minimal enough to read can be too minimal to discriminate.** `sealed()` produced scan
+units with a single attribute key, so "move within a section" and "hop between sections" were
+indistinguishable — every press was a hop, and the test passed either way. It only failed once the
+test asked the right question. Minimal fixtures are good; minimal fixtures that collapse two
+behaviours into one are a silent gap.
+
+**Assert against the enumeration, not today's members of it.** Two tests written against
+`Screen::ORDER` caught their own bug when a screen was added; the one written against screen names had
+to be edited. Same shape held for section ordering: the attribute sections and the Overview gauges
+already agreed, but they are two independent lists in two crates, so agreement is now a test.
+
+**The standalone build tells the truth.** Three feature breakages this session, all the same shape:
+`cargo build --workspace` unifies features, so a crate that *needs* one compiles as long as some
+sibling enables it. Every consumer now names `imbh/attrstats` explicitly, and `imbh-attrstats` carries
+`default = ["serde"]` so its own tests compile standalone — the arrangement `imbh-storage`'s `search`
+already used.
+
+### Open
+
+Nothing committed; the branch still carries the earlier housekeeping work and the CHANGELOG entries
+sit under `[Unreleased]`. The one TODO this makes cheaper is pointing the measurement at production
+data: it can now be read off a running daemon (`POST /api/head/attributes/stats`), off the TUI, or by
+an agent over MCP, so no CLI has to be shipped to the machine holding the data and no database
+directory has to leave it.
+
+## Queued housekeeping on `imbhd`: the first endpoint whose answer is a handle (2026-08-09)
+
+`POST /admin/housekeeping` returns `202` with a job id; `GET /admin/housekeeping/<id>` reports the
+job; `GET /admin/housekeeping` lists the retained ones. A pass is seal → commit pending rewrites →
+retention (`Db::maintain`), plus `Db::compact` under `{"compact": true}`. ARCHITECTURE §10.16.2.
+
+### Why this one and not `/admin/flush`
+
+Every other endpoint on this server answers a question whose cost follows the **answer**; a
+housekeeping pass costs the **corpus**. Over a long retention window compaction runs for minutes,
+which outlasts what a proxy will hold a connection open for and is far longer than a caller should
+wait to learn its request was *accepted*. `/admin/flush` and `/admin/compact` stay synchronous
+deliberately — they are the small immediate versions and existing tooling drives them that way. Making
+them all async would have been symmetry for its own sake.
+
+The consequence worth stating: **a `200` here would be a lie.** The work has not run when the response
+is written, so the status has to be `202` and the body has to be a handle rather than a report.
+
+### Design decisions, and what each is defending against
+
+- **One permit for all passes.** Two concurrent passes over one database contend for the same disk
+  and, worse, can each seal or compact segments the other had planned around. Serializing them is what
+  makes "housekeeping is running" a state the database is in rather than a race to describe. It also
+  means the queue is a queue: a second submission is *accepted* and waits, which is the behaviour a
+  caller on a timer needs.
+- **Maintenance before compaction inside a pass.** `maintain` commits pending rewrites and applies
+  retention, so compaction afterwards works on the segment set that survives instead of merging
+  segments retention is about to drop. Same ordering argument as `maintain`'s own internals.
+- **Ids carry the process's start time.** Otherwise a restart resets a counter and an id from the old
+  process describes somebody else's job. Now it is a `404` — and the message says ids do not survive a
+  restart, because "not found" alone would read as "your job vanished".
+- **Nothing is resumed across a restart, by design.** Seal, commit and retention are each individually
+  crash-safe (§7), so an interrupted pass leaves no partial state to resume and the honest answer is
+  "submit it again". A durable queue would add a recovery path for a problem that does not exist.
+- **History is bounded, and eviction is oldest-*finished*-first.** A daemon running housekeeping on a
+  timer for a year must not accumulate a year of records; but dropping a queued or running job would
+  leave a client polling an id that answers `404` while the work it names is still happening. Those
+  two requirements together are what makes the eviction rule specific rather than "drop the oldest".
+- **Refused on a read-only handle.** A reader holds no writer lock, so the pass could never do
+  anything: `400` with the reason beats a job that exists only to fail. Third instance of the same
+  rule this session, after the promoted-set write and the TUI's `p`.
+
+### The state change that was not free
+
+The router had no state but `Arc<Db>`, and the queue has to live somewhere. It went into an
+`AppState { db, jobs }` rather than a process global, because the queue's whole job is to serialize
+passes over *one* database — a global would serialize them across every mounted router while handing
+out ids that mean nothing to the others.
+
+That rippled once: `head::routes()` returned `Router<Arc<Db>>` and a `merge` needs both halves to
+agree on the state type. Making it generic over `S where Arc<Db>: FromRef<S>` is the idiomatic axum
+answer and left every handler in it unchanged — they still ask for `State<Arc<Db>>`.
+
+It also exposed a **latent trap in the test helper**: `imbh_server::route` builds a fresh router per
+call, so a job submitted through one call cannot be polled through the next — the second call's
+registry never issued that id. Harmless while the server was stateless, silently confusing now. It is
+documented on `route` itself, and the e2e test uses a real `serve()` for the polling sequence.
+
+### Verified
+
+`fmt --all --check` clean; `clippy --workspace --all-targets -D warnings` clean; `imbh-server` **67
+passing** — the submit/poll round trip over a real socket (`202`, a non-terminal state at submission,
+a terminal one after polling, a report carrying both halves, timestamps that bracket the work), the
+listing, a `404` for an unissued id, a `400` for a malformed body, an empty body meaning the defaults,
+the read-only refusal queueing nothing, and the registry's own bookkeeping (bounded history, live jobs
+never evicted, unique process-scoped ids). Nothing committed.
+
+## Addendum: `max_jobs` on the housekeeping endpoint, and the bound it needed underneath (2026-08-09)
+
+The endpoint had no equivalent of `imbh-housekeeper --max-jobs`, and the reason is that
+**`Db::compact()` had no bound to expose**: it rewrites every eligible partition across every table in
+one call. So a submitted pass could run for as long as the corpus takes, and the only choice was that
+or not compacting.
+
+`Storage::compact_bounded(max_partitions)` / `Db::compact_bounded` are the missing half; `compact()`
+is now `compact_bounded(usize::MAX)`, so nothing existing changed. `{"max_jobs": N}` on the endpoint
+caps the pass.
+
+### Partitions, not segments
+
+The bound counts **partitions rewritten**, because a partition is the unit compaction works in — it
+reads a day's segments, concatenates, sorts, and writes one. A segment-count bound would have to stop
+*inside* a partition, which is exactly the state the design avoids: the deferred-delete ordering in
+§7 is what makes a compaction pass crash-safe, and a half-merged partition is not a state the manifest
+can describe.
+
+That is also why partitions past the bound are passed through **untouched** rather than partially
+processed. A capped pass is a *slice*, not a partial one: the segments it did not reach are still
+listed, still queryable, still exactly as they were. There is nothing to resume, so resuming is
+submitting again — and a pass that rewrites nothing is how a drain loop learns it is done.
+
+### Two small decisions that keep the API honest
+
+- **`compaction_complete` rather than a silent truncation.** A capped pass and a pass that finished
+  are indistinguishable from the counters alone, and the difference decides whether the caller loops.
+  Derived from whether the pass reached its own cap, so it cannot drift from the bound that produced
+  it.
+- **`max_jobs: 0` is a `400`.** It would otherwise mean "compact, but do no compaction" — which
+  `compact: false` already says — and the job would report success for having done nothing under a
+  name that promised otherwise.
+
+### Not done, and worth flagging
+
+There is a *second* thing `max_jobs` could have meant: a cap on the **queue depth**. Nothing today
+stops a client submitting a thousand passes, and since passes are serialized and housekeeping is
+close to idempotent, everything after the second is waste. Coalescing ("a pass is already queued —
+here is its id") is probably the better answer than a cap, and both are a different feature from the
+one asked for. Recorded rather than guessed at.
+
+### A pre-existing breakage this surfaced
+
+`cargo clippy -p imbh-storage --no-default-features --all-targets` does not build, and did not before
+this change either: `pending.rs`'s test module calls `write`, which is `#[cfg(feature = "compaction")]`
+while the tests are not, and `lib.rs`'s test module names `ParquetRecordBatchReaderBuilder`, whose
+import is feature-gated. CI never runs that combination — it builds `-p imbh --no-default-features` and
+`cargo test -p imbh-storage` with defaults — so nothing caught it.
+
+The `pending.rs` half is gated now (its tests write a record in order to read one back, so they need
+the feature that produces one). The `lib.rs` half is left alone: it is a test module this change does
+not touch, and fixing it properly means auditing which of its tests need which feature, which is a
+different task from the one asked for. Every *library* configuration builds clean, which is what a
+consumer sees.
+
+### Verified
+
+`fmt --all --check` clean; `clippy --workspace --all-targets -D warnings` clean; **704 passing**
+overall. New coverage: at the facade, three day-partitions with two segments each, asserting a bound
+of one rewrites exactly one partition, loses no rows, leaves the rest intact, and drains over repeated
+calls; through the endpoint, that the bound is reported back, `compaction_complete` distinguishes a
+capped pass from a finished one, and zero is refused. Nothing committed.
+
+## Coalescing, and housekeeping over MCP (2026-08-09)
+
+Two additions to the queued endpoint, and one finding about the daemon that came out of a question
+while doing them.
+
+### Duplicate submissions join the queued job
+
+A submission matching a job still **queued** answers `200` with that job's id and
+`"coalesced": true`, rather than `202` and a second pass. The motivating case is a caller on a timer:
+passes are serialized, so a pile-up is pure wait, and every pass after the first does nothing the one
+before it did not.
+
+The line is drawn at the queue, and that is the whole design:
+
+- **A queued job has not looked at the database yet**, so it will see everything a submission arriving
+  now wants covered. Joining it is exact, not approximate.
+- **A running job snapshotted before this submission arrived** and may already be past the segments
+  the caller cares about. Joining it would answer a request the pass cannot have covered — so a
+  running job is deliberately not a match, and neither is a finished one.
+
+Matching is an **exact parameter match** rather than a subsumption test. A queued `compact: true` pass
+would in fact cover a new `compact: false` request, but that rule has to be explained every time
+someone reads back a job id they did not expect, and the case that motivates coalescing is the *same*
+request repeatedly. Predictable beats clever.
+
+The search and the insert happen under one lock acquisition, because two submissions arriving together
+must not both find nothing and both queue a pass — which is precisely the pile-up being prevented.
+
+`coalesced` rides in the response rather than on `Job`: it describes *this submission*, not the job.
+
+### MCP drives the same queue, not one of its own
+
+`run_housekeeping` and `housekeeping_status` are the tools. The interesting part is placement: the
+queue is server wiring, and `imbh-mcp` sits **below** `imbh-server` so the stdio transport can share
+the tool surface. So the host hands its queue in — `imbh_mcp::Housekeeping`, a three-method sync trait,
+implemented by `imbh-server`'s `AppState` — and `handle_with` takes it. `handle` keeps its old
+signature and passes `None`.
+
+That falls straight into the rule the surface already had: **a tool is offered only where it can
+work.** `visible()` already dropped write tools on a read-only handle; it now also drops
+queue-dependent tools when the host runs no queue. `imbh-tui --mcp-stdio` therefore advertises
+neither, without a flag anyone has to set.
+
+The alternative — MCP running housekeeping synchronously — was rejected for the reason the endpoint
+exists: a pass costs the corpus, and a tool call that waits for one reintroduces exactly the timeout
+problem, this time against a model's client rather than a proxy.
+
+### The trap, twice
+
+The MCP e2e test failed on the first run: `call_tool` builds a fresh `app(db)` per call, so each call
+got a fresh queue and the second could not find the first's job. This is the same hazard already
+documented on `imbh_server::route` — and it had been harmless for as long as the server was stateless.
+Fixed by holding one `Router` and cloning it per call (clones share the state `Arc`). Worth the note:
+**adding state to something previously stateless invalidates every helper that quietly rebuilds it**,
+and the failure mode is a 404 rather than a compile error.
+
+### Finding: `Db::maintain()` is never called by the running daemon
+
+Asked in passing, and the answer is more interesting than expected. `imbhd` configures
+`Maintenance::Background(interval)`, whose loop (`FlushScheduler::advance`) calls the *storage*
+primitives directly — `seal()`, `sync_wal()`, `retain()`. It does **not** call `Db::maintain()`, and
+in particular it never calls `commit_pending()`.
+
+So before this endpoint, the only in-process triggers for `commit_pending` were `open()` and
+`close()`. A long-running `imbhd` with an external `imbh-housekeeper` preparing rewrites would apply
+them **only at restart** — the prepare/commit handoff of §7.2 works on a daemon that restarts and not
+on one that stays up. The new endpoint is the first thing that closes that loop while running.
+
+That is arguably a gap in the scheduler rather than a feature of the endpoint: `advance`'s retention
+step could call `commit_pending()` alongside `retain()`. It changes engine behaviour for every
+embedder on `Maintenance::Background`, so it is recorded here and left for a decision rather than
+taken unilaterally.
+
+### Verified
+
+`fmt --all --check` clean; `clippy --workspace --all-targets -D warnings` clean; **709 passing**. New
+coverage: coalescing at the registry (queued joins, running/finished/different-parameters do not, and
+the search-and-insert is one critical section), coalescing over HTTP (a burst of identical submissions
+where every one is accepted and far fewer passes exist), and over MCP the submit → poll → list round
+trip against one router, an unknown id explaining itself, `max_jobs: 0` refused, and a host with no
+queue advertising neither tool. Nothing committed.
+
+## The background loop commits pending rewrites — and why it does not call `maintain()` (2026-08-09)
+
+`FlushScheduler::advance` now calls `commit_pending()` on the maintenance interval, immediately before
+`retain()`. That closes the gap the previous entry recorded: with only `open()`/`close()` pickup, a
+long-running `imbhd` applied an external preparer's rewrites **at restart and at no other time**, so
+the preparer kept re-preparing partitions that never landed — which is precisely the failure the
+open/close pickup was added to prevent, displaced from "a host that never calls `maintain()`" to "a
+host that never restarts".
+
+### Why not just call `maintain()` from the loop
+
+It was the obvious suggestion and it is wrong for one specific reason: **`maintain()` seals
+unconditionally**, and deciding whether to seal is the loop's entire job. `FlushPolicy` exists to
+answer that — by interval, buffer bytes, row count, WAL bytes, or idle time — and `manual` means "seal
+only on `/admin/flush` and shutdown". A loop that called `maintain()` every tick would seal every
+tick, producing a tiny segment per second and breaking the one policy whose contract is *not* to.
+
+So the loop performs `maintain()`'s **order** rather than calling it: seal (policy-decided), commit,
+retain. That is one ordering rule in two places, which is a real cost — but the alternative is either
+breaking the flush policy or splitting `maintain()` into a sealless half whose only caller would be
+this loop.
+
+The seal/commit order turns out not to be load-bearing either way: sealing appends a segment and never
+removes one, so it cannot invalidate a record, and a record's validation is against the input segments
+and the promoted set, neither of which a seal touches. **Commit before retention is** load-bearing,
+for the reason `maintain()` documents — retention drops segments, and a rewrite whose inputs it is
+about to drop should land first. That is the constraint the placement honours.
+
+### The test is the interesting part
+
+Asserting "the loop did it" means asserting that *nobody else* did. The test prepares a rewrite from
+outside against a live writer, then calls nothing at all — no `maintain()`, no `commit_pending()`, no
+`flush()` — and waits for the segment count to drop. `FlushPolicy::manual()` is what makes it precise:
+the loop's seal step can never fire, so the only thing that can change the manifest is the commit under
+test.
+
+### Verified
+
+`fmt --all --check` clean; `clippy --workspace --all-targets -D warnings` clean; **710 passing**.
+Nothing committed.
+
+## Closing summary: the housekeeping surface, and what asking "what does it really do" was worth (2026-08-09)
+
+Five entries above cover the second half of this session — the `imbhd` housekeeping work that grew out
+of the attribute/promotion arc. This closes it.
+
+### What shipped
+
+| Surface | What it does |
+|---|---|
+| `POST /admin/housekeeping` | queue a pass; `202` + a job id, never the outcome |
+| `GET /admin/housekeeping/<id>` · `GET /admin/housekeeping` | poll one job; list the retained ones |
+| `{"compact": true, "max_jobs": N}` | compaction, bounded to N partitions |
+| `run_housekeeping` · `housekeeping_status` | the same queue, over MCP |
+| `Db::compact_bounded` / `Storage::compact_bounded` | the bound the endpoint needed underneath |
+| the background maintenance loop | now commits prepared rewrites, before retention |
+
+Tests: **704 → 711** over this half (668 at the session's start). 53 files changed overall,
++7,971/−1,675. Twenty MCP tools now, eighteen of them read-only.
+
+### Findings
+
+**A response status has to describe what happened, not what was asked.** The work has not run when a
+submission is answered, so `202` and a *handle* — a `200` with a report would be a lie. The same rule
+produced the `200` on a coalesced submission (nothing was created) and the `400` on a read-only
+handle (nothing could be). Each time the status fell out of the truth rather than out of a convention.
+
+**Capability follows the handle.** Fourth and fifth instances this session: the housekeeping endpoint
+refuses a read-only handle, and MCP hides queue-dependent tools from a host that runs no queue. Both
+are structural facts — a reader holds no writer lock; a host without a queue has nothing for the tool
+to call — rather than policy someone must remember to configure. The corollary is the error message:
+refuse up front and say *what would work*, never surface the layer below's complaint.
+
+**Bound the unit the work is actually done in.** `max_jobs` counts **partitions**, not segments,
+because a partition is what compaction reads, sorts and writes as one. A segment bound would have to
+stop *inside* a partition, and a half-merged partition is not a state the manifest can describe. That
+also made "capped" mean *slice*, not *partial*: everything past the bound is untouched, so there is
+nothing to resume and resuming is submitting again.
+
+**Coalescing's whole design is where the line is drawn.** A **queued** job has not looked at the
+database, so it will cover a request arriving now; a **running** one snapshotted before that request
+existed and may already be past what it wants. So queued coalesces and running does not — and matching
+is an exact parameter match rather than a subsumption test, because a rule that has to be explained
+every time someone reads back an unexpected job id is a worse rule than one they can predict.
+
+**One ordering rule in two places beat the alternatives.** The maintenance loop performs `maintain()`'s
+order — seal, commit, retain — rather than calling it, because `maintain()` seals *unconditionally*
+and deciding whether to seal is the loop's entire job (`FlushPolicy::manual` means "seal only on
+`/admin/flush` and shutdown"). Duplication is a real cost; breaking the flush policy, or splitting
+`maintain()` into a sealless half whose only caller is this loop, were worse.
+
+**Adding state invalidates every helper that quietly rebuilt it.** `imbh_server::route` and the MCP
+test's `call_tool` both construct a fresh router per call. Harmless for as long as the server was
+stateless; the moment a queue lived in router state, a job submitted through one call could not be
+polled through the next — and the failure mode is a `404`, not a compile error. Documented on `route`,
+and the tests now hold one router.
+
+### The finding that came from a question, not from code
+
+Two exchanges did more than any refactor here.
+
+**"I should've asked what `commit_pending()` really does."** It does no rewriting: it validates a
+record (inputs still present, promote set unchanged, output digest matches) and swaps an
+already-produced file into the manifest. The rewrite — including the projection of promoted columns —
+happens in `compact_partition`/`backfill_promoted`, in-process or in a preparer. Which means moving
+the commit earlier in the loop would have changed **nothing** for a daemon with no preparer running:
+`commit_pending` finds an empty directory forever. A scheduling change aimed at the wrong mechanism.
+
+**"We should want to see the attributes promoted in the next seal."** I believed it already worked and
+could have said so. Writing the test instead was the right call and it passed first run — a segment
+sealed after `set_promote` carries the column, the one before it does not, and both answer the same
+query through the JSON fallback. The belief was right; the *evidence* is now a regression guard that
+did not exist, since the existing promotion tests covered the barrier and the compaction projection but
+not the seal path.
+
+The transferable form: **"X should happen sooner" is answerable only once you know which mechanism
+produces X.** Promotion reaches new rows through append-time encoding (immediate, at the next seal) and
+reaches old segments through a rewrite (needs compaction or a preparer). Those are different clocks,
+and the fix for one does nothing for the other.
+
+### Open
+
+Nothing committed. Still unbuilt, and recorded rather than guessed at: a **queue-depth** bound
+(coalescing removes the common pile-up, but nothing stops a client submitting a thousand *differing*
+requests), and convergence of already-sealed segments at seal time rather than only in a rewrite pass —
+which would turn a bounded buffer write into an unbounded one, so it needs a decision rather than an
+implementation. `cargo clippy -p imbh-storage --no-default-features --all-targets` remains broken on a
+test module this work did not touch (pre-existing; every *library* configuration is clean).

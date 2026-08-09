@@ -165,7 +165,38 @@ impl Reply {
 /// Transport-agnostic on purpose: it takes the message bytes plus which [`Transport`] they arrived
 /// over (with the already-extracted header values, for HTTP) and returns a [`Reply`] the caller
 /// serializes, so the HTTP endpoint and the stdio loop share every line of protocol logic.
+/// A host's **housekeeping queue**, if it runs one.
+///
+/// The queue lives in the host (`imbh-server` owns one per router), not here: it is server wiring, and
+/// this crate sits below the server so that the stdio transport can share the tools. So the host
+/// passes its queue in, and a host without one — `imbh-tui --mcp-stdio`, which opens the database
+/// read-only — simply does not offer the tools that need it. Same rule as the write tools: the
+/// capability follows what the host actually has, rather than a flag someone must remember to set.
+///
+/// Every method is synchronous. Submitting returns a *handle*, not an outcome, which is the whole
+/// point of the queue — see `imbh_server::jobs`.
+pub trait Housekeeping: Send + Sync {
+    /// Queue a pass (or join the identical one already queued) and return its record, including
+    /// whether this submission coalesced.
+    fn submit(&self, compact: bool, max_jobs: Option<usize>) -> Value;
+    /// One job by id, or `None` for an id this process never issued.
+    fn get(&self, id: &str) -> Option<Value>;
+    /// The retained jobs, newest submission first.
+    fn recent(&self) -> Vec<Value>;
+}
+
+/// Dispatch one MCP message against a database with no housekeeping queue — see [`handle_with`].
 pub async fn handle(db: &Arc<Db>, body: &[u8], transport: &Transport<'_>) -> Reply {
+    handle_with(db, None, body, transport).await
+}
+
+/// Dispatch one MCP message, offering the housekeeping tools when the host supplies a queue.
+pub async fn handle_with(
+    db: &Arc<Db>,
+    housekeeping: Option<&Arc<dyn Housekeeping>>,
+    body: &[u8],
+    transport: &Transport<'_>,
+) -> Reply {
     // `from_slice` covers invalid UTF-8 too, so there is one parse-failure path rather than two.
     let message: Value = match serde_json::from_slice(body) {
         Ok(message) => message,
@@ -237,8 +268,7 @@ pub async fn handle(db: &Arc<Db>, body: &[u8], transport: &Transport<'_>) -> Rep
         // ── both eras ───────────────────────────────────────────────────────────────────────────
         "ping" => Reply::json(200, result_body(id, tag(modern, json!({})))),
         "tools/list" => {
-            let list: Vec<Value> = tools::TOOLS
-                .iter()
+            let list: Vec<Value> = tools::visible(db, housekeeping)
                 .map(|tool| {
                     json!({
                         "name": tool.name,
@@ -262,7 +292,7 @@ pub async fn handle(db: &Arc<Db>, body: &[u8], transport: &Transport<'_>) -> Rep
                 );
             };
             let args = Args::new(param("arguments"));
-            match tools::call(db, name, &args).await {
+            match tools::call(db, housekeeping, name, &args).await {
                 // An unknown tool is a protocol error: no argument the model could pick would fix it.
                 None => Reply::json(
                     200,

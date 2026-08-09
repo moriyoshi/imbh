@@ -4,8 +4,10 @@
 //! service/name + duration + the span list). `db.traces().search(TraceQuery)` finds traces with
 //! a span matching the filter and returns [`TraceSummary`]s. Both compile to SQL over the
 //! `spans` table and materialize the result batches — one query path, two front doors (§9.4).
-//! `get` filters on the raw `trace_id` bytes (`trace_id = X'…'`) so the query provider can prune
-//! whole span segments via their Parquet bloom filter (§8); `search` renders ids with `hex()`.
+//! Both filter on the raw `trace_id` bytes — `get` as `trace_id = X'…'`, `search`'s phase-2 span
+//! fetch as `trace_id IN ($1, …)` — so the query provider can prune whole span segments via their
+//! Parquet bloom filter (§8). `search`'s phase-1 candidate ranking still groups/semi-joins on
+//! `hex(trace_id)`: its id set is a subquery, not literals, so no bloom probe exists there anyway.
 //!
 //! `db.traces().span_metrics(SpanMetricsQuery)` computes RED metrics (calls / error rate /
 //! duration quantiles) over a span filter, grouped by attributes, per `step` bucket. Per-segment
@@ -32,6 +34,24 @@ use crate::{Db, Result};
 const SPAN_COLS: &str = "trace_id, span_id, parent_span_id, name, kind, start_time, duration_ns, \
      status_code, status_message, service, attributes, resource, scope, events, links, \
      trace_state, flags";
+
+/// The phase-2 span fetch of [`TracesApi::search`]: every span of the candidate traces `ids`.
+///
+/// The predicate is `trace_id IN ($1, …, $n)` over the **raw** id bytes, never `hex(trace_id) IN
+/// ('…')`: only the raw binary form lets the query provider probe each segment's Parquet bloom filter
+/// and skip the segments that hold none of the candidate ids (ARCHITECTURE.md §8) — the `hex()` UDF
+/// form hides the bytes and forces a read of every span segment in the database. Values stay bound
+/// (`$N` placeholders, `FixedSizeBinary` scalars), so nothing reaches the SQL text as an interpolated
+/// literal. Semantically identical either way — the pushdown is `Inexact`, so DataFusion re-applies
+/// the predicate above the scan and pruning can only ever save I/O, never change the answer.
+fn spans_of_traces_sql(ids: &[TraceId], params: &mut SqlParams) -> String {
+    let in_list = ids
+        .iter()
+        .map(|id| params.id_bytes(&id.0))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("SELECT {SPAN_COLS} FROM spans WHERE trace_id IN ({in_list})")
+}
 
 /// Traces query namespace, reached via [`Db::traces`].
 pub struct TracesApi {
@@ -109,16 +129,17 @@ impl TracesApi {
             return Ok(Vec::new());
         }
 
-        // Phase 2: fetch every span of those traces and assemble summaries in Rust. The `tid`s are
-        // machine-derived `hex()` output (only `0-9A-F`), but bind them anyway so no value reaches
-        // the SQL text as an interpolated literal.
+        // Phase 2: fetch every span of those traces and assemble summaries in Rust, filtering on the
+        // **raw** `trace_id` bytes so the segment bloom filters can prune (see `spans_of_traces_sql`).
+        // The candidate ids come back from phase 1 as `hex()` text; decode them to bytes (a
+        // machine-derived id always parses — skip anything that somehow does not rather than falling
+        // back to an unprunable predicate).
+        let ids: Vec<TraceId> = tids.iter().filter_map(|t| TraceId::from_hex(t)).collect();
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
         let mut params = SqlParams::with_promote(self.db.storage.promote().keys());
-        let in_list = tids
-            .iter()
-            .map(|t| params.str(t))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql = format!("SELECT {SPAN_COLS} FROM spans WHERE hex(trace_id) IN ({in_list})");
+        let sql = spans_of_traces_sql(&ids, &mut params);
         let spans = materialize_spans(
             &self
                 .db
@@ -818,6 +839,31 @@ mod native_trace_query_tests {
     use datafusion::scalar::ScalarValue;
 
     #[test]
+    fn spans_of_traces_filters_on_raw_bound_id_bytes() {
+        let mut params = SqlParams::with_promote(&[]);
+        let sql = spans_of_traces_sql(&[TraceId([0x11; 16]), TraceId([0x22; 16])], &mut params);
+
+        // Raw `trace_id`, not `hex(trace_id)` — the bloom filters can only probe the raw bytes.
+        assert!(
+            sql.ends_with("FROM spans WHERE trace_id IN ($1, $2)"),
+            "unexpected SQL: {sql}"
+        );
+        assert!(
+            !sql.contains("hex("),
+            "the hex() form defeats bloom pruning: {sql}"
+        );
+        // Values stay bound (never interpolated) and carry the column's exact width, which is what
+        // DataFusion type-checks the `$N` placeholders against.
+        assert_eq!(
+            params.into_values(),
+            vec![
+                ScalarValue::FixedSizeBinary(16, Some(vec![0x11; 16])),
+                ScalarValue::FixedSizeBinary(16, Some(vec![0x22; 16])),
+            ]
+        );
+    }
+
+    #[test]
     fn trace_start_bounds_are_bound_and_closed_when_requested() {
         let query = TraceQuery::new()
             .trace_start_range_inclusive(Timestamp(i64::MIN + 7), Timestamp(i64::MAX - 7));
@@ -835,5 +881,133 @@ mod native_trace_query_tests {
                 ScalarValue::Int64(Some(i64::MAX - 7))
             ]
         );
+    }
+}
+
+/// The read-side payoff of the raw-`trace_id` phase-2 predicate: a trace search must skip the span
+/// segments that hold none of the candidate ids, and must return exactly what the old `hex()` form
+/// returned. Needs the OTLP ingest path to build real (bloom-carrying) segments.
+#[cfg(all(test, feature = "ingest"))]
+mod trace_search_pruning_tests {
+    use super::*;
+    use imbh_test_support::otlp::otlp_trace_tree;
+
+    /// Three traces, each sealed into its own bloom-carrying span segment.
+    async fn db_with_three_trace_segments(dir: &std::path::Path) -> Arc<Db> {
+        let db = Db::builder(dir).open().unwrap();
+        for (i, id) in [[0x11u8; 16], [0x22; 16], [0x33; 16]].iter().enumerate() {
+            db.ingest_otlp_traces(&otlp_trace_tree(&format!("svc{i}"), *id))
+                .await
+                .unwrap();
+            db.flush().await.unwrap(); // one segment per trace
+        }
+        db
+    }
+
+    /// A stable, comparable rendering of a span set (order-independent).
+    fn span_keys(spans: &[Span]) -> Vec<(String, String, String, i64)> {
+        let mut keys: Vec<_> = spans
+            .iter()
+            .map(|s| {
+                (
+                    s.trace_id.to_hex(),
+                    s.span_id.to_hex(),
+                    s.name.clone(),
+                    s.start_time.0,
+                )
+            })
+            .collect();
+        keys.sort();
+        keys
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn phase2_fetch_prunes_segments_without_changing_the_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = db_with_three_trace_segments(dir.path()).await;
+
+        // The phase-2 predicate `search` now issues, for a single candidate trace.
+        let wanted = TraceId([0x22; 16]);
+        let mut params = SqlParams::with_promote(&[]);
+        let sql = spans_of_traces_sql(&[wanted], &mut params);
+        let (_schema, batches, scan) = db
+            .sql_with_params(sql, params.into_values())
+            .collect_with_stats()
+            .await
+            .unwrap();
+        let raw_spans = materialize_spans(&batches).unwrap();
+        assert_eq!(
+            scan.segments_pruned, 2,
+            "the two segments holding no candidate id are skipped via their blooms"
+        );
+        assert_eq!(scan.segments_scanned, 1);
+
+        // The pre-fix predicate: identical rows, but every segment read — the bug being fixed.
+        let mut params = SqlParams::with_promote(&[]);
+        let hex_sql = format!(
+            "SELECT {SPAN_COLS} FROM spans WHERE hex(trace_id) IN ({})",
+            params.str(wanted.to_hex())
+        );
+        let (_schema, hex_batches, hex_scan) = db
+            .sql_with_params(hex_sql, params.into_values())
+            .collect_with_stats()
+            .await
+            .unwrap();
+        assert_eq!(
+            hex_scan.segments_pruned, 0,
+            "hex(trace_id) hides the raw bytes, so nothing can be bloom-pruned"
+        );
+        assert_eq!(hex_scan.segments_scanned, 3);
+        assert_eq!(
+            span_keys(&raw_spans),
+            span_keys(&materialize_spans(&hex_batches).unwrap()),
+            "pruning must never change the rows returned"
+        );
+        assert_eq!(
+            raw_spans.len(),
+            2,
+            "the fixture trace has a root and a child"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn search_returns_the_same_traces_it_always_did() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = db_with_three_trace_segments(dir.path()).await;
+
+        // A single-candidate search (the maximally prunable case).
+        let one = db
+            .traces()
+            .search(TraceQuery::new().service("svc1"))
+            .await
+            .unwrap();
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].trace_id, TraceId([0x22; 16]));
+        assert_eq!(one[0].span_count, 2);
+        assert_eq!(one[0].root_name.as_deref(), Some("GET /cart"));
+        assert!(one[0].error, "the fixture root span is ERROR");
+
+        // An unfiltered search: all three traces, each fully assembled. A dropped span (or trace)
+        // from over-eager pruning would show up here as a wrong `span_count`/set of ids.
+        let all = db.traces().search(TraceQuery::new()).await.unwrap();
+        let mut ids: Vec<String> = all.iter().map(|t| t.trace_id.to_hex()).collect();
+        ids.sort();
+        assert_eq!(
+            ids,
+            vec![
+                TraceId([0x11; 16]).to_hex(),
+                TraceId([0x22; 16]).to_hex(),
+                TraceId([0x33; 16]).to_hex(),
+            ]
+        );
+        assert!(all.iter().all(|t| t.span_count == 2));
+
+        // A candidate set that matches nothing still comes back empty, not wrong.
+        let none = db
+            .traces()
+            .search(TraceQuery::new().service("nope"))
+            .await
+            .unwrap();
+        assert!(none.is_empty());
     }
 }

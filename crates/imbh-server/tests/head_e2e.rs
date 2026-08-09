@@ -439,3 +439,174 @@ async fn a_duplicate_timestamp_names_the_series_over_the_wire() {
         );
     }
 }
+
+/// Attribute statistics cross the wire losslessly — the one head operation whose result is a whole
+/// measurement rather than a row set.
+///
+/// It needs an **on-disk** database, unlike every other case here: the measurement is defined over
+/// sealed segments, and an in-memory database has none. That is also what the last assertion pins —
+/// asking an in-memory daemon is a `400` naming the reason, not an empty report that would read as
+/// "this database has no attributes".
+#[tokio::test]
+async fn attribute_statistics_cross_the_wire_losslessly() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let addr = free_addr();
+    let db: Arc<Db> = Db::builder(dir.path()).open().expect("open db");
+    let served = Arc::clone(&db);
+    let serve_addr = addr.clone();
+    std::thread::spawn(move || {
+        let _ = serve(served, &serve_addr);
+    });
+    for _ in 0..200 {
+        if let Ok(resp) = http::get(&addr, "/health")
+            && resp.status == 200
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    for (service, body, ts) in [
+        ("cart", "checkout failed", 1_000),
+        ("cart", "checkout retried", 2_000),
+        ("api", "ok", 3_000),
+    ] {
+        let payload = otlp_log(service, body, ts);
+        let resp =
+            http::post(&addr, "/v1/logs", "application/x-protobuf", &payload).expect("ingest");
+        assert_eq!(resp.status, 200, "{}", resp.text());
+    }
+    // Only sealed segments are measurable, so the rows must reach Parquet before either side asks.
+    db.flush().await.expect("flush");
+
+    let client = HeadClient::new(&addr).expect("head client");
+    let request = dto::AttrStatsRequest::default();
+    let local = exec::attribute_stats(&db, &request)
+        .await
+        .expect("local attribute stats");
+    let remote = client
+        .attribute_stats(&request)
+        .await
+        .expect("remote attribute stats");
+    assert_eq!(local, remote, "the whole report survives the round trip");
+
+    // And it is a real measurement, not two identical empties.
+    assert!(local.global.segments >= 1, "the flush sealed a segment");
+    let service = local
+        .global
+        .key("resource:service.name")
+        .expect("the resource scope is measured");
+    assert_eq!(service.distinct_est, 2.0, "cart and api");
+    assert!(
+        local.dir.contains(
+            dir.path()
+                .file_name()
+                .and_then(|n| n.to_str())
+                .expect("dir name")
+        ),
+        "the report names the daemon's directory: {}",
+        local.dir
+    );
+
+    // A narrowed range is honoured on the remote side too — that is what bounds a head's cost.
+    let narrowed = client
+        .attribute_stats(&imbh::attrstats::Options {
+            range: Some((2_500, i64::MAX)),
+            ..Default::default()
+        })
+        .await
+        .expect("narrowed attribute stats");
+    assert!(
+        narrowed.global.rows <= local.global.rows,
+        "a narrower window cannot measure more rows: {} vs {}",
+        narrowed.global.rows,
+        local.global.rows
+    );
+
+    // An in-memory daemon has nothing to measure, and says so as a 400 rather than an empty report.
+    let (memory_db, memory_client) = start();
+    let local_error = exec::attribute_stats(&memory_db, &request)
+        .await
+        .expect_err("no directory");
+    let remote_error = memory_client
+        .attribute_stats(&request)
+        .await
+        .expect_err("no directory");
+    assert_eq!(local_error.status(), 400);
+    assert_eq!(local_error.message(), remote_error.message());
+    assert!(
+        remote_error.message().contains("in-memory"),
+        "{remote_error}"
+    );
+}
+
+/// `GET`/`POST /admin/promote` — the one operation a head can drive that **writes**.
+///
+/// It is on `/admin/*` rather than under the read-only `/api/head` prefix, and this pins both halves
+/// of that: the endpoint works, and the head prefix stays free of it (see
+/// `the_head_prefix_is_a_gateable_unit`, which asserts every head path shares that prefix).
+#[tokio::test]
+async fn the_promoted_set_can_be_read_and_replaced_over_the_wire() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let addr = free_addr();
+    let db: Arc<Db> = Db::builder(dir.path()).open().expect("open db");
+    let served = Arc::clone(&db);
+    let serve_addr = addr.clone();
+    std::thread::spawn(move || {
+        let _ = serve(served, &serve_addr);
+    });
+    for _ in 0..200 {
+        if let Ok(resp) = http::get(&addr, "/health")
+            && resp.status == 200
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let client = HeadClient::new(&addr).expect("head client");
+
+    // Nothing is promoted until something asks for it.
+    assert!(client.promoted().await.expect("read").keys.is_empty());
+    assert!(db.promote().keys().is_empty());
+
+    // The whole set is sent, and the answer is what is now in effect — so a caller never re-reads to
+    // find out what it got.
+    let applied = client
+        .set_promoted(&dto::PromoteRequest {
+            keys: vec!["http.route".to_owned(), "env".to_owned()],
+        })
+        .await
+        .expect("promote");
+    assert_eq!(applied.keys, vec!["http.route", "env"]);
+    assert_eq!(
+        db.promote().keys(),
+        applied.keys,
+        "the daemon's live set is what the response describes"
+    );
+    assert_eq!(client.promoted().await.expect("read").keys, applied.keys);
+
+    // Rows written afterwards carry the promoted columns; rows written before keep their schema, and
+    // both remain queryable — which is what makes this safe to do on a live database.
+    db.ingest_otlp_logs(&otlp_log("cart", "after promotion", 1_000))
+        .await
+        .expect("ingest");
+    db.flush().await.expect("flush");
+
+    // Demotion is the same call with the key removed, and it is always safe: the key never left the
+    // JSON blob, so a query for it still answers.
+    let demoted = client
+        .set_promoted(&dto::PromoteRequest {
+            keys: vec!["env".to_owned()],
+        })
+        .await
+        .expect("demote");
+    assert_eq!(demoted.keys, vec!["env"]);
+
+    // A malformed body is a 400 naming the problem, not a 500.
+    let bad =
+        http::post(&addr, "/admin/promote", "application/json", b"{\"keys\":3}").expect("post");
+    assert_eq!(bad.status, 400, "{}", bad.text());
+    assert!(bad.text().contains("promote request"), "{}", bad.text());
+
+    db.close().await.expect("close");
+}

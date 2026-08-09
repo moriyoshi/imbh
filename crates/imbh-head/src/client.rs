@@ -256,6 +256,40 @@ impl HeadClient {
     ) -> Result<dto::Names, HeadError> {
         self.post_json(path::ATTRIBUTES_VALUES, request).await
     }
+
+    /// The promoted attribute keys now in effect (`GET /admin/promote`).
+    pub async fn promoted(&self) -> Result<dto::PromoteState, HeadError> {
+        self.get_json(path::ADMIN_PROMOTE).await
+    }
+
+    /// Replace the promoted attribute keys (`POST /admin/promote`), answering with the set now in
+    /// effect.
+    ///
+    /// **The one call on this client that writes.** It seals the daemon's buffer and changes the
+    /// schema every subsequent segment is written with (ARCHITECTURE.md §6.1), which is why it is on
+    /// `/admin/*` rather than under the read-only `/api/head` prefix — and why a head that offers it
+    /// should make clear it is acting on the database rather than reading it.
+    pub async fn set_promoted(
+        &self,
+        request: &dto::PromoteRequest,
+    ) -> Result<dto::PromoteState, HeadError> {
+        self.post_json(path::ADMIN_PROMOTE, request).await
+    }
+
+    /// Attribute cardinality and selectivity. See
+    /// [`exec::attribute_stats`](crate::exec::attribute_stats).
+    ///
+    /// The daemon scans for this one, so it can take far longer than the other operations on a large
+    /// database — and the client sets only a *connect* timeout, so a request that has been accepted
+    /// waits as long as the scan takes. Narrow it with
+    /// [`Options::range`](imbh::attrstats::Options::range), and drive it from a task a head can
+    /// abandon rather than from its redraw path.
+    pub async fn attribute_stats(
+        &self,
+        request: &dto::AttrStatsRequest,
+    ) -> Result<dto::AttrStats, HeadError> {
+        self.post_json(path::ATTRIBUTES_STATS, request).await
+    }
 }
 
 /// Normalize a `--url` into the prefix every operation path is appended to.

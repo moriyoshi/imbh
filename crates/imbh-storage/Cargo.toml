@@ -22,7 +22,17 @@ fs4.workspace = true
 tracing = { workspace = true, optional = true }
 
 [features]
-default = ["search"]
+# Segment rewriting: merge same-day segments, and converge one whose schema lags the promoted key
+# set. Carries the Parquet write + sort + (with `search`) Tantivy index build. Off drops
+# `Storage::compact` and `prepare_pending`; `commit_pending` stays, because applying a record a
+# housekeeper prepared is cheap bookkeeping an embedded host still wants.
+#
+# In `default` for the same reason `search` is: the workspace pins this crate with
+# `default-features = false`, so the facade drives the feature and only a **standalone**
+# `cargo test -p imbh-storage` sees this list — which is exactly where the compaction unit tests and
+# the Windows portability gate (retention/compaction reclaim of files a reader still has mapped) run.
+compaction = []
+default = ["search", "compaction"]
 # Test-only deterministic crash injection: under this feature, `seal()` consults `IMBH_FAULT_ABORT_*`
 # env vars and `process::abort()`s at named hazard points (before the manifest is persisted; after it
 # is durable but before WAL reclaim). Off by default and adds no dependencies, so the shipping graph

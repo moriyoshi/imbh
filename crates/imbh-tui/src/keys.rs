@@ -12,8 +12,8 @@ use crate::model::{
     Focus, LogCorrelation, Mode, Options, Route, Screen, Snapshot, TIME_RANGES, Update,
 };
 use crate::tasks::{
-    maybe_discover_label_dims, request_metric_dims, request_metric_exemplars, request_refresh,
-    request_vocabulary, request_waterfall,
+    maybe_discover_label_dims, request_metric_dims, request_metric_exemplars, request_promotion,
+    request_refresh, request_vocabulary, request_waterfall,
 };
 use crate::textfield::handle_edit_key;
 
@@ -373,6 +373,16 @@ pub(crate) fn handle_key(
                 begin_editing(app, backend, sender);
                 return Control::Continue;
             }
+            // The range line's own action. Reached by focusing the line that displays the range,
+            // rather than by a global key, because it belongs to this pane and to nothing else — the
+            // *query* range already owns the global binding (`t`).
+            Focus::AttrRange => {
+                app.open_attr_range_form();
+                return Control::Continue;
+            }
+            // The rows have no Enter action: `p` is what acts on one, and Enter here would have to
+            // guess which of the pane's two things the user meant.
+            Focus::AttrTable(_) => {}
             Focus::Primary => {}
         },
         // Left/Right select among the menu-bar items when the ring is on the bar, returning early so
@@ -495,6 +505,13 @@ pub(crate) fn handle_key(
                 request_refresh(app, backend.clone(), options.clone(), sender.clone());
             }
         }
+        // `p` promotes (or demotes) the attribute key under the pane's cursor. Ahead of the paging
+        // binding below and guarded on the focus, so the two never contend: it is the pane's action,
+        // it needs the pane's cursor to mean anything, and it is the one key in this program that
+        // *writes* to the database.
+        KeyCode::Char('p') if matches!(app.effective_focus(), Focus::AttrTable(_)) => {
+            toggle_promotion(app, backend, sender);
+        }
         // Older/newer log paging (Logs list): `n` = older page, `p` = newer page. No-ops off the Logs
         // list or at the ends (`logs_page_*` guards the screen and the cursor stack).
         KeyCode::Char('n') => {
@@ -556,6 +573,10 @@ pub(crate) fn handle_key(
         ),
         KeyCode::Char('e') if app.has_query() => begin_editing(app, backend, sender),
         KeyCode::Char('r') => {
+            // An explicit refresh means "measure again": the Overview's attribute block is otherwise
+            // reused across auto-refresh ticks (see `App::needs_attr_measure`), and `r` is how a
+            // person asks for the numbers now rather than the ones from up to a minute ago.
+            app.attr_stats = None;
             request_refresh(app, backend.clone(), options.clone(), sender.clone())
         }
         // Shift+R (the uppercase char crossterm delivers) toggles background auto-refresh.
@@ -604,6 +625,12 @@ pub(crate) fn handle_key(
 /// focus so the waterfall follows the selection again.
 pub(crate) fn move_selection(app: &mut App, delta: isize) {
     app.clear_trace_focus();
+    // The attribute pane's rows are not contiguous — titles, per-section headers and spacers sit
+    // between them — so its cursor steps key-to-key rather than by row index.
+    if matches!(app.effective_focus(), Focus::AttrTable(_)) {
+        app.move_attr_cursor(delta);
+        return;
+    }
     if let Some((first, last)) = app.selectable_bounds() {
         let current = app.selected.clamp(first, last) as isize;
         app.selected = (current + delta).clamp(first as isize, last as isize) as usize;
@@ -615,6 +642,40 @@ pub(crate) fn move_selection(app: &mut App, delta: isize) {
     } else {
         app.scroll = app.scroll.saturating_sub(delta.unsigned_abs() as u16);
     }
+}
+
+/// Promote or demote the attribute key under the attribute pane's cursor.
+///
+/// Refused up front where the session cannot write — a local explorer opened the database read-only,
+/// so there is nothing to attempt — and the refusal says what *would* work rather than reporting the
+/// storage layer's error. Otherwise the whole set is sent (promotion is a *list*, and its order is the
+/// column order), and the answer is what the daemon ended up with, so the pane re-renders against the
+/// state that actually exists rather than the one this head assumed.
+pub(crate) fn toggle_promotion(
+    app: &mut App,
+    backend: &Backend,
+    sender: &mpsc::UnboundedSender<Update>,
+) {
+    let Some(key) = app.selected_attr_key() else {
+        return;
+    };
+    if !backend.can_promote() {
+        app.last_error = Some(
+            "promotion changes what the writer writes, and this session opened the database \
+             read-only. Point the explorer at the daemon that owns it (`imbh-tui --url \
+             http://host:4318`) to change the promoted keys."
+                .to_owned(),
+        );
+        return;
+    }
+    let mut keys = app.promoted.clone();
+    match keys.iter().position(|k| *k == key) {
+        Some(at) => {
+            keys.remove(at);
+        }
+        None => keys.push(key),
+    }
+    request_promotion(keys, backend.clone(), sender.clone());
 }
 
 /// Open the time-range dropdown, seeding the cursor from the current window and moving focus to the
@@ -882,6 +943,111 @@ mod tests {
             app.abs_start, "2026-07-21 15:05:00",
             "the in-place edit is what was committed"
         );
+    }
+
+    /// The attribute range is opened *through the line that displays it* — focus it, press Enter —
+    /// rather than by a global key or from anywhere in the pane. The query range keeps `t`; nothing
+    /// else in the global map opens a range form, so the two cannot be confused for each other.
+    #[test]
+    fn the_attribute_range_is_opened_through_the_line_that_shows_it() {
+        use crate::model::AbsTarget;
+
+        let mut app = App::new();
+        assert_eq!(app.screen(), Screen::Overview);
+        // The *table* stop has no Enter action — it would have to guess between the pane's two
+        // things — so the form opens from the stop that displays the range.
+        app.focus = Focus::AttrTable(0);
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(app.mode, Mode::Normal, "the rows have no Enter action");
+        app.focus = Focus::AttrRange;
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(app.mode, Mode::AbsoluteRange);
+        assert_eq!(app.abs_target, AbsTarget::Attributes);
+        // The pane starts unbounded, and an empty form is how the form spells that.
+        assert!(app.abs_start.is_empty() && app.abs_end.is_empty());
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(app.mode, Mode::Normal);
+
+        // `t` still opens the *query* range picker, and it is the only global range binding.
+        press(&mut app, KeyCode::Char('t'), KeyModifiers::NONE);
+        assert_eq!(app.mode, Mode::TimeRange);
+        assert_eq!(app.abs_target, AbsTarget::Attributes, "not committed yet");
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        press(&mut app, KeyCode::Char('a'), KeyModifiers::NONE);
+        assert_eq!(app.mode, Mode::Normal, "`a` is not a binding");
+
+        // Off the Overview the stop is gone, so Enter on a stale focus does nothing.
+        app.route = Route::Logs;
+        app.focus = Focus::AttrRange;
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(
+            app.mode,
+            Mode::Normal,
+            "no attribute pane on the Logs screen, so no form"
+        );
+    }
+
+    /// Promotion is offered only where it can work. A local session opened the database read-only, so
+    /// `p` reports why it cannot rather than attempting a write that the storage layer would refuse —
+    /// and the paging binding on the same key is untouched, because the two are guarded apart.
+    #[test]
+    fn promotion_is_refused_on_a_session_that_only_reads() {
+        // A *local* backend, unlike the shared harness: this is the case under test, and it is also
+        // the one that spawns no task, so it needs no runtime.
+        let local = Backend::from(imbh::Db::in_memory().open().expect("open"));
+        assert!(!local.can_promote());
+        let (_, options, sender, _receiver) = harness();
+        let press = |app: &mut App, code: KeyCode| {
+            handle_key(
+                app,
+                KeyEvent::new(code, KeyModifiers::NONE),
+                &local,
+                &options,
+                &sender,
+            );
+        };
+
+        let mut app = App::new();
+        app.focus = Focus::AttrTable(0);
+        app.snapshot.detail = Some(crate::fetch::attribute_placeholder());
+        // Shaped like a real pane: a section, its header, then the key. The section is load-bearing —
+        // each one is a Tab stop, and the cursor belongs to the focused section.
+        app.snapshot.detail.as_mut().expect("pane").table = Some(crate::model::PaneTable {
+            data: crate::model::TableData {
+                header: vec!["Key".to_owned(), "Scope".to_owned()],
+                rows: vec![
+                    vec!["ALL TABLES -- 1 segment".to_owned(), String::new()],
+                    vec!["Key".to_owned(), "Scope".to_owned()],
+                    vec!["service.name".to_owned(), "attributes".to_owned()],
+                ],
+            },
+            kinds: vec![
+                crate::model::AttrRow::Section,
+                crate::model::AttrRow::Header,
+                crate::model::AttrRow::Key("service.name".to_owned()),
+            ],
+        });
+        app.snap_attr_cursor();
+        assert_eq!(app.selected_attr_key().as_deref(), Some("service.name"));
+
+        press(&mut app, KeyCode::Char('p'));
+        let error = app.last_error.as_deref().expect("a reason, not a silence");
+        assert!(error.contains("read-only"), "{error}");
+        assert!(
+            error.contains("--url"),
+            "the message must name what would work: {error}"
+        );
+        assert!(
+            app.promoted.is_empty(),
+            "nothing was promoted locally, not even optimistically"
+        );
+
+        // Off the pane, `p` is the Logs paging key again — the guard is what keeps them apart.
+        app.route = Route::Logs;
+        app.focus = Focus::Primary;
+        app.last_error = None;
+        press(&mut app, KeyCode::Char('p'));
+        assert!(app.last_error.is_none());
     }
 
     #[test]

@@ -1,0 +1,26 @@
+[package]
+name = "attr-stats"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "Command line over imbh-attrstats: measure per-attribute cardinality and per-segment selectivity (sigma) over an existing imbh database, to size a segment-granularity attribute index and to pick `promote` keys."
+
+# Keep this crate out of the cargo-release plan entirely (same rationale as examples/gen-demo-db):
+# `publish = false` stops the crates.io upload, but a plan member still shows up in `cargo release`'s
+# "Publishing ..." status line. The shared version bump still reaches this crate through
+# `version.workspace = true`.
+[package.metadata.release]
+release = false
+
+# The measurement itself lives in the library; this binary only parses arguments and renders. `serde`
+# is what `--json` needs (the documented flattened document, `imbh_attrstats::report::to_json`).
+[dependencies]
+imbh-attrstats = { workspace = true, features = ["serde"] }
+serde_json.workspace = true
+
+[[bin]]
+name = "attr-stats"
+path = "src/main.rs"

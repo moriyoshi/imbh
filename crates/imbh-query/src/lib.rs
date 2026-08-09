@@ -375,6 +375,10 @@ pub struct TableInput {
     pub segments: Vec<SegmentInput>,
     pub text_column: Option<&'static str>,
     pub bloom_columns: &'static [&'static str],
+    /// The column each [`SegmentInput::time_range`] describes — the table's sort column (`time` for
+    /// logs and metrics, `start_time` for spans). `None` disables the manifest-range segment skip;
+    /// set it only when the segments actually carry their bounds.
+    pub time_column: Option<&'static str>,
 }
 
 /// Run SQL over the given tables (each = buffer snapshot ∪ sealed segments), with cost-gated
@@ -510,6 +514,7 @@ async fn plan_query(
             t.segments,
             t.text_column.map(str::to_owned),
             t.bloom_columns.iter().map(|c| (*c).to_owned()).collect(),
+            t.time_column.map(str::to_owned),
             stats.clone(),
         );
         ctx.register_table(t.name, Arc::new(provider))
@@ -668,6 +673,7 @@ mod tests {
             segments: Vec::new(),
             text_column: None,
             bloom_columns: &[],
+            time_column: None,
         }]
     }
 
@@ -704,6 +710,7 @@ mod tests {
                 segments: Vec::new(),
                 text_column: Some("body"),
                 bloom_columns: &[],
+                time_column: None,
             }];
             let (_ctx, df, _stats) = plan_query(tables, 64 << 20, sql, Vec::new()).await.unwrap();
             let plan = df.create_physical_plan().await.unwrap();

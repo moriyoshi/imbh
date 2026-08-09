@@ -21,3 +21,7 @@ imbh.workspace = true
 opentelemetry-proto.workspace = true
 prost.workspace = true
 tempfile.workspace = true
+# Already in the graph via `imbh`; needed here only to drive the async `stream_with_stats` path,
+# which is the sole public surface exposing whether the Tantivy RowSelection was actually applied.
+tokio = { workspace = true, features = ["rt", "macros"] }
+futures.workspace = true

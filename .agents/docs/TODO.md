@@ -9,13 +9,11 @@ git history); this file tracks only what is still open.
 
 ## Open Items
 
-- [ ] **v0.7.0 is prepared but not cut.** The workspace is bumped to `0.7.0`, the changelog section
-      is closed and dated, `README.md` / `docs/DOCKER_LOG_DRIVER.md` version strings are corrected by
-      hand, notices are regenerated and every gate is green — see JOURNAL "Preparing v0.7.0". Open
-      because nothing is tagged or published, so neither the canonical-JSON codec swap (JOURNAL
-      2026-08-08) nor the two `imbh-tui` fixes have reached anyone. Close this once the `v0.7.0` tag
-      is pushed and the plugin job has published its tags. Releases are cut only when explicitly
-      asked.
+- [x] **v0.7.0 is prepared but not cut.** *(Closed 2026-08-09 — `v0.7.0` was tagged and released
+      2026-08-09, so the canonical-JSON codec swap and the two `imbh-tui` fixes have shipped.)* The
+      workspace was bumped, the changelog section closed and dated, `README.md` /
+      `docs/DOCKER_LOG_DRIVER.md` version strings corrected by hand, notices regenerated and every
+      gate green — see JOURNAL "Preparing v0.7.0".
 
       *(v0.6.2 — the entry this replaces — was tagged and published on 2026-08-07T12:12Z with six
       release assets, and `ghcr.io/moriyoshi/imbh-log-driver:0.6.2-{amd64,arm64}` are both on GHCR,
@@ -25,6 +23,193 @@ git history); this file tracks only what is still open.
       spelling of an integral `Double` changed — which semver does not describe and a patch number
       would hide. The bump was the user's call; the accompanying release note (what mixed-vintage
       data means, and that compaction is not a rewrite) is in the `[0.7.0]` `### Changed` entry.
+
+- [x] **Measure the promoted-column cost before setting any auto-promotion budget.** *(Closed
+      2026-08-08 — `examples/bench --bin promote-cost`. The gate passes, and it moved the budget from
+      "how many keys" to "which keys".)* 50k log rows + 5k spans + 5k gauges, keys present on logs
+      only so the six all-NULL columns on the other signals are included; one process per count, since
+      sharing a process makes the RSS axis meaningless (the first count absorbs ~200 MiB of
+      first-touch pages and later ones measure ~0).
+
+      **Low-cardinality keys — the case promotion exists for — are nearly free.** Disk is bit-exact
+      reproducible: 0 keys 1,230,070 B; 1 key +1,221; 5 keys +6,042; 20 keys +24,110. That is
+      **~1,206 B per key, +2.0% at 20 keys**. Seal time and buffer RSS are both **below the noise
+      floor**: best-of-5 seal is 487.8 ms at 0 keys vs **473.3 ms at 20** (the 20-key run is faster),
+      and VmRSS is 210,348–210,356 kiB across all four counts. Arithmetic bounds the buffer cost at
+      4 bytes/row/key for the `Int32` index array — 4 MiB at 20 keys x 50k rows, ~2% of the ingest
+      working set, which is why it is invisible.
+
+      **A wrong choice costs 95x more.** Re-run with every value distinct (`card=50000`, the
+      high-cardinality anti-pattern §6.1 warns against): 0 keys 4,694,514 B → 20 keys 6,980,273 B, i.e.
+      **+114,288 B per key and +48.7% total**, with seal 770 → 883 ms (+15%). So the budget must gate
+      on **cardinality, not on key count** — 20 well-chosen keys cost +2%, 20 badly-chosen ones nearly
+      halve storage efficiency. `attr-stats` already reports per-key distinct-value counts, so the
+      classifier has exactly the input this implies. — *source: promote-cost, 2026-08-08*
+
+      **Correction, same day: the driver is in-segment *repetition*, not cardinality of any kind.**
+      Parquet builds its dictionary per column chunk, so what a promoted column costs is how much its
+      values recur *within a segment*. At a fixed 50 segments x 1,000 rows, per-key disk cost was
+      +1,206 B at 3,125x repetition, +22,067 B at 50x, and +108,842 B when every value was unique per
+      row. Spreading 50,000 globally-distinct values across 50 segments barely helped (+108,842 vs
+      +114,284 B/key) because the values were still unique per row — segmenting does not reduce how
+      many distinct strings must be stored. **So a gate on global distinct count is wrong**, and would
+      reject exactly the keys worth promoting: `pod.name` has huge global cardinality but only the
+      currently-running pods appear in any one segment, each on many rows, so it is cheap.
+
+      **Second correction, same day: repetition is necessary but not sufficient — run structure is
+      the larger term.** A promoted column is a dictionary *plus a per-row `Int32` index array*, and
+      the index array's compressed size tracks the **entropy of the value sequence**, which
+      repetition cannot see. `archetype-bench` isolated it with a controlled pair: the same session
+      population, ~25 events each, laid out contiguously versus interleaved across 200 concurrent
+      sessions — **9,079 B against 64,252 B**, 7.1x apart, of which only ~2x is postings. A
+      `rows/postings` gate rated `k8s.pod.name` (42,135 B) cheaper than the contiguous sessions
+      (9,079 B). The model is now
+
+          est B/row = [ C(seg) * mean_len + runs * log2(C(seg)) / 8 ] / rows_per_segment
+
+      which ranks all seven archetypes in exactly their measured disk order across a 26x range.
+      Absolute values run 2-5x high (zstd beats the model), so it ranks keys rather than sizing
+      budgets. `attr-stats` now counts `runs` — which required `scan.rs` to walk rows in order, since
+      the dictionary path previously tallied per-entry counts and discarded order entirely.
+
+- [ ] **Cross the demand signal with the cost signal — cost alone picks the wrong keys.**
+      `archetype-bench` measured promotion's *speed* win and it is entirely at **unselective**
+      filters: `env` at 100% selectivity went 19.80 -> 6.93 ms and `http.method` at 14% went
+      10.52 -> 6.92 ms, while every key at or below 1.7% saw **no win at all** — the `attrs` index
+      already has those at the `count(*)` floor (5.10 ms against a 5.62 ms floor). That is the same
+      boundary the cost gate shows from the other side, declining to prune above a ~50% hit fraction.
+
+      So a promoted column pays for keys that are queried *unselectively*, and the cost model — even
+      the corrected two-term one — cannot express that, because it only answers "what would this
+      column cost", never "would anyone benefit".
+
+      **A demand counter existed and was cut before release (2026-08-09).** `Db::attr_access_stats`
+      tallied `(key, backend, count)` at SQL-construction time. It was removed rather than shipped
+      because nothing consumed it and, more importantly, it recorded the wrong thing:
+      - **no selectivity**, which the archetype measurements show is the deciding axis — promotion's
+        win is entirely at unselective filters (`env` at 100%: 19.80 -> 6.93 ms; nothing at or below
+        1.7%);
+      - **filters and projections conflated** — `select.push(format!("{} AS g{i}", p.attr_field(k)))`
+        increments identically to a `WHERE` predicate, so a key only ever grouped by is
+        indistinguishable from one filtered on, and only the latter bears on the index gate.
+
+      What a replacement needs, so the next attempt starts from the measured requirement: record the
+      **role** (filter vs projection) and a **selectivity bucket**, and populate it *after* results are
+      known rather than at SQL-build time. Build it together with its consumer — either the promotion
+      recommendation, or making the reactive Tantivy `RowSelection` gate predictive (skip the index
+      search for keys known unselective; measured waste ~0.28 ms per segment when the gate declines,
+      sized at ~1% of a 5.5 ms query, so that alone does not justify it).
+      — *source: archetype-bench, 2026-08-08*
+
+- [ ] **The metrics attribute gap: close it with `promote`, not with a metrics index.** Measured with
+      `examples/bench --bin metricattr-bench` (20 segments x 5,000 points, 10 labels/point, best of 5).
+      Metric tables get no `.tidx` (§8), so an arbitrary label matcher is a full JSON scan. The gap is
+      **+26.0 ms over the `count(*)` floor at both selectivities** (33.4 ms vs a 7.4 ms floor), and it
+      is the same 26 ms whether the matcher selects 50% or 1% of points — the JSON cost is per row
+      scanned, not per row matched.
+
+      **A promoted column recovers 95–97% of it, at every selectivity**: 33.4 → 8.1 ms at 50%
+      selectivity, 33.7 → 8.8 ms at 1%. **Extending the `attrs` index to metric segments recovers the
+      gap only when the matcher is selective**: at 1% the indexed `logs` path runs the same filter in
+      6.2 ms, but at 50% the cost gate declines to prune and it recovers nothing (measured directly in
+      `attr-bench`: the index search costs ~0.28 ms and saves 0 when it declines). PromQL selectors
+      like `service="api"` in a single-service deployment are exactly the unselective case.
+
+      So the index would cost a Tantivy build at seal on the **highest-volume signal** — which §8
+      deliberately avoids — to help only selective filters on un-promoted keys, while promotion helps
+      every filter on promoted keys with infrastructure that already exists. **Recommendation: do not
+      build a metrics index.** Use `promote`, now that `imbh-attrstats` makes the key set choosable
+      from data instead of guesswork. (`Db::attr_access_stats` was cut 2026-08-09 — it contributed to
+      no push-down and conflated filters with projections; see the demand-signal item below.)
+
+      Residual, and it is the honest limit: promotion is curated, so an *arbitrary* metric label still
+      pays the +26 ms JSON scan (down from ~78 ms before the targeted extractor). Fully serving "any
+      attribute" on metrics would need either the index or the still-sigma-gated segment bloom. Note
+      the caveat on the cross-signal comparison: `logs` and `metrics_gauge` have different schemas, so
+      the +4.1 ms by which the indexed logs path trailed metrics at 50% conflates table width with
+      index cost — the clean index-cost number is the 0.28 ms from `attr-bench`.
+      — *source: metricattr-bench, 2026-08-08*
+
+- [ ] **The `CAST(col AS VARCHAR)` in `attr_field` is pure overhead for equality filters — measured.**
+      A promoted key compiles to `CAST("k" AS VARCHAR)` so the fragment's Arrow type is the same
+      whether or not the key is promoted; that matters for the *projection* sites (`… AS g{i}` group-by
+      outputs, where dropping it would make a result column's type depend on the promote set) but not
+      for filters. Measured with `attr-bench` at all four selectivities: `"k" = 'v0'` in dictionary
+      space beats `CAST("k" AS VARCHAR) = 'v0'` by **0.20–0.31 ms** per 100k rows, consistently —
+      *more* than the new `CASE` fallback costs (+0.04–0.11 ms). A predicate-level helper
+      (`attr_eq_sql(key, value)` beside the value-level `attr_field`) emitting
+      `("k" = $v OR ("k" IS NULL AND json_get_str(attributes,$k) = $v))` would be both correct and
+      faster than what shipped before the fallback existed. This cannot come from `attr_field` itself:
+      it returns a *value* expression, and a `CASE` whose arms are `Dictionary` and `Utf8` is coerced
+      back to `Utf8`, reintroducing the cast. ~5% of a 5.5 ms query — real but small; do not extend it
+      speculatively to the other matchers. — *source: attr-bench, 2026-08-08*
+
+- [x] **A read-only handle used its own `promote`, not the writer's.** *(Closed 2026-08-08.)* The
+      read-only `Storage` was built with the reader's *builder* config and nothing read the writer's
+      set off disk, so reader and writer could disagree about the schema of the same segments. The
+      `CASE` fallback made that *correct* but not *coherent*, and auto-promotion — where the writer's
+      set changes at run time and a reader could never learn it — needed coherence.
+
+      **The promoted set is now durable database state**, recorded in `db.info` (one escaped
+      `promote\t<key>` line per key, temp→rename) and read at open:
+      - omitting `DbBuilder::promote` **inherits** the database's set rather than resetting it to
+        empty. An explicitly empty `Promote` still demotes everything — only *omitting* the call
+        inherits, which is why the builder field became `Option<Promote>` internally. Without that
+        distinction, every host that stopped passing its list would have silently demoted its DB.
+      - a read-only handle adopts the durable set and ignores its own builder outright.
+      - `Storage::promote()` returns an owned `Promote` (the set is mutable now, so handing out a
+        reference would pin the lock), and `promote` moved behind an `RwLock`.
+
+      **Trap worth keeping:** `Storage::open` calls `write_db_info`, which rewrote `db.info` with
+      `Promote::default()` — so *opening* a promoted database erased the marker before the facade
+      could read it, and a reader then saw no promoted columns at all. Open must carry the existing
+      set through. Caught by the durability test, not by reasoning.
+      — *source: design review, 2026-08-08; fixed 2026-08-08*
+
+- [x] **A promote-set change must seal the buffer first.** *(Closed 2026-08-08.)* `concat_buffer`
+      concatenates buffered batches against the **live** schema, and `concat_batches` takes columns
+      *positionally* without validating them against the schema it is handed — so a buffer holding
+      batches encoded on both sides of a promote change can panic (first batch wider), silently
+      truncate (first batch narrower), or silently concatenate two differently-named promoted columns
+      into one. That is the same hazard §6.1 records for compaction; making the set mutable would have
+      reproduced it in the buffer.
+
+      `Storage::set_promote` seals, then takes the `inner` lock, verifies every buffer is empty, and
+      swaps under that lock. Correctness rests on ingest reading the promote set **beneath the same
+      lock it appends under** (`push_log_batch(&mut inner, rows, &self.promote_keys())`), so once the
+      swap holds `inner` with empty buffers, no encode can be in flight against the old set. A racing
+      ingest between the seal and the lock costs another round; bounded at 8 attempts rather than
+      spinning forever inside a public call. A no-op change short-circuits without sealing.
+
+      Exposed as `Db::set_promote` / `BlockingDb::set_promote`, rejected on read-only handles. The
+      regression test was verified to fail with the seal removed, rather than merely passing with it.
+      — *source: design review, 2026-08-08; fixed 2026-08-08*
+
+- [x] **Compaction baked an all-NULL promoted column into merged segments.** *(Closed 2026-08-09.)*
+      `compact_partition` normalised every source batch to the live promote set with
+      `coerce_to_schema`, which null-fills a column the segment predates. **Not a wrong answer** — the
+      `CASE` fallback is immune, since a null-filled column takes the JSON arm exactly as an absent
+      one would, which remains a decisive point in its favour over any scheme keyed on column
+      absence. *(A backlog summary of mine on 2026-08-08 called this the last remaining wrong-answer
+      bug. That was wrong; this entry always said otherwise.)*
+
+      It was a **convergence** defect: compaction is the one operation that rewrites these rows, so
+      null-filling there made the fallback permanent and every query on the key kept paying a JSON
+      parse over that data for the life of the merged segment. `backfill_promoted` now projects the
+      column from the retained `attributes` JSON via the same `build_promoted_columns` /
+      `lookup_promoted` path seal uses, so a back-filled cell and a sealed-at-ingest cell cannot
+      disagree. Only columns the *source* lacked are derived — a column the source had is kept, since
+      a NULL there means the row genuinely carried no string value and re-deriving would spend a
+      lookup to reproduce it.
+
+      Two notes worth keeping. An existing storage test asserted the old `[None, None, Some]`
+      behaviour and had to be updated — the null-fill was deliberate, not accidental. And the zip in
+      `backfill_promoted` goes through `promoted_columns(missing)` rather than `missing` defensively;
+      the misalignment it guards against looks **unreachable** today (`missing` holds only keys absent
+      from the source schema, and the reserved names are the built-in columns, which every segment
+      has), so the test written to catch it does not — verified by reintroducing the bad zip and
+      watching the test still pass. The guard stays for the day the built-in column set changes.
+      — *source: design review, 2026-08-08; fixed 2026-08-09*
 
 - [ ] **`cargo release` still cannot be run as configured — five releases and counting.** Two
       independent defects in the root `Cargo.toml`, worked around by hand for v0.5.0, v0.6.0, v0.6.1,
@@ -534,6 +719,415 @@ git history); this file tracks only what is still open.
       Not done deliberately: a persistent retry queue so a refused unlink retries on the next pass
       rather than waiting for a reopen — invasive new durable state, and the orphan sweep already
       bounds the leak. — *source: TODO sweep 2026-08-06*
+
+- [x] **`ARCHITECTURE.md` says the Tantivy `attrs` field is not built. It is.** *(closed 2026-08-08 —
+      §6.1 item 3, the §8 schema list + deviation block, and the §9.2 pushdown contract were all
+      rewritten against the code; the `imbh-index` crate docs were already correct. Fixing §9.2
+      surfaced two further inaccuracies in the same list, handled as described in the follow-up item
+      below.)* §6.1 item 3 and the
+      §8 deviation block both state that the original design's Tantivy JSON field for attributes was
+      never implemented, so "attribute predicates do not push into Tantivy — they run as UDF scans
+      over surviving rows". That is false as of the current tree: `crates/imbh-index/src/lib.rs`
+      adds an `attrs` JSON field (raw tokenizer, indexed as `attrs.<key> = <value>`, string values
+      only) and exposes `search_attr_eq`, and `crates/imbh-query/src/provider.rs:199`
+      (`has_attr_index()` + `attr_eq_predicate`) pushes attribute equality down as `Inexact`,
+      resolving it to a cost-gated `RowSelection` through the same row-ordinal bridge as `matches`.
+      `has_attr_index()` is `text_column.is_some()`, so the pushdown covers `logs`/`spans` and
+      metric tables correctly fall through to a scan. Index-vs-`json_get_str` agreement is pinned by
+      `attr_eq_index_matches_rowwise_fallback`. Fix the two prose sites; also check §9.2's pushdown
+      contract, which lists "attribute equality (no Tantivy attrs field)" under **Unsupported** and
+      is stale for the same reason, and the `imbh-index` crate docs if they disagree. Worth doing
+      because these three sites are the canonical design reference: a design discussion on
+      2026-08-08 (whether to migrate the backing store to Tantivy, Quickwit-style) reached the wrong
+      recommendation from them, proposing as new work something the tree already ships. While
+      there, confirm whether the LTM notes (`full-text-search-tantivy-bridge.md`,
+      `query-engine-and-typed-apis.md`) carry the same stale claim. *(The LTM check is the one part
+      not done — the two notes were not read.)*
+
+- [x] **Trace search defeated its own bloom filters.** *(Closed 2026-08-08.)* `TracesApi::search`
+      phase 2 issued `WHERE hex(trace_id) IN (…)`, a shape `bloom_id_eq` explicitly excludes (it never
+      yields the raw id bytes a bloom needs), and the extractor only matched `Operator::Eq`, never
+      `Expr::InList` — so the most bloom-friendly predicate in the system read every span segment in
+      the DB. Fixed on both sides: phase 2 now binds raw `trace_id` bytes
+      (`SqlParams::id_bytes` → `ScalarValue::FixedSizeBinary`), and the provider's new `bloom_probe`
+      treats a probe as a *candidate set*, skipping a segment only when the blooms prove every
+      candidate absent. **The load-bearing discovery**: DataFusion's `ShortenInListSimplifier` rewrites
+      an `IN` of ≤ 3 values into an `OR` chain, and `SimplifyExpressions` runs *before* `PushDownFilter`
+      — so handling `Expr::InList` alone would have silently done nothing for the common small-k case.
+      The `OR` shape is handled too, verified with both 2-value and 4-value queries. Measured: phase-2
+      fetch over 3 traces in 3 bloom-carrying segments → 2 pruned, 1 scanned, identical rows to the old
+      query (old form measured 0 pruned, 3 scanned in the same test). Phase 1 deliberately unchanged —
+      its id set is a subquery that DataFusion decorrelates, so the outer scan carries no id predicate
+      for a bloom to probe. No public API change. — *source: design review + implementation, 2026-08-08*
+
+- [x] **Reconsider option (a) — manifest `min/max_time` pruning before the file is opened.**
+      *(Closed 2026-08-08 — implemented, and it recovered almost exactly what the measurement
+      predicted.)* `SegmentInput` gained `time_range: Option<(i64, i64)>` (manifest bounds, inclusive)
+      and `TableInput` gained `time_column: Option<&'static str>` naming the column those bounds
+      describe; the scan loop tests pushed range probes against the declared bounds **before**
+      `row_selection_for` or `open_segment`, so an excluded segment costs no `File::open`, no footer
+      read, and no `.tidx` search. The `time_column` guard is load-bearing: without it a range
+      predicate on another INT64 column (`duration_ns`) would be tested against time bounds and skip
+      segments that do match. Same bench, same host: the 1-of-60 window went **2.09 ms → 0.73 ms**, a
+      further 2.9x on top of option (b) and **11.9x against the HEAD baseline of 8.71 ms**. Both
+      mechanisms are kept — the footer-statistics path still handles segments with no declared range
+      and still does the row-group narrowing. **Semver: this is a breaking change** to the published
+      `imbh-query` (two new public fields on structs with public fields, plus an argument on
+      `SegmentTableProvider::new`). Under Cargo's 0.x rules that requires a minor bump, which the
+      canonical-JSON item already puts on the table for the next minor — it rides along at no extra cost, but
+      it must not ship as a patch. — *source: prune-bench A/B + implementation, 2026-08-08*
+
+      Original finding: It was
+      declined during the time-pruning work as a second-order win needing a breaking `SegmentInput`
+      change. **Measurement moved it.** `examples/bench --bin prune-bench`, 60 segments x 2,000 rows,
+      best of 5, A/B against a pristine HEAD worktree: a 1-of-60-segment time window went
+      **8.71 ms → 2.09 ms (4.2x)**. But a 60x reduction in rows read bought only 4.2x, because option
+      (b) still opens all 60 Parquet footers — the residual ~2 ms is ~35 us per segment of footer I/O
+      and is now the dominant cost of a narrow query. Corroborated by the trace path landing at the
+      same floor: a pruned point lookup is 2.12–2.36 ms over the same 60 segments. Option (a) attacks
+      exactly that residual and would compound with (b), not replace it. Re-cost it against the
+      `SegmentInput` break now that the payoff is a measured number rather than a guess.
+      — *source: prune-bench A/B, 2026-08-08*
+
+- [x] **`attr-stats`'s `hint` column collapsed two independent axes.** *(Closed 2026-08-08.)* On the
+      `prune-bench` corpus `shard` has 60 distinct values and sigma **0.017** (= 1/60 exactly, every
+      value in the lowest histogram bucket) — and the classifier hinted `promote`, because 60 values
+      reads as low cardinality. Both readings are defensible and that was the problem: cardinality
+      and sigma are orthogonal, so `shard` wants a promoted column (fast filtering) *and* a segment
+      index (pruning), and one `hint` produced by an if/else chain could only ever say one.
+
+      Now two independent columns, `promote` and `index@`, and the split fixed a second defect on the
+      way. **The promotion gate no longer looks at cardinality at all.** It was `distinct_est <= 256`,
+      which the `promote-cost` correction above had already shown to be the wrong axis. It became
+      `postings / rows` the same day, and then — after `archetype-bench` found that gate mis-ranking
+      keys by up to 7x — the two-term `est B/row` model recorded above. Below
+      `PROMOTE_MIN_ROWS_PER_SEGMENT` rows/segment the verdict is `-` rather than a guess, so the
+      classifier declines to blame a key for the corpus; and the estimate is normalised **per row**
+      because an absolute per-segment threshold calls every key in a short segment cheap (caught by
+      the regression test below, which rejected the first threshold immediately).
+
+      `the_promotion_verdict_follows_repetition_not_cardinality` pins the finding as behaviour: over
+      6 segments x 200 rows, `env` (1 distinct value) and `pod` (6, a fresh one per segment) have
+      **identical** postings, repetition and verdict — 6x apart in cardinality, same cost — while
+      `req_id` (1,200, unique per row) is `costly`. And the two verdicts point opposite ways for
+      `pod`: `promote yes`, `index@ all`.
+
+      **`index@` reports a scale, not a yes/no**, which is what the window ladder made possible. A
+      segment index prunes `1 - sigma`, and sigma depends on the range queried: a value can occupy a
+      tiny fraction of a day's segments and all of the segments in the minute it appeared. So the
+      column names the widest rung whose mean sigma is still <= 0.25 (`all` when even the whole scan
+      qualifies, `-` when no rung does). `sigma(w) = C(seg)/C(w)` falls straight out of the ladder's
+      definitions, with `sigma(all) = 1/locality`. Note it is a **mean**, while section 1's
+      `p50`/histogram give the distribution at segment scale — both are printed, and a key whose mean
+      and median disagree is one whose values differ a lot from each other.
+      — *source: prune-bench + attr-stats, 2026-08-08; split and re-gated 2026-08-08*
+
+- [ ] **Point `examples/attr-stats` at a production database.** *(Scope reduced 2026-08-08 — see
+      `archetype-bench`. The decision rule is now validated against seven attribute archetypes that
+      bound the space of shapes real telemetry occupies, so the open question is no longer "what does
+      the data look like" but "which of these archetypes are present, and in what proportion" — which
+      a handful of parameters answers without the data leaving anywhere. Two are already known from
+      the operator: request- and session-scoped identifiers do appear as attributes, and concurrent
+      pods number under 50. Note `attr-stats` output contains no attribute values at all — the
+      bottom-k sketch only ever hashes them — so what it emits is key names plus aggregates.
+      **Reach extended 2026-08-09:** the measurement is now the `imbh-attrstats` crate rather than an
+      example binary, so it can be read off a *running* `imbhd` (`POST /api/head/attributes/stats`) or
+      off the TUI Overview's attribute block — no CLI to ship to the machine holding the data, and no
+      database directory to hand over.)* The tool is built and green
+      (`cargo run -p attr-stats -- <db-dir> [--scope all|attributes] [--last <min>] [--windows 1m,1h,24h]
+      [--top N] [--json]`),
+      and it is the input to *two* open decisions: whether a segment-granularity attribute index is
+      worth building, and whether `promote` could be chosen automatically. It reports, per table and
+      per key, distinct-value count, `postings` (the `(key, value, segment)` entries such an index
+      would store), the sigma distribution (p50/p90/max/mean, fraction ≤ 0.25, 10-bucket histogram),
+      and — restricted to record-`attributes` string values, matching `lookup_promoted` exactly — the
+      promotion-candidate stats. **Run on `gen-demo-db` every sigma is exactly 1.000**, for all 19 keys
+      across 5 tables, with `frac ≤ 0.25` at 0.00 everywhere. That is the signature of synthetic data,
+      not a finding: the generator emits a fixed label set every step and each run flushes one segment,
+      so "every value in every segment" is the generator author's choice. The demo DB also contains no
+      high-cardinality attribute at all (trace/span ids are columns, not attributes), so it never even
+      exercises the sampling path. **Both design questions therefore remain open**, and closing them
+      needs this pointed at data with real pod names, build ids, or customer ids. — *source: design
+      review + implementation, 2026-08-08*
+
+- [ ] **Decide whether the cardinality curve becomes a *persisted* statistic.** `attr-stats` now
+      measures cardinality at a ladder of window widths, not just at the segment (`--windows`,
+      default `1m,1h,24h`; section 2 of the report). The motivation is that sigma answers the pruning
+      question at exactly one granularity, and the same key can be localized against a day and
+      interleaved against a minute — so `C(w)`, the mean distinct values within one window of width
+      `w`, is a curve whose *shape* is the answer. Flat (`loc = C(all)/C(seg) ~ 1`) means every
+      segment already holds every value and nothing prunes at any scale; rising means values churn,
+      and the width where it flattens is the horizon beyond which segment pruning stops paying. The
+      report also emits `rep` (`rows / postings`, in-segment repetition), which is the number the
+      promoted-column cost measurement identified as the real driver, so the two live side by side.
+      **What is still open is where this lives.** Today it is offline and after-the-fact: one pass
+      over sealed Parquet, no manifest change, no cost at seal. Making it a statistic the *database*
+      keeps means per-segment state at seal — and the wider rungs cannot be per-segment by
+      construction, since they aggregate across segments. The shape that works is a **mergeable
+      per-`(segment, key)` sketch**, folded at read time to get any window: retention then drops a
+      segment's sketch with the segment, and no bucket is stored twice.
+
+      **The merge property was measured, found to half-hold, and then made to hold.**
+
+      As originally written, `SampledMap` bounded itself by adaptive halving: retain
+      `hash(k) <= u64::MAX >> shift`, and raise `shift` whenever the map is full. Folding was
+      *sound* under that scheme (complete counters, a valid sample, the cap honoured) but could not
+      be *exact* — because there was no single direct-scan answer to be exact to. The scan itself
+      was order-dependent: it halved whenever the map was full **at the moment a key arrived**, so
+      different arrival orders reached different rates, kept different keys, and reported different
+      `estimated_total`s over identical input. An exhaustive permutation search over 4,800
+      (key-family, n, cap) combinations found 60,012 permutation pairs disagreeing on the *estimate*.
+      That was a property of the already-shipped accumulator, not of merging: `distinct`/`postings`
+      were reproducible only while the caps were disengaged — i.e. exactly when they print without
+      the `~` marker.
+
+      **`SampledMap` is now a bottom-k sketch**: a single `BTreeMap<u64, V>` keyed by the hash of
+      the entry's name, which is the lookup structure and the order structure at once (`pop_last` is
+      the eviction). The retained set is a pure function of the name *set*,
+      so all three properties now hold and are pinned by tests in `accum`:
+      - counters are complete, never partial (a key in the final bottom-k was in the bottom-k of
+        every prefix containing it, so it was admitted on first sight and never evicted);
+      - the sample is independent of arrival order — 78,300 permutations, zero disagreements, on
+        the same sweep that previously found tens of thousands;
+      - **folding is exact**, above the cap as well as below: a 3-part fold and a single pass agree
+        on keys, counters, rate, and estimate. So a persisted per-`(segment, key)` sketch is a
+        viable basis for the ladder, and retention drops a segment's statistics with the segment.
+
+      Two traps worth keeping. (1) The predecessor's `shrink()` cut at `len >= cap` because the scan
+      path called it *before* inserting one more key; a merge inserts nothing afterwards, so reusing
+      it cut one rate further and silently halved the sample. (2) In the bottom-k version, eviction
+      and refusal are both drops — marking only refusals leaves a map that evicted freely still
+      reporting itself exact. Both were caught by tests that failed loudly, the second by the
+      order-dependence test continuing to pass when it should have started failing. (3) The first
+      cut kept a `HashMap<Rc<str>, V>` beside a `BTreeSet<(u64, Rc<str>)>` — a shadow index holding
+      an entry for every key, 1:1 with the map, to answer only "what is the maximum", and hashing
+      every name twice per lookup (SipHash for the probe, xxh3 for the predicate). Keying by hash
+      collapsed both containers into one, dropped ~88 bytes of identity per value entry to 8, and
+      removed `MAX_VALUE_BYTES` digest folding entirely — value text is never read back, so it is
+      never stored.
+
+      **A persisted sketch would also need a run counter.** The fold described here carries value
+      *presence* per segment, which is what sigma and the cardinality ladder need — but the dominant
+      term in promoted-column cost turned out to be value *order* within a segment (see the
+      `archetype-bench` correction above), and order is not something a set union preserves. A
+      per-segment `runs` tally is additive across segments and would ride alongside the sketch, but
+      it has to be designed in rather than derived from it.
+
+      `SampledMap::merge` remains `#[cfg(test)]`: it establishes the property, and nothing in the
+      tool calls it yet. What is still open is the persistence itself — per-segment sketches written
+      at seal, and the manifest/retention plumbing. Do not size that before the previous item (real
+      data): on synthetic corpora every curve is flat by construction, exactly as every sigma is
+      1.000.
+      — *source: window ladder + merge verification + bottom-k conversion, 2026-08-08*
+
+- [x] **`Db::segment_files()` returned empty for read-only handles.** *(Closed 2026-08-08.)*
+      `Storage::open_read_only` leaves the in-RAM segment lists unpopulated (a reader derives its
+      view per query), so the accessor silently reported no segments for a fully populated database —
+      `[]` is indistinguishable from "this table has no segments", so a host handing the paths to
+      DuckDB `read_parquet` (the documented use, §10.11) got no data and no error.
+
+      Fixed by deriving from `read_disk_snapshot` on read-only handles — the same source the reader's
+      query path already uses — and by making the accessor **fallible**: `Db::segment_files` now
+      returns `Result<Vec<PathBuf>>`. Breaking for the `imbh` facade, taken in the window after v0.7.0
+      (which shipped without it — the change is on the unmerged housekeeping branch),
+      and the signature is the point: a reader must be able to report an I/O failure rather than mask
+      it as an empty database, which the infallible form could not express. `BlockingDb` gained the
+      mirroring `segment_files` it had been missing.
+
+      **Scope correction.** This was initially scoped as a *family* of accessors on the theory that
+      anything reading `inner.segments` was affected — `stats()`, `snapshot()`, the
+      retention/compaction scans. Reading the callers rather than the field shows otherwise:
+      `Db::stats` already branches to `reader_stats()` (which uses `read_disk_snapshot`) and
+      `Db::snapshot` already calls `ensure_writable()?`, so it refuses explicitly instead of
+      returning something wrong. `segment_files` was the only silent one. Lifting the writer-only
+      restriction on `snapshot()` for readers remains open, but it is a feature, not a defect — the
+      code comment marks it "for now".
+
+      Regression test `read_only_segment_files_sees_the_writers_segments` covers both handles across
+      two seals plus the empty-table cases, and was verified to fail against the old behaviour
+      (`[]` vs the writer's one path) rather than merely passing against the new one.
+      — *source: attr-stats implementation, 2026-08-08; fixed 2026-08-08*
+
+- [x] **The `housekeeper` feature gated the binary, not the merge machinery.** *(Closed 2026-08-09.)*
+      There is now a `compaction` feature (on by default, like the other footprint levers) gating
+      `Storage::compact`, `compact_partition`, `rewrite_segment_set`, `prepare_pending` and their
+      helpers; `commit_pending` stays in every build, because applying a record is cheap bookkeeping
+      an embedded host still wants. `housekeeper` implies `compaction`.
+
+      **Measured, and the design note oversold it.** That note listed "Parquet write, Tantivy build,
+      sort, JSON projection" as machinery the host would stop carrying; two of those are wrong, since
+      **seal** already writes Parquet and builds the sidecar. Dropping `compaction` removes **no
+      dependency at all** — 381 crates either way — and 110,434 B of code, 2.5% of `libimbh.rlib` in
+      release. The gate still earns its place as an API-surface guarantee (a host that does not link
+      the rewrite cannot start an unbounded one on its own thread), which is what it is now claimed to
+      deliver. Corrected in the note and in the feature's own comment.
+      — *source: housekeeper implementation, 2026-08-09; closed 2026-08-09*
+
+- [x] **An embedded host that never called `maintain()` never picked up pending records.**
+      *(Closed 2026-08-09.)* The default `Maintenance::Manual` means a host may never call
+      `maintain()`, so a housekeeper's work sat on disk indefinitely — and the preparer, seeing
+      nothing land, re-prepared the same partitions on every pass, burning IO forever.
+
+      Now committed at **`open()`** (after the promoted set is applied — records validate against it,
+      so committing earlier would discard every one as stale) and at **`close()`** (swallowing any
+      failure, which leaves the records for the next open, exactly the state a crash would produce).
+      One `read_dir` of a usually-empty directory, on paths already doing recovery work.
+
+      Note the ordering that makes the restart test meaningful: `cleanup_orphans` runs inside
+      `Storage::open` and the commit runs after it, so a merged result *proves* cleanup respected the
+      pending record — had it swept the output, the commit would have failed its digest check.
+      — *source: housekeeper implementation, 2026-08-09; closed 2026-08-09*
+
+- [ ] **Housekeeping handoff: the questions left open when the design was folded into ARCHITECTURE §7.2.**
+      *(From the retired `COMPACTION_HANDOFF.md`, 2026-08-09.)*
+      1. The pending record lives in `pending/` as its own file. A manifest frame type would reuse the
+         framing and replay path, at the cost of putting non-committed state in the committed log. The
+         current choice was made for simplicity, not after weighing that.
+      2. No lease stops two housekeepers duplicating work. A `maintain.lock` is cheap and would not
+         block the writer. Not a correctness requirement — duplicate work is discarded at commit, as
+         the end-to-end test shows — so it is an optimisation.
+      3. `append_frame` uses `write_all`, which loops on a short write. `O_APPEND` makes a *single*
+         `write` atomic against other appenders; a looping one does not. Not a live bug (the manifest
+         has one mutator), but any future multi-mutator design must make it a guarantee rather than an
+         observation.
+      — *source: design note consolidation, 2026-08-09*
+
+- [ ] **Auto-promotion policy, for when it is built.** *(From the retired `AUTO_PROMOTION_PLAN.md`,
+      2026-08-09 — the rest of that plan is superseded: its `coalesce` rejection was refuted, its
+      correctness constraint fixed by the `CASE` fallback, its "unmeasured prerequisite" measured, its
+      promotion-epoch design rejected because re-promotion makes a key's validity a set of intervals,
+      and its compaction back-fill shipped.)* What survives is policy, none of it implemented:
+      - **Slow to promote, willing to demote.** Demotion is correctness-free — the key never left the
+        JSON blob — while promotion is the direction that needed the read-side fallback. That is the
+        opposite of the usual cache intuition.
+      - **Hysteresis.** Promotion is a schema change; flapping multiplies distinct segment schemas and
+        stresses `coerce` and compaction normalisation. Require sustained evidence, and rate-limit to
+        at most one change per compaction cycle.
+      - **Manual override stays authoritative.** `DbBuilder::promote` pins its keys; automation may
+        only add, never remove. Hosts that know their data should not be second-guessed.
+      - **Kill criteria**, worth checking before building rather than after: access counts turning out
+        flat (no small key set captures the benefit), or a promoted column proving expensive enough
+        that the budget shrinks to a handful of keys and hand-authoring is fine.
+      - **Out of scope by construction:** promoting non-string values or `resource`/`scope` keys
+        (`lookup_promoted` is record-scope, `AnyValue::Str` only, and the fallback's soundness depends
+        on it); and dropping a promoted key from the JSON blob — promotion is a *projection*, not a
+        relocation, and every fallback path depends on the JSON still being there.
+      — *source: design note consolidation, 2026-08-09*
+
+- [ ] **Pacing is only `--max-jobs`.** Convergence is triggered by schema lag, so the first pass after
+      a `set_promote` makes **every** segment lacking the new column eligible. `--max-jobs` bounds one
+      pass but nothing orders the work — oldest-first, or smallest-first, would both be defensible and
+      neither is implemented; the planner takes tables and days in iteration order. Also worth deciding
+      whether in-process `Db::compact()` needs a cap of its own, since it has none.
+      — *source: housekeeper implementation, 2026-08-09*
+
+- [ ] **`Compression` is still per-handle config, unlike `promote` and `retention`.** The housekeeper
+      writes its output with `Compression::default()`, which may differ from what the host writes.
+      Segments are self-describing so this is *correct* — it costs a size difference and nothing more,
+      which is what the binary's comment says — but it is the same incoherence that made a reader and
+      writer disagree about promoted columns, and the same fix applies (persist it in `db.info`, let
+      omitting the builder call inherit). Lower stakes than the other two, hence not done with them.
+      — *source: housekeeper implementation, 2026-08-09*
+
+- [ ] **`DbStats` cannot gain a field without a breaking change.** `crates/imbh/src/lib.rs:1892` is a
+      plain `#[derive(Debug, Clone)]` struct with no `#[non_exhaustive]` and no `Default` — that file
+      has zero `#[non_exhaustive]` attributes anywhere. Adding any field breaks every downstream struct
+      literal across 12 published crates. This is why the sigma tooling landed as an example binary
+      rather than a `Db` stats API. If telemetry surfaces are ever expected to grow, `#[non_exhaustive]`
+      on the stats structs is a one-time breaking change worth making deliberately at the next major,
+      instead of paying it per field forever. — *source: attr-stats implementation, 2026-08-08*
+
+- [x] **Promoting a key makes its equality filter prune *less* — measured, and it does not matter.**
+      *(Closed 2026-08-08 as WONTFIX. `examples/bench --bin attr-bench`.)* The mechanism claim was
+      right and the performance claim built on it was wrong. Measured 20 segments x 5,000 rows, best
+      of 5, no time predicate, on a DB with `promote(["k"])` so both spellings exist per row; the
+      pruning component isolated by re-running with `SELECTIVITY_THRESHOLD = 0.0`. The promoted
+      column beats the *indexed* json path at 50% (5.47 vs 24.10 ms), 10% (5.53 vs 10.47) and 1%
+      (5.68 vs 6.13) selectivity, and loses only at 0.1% by 0.35 ms. Reason: index pruning is worth
+      11–16 ms on the json path almost entirely by **avoiding the JSON parse** on non-matching rows —
+      a promoted column has no JSON parse, because removing it is what promotion already did. The
+      promoted path sits within 0.13–0.55 ms of the bare `count(*)` floor at every selectivity, so
+      that is the whole budget the push-down could recover: under 8%, and nothing at all at 1%. The
+      only regime where it would help needs ~1,000 distinct values on one key — a high-cardinality
+      key, which §6.1 says not to promote in the first place. Plan folded into
+      JOURNAL.md "Segment pruning: three stale doc claims, 11.9x on a time-bounded query, and a plan measured into the bin" (2026-08-08), which records the numbers and the retraction. — *source: attr-bench, 2026-08-08*
+
+      Original claim: `SqlParams::attr_field`
+      (`crates/imbh/src/sql.rs:69`) emits `CAST("k" AS VARCHAR) = $N` for a promoted key, a shape
+      `attr_eq_predicate` (`crates/imbh-query/src/provider.rs:653`) does not recognize — so it reaches
+      the provider as `Unsupported` and the segment is read in full, while the *same key un-promoted*
+      pushes into `search_attr_eq` and prunes. Promotion currently trades a JSON parse for a
+      dictionary decode but gives up row pruning, which is the opposite of what it advertises. The fix
+      is confined to predicate recognition plus threading the promote set into the provider; the
+      `attrs` index already carries the term, since a promoted key stays in the JSON blob. Plan
+      written up (since folded into JOURNAL.md, 2026-08-08). **Blocked on
+      the doc fix below** — §6.1 item 2's claim that promoted columns merge
+      `attributes` → `resource` → `scope` would make the push-down unsound if it were true.
+      — *source: design review, 2026-08-08*
+
+- [x] **`ARCHITECTURE.md` §6.1 item 2 states the wrong scope for promoted columns.** *(Closed
+      2026-08-08 — item 2 now states record-`attributes`-scope-only, matching `lookup_promoted`, and
+      records why the distinction is load-bearing.)* It says each
+      promoted column is "materialized at buffer-encode time from the row's canonical-JSON scopes with
+      record `attributes` → `resource` → `scope` precedence". The code does no such merge:
+      `lookup_promoted` (`crates/imbh-storage/src/lib.rs:2108`) reads the **record `attributes` scope
+      only**, and its own doc comment says resource and scope are deliberately excluded because "a
+      record-attribute predicate must not see a resource value". §6.1's own pushdown-dispatch
+      paragraph, a few lines later, contradicts item 2 and matches the code ("the column mirrors the
+      record `attributes` scope only"), as does `crates/imbh/src/sql.rs:64`. Correct item 2. This is
+      not cosmetic: the record-scope-only rule is exactly what makes the promoted column and the
+      Tantivy `attrs` field describe the same row set, which is the correctness premise of the
+      push-down item above. — *source: design review, 2026-08-08*
+
+- [x] **Time-range pruning does not happen at all. Confirmed 2026-08-08 — and fixed the same day.**
+      *(Closed 2026-08-08.)* Fixed via option (b): `supports_filters_pushdown` now claims INT64-domain
+      comparisons `Inexact` and the per-segment reader tests them against the Parquet row-group
+      statistics already in the footer it reads. Option (a) — manifest `min/max_time` pruning before
+      the file is opened — was **not** taken: `open_segment` already reads every footer
+      unconditionally, so (b) costs zero extra I/O relative to the status quo, while (a) would need a
+      breaking change to the published `imbh_query::SegmentInput` for the marginal win of skipping
+      that footer read. (b) also covers raw `db.sql()`, which (a) structurally cannot. Measured
+      end-to-end through the typed path: `LogQuery::range(200..400)` over three sealed segments →
+      `segments_scanned == 1`, `segments_pruned == 2`, where `segments_pruned` was structurally 0 for
+      `logs` at any range width before. No public API change. Caveat recorded in ARCHITECTURE.md §9.2:
+      the writer emits one row group per segment, so row-group *narrowing* is dormant in practice and
+      the whole-segment skip is the entire win; page-index pruning remains unimplemented.
+      — *source: design review + implementation, 2026-08-08*
+
+      Original finding: Three independent reads all
+      say the same thing: `supports_filters_pushdown` never claims a time predicate, so it never
+      reaches `scan()`; the per-segment reader (`crates/imbh-query/src/provider.rs:736`) applies only
+      the bloom whole-segment skip and the Tantivy `RowSelection`, never a row-group filter built from
+      column statistics; and `Storage::query_snapshot` (`crates/imbh-storage/src/lib.rs:886`) takes **no
+      time argument** — it hands back every segment of every table, and `writer_tables` passes them
+      all to the provider. `SegmentRef` carries `min_time_unix_nano`/`max_time_unix_nano`
+      (`crates/imbh-core/src/manifest.rs:12`) and nothing consults them on the query path. So a
+      `WHERE time > now() - 5m` query over a DB holding 30 days of data opens and reads all 30 days of
+      segments, and the `FilterExec` above the scan discards the rest. Correct, but the manifest data
+      needed to skip them is already in memory. Two fixes, independent: (a) filter segments by
+      `min/max_time` against the query's bound before building `TableInput` — needs the bound threaded
+      into the snapshot; (b) claim time predicates in `supports_filters_pushdown` and hand them to the
+      Parquet reader so row-group statistics and the page index (already written — §7 says page index
+      on) do intra-segment pruning. (a) is the larger win and the smaller change. This is likely the
+      single biggest read-path performance item in the tree, and it dominates any new index work — see
+      the segment-granularity discussion in JOURNAL.md "Segment pruning: three stale doc claims, 11.9x on a time-bounded query, and a plan measured into the bin" (2026-08-08).
+      — *source: design review, 2026-08-08*
+
+      Original question: Fixing §9.2 (item above) found that
+      `supports_filters_pushdown` claims no time-range predicate at all — the four shapes it claims
+      are `matches` / `NOT matches`, the `attrs` equality, and bloom id equality, all `Inexact`. The
+      old §9.2 text claimed time-range as **`Exact`**, "segment prune via manifest, row-group/page
+      prune via Parquet stats". Since DataFusion hands `scan()` only the filters a provider claims, a
+      time bound cannot be reaching the provider by that route, and no `min_time`/`max_time` predicate
+      pruning turned up in `imbh-query`, `imbh-storage`, or the facade on a grep. Yet §7
+      (Partitioning) describes range-based pruning as real, and the typed APIs all carry time bounds,
+      so *something* is presumably narrowing the segment set. Trace the real path and write it down;
+      if the answer is that predicate-driven time pruning is simply absent and every query reads every
+      segment, that is a performance finding worth its own item, not just a doc edit. §9.2 currently
+      says the mechanism is unconfirmed and points here. Also settle whether the `Exact` vs `Inexact`
+      distinction was ever intended: nothing in the tree returns `Exact`, and the
+      re-check-above-the-scan invariant that makes every pushdown a pure accelerator depends on that
+      staying true. — *source: ARCHITECTURE.md §9.2 rewrite, 2026-08-08*
 
 ## Closed, awaiting the next sweep
 

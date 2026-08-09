@@ -59,6 +59,7 @@ pub mod docker;
 #[cfg(feature = "grpc")]
 pub mod grpc;
 pub mod head;
+pub mod jobs;
 pub mod shutdown;
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -78,7 +79,8 @@ use tower::ServiceExt;
 
 pub use shutdown::{DEFAULT_DRAIN_TIMEOUT, Shutdown};
 
-use imbh::{Db, FlushPolicy};
+use imbh::{Db, FlushPolicy, Promote};
+use serde_json::{Value, json};
 
 /// The MCP server (protocol, tools, and the stdio transport) lives in its own crate, since the
 /// `imbh-tui` binary hosts the stdio half of it. Re-exported under the name this module has always
@@ -848,12 +850,56 @@ fn too_large(max_body: u64) -> Response {
     )
 }
 
+/// The router's state: the database, and the housekeeping jobs submitted against it.
+///
+/// The jobs live here rather than in a process global so two mounted routers over two databases keep
+/// two queues — the queue's whole job is to serialize passes over *one* database, and a global would
+/// serialize them across all of them while handing out ids that mean nothing to the other.
+///
+/// Every existing handler still extracts `State<Arc<Db>>`, through the [`FromRef`] below; only the
+/// housekeeping handlers ask for the whole state.
+#[derive(Clone)]
+pub struct AppState {
+    pub db: Arc<Db>,
+    pub jobs: Arc<jobs::Jobs>,
+}
+
+impl axum::extract::FromRef<AppState> for Arc<Db> {
+    fn from_ref(state: &AppState) -> Arc<Db> {
+        Arc::clone(&state.db)
+    }
+}
+
+/// The housekeeping queue as MCP sees it, so an agent submits and polls **the same** passes the HTTP
+/// endpoint does. The queue is server wiring and `imbh-mcp` sits below the server, so the capability
+/// is handed in rather than reached for; a host without one simply does not offer those tools.
+impl mcp::Housekeeping for AppState {
+    fn submit(&self, compact: bool, max_jobs: Option<usize>) -> Value {
+        let submission = self.jobs.submit(&self.db, compact, max_jobs);
+        let mut body = submission.job().to_json();
+        body["coalesced"] = json!(submission.is_coalesced());
+        body
+    }
+
+    fn get(&self, id: &str) -> Option<Value> {
+        self.jobs.get(id).map(|job| job.to_json())
+    }
+
+    fn recent(&self) -> Vec<Value> {
+        self.jobs.recent().iter().map(jobs::Job::to_json).collect()
+    }
+}
+
 /// The route table, over a shared `Db`.
 ///
 /// Public because it is the useful half of this crate for a host that already runs axum: mount it
 /// (or a `Router::nest` of it) in an existing application and imbh's endpoints come along, without
 /// [`serve`]'s opinions about runtimes, ports, or shutdown.
 pub fn app(db: Arc<Db>) -> Router {
+    let state = AppState {
+        db,
+        jobs: Arc::new(jobs::Jobs::default()),
+    };
     Router::new()
         .route("/", get(health))
         .route("/health", get(health))
@@ -868,6 +914,20 @@ pub fn app(db: Arc<Db>) -> Router {
         .merge(head::routes())
         .route("/admin/flush", post(admin_flush))
         .route("/admin/compact", post(admin_compact))
+        // Read and replace the promoted attribute keys (§6.1). On `/admin/*` rather than under the
+        // read-only `/api/head` prefix because it *writes*: it seals the buffer and changes the schema
+        // every subsequent segment is written with.
+        .route(
+            imbh_head::path::ADMIN_PROMOTE,
+            get(admin_promoted).post(admin_promote),
+        )
+        // Housekeeping is submitted, not performed: a pass can run for minutes, so `POST` answers a
+        // job id and the client asks about that id afterwards. See `jobs`.
+        .route(
+            "/admin/housekeeping",
+            get(admin_housekeeping_list).post(admin_housekeeping_submit),
+        )
+        .route("/admin/housekeeping/{job_id}", get(admin_housekeeping_get))
         // MCP's Streamable HTTP endpoint. `GET`/`DELETE` are the SSE-stream and session-teardown
         // verbs of the older revisions, which this server does not implement — `405` is the answer
         // the spec prescribes, and it is what tells a client not to wait for a stream.
@@ -876,7 +936,7 @@ pub fn app(db: Arc<Db>) -> Router {
             post(mcp_post).get(mcp_unsupported).delete(mcp_unsupported),
         )
         .fallback(not_found)
-        .with_state(db)
+        .with_state(state)
 }
 
 async fn health() -> Response {
@@ -909,10 +969,11 @@ async fn stats(State(db): State<Arc<Db>>) -> Response {
 
 /// `POST /mcp` — one MCP message in, one JSON-RPC message out (see [`mcp`]).
 async fn mcp_post(
-    State(db): State<Arc<Db>>,
+    State(state): State<AppState>,
     headers: axum::http::HeaderMap,
     body: Bytes,
 ) -> Response {
+    let db = Arc::clone(&state.db);
     let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
 
     // The DNS-rebinding check comes before anything reads the body: a page that should not be
@@ -937,7 +998,10 @@ async fn mcp_post(
         method: header("mcp-method"),
         name: header("mcp-name"),
     });
-    let reply = mcp::handle(&db, &body, &transport).await;
+    // The queue travels with the request, so an agent submits and polls the *same* passes the HTTP
+    // endpoint does rather than a second set of its own.
+    let housekeeping: Arc<dyn mcp::Housekeeping> = Arc::new(state);
+    let reply = mcp::handle_with(&db, Some(&housekeeping), &body, &transport).await;
     match reply.body {
         // Serializing a `Value` fails only on a non-finite float or a non-string map key, neither of
         // which the MCP module can construct — but a 500 beats a panic on a request path.
@@ -987,8 +1051,171 @@ async fn admin_compact(State(db): State<Arc<Db>>) -> Response {
     }
 }
 
+/// The promoted attribute keys now in effect, in column order.
+async fn admin_promoted(State(db): State<Arc<Db>>) -> Response {
+    promote_response(db.promote())
+}
+
+/// Replace the promoted attribute keys (ARCHITECTURE.md §6.1).
+///
+/// **The one `/admin` action that changes what future writes look like.** `Db::set_promote` seals
+/// first, so no buffered batch straddles the change, and every segment sealed afterwards carries the
+/// new column set; segments already on disk keep theirs, which is why reads stay correct either way
+/// (the `CASE` fallback in the SQL builder reads a promoted key out of the JSON blob wherever the
+/// column is absent).
+///
+/// The body carries the whole set rather than a delta — see [`dto::PromoteRequest`] — and the answer
+/// is the set now in effect, so a caller never has to re-read to find out what it got.
+async fn admin_promote(State(db): State<Arc<Db>>, body: Bytes) -> Response {
+    let request: imbh_head::dto::PromoteRequest = match serde_json::from_slice(&body) {
+        Ok(request) => request,
+        Err(e) => {
+            return Response::json(
+                400,
+                format!(
+                    "{{\"error\":{}}}",
+                    json_string(&format!("request body is not a promote request: {e}"))
+                )
+                .into_bytes(),
+            );
+        }
+    };
+    match offload(db.set_promote(Promote::new(request.keys))).await {
+        Ok(()) => promote_response(db.promote()),
+        Err(e) => error_response(&e),
+    }
+}
+
+fn promote_response(promote: Promote) -> Response {
+    let state = imbh_head::dto::PromoteState {
+        keys: promote.keys().to_vec(),
+    };
+    match serde_json::to_vec(&state) {
+        Ok(body) => Response::json(200, body),
+        Err(e) => Response::json(
+            500,
+            format!(
+                "{{\"error\":{}}}",
+                json_string(&format!("cannot serialize the promoted set: {e}"))
+            )
+            .into_bytes(),
+        ),
+    }
+}
+
+// ── housekeeping (queued) ───────────────────────────────────────────────────────────────────────
+
+/// Queue a housekeeping pass: seal, commit pending rewrites, apply retention, and — with
+/// `{"compact": true}` — compact afterwards.
+///
+/// Answers `202 Accepted` with the job record, not the outcome. The work has not run yet and may not
+/// for a while; a `200` here would claim otherwise.
+///
+/// Refused up front on a read-only handle rather than queued and failed: a reader holds no writer
+/// lock, so the pass could never do anything, and a job that exists only to fail is worse than a
+/// refusal that says why.
+async fn admin_housekeeping_submit(State(state): State<AppState>, body: Bytes) -> Response {
+    if state.db.is_read_only() {
+        return json_error(
+            400,
+            "this server opened the database read-only, so it cannot run housekeeping. Point the \
+             request at the process that writes the database.",
+        );
+    }
+    // An empty body is the common case (`curl -XPOST`), and means the defaults.
+    let request = if body.is_empty() {
+        Value::Null
+    } else {
+        match serde_json::from_slice::<Value>(&body) {
+            Ok(value) => value,
+            Err(e) => {
+                return json_error(
+                    400,
+                    &format!("request body is not a housekeeping request: {e}"),
+                );
+            }
+        }
+    };
+    let compact = request
+        .get("compact")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    // `max_jobs` bounds the partitions this pass rewrites — `imbh-housekeeper --max-jobs` for the
+    // endpoint. Absent means unbounded; zero would mean "compact nothing", which `compact: false`
+    // already says, so it is refused rather than silently accepted as a pass that maintains and then
+    // does nothing under a name that promised otherwise.
+    let max_jobs = match request.get("max_jobs") {
+        None | Some(Value::Null) => None,
+        Some(value) => match value.as_u64() {
+            Some(n) if n > 0 => Some(n as usize),
+            _ => {
+                return json_error(
+                    400,
+                    "`max_jobs` must be a positive integer — the number of partitions this pass may \
+                     rewrite. Omit it for an unbounded pass, or set `compact: false` to skip \
+                     compaction entirely.",
+                );
+            }
+        },
+    };
+    let submission = state.jobs.submit(&state.db, compact, max_jobs);
+    // `202` created a pass; `200` found the identical one already queued and is handing back its id.
+    // Both are success and both carry the id that will do the work, so a client reading `job_id`
+    // needs no branch — `coalesced` is there for one that wants to know it changed nothing.
+    let status = if submission.is_coalesced() { 200 } else { 202 };
+    let mut body = submission.job().to_json();
+    body["coalesced"] = json!(submission.is_coalesced());
+    match serde_json::to_vec(&body) {
+        Ok(body) => Response::json(status, body),
+        Err(e) => json_error(500, &format!("cannot serialize the job: {e}")),
+    }
+}
+
+/// One housekeeping job by id. `404` for an id this process never issued — including one from a
+/// previous `imbhd`, since the queue does not survive a restart.
+async fn admin_housekeeping_get(
+    State(state): State<AppState>,
+    axum::extract::Path(job_id): axum::extract::Path<String>,
+) -> Response {
+    match state.jobs.get(&job_id) {
+        Some(job) => match serde_json::to_vec(&job.to_json()) {
+            Ok(body) => Response::json(200, body),
+            Err(e) => json_error(500, &format!("cannot serialize the job: {e}")),
+        },
+        None => json_error(
+            404,
+            &format!(
+                "no housekeeping job {job_id}. Ids do not survive a restart, and only the most \
+                 recent jobs are retained."
+            ),
+        ),
+    }
+}
+
+/// The retained jobs, newest submission first — for a client that has lost an id.
+async fn admin_housekeeping_list(State(state): State<AppState>) -> Response {
+    let jobs: Vec<Value> = state.jobs.recent().iter().map(jobs::Job::to_json).collect();
+    match serde_json::to_vec(&json!({ "jobs": jobs })) {
+        Ok(body) => Response::json(200, body),
+        Err(e) => json_error(500, &format!("cannot serialize the jobs: {e}")),
+    }
+}
+
+/// A failure in the same `{"error": …}` shape every other endpoint here answers with.
+fn json_error(status: u16, message: &str) -> Response {
+    Response::json(
+        status,
+        format!("{{\"error\":{}}}", json_string(message)).into_bytes(),
+    )
+}
+
 /// Dispatch one request through the same route table [`app`] builds, without a socket. Exposed for
 /// testing, and for a host that owns its own transport and just wants the handlers.
+///
+/// **Each call builds a fresh router**, so anything the server keeps between requests does not carry
+/// across them — a housekeeping job submitted through one call cannot be polled through the next,
+/// because the second call's registry never issued that id. Hold one [`app`] and drive it with
+/// `oneshot`, or use [`serve`], for a sequence that depends on server-side state.
 pub async fn route(db: &Arc<Db>, method: &str, path: &str, body: &[u8]) -> Response {
     let request = match Request::builder()
         .method(method)

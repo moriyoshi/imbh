@@ -15,6 +15,81 @@ use crate::time::{clock_hms_ns, format_datetime_ns};
 use crate::ui::focus_border;
 use crate::ui::glyphs::Glyphs;
 
+/// Column widths from the widest cell (header included), each capped so one wide column cannot crowd
+/// out the rest; the final column absorbs the remaining space.
+///
+/// Measured by **display width**, not code-point count, so full-width (CJK) glyphs and other wide
+/// characters in names/labels/values size their column to the cells they actually occupy instead of
+/// being under-measured and truncated. Consistent with the width-aware header and waterfall.
+pub(crate) fn column_widths<'a>(
+    header: &[String],
+    rows: impl Iterator<Item = &'a Vec<String>>,
+) -> Vec<usize> {
+    let mut widths = header
+        .iter()
+        .map(|cell| UnicodeWidthStr::width(cell.as_str()))
+        .collect::<Vec<_>>();
+    for row in rows {
+        for (index, cell) in row.iter().enumerate() {
+            if index < widths.len() {
+                widths[index] = widths[index].max(UnicodeWidthStr::width(cell.as_str()));
+            }
+        }
+    }
+    widths
+}
+
+/// [`column_widths`] as ratatui constraints: every column but the last is fixed, and the last absorbs
+/// what is left.
+pub(crate) fn column_constraints<'a>(
+    header: &[String],
+    rows: impl Iterator<Item = &'a Vec<String>>,
+) -> Vec<Constraint> {
+    let column_count = header.len();
+    column_widths(header, rows)
+        .iter()
+        .enumerate()
+        .map(|(index, &width)| {
+            if index + 1 == column_count {
+                Constraint::Min(width.clamp(6, 60) as u16)
+            } else {
+                Constraint::Length(width.clamp(4, 48) as u16)
+            }
+        })
+        .collect()
+}
+
+/// Pad `cell` to `width` display columns, or truncate it to fit with a `>` marking the cut. Display
+/// width, not character count, so a CJK glyph occupies the two cells it actually draws in.
+pub(crate) fn pad_cell(cell: &str, width: usize) -> String {
+    let actual = UnicodeWidthStr::width(cell);
+    if actual <= width {
+        return format!("{cell}{}", " ".repeat(width - actual));
+    }
+    let mut out = String::new();
+    let mut used = 0usize;
+    for character in cell.chars() {
+        let next = used + UnicodeWidthStr::width(character.to_string().as_str());
+        if next > width.saturating_sub(1) {
+            break;
+        }
+        out.push(character);
+        used = next;
+    }
+    out.push('>');
+    format!("{out}{}", " ".repeat(width.saturating_sub(used + 1)))
+}
+
+/// The header row style shared by every table pane: the column names, set apart from the data under
+/// them.
+pub(crate) fn table_header(table: &TableData) -> Row<'static> {
+    Row::new(table.header.iter().cloned()).style(
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+    )
+}
+
 /// Render the primary pane as a selectable table with a header row and column-aligned cells. The
 /// selection cursor (`app.selected`) indexes `table.rows`; `TableState` scrolls to keep it in view.
 pub(crate) fn draw_metric_table(
@@ -25,41 +100,8 @@ pub(crate) fn draw_metric_table(
     focused: bool,
     g: &Glyphs,
 ) {
-    // Column widths from the widest cell (header included), each capped so one wide column cannot
-    // crowd out the rest; the final column absorbs remaining space.
-    // Measure by display width, not code-point count, so full-width (CJK) glyphs and other wide
-    // characters in names/labels/values size their column to the cells they actually occupy instead of
-    // being under-measured and truncated. Consistent with the width-aware header and waterfall.
-    let column_count = table.header.len();
-    let mut widths = table
-        .header
-        .iter()
-        .map(|cell| UnicodeWidthStr::width(cell.as_str()))
-        .collect::<Vec<_>>();
-    for row in &table.rows {
-        for (index, cell) in row.iter().enumerate() {
-            if index < widths.len() {
-                widths[index] = widths[index].max(UnicodeWidthStr::width(cell.as_str()));
-            }
-        }
-    }
-    let constraints = widths
-        .iter()
-        .enumerate()
-        .map(|(index, &width)| {
-            if index + 1 == column_count {
-                Constraint::Min(width.clamp(6, 60) as u16)
-            } else {
-                Constraint::Length(width.clamp(4, 48) as u16)
-            }
-        })
-        .collect::<Vec<_>>();
-
-    let header = Row::new(table.header.iter().cloned()).style(
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
-    );
+    let constraints = column_constraints(&table.header, table.rows.iter());
+    let header = table_header(table);
     // In the catalog tree the first column carries the branch marker (`v `/`> `). Split that leading
     // marker into a dark-grey span so it reads as chrome rather than content. Only the tree rows carry
     // a marker prefix — checkbox/loading rows and the (non-catalog) series table never match, so they

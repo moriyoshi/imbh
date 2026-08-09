@@ -56,9 +56,18 @@ serde = { workspace = true, optional = true }
 # Optional protobuf wire types for the query-API inputs (ARCHITECTURE.md §10.17), off by default —
 # the `proto` feature below. Its build.rs (protox) compiles only when this crate is in the graph.
 imbh-proto = { workspace = true, optional = true }
+# Optional attribute cardinality/selectivity statistics (`Db::attribute_stats`), off by default — the
+# `attrstats` feature below. Pure Rust over imbh-core + imbh-storage + arrow/parquet, all already in
+# the graph, so it adds one workspace crate and no third-party subtree.
+imbh-attrstats = { workspace = true, optional = true }
+
+[[bin]]
+name = "imbh-housekeeper"
+path = "src/bin/housekeeper.rs"
+required-features = ["housekeeper"]
 
 [features]
-default = ["ingest", "query", "search"]
+default = ["ingest", "query", "search", "compaction"]
 # Producer / consumer split (ARCHITECTURE.md §11, the biggest footprint lever). A host compiles only
 # the role it plays:
 #   `ingest` — producer: OTLP decode (imbh-otlp) + the `Db::ingest_otlp_*` write paths. No query engine.
@@ -80,7 +89,33 @@ search = ["query", "dep:imbh-index", "imbh-storage/search", "imbh-query?/search"
 # result DTOs (`LogEntry`/`Trace`/`Matrix`/…) — the §10.13 footprint lever. Off by default; enabling
 # it adds no new crate to the graph (serde is already compiled transitively). Forwards to imbh-core
 # so the embedded domain types (ids, timestamps, attributes) serialize too.
-serde = ["dep:serde", "imbh-core/serde"]
+serde = ["dep:serde", "imbh-core/serde", "imbh-attrstats?/serde"]
+# `Db::attribute_stats`: attribute cardinality and per-segment selectivity (sigma) over the open
+# database, the measurement behind a `promote` list (ARCHITECTURE.md §6.1, §10.20). Off by default —
+# it is a diagnostic, not part of the ingest or query path, and an embedded host that never asks for
+# it should not carry the scanner. Reads the manifest and the sealed segments' attribute columns and
+# writes nothing, so it works on a read-only handle and alongside a live writer.
+attrstats = ["dep:imbh-attrstats"]
+# The `imbh-housekeeper` binary: out-of-process segment rewriting for an embedded host
+# (ARCHITECTURE.md §7.2). Off by default and gated with `required-features`, so a
+# library consumer never builds it — an embedded host links the engine, not a CLI.
+#
+# Segment rewriting — `Db::compact` and `prepare_pending` (ARCHITECTURE.md §7.2). On
+# by default, like the other levers, so no existing build changes. Dropping it
+# (`--no-default-features --features ingest,query,search`) leaves an embedded host with only
+# `Db::commit_pending` — validate a record a housekeeper prepared, one manifest delta, unlink.
+#
+# Measured, so the lever is not oversold: **no dependency leaves the graph** (381 crates either way).
+# Seal already writes Parquet and builds the Tantivy sidecar, so those subtrees stay regardless; what
+# goes is the merge/sort/coerce/backfill code itself — **110,434 B, 2.5% of `libimbh.rlib`** in
+# release. The real win is the handoff, not the byte count: an embedded host cannot start an
+# unbounded rewrite on its own thread if the code is not there.
+compaction = ["imbh-storage/compaction"]
+# The `imbh-housekeeper` binary: out-of-process segment rewriting for an embedded host
+# (ARCHITECTURE.md §7.2). Off by default and gated with `required-features`, so a
+# library consumer never builds it — an embedded host links the engine, not a CLI. Implies
+# `compaction`, since preparing a rewrite is exactly that machinery.
+housekeeper = ["compaction"]
 # Protobuf query-input types + `TryFrom<imbh_proto::*>` mappings onto the typed builders, and the
 # Arrow-`RecordBatch`-returning query entry points that a Go / FFI binding drives (ARCHITECTURE.md
 # §10.17, "Phase 0"). Off by default: pulls the `imbh-proto` crate (+ its build-time protox codegen)

@@ -9,6 +9,7 @@
 //! called out inline where it shapes the code.
 
 mod manifest;
+pub mod pending;
 mod schema;
 mod wal;
 
@@ -17,8 +18,8 @@ use manifest::{Manifest, ManifestView, ManifestWriter};
 use std::collections::BTreeMap;
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, RwLock};
 
 use arrow::array::{
     Array, ArrayRef, BooleanBuilder, FixedSizeBinaryBuilder, Float64Builder, Int32Builder,
@@ -28,6 +29,7 @@ use arrow::array::{
 use arrow::datatypes::{DataType, Int32Type, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::ArrowWriter;
+#[cfg(feature = "compaction")]
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::basic::{Compression as PqCompression, ZstdLevel};
 use parquet::file::properties::WriterProperties;
@@ -104,9 +106,9 @@ pub struct Storage {
     wal_mode: WalMode,
     retention: Retention,
     /// Attribute keys promoted to typed columns (ARCHITECTURE.md §6.1). Immutable for the DB's
-    /// lifetime; drives both the schema width (`*_schema(self.promote.keys())`) and the extra
+    /// lifetime; drives both the schema width (`*_schema(&self.promote_keys())`) and the extra
     /// columns each `*_rows_to_batch` materializes from the row's canonical JSON. Empty by default.
-    promote: Promote,
+    promote: RwLock<Promote>,
     /// Auto-seal trigger: `seal_if_full` seals once `buffer_bytes` reaches this (ARCHITECTURE.md §7).
     seal_threshold_bytes: usize,
     /// When this handle opened, so the flush scheduler's idle trigger has a clock even before the
@@ -170,6 +172,7 @@ struct SealingBatches {
     summary: Vec<RecordBatch>,
 }
 
+#[derive(Default)]
 struct Inner {
     /// The `logs` table buffer and sealed segments. The buffer is an ordered `Vec<RecordBatch>`:
     /// each ingest/replay call encodes its rows to a `RecordBatch` once and appends it (IOx-style,
@@ -260,7 +263,7 @@ impl Storage {
             compression,
             wal_mode,
             retention,
-            promote: Promote::default(),
+            promote: RwLock::new(Promote::default()),
             seal_threshold_bytes: seal_threshold(budget),
             opened_at: std::time::Instant::now(),
             seq: AtomicU64::new(0),
@@ -270,23 +273,14 @@ impl Storage {
             read_only: false,
             _writer_lock: Some(writer_lock),
             inner: Mutex::new(Inner {
-                buffer: Vec::new(),
                 segments: manifest.logs,
-                spans_buffer: Vec::new(),
                 spans_segments: manifest.spans,
-                metric_buffers: BTreeMap::new(),
                 metric_segments: manifest.metrics,
-                histogram_buffer: Vec::new(),
-                exp_histogram_buffer: Vec::new(),
-                summary_buffer: Vec::new(),
-                buffer_bytes: 0,
                 watermark,
                 buffer_max_lsn: watermark,
                 next_lsn,
                 pending_replay,
-                last_append: None,
-                sealing: BTreeMap::new(),
-                next_seal_gen: 0,
+                ..Default::default()
             }),
         })
     }
@@ -298,7 +292,7 @@ impl Storage {
             compression,
             wal_mode: WalMode::Off,
             retention: Retention::none(),
-            promote: Promote::default(),
+            promote: RwLock::new(Promote::default()),
             seal_threshold_bytes: seal_threshold(budget),
             opened_at: std::time::Instant::now(),
             seq: AtomicU64::new(0),
@@ -308,23 +302,8 @@ impl Storage {
             read_only: false,
             _writer_lock: None,
             inner: Mutex::new(Inner {
-                buffer: Vec::new(),
-                segments: Vec::new(),
-                spans_buffer: Vec::new(),
-                spans_segments: Vec::new(),
-                metric_buffers: BTreeMap::new(),
-                metric_segments: BTreeMap::new(),
-                histogram_buffer: Vec::new(),
-                exp_histogram_buffer: Vec::new(),
-                summary_buffer: Vec::new(),
-                buffer_bytes: 0,
-                watermark: 0,
-                buffer_max_lsn: 0,
                 next_lsn: 1,
-                pending_replay: Vec::new(),
-                last_append: None,
-                sealing: BTreeMap::new(),
-                next_seal_gen: 0,
+                ..Default::default()
             }),
         }
     }
@@ -358,7 +337,7 @@ impl Storage {
             compression,
             wal_mode: WalMode::Off,
             retention: Retention::none(),
-            promote: Promote::default(),
+            promote: RwLock::new(Promote::default()),
             seal_threshold_bytes: seal_threshold(budget),
             opened_at: std::time::Instant::now(),
             seq: AtomicU64::new(0),
@@ -368,23 +347,12 @@ impl Storage {
             read_only: true,
             _writer_lock: None,
             inner: Mutex::new(Inner {
-                buffer: Vec::new(),
-                segments: Vec::new(),
-                spans_buffer: Vec::new(),
-                spans_segments: Vec::new(),
-                metric_buffers: BTreeMap::new(),
-                metric_segments: BTreeMap::new(),
-                histogram_buffer: Vec::new(),
-                exp_histogram_buffer: Vec::new(),
-                summary_buffer: Vec::new(),
                 buffer_bytes: 0,
                 watermark,
                 buffer_max_lsn: watermark,
                 next_lsn: watermark + 1,
-                pending_replay: Vec::new(),
-                last_append: None,
-                sealing: BTreeMap::new(),
                 next_seal_gen: 0,
+                ..Default::default()
             }),
         })
     }
@@ -404,28 +372,112 @@ impl Storage {
     /// right after construction; storage defaults to no promotion. Must be set before any ingest so
     /// every buffered batch and sealed segment shares one schema width for the DB's lifetime.
     pub fn with_promote(mut self, promote: Promote) -> Self {
-        self.promote = promote;
+        self.promote = RwLock::new(promote);
         self
     }
 
+    /// The retention policy in effect (durable database state, read at open).
+    pub fn retention(&self) -> Retention {
+        self.retention
+    }
+
     /// The promoted attribute keys in effect (empty when nothing is promoted).
-    pub fn promote(&self) -> &Promote {
-        &self.promote
+    ///
+    /// Returns a clone rather than a borrow because the set is mutable at runtime through
+    /// [`Self::set_promote`]; handing out a reference would pin the lock for the caller's lifetime.
+    pub fn promote(&self) -> Promote {
+        self.promote.read().unwrap().clone()
+    }
+
+    /// The promoted keys, copied out of the lock. Every schema and encode path goes through this, so
+    /// a batch is always built against one consistent set. Cheap: the set is a handful of short keys
+    /// and this is per batch or per query, never per row.
+    fn promote_keys(&self) -> Vec<String> {
+        self.promote.read().unwrap().keys().to_vec()
+    }
+
+    /// Write the current promoted set to [`INFO_FILE`], making it the database's durable state.
+    ///
+    /// **Fallible, unlike the WAL-mode marker.** That one is a hint a reader may ignore; this is the
+    /// set every handle on the directory must agree on, so a silent failure would leave two handles
+    /// disagreeing about the schema of the same segments.
+    pub fn persist_promote(&self) -> Result<()> {
+        let Some(dir) = self.dir.as_deref() else {
+            return Ok(()); // in-memory: nothing durable to disagree with.
+        };
+        write_db_info_at(
+            dir,
+            self.wal_mode,
+            &self.promote.read().unwrap(),
+            self.retention,
+        )
+        .map_err(|e| Error::open_ctx("persist promoted key set", e))
+    }
+
+    /// Change the promoted key set on a live database, **sealing first** so no buffered batch
+    /// straddles the change.
+    ///
+    /// The barrier is the whole point. Batches are encoded at *ingest*, against the set in effect at
+    /// that moment, and `concat_buffer` later concatenates them against the *current* schema —
+    /// `concat_batches` takes columns positionally and does not validate them against the schema it
+    /// is handed. So a buffer holding batches from both sides of a promote change can panic (first
+    /// batch wider), silently truncate (first batch narrower), or silently concatenate two
+    /// differently-named promoted columns into one. That is the same hazard §6.1 records for
+    /// compaction, and making the set mutable would otherwise reproduce it in the buffer.
+    ///
+    /// Correctness rests on ingest reading the set **under the same lock** it appends beneath (see
+    /// `append_logs` / `ingest`): once this holds `inner` and finds the buffers empty, no encode can
+    /// be in flight against the old set, and the next ingest to take the lock sees the new one.
+    /// A racing ingest between the seal and the lock simply costs another round.
+    ///
+    /// Demotion is the safe direction and promotion the dangerous one — a demoted key never left the
+    /// JSON blob, while a promoted one is absent from every older segment — but both go through here,
+    /// because both change the schema new batches are built against.
+    pub fn set_promote(&self, promote: Promote) -> Result<()> {
+        if self.read_only {
+            return Err(Error::read_only());
+        }
+        if *self.promote.read().unwrap() == promote {
+            return Ok(()); // no change; do not seal a quiet database for nothing.
+        }
+        // Bounded rather than unbounded: under continuous ingest a quiet moment may never arrive, and
+        // spinning forever inside a public call is worse than telling the caller to try again.
+        const ATTEMPTS: usize = 8;
+        for _ in 0..ATTEMPTS {
+            self.seal()?;
+            let inner = self.inner.lock().unwrap();
+            let empty = inner.buffer.is_empty()
+                && inner.spans_buffer.is_empty()
+                && inner.histogram_buffer.is_empty()
+                && inner.exp_histogram_buffer.is_empty()
+                && inner.summary_buffer.is_empty()
+                && inner.metric_buffers.values().all(Vec::is_empty);
+            if empty {
+                // Swapped while `inner` is held, so an ingest is either fully before or fully after.
+                *self.promote.write().unwrap() = promote;
+                drop(inner);
+                return self.persist_promote();
+            }
+        }
+        Err(Error::storage_msg(
+            "set_promote: the ingest buffer refilled on every attempt; \
+             retry when ingest is quieter",
+        ))
     }
 
     /// The `logs` table schema (shared with the query layer through the facade).
     pub fn schema(&self) -> SchemaRef {
-        logs_schema(self.promote.keys())
+        logs_schema(&self.promote_keys())
     }
 
     /// The `spans` table schema.
     pub fn schema_spans(&self) -> SchemaRef {
-        spans_schema(self.promote.keys())
+        spans_schema(&self.promote_keys())
     }
 
     /// The shared scalar-metric schema (used by `metrics_gauge`/`metrics_sum`).
     pub fn schema_metric_scalar(&self) -> SchemaRef {
-        metric_scalar_schema(self.promote.keys())
+        metric_scalar_schema(&self.promote_keys())
     }
 
     /// Live ingest: assign an LSN, append the raw OTLP bytes to the WAL (fsync per
@@ -444,7 +496,7 @@ impl Storage {
         }
         let mut inner = self.inner.lock().unwrap();
         let (lsn, durable) = self.wal_append_assign(signal, raw, sync_now, &mut inner)?;
-        push_log_batch(&mut inner, rows, self.promote.keys())?;
+        push_log_batch(&mut inner, rows, &self.promote_keys())?;
         Ok((Lsn::new(lsn).expect("assigned LSN is >= 1"), durable))
     }
 
@@ -460,7 +512,7 @@ impl Storage {
         }
         let mut inner = self.inner.lock().unwrap();
         let (lsn, durable) = self.wal_append_assign(SIGNAL_TRACES, raw, sync_now, &mut inner)?;
-        push_span_batch(&mut inner, rows, self.promote.keys())?;
+        push_span_batch(&mut inner, rows, &self.promote_keys())?;
         Ok((Lsn::new(lsn).expect("assigned LSN is >= 1"), durable))
     }
 
@@ -517,7 +569,7 @@ impl Storage {
         // propagating a malformed-row error is not possible here — a corrupt row would already have
         // failed at its original ingest. Panic on the (unreachable) encode failure rather than widen
         // this fn's signature to `Result`.
-        push_log_batch(&mut inner, rows, self.promote.keys()).expect("replay: encode logs batch");
+        push_log_batch(&mut inner, rows, &self.promote_keys()).expect("replay: encode logs batch");
         inner.buffer_max_lsn = inner.buffer_max_lsn.max(lsn);
         inner.next_lsn = inner.next_lsn.max(lsn + 1);
     }
@@ -525,7 +577,8 @@ impl Storage {
     /// Refill the `spans` buffer from a WAL record during recovery.
     pub fn replay_traces(&self, lsn: u64, rows: Vec<SpanRow>) {
         let mut inner = self.inner.lock().unwrap();
-        push_span_batch(&mut inner, rows, self.promote.keys()).expect("replay: encode spans batch");
+        push_span_batch(&mut inner, rows, &self.promote_keys())
+            .expect("replay: encode spans batch");
         inner.buffer_max_lsn = inner.buffer_max_lsn.max(lsn);
         inner.next_lsn = inner.next_lsn.max(lsn + 1);
     }
@@ -548,7 +601,7 @@ impl Storage {
         let mut inner = self.inner.lock().unwrap();
         // One WAL frame + one LSN for the whole OTLP request; all row kinds re-derive on replay.
         let (lsn, durable) = self.wal_append_assign(SIGNAL_METRICS, raw, sync_now, &mut inner)?;
-        let keys = self.promote.keys();
+        let keys = &self.promote_keys();
         push_scalar_metric_batches(&mut inner, rows, keys)?;
         push_histogram_batch(&mut inner, histograms, keys)?;
         push_exp_histogram_batch(&mut inner, exp_histograms, keys)?;
@@ -559,7 +612,7 @@ impl Storage {
     /// Refill the scalar metric buffers from a WAL record during recovery.
     pub fn replay_metrics(&self, lsn: u64, rows: Vec<ScalarMetricRow>) {
         let mut inner = self.inner.lock().unwrap();
-        push_scalar_metric_batches(&mut inner, rows, self.promote.keys())
+        push_scalar_metric_batches(&mut inner, rows, &self.promote_keys())
             .expect("replay: encode scalar-metric batch");
         inner.buffer_max_lsn = inner.buffer_max_lsn.max(lsn);
         inner.next_lsn = inner.next_lsn.max(lsn + 1);
@@ -569,7 +622,7 @@ impl Storage {
     /// record as [`Storage::replay_metrics`] (same LSN/frame), so it does not re-advance the LSN.
     pub fn replay_histograms(&self, lsn: u64, rows: Vec<HistogramRow>) {
         let mut inner = self.inner.lock().unwrap();
-        push_histogram_batch(&mut inner, rows, self.promote.keys())
+        push_histogram_batch(&mut inner, rows, &self.promote_keys())
             .expect("replay: encode histogram batch");
         inner.buffer_max_lsn = inner.buffer_max_lsn.max(lsn);
         inner.next_lsn = inner.next_lsn.max(lsn + 1);
@@ -578,7 +631,7 @@ impl Storage {
     /// Refill the `metrics_exp_histogram` buffer from a WAL record during recovery.
     pub fn replay_exp_histograms(&self, lsn: u64, rows: Vec<ExpHistogramRow>) {
         let mut inner = self.inner.lock().unwrap();
-        push_exp_histogram_batch(&mut inner, rows, self.promote.keys())
+        push_exp_histogram_batch(&mut inner, rows, &self.promote_keys())
             .expect("replay: encode exp-histogram batch");
         inner.buffer_max_lsn = inner.buffer_max_lsn.max(lsn);
         inner.next_lsn = inner.next_lsn.max(lsn + 1);
@@ -587,7 +640,7 @@ impl Storage {
     /// Refill the `metrics_summary` buffer from a WAL record during recovery.
     pub fn replay_summaries(&self, lsn: u64, rows: Vec<SummaryRow>) {
         let mut inner = self.inner.lock().unwrap();
-        push_summary_batch(&mut inner, rows, self.promote.keys())
+        push_summary_batch(&mut inner, rows, &self.promote_keys())
             .expect("replay: encode summary batch");
         inner.buffer_max_lsn = inner.buffer_max_lsn.max(lsn);
         inner.next_lsn = inner.next_lsn.max(lsn + 1);
@@ -599,15 +652,16 @@ impl Storage {
         let batches = inner.metric_buffers.get(&table).map(Vec::as_slice);
         concat_buffer(
             batches.unwrap_or(&[]),
-            metric_scalar_schema(self.promote.keys()),
+            metric_scalar_schema(&self.promote_keys()),
         )
     }
 
     /// The canonical Arrow schema of `table` under the **current** promoted key set — the schema a
     /// freshly written segment of that table gets, and therefore the schema compaction must produce
     /// when it merges segments sealed under older `promote` settings.
+    #[cfg(feature = "compaction")]
     fn table_schema(&self, table: Table) -> SchemaRef {
-        let keys = self.promote.keys();
+        let keys = &self.promote_keys();
         match table {
             Table::Logs => logs_schema(keys),
             Table::Spans => spans_schema(keys),
@@ -620,7 +674,7 @@ impl Storage {
 
     /// The `metrics_histogram` Arrow schema.
     pub fn schema_histogram(&self) -> SchemaRef {
-        histogram_schema(self.promote.keys())
+        histogram_schema(&self.promote_keys())
     }
 
     /// A snapshot of the `metrics_histogram` buffer as one Arrow batch.
@@ -628,7 +682,7 @@ impl Storage {
         let inner = self.inner.lock().unwrap();
         concat_buffer(
             &inner.histogram_buffer,
-            histogram_schema(self.promote.keys()),
+            histogram_schema(&self.promote_keys()),
         )
     }
 
@@ -644,7 +698,7 @@ impl Storage {
 
     /// The `metrics_exp_histogram` Arrow schema.
     pub fn schema_exp_histogram(&self) -> SchemaRef {
-        exp_histogram_schema(self.promote.keys())
+        exp_histogram_schema(&self.promote_keys())
     }
 
     /// A snapshot of the `metrics_exp_histogram` buffer as one Arrow batch.
@@ -652,7 +706,7 @@ impl Storage {
         let inner = self.inner.lock().unwrap();
         concat_buffer(
             &inner.exp_histogram_buffer,
-            exp_histogram_schema(self.promote.keys()),
+            exp_histogram_schema(&self.promote_keys()),
         )
     }
 
@@ -668,13 +722,13 @@ impl Storage {
 
     /// The `metrics_summary` Arrow schema.
     pub fn schema_summary(&self) -> SchemaRef {
-        summary_schema(self.promote.keys())
+        summary_schema(&self.promote_keys())
     }
 
     /// A snapshot of the `metrics_summary` buffer as one Arrow batch.
     pub fn buffer_snapshot_summary(&self) -> Result<RecordBatch> {
         let inner = self.inner.lock().unwrap();
-        concat_buffer(&inner.summary_buffer, summary_schema(self.promote.keys()))
+        concat_buffer(&inner.summary_buffer, summary_schema(&self.promote_keys()))
     }
 
     /// The sealed `metrics_summary` segments (stored in the shared metric-segment map).
@@ -719,7 +773,7 @@ impl Storage {
         let n = rows.len();
         let mut inner = self.inner.lock().unwrap();
         // Test-only helper over always-valid rows; a build failure here is a bug, not a runtime path.
-        push_log_batch(&mut inner, rows, self.promote.keys())
+        push_log_batch(&mut inner, rows, &self.promote_keys())
             .expect("append_logs: encode logs batch");
         n
     }
@@ -832,13 +886,13 @@ impl Storage {
     /// buffer → an empty batch carrying the schema.
     pub fn buffer_snapshot(&self) -> Result<RecordBatch> {
         let inner = self.inner.lock().unwrap();
-        concat_buffer(&inner.buffer, logs_schema(self.promote.keys()))
+        concat_buffer(&inner.buffer, logs_schema(&self.promote_keys()))
     }
 
     /// A snapshot of the `spans` buffer as one Arrow batch.
     pub fn buffer_snapshot_spans(&self) -> Result<RecordBatch> {
         let inner = self.inner.lock().unwrap();
-        concat_buffer(&inner.spans_buffer, spans_schema(self.promote.keys()))
+        concat_buffer(&inner.spans_buffer, spans_schema(&self.promote_keys()))
     }
 
     /// Absolute paths of all sealed `logs` segments, in manifest order.
@@ -905,10 +959,10 @@ impl Storage {
                     v.extend(b.iter().cloned());
                 }
             }
-            let keys = self.promote.keys();
+            let keys = &self.promote_keys();
             metric_buffers.insert(table, concat_buffer(&v, metric_scalar_schema(keys))?);
         }
-        let keys = self.promote.keys();
+        let keys = &self.promote_keys();
         Ok(QuerySnapshot {
             dir: self.dir.clone(),
             logs_buffer: concat_buffer(&unioned(&inner.buffer, |s| &s.logs), logs_schema(keys))?,
@@ -1284,6 +1338,105 @@ impl Storage {
         Ok((relative_path, abs_path))
     }
 
+    /// Apply any **pending housekeeping records** left by a prepare step (`pending::PendingRewrite`).
+    ///
+    /// This is the writer's half of the handoff described in ARCHITECTURE.md §7.2: a
+    /// separate process did the expensive rewrite against a read-only view, and all that remains is
+    /// the bookkeeping only the writer may do — one manifest delta, then unlink the inputs.
+    ///
+    /// **Every record is validated before it is applied**, and rejection is always safe because the
+    /// inputs are untouched until the swap:
+    ///
+    /// - unreadable (torn, bad checksum, unknown version) — delete the record;
+    /// - an input is no longer in the manifest (retention dropped it, or another rewrite already
+    ///   consumed it) — the record is stale; discard it;
+    /// - the promoted key set has changed since prepare — the output's column layout no longer
+    ///   matches what the manifest would imply; discard;
+    /// - the output is missing or its digest does not match — a truncated or swept output; discard.
+    ///
+    /// Discarding removes the output file **only when the manifest does not reference it**. That
+    /// matters for the crash window between "manifest is durable" and "record deleted": on the next
+    /// pass the inputs are legitimately absent, so the record looks stale — but its output is by then
+    /// a live segment, and deleting it would destroy committed data.
+    ///
+    /// Crash safety follows the same ordering `seal` uses. The manifest is made durable *before* the
+    /// inputs are unlinked, so a crash in between leaves the inputs as unreferenced files that
+    /// `cleanup_orphans` sweeps on the next open — never a manifest pointing at a deleted file.
+    pub fn commit_pending(&self) -> Result<PendingReport> {
+        let mut report = PendingReport::default();
+        if self.read_only {
+            return Err(Error::read_only());
+        }
+        let Some(dir) = self.dir.clone() else {
+            return Ok(report); // in-memory: no segments, nothing to hand off.
+        };
+        let live_promote = self.promote();
+        for entry in pending::list(&dir) {
+            let (record_path, rec) = match entry {
+                Ok(pair) => pair,
+                Err(path) => {
+                    let _ = std::fs::remove_file(&path);
+                    report.discarded += 1;
+                    continue;
+                }
+            };
+            let out_abs = dir.join(&rec.output.relative_path);
+            let mut inner = self.inner.lock().unwrap();
+            let current = segments_for_mut(&mut inner, rec.table);
+            let inputs_present = rec
+                .inputs
+                .iter()
+                .all(|i| current.iter().any(|s| &s.relative_path == i));
+            let output_committed = current
+                .iter()
+                .any(|s| s.relative_path == rec.output.relative_path);
+            let digest_ok = !output_committed
+                && out_abs.is_file()
+                && pending::digest_file(&out_abs).is_ok_and(|d| d == rec.output_digest);
+
+            if !inputs_present || rec.promote != live_promote || !digest_ok {
+                drop(inner);
+                // Only reap the output when it is not already a committed segment — see the crash
+                // window in this method's docs.
+                if !output_committed {
+                    let _ = std::fs::remove_file(&out_abs);
+                    let _ = std::fs::remove_file(out_abs.with_extension("tidx"));
+                }
+                let _ = std::fs::remove_file(&record_path);
+                report.discarded += 1;
+                continue;
+            }
+
+            let doomed: std::collections::HashSet<&String> = rec.inputs.iter().collect();
+            let removed: Vec<SegmentRef> = current
+                .iter()
+                .filter(|s| doomed.contains(&s.relative_path))
+                .cloned()
+                .collect();
+            current.retain(|s| !doomed.contains(&s.relative_path));
+            current.push(rec.output.clone());
+            let watermark = inner.watermark;
+            self.persist_manifest(
+                &inner.segments,
+                &inner.spans_segments,
+                &inner.metric_segments,
+                watermark,
+            )?;
+            drop(inner);
+            // Manifest is durable; the inputs are now unreferenced and safe to unlink. A failure
+            // here leaves an orphan for the next open to sweep rather than failing the pass.
+            for s in &removed {
+                let p = dir.join(&s.relative_path);
+                let _ = std::fs::remove_file(p.with_extension("tidx"));
+                let _ = std::fs::remove_file(&p);
+            }
+            let _ = std::fs::remove_file(&record_path);
+            report.applied += 1;
+            report.segments_replaced += removed.len() as u64;
+        }
+        Ok(report)
+    }
+
     /// Drop segments outside the retention policy (ARCHITECTURE.md §7): older than `max_age`, or
     /// oldest-first until the total on-disk size is under `max_disk_bytes`. Deletes the Parquet
     /// file and its `.tidx` sidecar and rewrites the manifest. No-op for in-memory DBs. Reclaiming
@@ -1496,10 +1649,28 @@ impl Storage {
         feature = "tracing",
         tracing::instrument(level = "debug", name = "storage.compact", skip_all)
     )]
+    #[cfg(feature = "compaction")]
     pub fn compact(&self) -> Result<CompactionReport> {
+        self.compact_bounded(usize::MAX)
+    }
+
+    /// [`Storage::compact`], stopping after `max_partitions` partitions have been rewritten.
+    ///
+    /// A pass over a database with hundreds of day-partitions rewrites every one of them, and its
+    /// duration is the corpus rather than the request. A bound turns that into **incremental
+    /// progress**: an operator (or a scheduler) does a slice now and the rest later, instead of
+    /// choosing between an hour-long call and never compacting.
+    ///
+    /// Partitions past the bound are left exactly as they were — untouched, still listed, still
+    /// queryable — so a capped pass is not a partial one. There is nothing to resume: run it again
+    /// and the next slice is done. A pass that rewrites **nothing** is how a caller learns there was
+    /// nothing left to do, which is what a drain loop stops on.
+    #[cfg(feature = "compaction")]
+    pub fn compact_bounded(&self, max_partitions: usize) -> Result<CompactionReport> {
         let Some(dir) = self.dir.clone() else {
             return Ok(CompactionReport::default());
         };
+        let mut budget = max_partitions;
 
         // 1. Snapshot the segment lists under the lock (a cheap `Vec<SegmentRef>` clone — the segment
         //    *metadata*, not the Parquet data), then release. The read/concat/sort/write below runs
@@ -1526,6 +1697,7 @@ impl Storage {
             logs_snap,
             &mut report,
             &mut deferred_deletes,
+            &mut budget,
         )?;
         let new_spans = self.compact_partition(
             &dir,
@@ -1535,6 +1707,7 @@ impl Storage {
             spans_snap,
             &mut report,
             &mut deferred_deletes,
+            &mut budget,
         )?;
         let mut new_metrics: Vec<(Table, Vec<SegmentRef>)> = Vec::new();
         for (table, segs) in metrics_snap {
@@ -1546,6 +1719,7 @@ impl Storage {
                 segs,
                 &mut report,
                 &mut deferred_deletes,
+                &mut budget,
             )?;
             new_metrics.push((table, merged));
         }
@@ -1586,6 +1760,7 @@ impl Storage {
 
     /// Merge each day-partition group of `>1` segments into a single sorted segment.
     #[allow(clippy::too_many_arguments)]
+    #[cfg(feature = "compaction")]
     fn compact_partition(
         &self,
         dir: &Path,
@@ -1595,6 +1770,9 @@ impl Storage {
         segs: Vec<SegmentRef>,
         report: &mut CompactionReport,
         deferred_deletes: &mut Vec<SegmentRef>,
+        // Partitions this pass may still rewrite, shared across every table so the bound is on the
+        // *pass* rather than on each table's share of it.
+        budget: &mut usize,
     ) -> Result<Vec<SegmentRef>> {
         let mut by_day: BTreeMap<String, Vec<SegmentRef>> = BTreeMap::new();
         for s in segs {
@@ -1605,10 +1783,35 @@ impl Storage {
         }
 
         let mut result = Vec::new();
+        let promote = self.promote_keys();
         for group in by_day.into_values() {
-            if group.len() <= 1 {
+            // Out of budget: pass the rest through untouched, so this table's segment list stays
+            // complete and the partitions are exactly as they were. `continue` rather than `break`
+            // because every remaining group still has to reach `result`.
+            if *budget == 0 {
                 result.extend(group);
                 continue;
+            }
+            // A partition with one segment is normally nothing to merge — but it is still rewritten
+            // when its schema **lags the live promote set**, because that rewrite is the only way
+            // such a partition ever converges. A day that will never gain a second segment (an old
+            // partition, a low-volume signal, a database that seals rarely) would otherwise keep
+            // paying the JSON fallback forever, no matter how often compaction runs.
+            //
+            // Merging and converging are deliberately the *same* pass, not two jobs: compaction
+            // already projects promoted columns while it rewrites (see `backfill_promoted`), so
+            // separating them would rewrite the same bytes twice and — under the out-of-process
+            // design in ARCHITECTURE.md §7.2 — have two pending records claiming the
+            // same input segment, where whichever committed first would invalidate the other.
+            if group.len() <= 1 {
+                let lags = match group.first() {
+                    Some(s) => segment_schema_lags(&dir.join(&s.relative_path), &promote)?,
+                    None => false,
+                };
+                if !lags {
+                    result.extend(group);
+                    continue;
+                }
             }
             // Segments in one day partition can have been sealed under *different* promoted key
             // sets (ARCHITECTURE.md §6.1 allows the embedder to change `promote` between runs), so
@@ -1621,7 +1824,16 @@ impl Storage {
             let mut batches = Vec::new();
             for s in &group {
                 for b in read_parquet_file(&dir.join(&s.relative_path))? {
-                    batches.push(coerce_to_schema(b, &canonical)?);
+                    // Which promoted columns this source segment predates. Captured *before* the
+                    // coerce, because coercion is what makes them indistinguishable from a column
+                    // that is present and genuinely NULL.
+                    let missing: Vec<String> = promote
+                        .iter()
+                        .filter(|k| b.schema().index_of(k).is_err())
+                        .cloned()
+                        .collect();
+                    let coerced = coerce_to_schema(b, &canonical)?;
+                    batches.push(backfill_promoted(coerced, &missing)?);
                 }
             }
             if batches.is_empty() {
@@ -1652,8 +1864,13 @@ impl Storage {
                     _ => build_logs_sidecar(&tidx, &logs_batch_to_index_rows(&sorted))?,
                 }
             }
-            report.segments_merged += group.len() as u64;
+            if group.len() == 1 {
+                report.segments_converged += 1;
+            } else {
+                report.segments_merged += group.len() as u64;
+            }
             report.segments_created += 1;
+            *budget -= 1;
             // Defer deleting the merged-away sources until the manifest that points at the new
             // merged segment is durable (see `compact`). Deleting them now would risk losing every
             // row if a crash struck before the manifest was persisted.
@@ -1669,18 +1886,275 @@ impl Storage {
     }
 }
 
+/// The per-table segment list inside `Inner`, mutably.
+fn segments_for_mut(inner: &mut Inner, table: Table) -> &mut Vec<SegmentRef> {
+    match table {
+        Table::Logs => &mut inner.segments,
+        Table::Spans => &mut inner.spans_segments,
+        other => inner.metric_segments.entry(other).or_default(),
+    }
+}
+
+/// Outcome of a [`Storage::commit_pending`] pass.
+#[derive(Debug, Default, Clone)]
+pub struct PendingReport {
+    /// Records validated and swapped into the manifest.
+    pub applied: u64,
+    /// Records rejected — stale, corrupt, or built against a different promoted key set. Their
+    /// inputs are untouched, so the only cost is the preparer's wasted work.
+    pub discarded: u64,
+    /// Input segments removed by the applied records.
+    pub segments_replaced: u64,
+}
+
 /// Outcome of a compaction pass (ARCHITECTURE.md §7).
 #[derive(Debug, Default, Clone)]
 pub struct CompactionReport {
+    /// Segments consumed by a **merge** (a partition holding more than one).
     pub segments_merged: u64,
+    /// Segments rewritten **in place** because their schema lagged the live promote set — a 1 -> 1
+    /// convergence, not a merge. Counted separately so `segments_merged` stays literally true.
+    pub segments_converged: u64,
     pub segments_created: u64,
 }
 
 /// The UTC-day component of a `<table>/<day>/<id>.parquet` relative path.
+#[cfg(feature = "compaction")]
 fn day_of_path(rel: &str) -> String {
     rel.split('/').nth(1).unwrap_or_default().to_owned()
 }
 
+/// Whether a segment's stored schema is **missing** any of `promote`'s columns — i.e. it was sealed
+/// before those keys were promoted and has not been converged yet.
+///
+/// Reads the Parquet footer only (no row groups), so probing every segment of a partition costs one
+/// small seek each rather than a decode.
+#[cfg(feature = "compaction")]
+fn segment_schema_lags(path: &Path, promote: &[String]) -> Result<bool> {
+    if promote.is_empty() {
+        return Ok(false);
+    }
+    let file = std::fs::File::open(path)?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+        .map_err(|e| Error::storage_io(Some(path.to_path_buf()), e))?;
+    let schema = builder.schema();
+    Ok(crate::schema::promoted_columns(promote)
+        .into_iter()
+        .any(|k| schema.index_of(k).is_err()))
+}
+
+/// The canonical Arrow schema of `table` under `promote`, free of any `Storage`.
+#[cfg(feature = "compaction")]
+fn table_schema_for(table: Table, promote: &[String]) -> SchemaRef {
+    match table {
+        Table::Logs => logs_schema(promote),
+        Table::Spans => spans_schema(promote),
+        Table::MetricsGauge | Table::MetricsSum => metric_scalar_schema(promote),
+        Table::MetricsHistogram => histogram_schema(promote),
+        Table::MetricsExpHistogram => exp_histogram_schema(promote),
+        Table::MetricsSummary => summary_schema(promote),
+    }
+}
+
+/// How each table's segments are ordered and whether they carry a Tantivy sidecar. One place, so the
+/// in-process compactor and the out-of-process preparer cannot drift apart on it.
+#[cfg(feature = "compaction")]
+fn rewrite_params(table: Table) -> (&'static str, bool) {
+    match table {
+        Table::Logs => ("time", true),
+        Table::Spans => ("start_time", true),
+        _ => ("time", false),
+    }
+}
+
+/// Write `batch` as a segment Parquet under `dir`, returning `(relative_path, absolute_path)`.
+///
+/// The free counterpart of `Storage::write_segment_parquet`, so a **read-only** preparer can produce
+/// a segment without holding the writer lock. `unique` distinguishes concurrently-written files;
+/// the writer passes its `seq` counter, a preparer passes anything process-unique.
+#[cfg(feature = "compaction")]
+fn write_segment_parquet_at(
+    dir: &Path,
+    table: &str,
+    min_time: i64,
+    batch: &RecordBatch,
+    compression: Compression,
+    unique: u64,
+) -> Result<(String, PathBuf)> {
+    let day = utc_date_string(min_time);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let relative_path = format!("{table}/{day}/{now:020}-{unique:06}.parquet");
+    let abs_path = dir.join(&relative_path);
+    if let Some(parent) = abs_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp_path = abs_path.with_extension("tmp");
+    let bloom_columns: &[&str] = if table == Table::Spans.as_str() {
+        &["trace_id", "span_id"]
+    } else {
+        &[]
+    };
+    write_parquet(batch, &tmp_path, compression, bloom_columns)?;
+    std::fs::rename(&tmp_path, &abs_path)?;
+    if let Some(parent) = abs_path.parent() {
+        fsync_dir(parent)?;
+    }
+    Ok((relative_path, abs_path))
+}
+
+/// Rewrite one segment set into a single converged segment, **without touching the manifest**.
+///
+/// This is the expensive half of housekeeping and the half that needs no exclusivity: it only reads
+/// the inputs and writes a new, unreferenced file. `Storage::compact` does the same work inline; a
+/// preparer running out of process calls this and hands the result over as a
+/// [`pending::PendingRewrite`].
+#[cfg(feature = "compaction")]
+fn rewrite_segment_set(
+    dir: &Path,
+    table: Table,
+    group: &[SegmentRef],
+    promote: &[String],
+    compression: Compression,
+    unique: u64,
+) -> Result<Option<SegmentRef>> {
+    let (time_col, build_index) = rewrite_params(table);
+    let canonical = table_schema_for(table, promote);
+    let mut batches = Vec::new();
+    for s in group {
+        for b in read_parquet_file(&dir.join(&s.relative_path))? {
+            let missing: Vec<String> = promote
+                .iter()
+                .filter(|k| b.schema().index_of(k).is_err())
+                .cloned()
+                .collect();
+            batches.push(backfill_promoted(
+                coerce_to_schema(b, &canonical)?,
+                &missing,
+            )?);
+        }
+    }
+    if batches.is_empty() {
+        return Ok(None);
+    }
+    let sorted = concat_and_sort(&batches, time_col)?;
+    let min_time = group
+        .iter()
+        .map(|s| s.min_time_unix_nano)
+        .min()
+        .unwrap_or(0);
+    let max_time = group
+        .iter()
+        .map(|s| s.max_time_unix_nano)
+        .max()
+        .unwrap_or(0);
+    let rows = sorted.num_rows() as u64;
+    let (relative_path, abs) =
+        write_segment_parquet_at(dir, table.as_str(), min_time, &sorted, compression, unique)?;
+    if build_index {
+        let tidx = abs.with_extension("tidx");
+        match table {
+            Table::Spans => build_spans_sidecar(&tidx, &spans_batch_to_index_rows(&sorted))?,
+            _ => build_logs_sidecar(&tidx, &logs_batch_to_index_rows(&sorted))?,
+        }
+    }
+    Ok(Some(SegmentRef {
+        relative_path,
+        min_time_unix_nano: min_time,
+        max_time_unix_nano: max_time,
+        rows,
+    }))
+}
+
+/// Plan and perform housekeeping rewrites against a database **without holding the writer lock**,
+/// leaving each result as a pending record for the writer to commit.
+///
+/// This is the out-of-process half of ARCHITECTURE.md §7.2. It reads the manifest and
+/// the durable promoted key set off disk, groups each table's segments by UTC day, and rewrites a
+/// group when either trigger fires:
+///
+/// - **merge** — the day partition holds more than one segment;
+/// - **converge** — a lone segment's stored schema lags the promoted key set, so its rows still
+///   answer through the JSON fallback.
+///
+/// Both are the same rewrite, which is why they are one job rather than two: separating them would
+/// let two records claim the same input segment, and whichever the writer committed first would
+/// invalidate the other.
+///
+/// `max_jobs` bounds one pass. Promotion triggers convergence on *every* segment lacking the new
+/// column, so an unbounded pass on a large database is one rewrite storm; pacing belongs here, in the
+/// planner, rather than in the engine.
+///
+/// Safe to run against a live writer: nothing here takes a lock, mutates the manifest, or deletes
+/// anything. The worst outcome of racing the writer is a record the writer later discards.
+#[cfg(feature = "compaction")]
+pub fn prepare_pending(
+    dir: impl AsRef<Path>,
+    compression: Compression,
+    max_jobs: usize,
+) -> Result<Vec<pending::PendingRewrite>> {
+    let dir = dir.as_ref();
+    let snap = read_disk_snapshot(dir)?;
+    let promote = read_promote(dir);
+    let keys = promote.keys();
+    let mut out = Vec::new();
+    for table in Table::ALL {
+        if out.len() >= max_jobs {
+            break;
+        }
+        let segs: &[SegmentRef] = match table {
+            Table::Logs => &snap.logs_segments,
+            Table::Spans => &snap.spans_segments,
+            other => snap
+                .metric_segments
+                .get(&other)
+                .map(|v| v.as_slice())
+                .unwrap_or(&[]),
+        };
+        let mut by_day: BTreeMap<String, Vec<SegmentRef>> = BTreeMap::new();
+        for s in segs {
+            by_day
+                .entry(day_of_path(&s.relative_path))
+                .or_default()
+                .push(s.clone());
+        }
+        for (i, group) in by_day.into_values().enumerate() {
+            if out.len() >= max_jobs {
+                break;
+            }
+            if group.len() <= 1 {
+                let lags = match group.first() {
+                    Some(s) => segment_schema_lags(&dir.join(&s.relative_path), keys)?,
+                    None => false,
+                };
+                if !lags {
+                    continue;
+                }
+            }
+            // `unique` only has to avoid colliding with a concurrently-written segment name; the
+            // nanosecond timestamp does the real work.
+            let unique = 900_000 + i as u64;
+            let Some(output) = rewrite_segment_set(dir, table, &group, keys, compression, unique)?
+            else {
+                continue;
+            };
+            let rec = pending::PendingRewrite {
+                table,
+                inputs: group.iter().map(|s| s.relative_path.clone()).collect(),
+                output_digest: pending::digest_file(&dir.join(&output.relative_path))?,
+                output,
+                promote: promote.clone(),
+            };
+            pending::write(dir, &rec)?;
+            out.push(rec);
+        }
+    }
+    Ok(out)
+}
+
+#[cfg(feature = "compaction")]
 fn read_parquet_file(path: &Path) -> Result<Vec<RecordBatch>> {
     let file = std::fs::File::open(path)?;
     let reader = ParquetRecordBatchReaderBuilder::try_new(file)
@@ -1850,6 +2324,7 @@ fn time_bounds(batch: &RecordBatch, time_col: &str) -> (i64, i64) {
 /// shared because `imbh-storage` and `imbh-query` are siblings (ARCHITECTURE.md §12 dependency
 /// direction `core ← {otlp, storage, index, query}`) and this version speaks plain `arrow` while the
 /// query one speaks DataFusion's arrow re-exports.
+#[cfg(feature = "compaction")]
 fn coerce_to_schema(batch: RecordBatch, schema: &SchemaRef) -> Result<RecordBatch> {
     // Fast path: identical schema (the common case — nothing changed since the segment was sealed).
     if batch.schema().as_ref() == schema.as_ref() {
@@ -2110,6 +2585,71 @@ fn lookup_promoted(attributes: &str, key: &str) -> Option<String> {
         Some(AnyValue::Str(v)) => Some(v),
         _ => None,
     }
+}
+
+/// Populate promoted columns that a source segment **predates**, projecting each from the row's
+/// retained `attributes` JSON instead of leaving the null-fill `coerce_to_schema` produced.
+///
+/// `promote` is not retroactive: a segment sealed before a key was promoted has no column for it, and
+/// `coerce_to_schema` null-fills that column so the batch matches the canonical schema. Answers stay
+/// correct — `SqlParams::attr_field` emits
+/// `CASE WHEN "k" IS NOT NULL THEN … ELSE json_get_str(attributes,'k') END`, and a null-filled column
+/// takes the JSON arm exactly as an absent one would. But compaction is the *one* operation that
+/// rewrites these rows, so null-filling there bakes the gap in permanently: every query on that key
+/// pays a JSON parse over those rows for the life of the merged segment.
+///
+/// Projecting instead converges history. A compacted segment ends up byte-for-byte what it would have
+/// been had the key been promoted from the start, and the fallback arm goes dead for that data.
+///
+/// **Only columns the source lacked are derived.** A column the source *had* is kept untouched: a
+/// NULL there means the row genuinely carried no string value for the key, and re-deriving would
+/// spend a JSON lookup to reproduce the same NULL. The projection uses the same
+/// [`build_promoted_columns`] / [`lookup_promoted`] path as seal, so a back-filled cell and a
+/// sealed-at-ingest cell cannot disagree.
+#[cfg(feature = "compaction")]
+fn backfill_promoted(batch: RecordBatch, missing: &[String]) -> Result<RecordBatch> {
+    if missing.is_empty() {
+        return Ok(batch);
+    }
+    let schema = batch.schema();
+    let Ok(attrs_idx) = schema.index_of("attributes") else {
+        // No record-attributes column to project from (no signal is shaped this way today). Leaving
+        // the null-fill is the honest outcome: correct, just unconverged.
+        return Ok(batch);
+    };
+    let attrs = batch
+        .column(attrs_idx)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| Error::storage_msg("compaction: `attributes` is not a StringArray"))?;
+    // `build_promoted_columns` wants one `&str` per row in row order; a NULL blob has no attributes,
+    // so it projects to NULL through the empty object.
+    let texts: Vec<&str> = (0..attrs.len())
+        .map(|i| {
+            if attrs.is_null(i) {
+                "{}"
+            } else {
+                attrs.value(i)
+            }
+        })
+        .collect();
+    let built = build_promoted_columns(missing, texts.into_iter());
+    // Zip against `promoted_columns(missing)`, NOT `missing` itself: it drops reserved names and
+    // de-duplicates, so the built vector can be shorter than and positionally offset from what was
+    // asked for, and zipping the request would silently write one key's values into another key's
+    // column. Believed unreachable as things stand — `missing` holds only keys absent from the source
+    // schema, and the reserved names are the built-in columns, which every segment has — so this is a
+    // guard against the built-in set changing, not against a live bug. Cheap enough to keep.
+    let names = crate::schema::promoted_columns(missing);
+    debug_assert_eq!(names.len(), built.len());
+    let mut columns = batch.columns().to_vec();
+    for (name, col) in names.into_iter().zip(built) {
+        if let Ok(idx) = schema.index_of(name) {
+            columns[idx] = col;
+        }
+    }
+    RecordBatch::try_new(schema, columns)
+        .map_err(|e| Error::storage_ctx("compaction: rebuild batch with projected columns", e))
 }
 
 /// Build the promoted label columns for a batch: one nullable `Dictionary(Int32,Utf8)` per
@@ -2647,6 +3187,7 @@ fn prepend_front<T>(buffer: &mut Vec<T>, mut restored: Vec<T>) {
 /// Apply a compaction result to a live segment list: drop the compacted-away sources (`deleted`),
 /// then add the segments the compaction produced (merged + untouched singletons), skipping any
 /// already present. Preserves segments a concurrent seal appended while compaction ran off-lock.
+#[cfg(feature = "compaction")]
 fn reconcile_segments(
     current: &mut Vec<SegmentRef>,
     deleted: &std::collections::HashSet<String>,
@@ -2915,6 +3456,18 @@ fn cleanup_orphans(dir: &Path, manifest: &Manifest, active_manifest: Option<u64>
         referenced.insert(p.with_extension("tidx"));
         referenced.insert(p);
     }
+    // A **prepared but uncommitted** rewrite is a segment no manifest points at yet — which is
+    // precisely the shape of an orphan. Reaping it would be safe (the commit's digest check would
+    // fail and discard the record) but ruinous in practice: an out-of-process preparer would lose its
+    // work to every writer restart, and the offline `--commit` mode, which opens the writer *after*
+    // preparing, would destroy its own output before committing it. So a valid pending record
+    // protects the file it names, and the record's own validation still decides whether it is ever
+    // committed.
+    for entry in pending::list(dir).into_iter().flatten() {
+        let p = dir.join(&entry.1.output.relative_path);
+        referenced.insert(p.with_extension("tidx"));
+        referenced.insert(p);
+    }
     // The live manifest log (named by CURRENT) must be kept; stray `MANIFEST-*` from an interrupted
     // roll must go. `active_manifest` is `None` for a DB whose manifest is not yet materialized.
     let active_name = active_manifest.map(|n| format!("MANIFEST-{n:06}"));
@@ -2964,18 +3517,132 @@ fn wal_mode_token(mode: WalMode) -> &'static str {
     }
 }
 
-/// Persist the writer's WAL mode to [`INFO_FILE`] (temp → rename, so a reader never sees a torn
-/// line). Best-effort: a hint for readers, never a correctness input for the writer, so any I/O error
-/// is swallowed rather than failing the open.
-fn write_db_info(dir: &Path, wal_mode: WalMode) {
-    let text = format!("wal_mode\t{}\n", wal_mode_token(wal_mode));
+/// Escape a promoted key for one tab-separated [`INFO_FILE`] field. Attribute keys are arbitrary
+/// UTF-8 and OpenTelemetry does not forbid a tab or newline in one, so round-tripping has to be
+/// total rather than merely likely.
+fn escape_field(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\t' => out.push_str("\\t"),
+            '\n' => out.push_str("\\n"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+fn unescape_field(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('t') => out.push('\t'),
+            Some('n') => out.push('\n'),
+            Some('\\') => out.push('\\'),
+            // An unknown escape is passed through verbatim rather than dropped, so a file written by
+            // a future version with more escapes degrades to a wrong key rather than a lost one.
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+    out
+}
+
+/// Render the [`INFO_FILE`] body: the writer's WAL mode plus the **durable promoted key set**, one
+/// `promote` line per key in column order.
+fn db_info_text(wal_mode: WalMode, promote: &Promote, retention: Retention) -> String {
+    let mut text = format!("wal_mode\t{}\n", wal_mode_token(wal_mode));
+    for key in promote.keys() {
+        text.push_str("promote\t");
+        text.push_str(&escape_field(key));
+        text.push('\n');
+    }
+    if let Some(age) = retention.max_age() {
+        text.push_str(&format!("retain_max_age_secs\t{}\n", age.as_secs()));
+    }
+    if let Some(bytes) = retention.disk_budget() {
+        text.push_str(&format!("retain_max_disk_bytes\t{bytes}\n"));
+    }
+    text
+}
+
+/// Persist [`INFO_FILE`] (temp → rename, so a reader never sees a torn file).
+fn write_db_info_at(
+    dir: &Path,
+    wal_mode: WalMode,
+    promote: &Promote,
+    retention: Retention,
+) -> std::io::Result<()> {
     let tmp = dir.join(format!("{INFO_FILE}.tmp"));
     let final_path = dir.join(INFO_FILE);
+    let text = db_info_text(wal_mode, promote, retention);
     let wrote =
         std::fs::write(&tmp, text.as_bytes()).and_then(|()| std::fs::rename(&tmp, &final_path));
     if wrote.is_err() {
         let _ = std::fs::remove_file(&tmp); // don't leave a stray temp behind
     }
+    wrote
+}
+
+/// Best-effort variant used at open, refreshing the WAL-mode line. The WAL-mode line is a hint for
+/// readers and never a correctness input, so an I/O error here is swallowed rather than failing the
+/// open — as it always has been. [`Storage::persist_promote`] is the fallible path, because a
+/// promoted set that fails to persist *is* a correctness problem.
+///
+/// **It carries the existing promoted set through rather than overwriting it.** The set is durable
+/// database state; opening a database must not be the thing that erases it. (It was: the first cut
+/// of this wrote `Promote::default()` here, so reopening a promoted database wiped the marker before
+/// the facade had a chance to read it, and a reader then saw no promoted columns at all.)
+fn write_db_info(dir: &Path, wal_mode: WalMode) {
+    let _ = write_db_info_at(dir, wal_mode, &read_promote(dir), read_retention(dir));
+}
+
+/// The **durable** retention policy recorded for `dir`, or [`Retention::none`] when the marker is
+/// absent — which is what a database written before this existed genuinely had.
+///
+/// Durable for the same reason the promoted set is: a housekeeper that applies retention must apply
+/// the host's policy rather than one taken from its own flags, and two handles on one directory must
+/// not disagree about when data is deleted.
+pub fn read_retention(dir: impl AsRef<Path>) -> Retention {
+    let Ok(text) = std::fs::read_to_string(dir.as_ref().join(INFO_FILE)) else {
+        return Retention::none();
+    };
+    let field = |tag: &str| -> Option<u64> {
+        text.lines().find_map(|line| {
+            let mut it = line.split('\t');
+            (it.next() == Some(tag))
+                .then(|| it.next()?.parse().ok())
+                .flatten()
+        })
+    };
+    Retention::from_parts(
+        field("retain_max_age_secs").map(std::time::Duration::from_secs),
+        field("retain_max_disk_bytes"),
+    )
+}
+
+/// The **durable** promoted key set recorded for `dir` — the set every handle on this database must
+/// agree on, rather than whatever list each host happened to pass its builder.
+///
+/// A missing or unparseable marker reads as empty, which is what a database written before this
+/// existed genuinely had.
+pub fn read_promote(dir: impl AsRef<Path>) -> Promote {
+    let Ok(text) = std::fs::read_to_string(dir.as_ref().join(INFO_FILE)) else {
+        return Promote::default();
+    };
+    Promote::new(text.lines().filter_map(|line| {
+        let mut it = line.split('\t');
+        (it.next() == Some("promote")).then(|| unescape_field(it.next().unwrap_or_default()))
+    }))
 }
 
 /// Whether the writer that last opened `dir` advertised a **disabled** WAL (via [`INFO_FILE`]).
@@ -3933,11 +4600,22 @@ mod tests {
             ],
             "rows from all three segments survive, time-sorted"
         );
-        // `region` is only *projected* at ingest, so the two older segments null-fill it — exactly
-        // what a query over those un-compacted segments already saw via `imbh-query`'s `coerce`.
+        // `region` is **back-filled from each row's retained `attributes` JSON**, so the two older
+        // segments — sealed before `region` was promoted — come out populated rather than NULL.
+        //
+        // This used to assert `[None, None, Some("us")]`. That was correct behaviour but not
+        // *converged*: a query still answered correctly, because `attr_field` emits a `CASE` whose
+        // NULL arm reads the key back out of the JSON, but those rows paid a JSON parse forever.
+        // Compaction is the one operation that rewrites them, so it is where the gap gets closed
+        // instead of baked in (see ARCHITECTURE.md §7.2).
         assert_eq!(
             str_column(&batch, "region"),
-            vec![None, None, Some("us".to_owned())]
+            vec![
+                Some("us".to_owned()),
+                Some("us".to_owned()),
+                Some("us".to_owned())
+            ],
+            "compaction converges promoted history instead of null-filling it"
         );
         // Nothing is actually lost by the drop: `attributes` is never rewritten, so the de-promoted
         // `env` is still there for every row.

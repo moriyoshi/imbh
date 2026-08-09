@@ -187,7 +187,7 @@ native-builder behavior (ARCHITECTURE.md §10.18). The host-integration guide is
 ## Crate map
 
 Cargo workspace (ARCHITECTURE.md §12); dependency direction
-`core ← {otlp, storage, index, query} ← imbh ← {exporter, server}`:
+`core ← {otlp, storage, index, query, attrstats} ← imbh ← {exporter, server}`:
 
 | Crate | Responsibility |
 |-------|----------------|
@@ -196,10 +196,11 @@ Cargo workspace (ARCHITECTURE.md §12); dependency direction
 | `imbh-storage` | WAL, mutable buffer, seal, Parquet segments, manifest IO, retention, compaction; owns the Arrow schemas |
 | `imbh-index` | Tantivy schema/build/search and the row-ordinal bridge (**only crate that knows Tantivy**) |
 | `imbh-query` | DataFusion providers, UDFs, session config, typed plans (**only crate that knows DataFusion**) |
+| `imbh-attrstats` | attribute cardinality and per-segment selectivity (sigma) over a database *directory*, plus the promote/index verdicts derived from them (ARCHITECTURE.md §10.20); reads and writes nothing, so it runs against a live writer's database. Behind the facade's off-by-default `attrstats` feature (`Db::attribute_stats`); also the `attr-stats` CLI, `imbhd`'s `POST /api/head/attributes/stats`, and the TUI Overview's attribute block |
 | `imbh-lgtm` | LGTM-stack (Loki/Tempo/Mimir) query-language compatibility: PromQL/LogQL/TraceQL parser-independent models + reference evaluators (`model`) and source-positioned translators for the pinned P1/L1/T1 profiles (`syntax`); optional native-IMBH adapters/builders under the `source` feature |
 | `imbh-tui` | optional read-only companion for metrics, traces, logs, and log-derived charts — over a local directory or, with `--url`, as a **head** onto a running `imbhd`; its binary also hosts the MCP **stdio** transport (`imbh-tui --mcp-stdio`) |
 | `imbh-head` | the head API: the typed read-only query surface a UI with no database of its own drives `imbhd` over — wire types, the single `Db`-side implementation of each operation (shared by the daemon and by the TUI's local backend), and the HTTP client; row-shaped results travel as Arrow IPC |
-| `imbh-mcp` | the MCP server: protocol dispatch, the 15 read-only tools, and the stdio transport — shared by `imbh-server`'s `POST /mcp` and `imbh-tui`'s stdio mode; adds no crate to the graph |
+| `imbh-mcp` | the MCP server: protocol dispatch, the 20 agent tools (18 read-only; `set_promoted_attributes` and `run_housekeeping` write, and each is offered only where it can work — a read-only handle, a host with no housekeeping queue), and the stdio transport — shared by `imbh-server`'s `POST /mcp` and `imbh-tui`'s stdio mode; adds no crate to the graph |
 | `imbh` | the facade embedders use: `Db`, blocking + async API; optional stderr console renderer (`imbh::console`, `tracing-console` feature) |
 | `imbh-proto` | protobuf wire types for the query-API inputs (Go/FFI binding surface, `proto` feature); generated from `.proto` via protox, prost-only, optional |
 | `imbh-otel-exporter` | opentelemetry-rust SDK exporter adapters (span/log/metric), optional |

@@ -59,18 +59,41 @@ impl SqlParams {
     }
 
     /// A `Utf8` SQL expression reading record-`attributes` key `key`: the built-in column when `key`
-    /// names one ([`builtin_column`]), else the promoted dictionary column cast to `VARCHAR`
-    /// (exactly how `service` is read) when `key` is promoted, else `json_get_str(attributes, $key)`.
-    /// The promoted and JSON forms are identical in result — a promoted key also stays in the JSON
-    /// blob and the column mirrors the record `attributes` scope only (§6.1) — so mixing them across
-    /// one query (some keys promoted, some not) is safe. The `CAST` normalizes the dict to plain text
-    /// so `= v` / `IS NOT NULL` / `matches(...)` / `coalesce(...)` compose the same regardless of
-    /// branch.
+    /// names one ([`builtin_column`]), else a promoted-column-with-JSON-fallback `CASE` when `key` is
+    /// promoted, else `json_get_str(attributes, $key)`. All three are identical in result — a promoted
+    /// key also stays in the JSON blob and the column mirrors the record `attributes` scope only
+    /// (§6.1) — so mixing them across one query (some keys promoted, some not) is safe. The `CAST`
+    /// normalizes the dict to plain text so `= v` / `IS NOT NULL` / `matches(...)` / `coalesce(...)`
+    /// compose the same regardless of branch.
+    ///
+    /// **Why the promoted branch is a `CASE` and not a bare column.** Promotion is not retroactive:
+    /// segments sealed before `key` was promoted have no such column and are null-filled by the
+    /// `coerce` schema-evolution path, so a bare `CAST("k" AS VARCHAR) = 'v'` matches *nothing* on
+    /// them — a filter on a newly promoted key silently loses all history. The `CASE` falls back to
+    /// the JSON blob exactly on the rows where the column is NULL, which is both the pre-promotion
+    /// segments and the rows that genuinely lack the key (where JSON yields NULL too, same answer).
+    ///
+    /// This costs nothing on the rows that matter. DataFusion rewrites the `CASE` to a physical
+    /// `CaseExpr` that evaluates the `WHEN` over the batch and then takes a whole-batch fast path when
+    /// it is uniformly true or false — and batches never span segments, so a post-promotion segment
+    /// takes the column arm with `json_get_str` never invoked, while a pre-promotion segment takes the
+    /// JSON arm exactly as it did before promotion. Only a segment where the key is present on *some*
+    /// rows pays for both, and there the JSON arm runs on the filtered remainder.
+    ///
+    /// The `WHEN` deliberately tests the **bare dictionary column**, not the `CAST`: the predicate is
+    /// evaluated over the full batch, so casting there would materialize a `Utf8` array from the
+    /// dictionary on every batch just to check nullity. `IS NOT NULL` on the dictionary is a null-
+    /// buffer read.
     pub(crate) fn attr_field(&mut self, key: &str) -> String {
         if let Some(col) = builtin_column(key) {
             format!("CAST({col} AS VARCHAR)")
         } else if self.promoted.iter().any(|c| c == key) {
-            format!("CAST(\"{}\" AS VARCHAR)", key.replace('"', "\"\""))
+            let col = key.replace('"', "\"\"");
+            let json = self.str(key);
+            format!(
+                "CASE WHEN \"{col}\" IS NOT NULL THEN CAST(\"{col}\" AS VARCHAR) \
+                 ELSE json_get_str(attributes, {json}) END"
+            )
         } else {
             format!("json_get_str(attributes, {})", self.str(key))
         }
@@ -84,13 +107,20 @@ impl SqlParams {
     /// integer- and double-typed JSON scalars, not only numbers that arrived as strings. NULL (⇒ the
     /// comparison is false) for an absent key or a non-numeric value, matching the evaluator: the
     /// resulting predicate is a sound superset of the typed comparison.
+    /// (The promoted branch is the same non-retroactive `CASE` as [`attr_field`](Self::attr_field) —
+    /// see its docs for why a bare column silently loses pre-promotion segments. Note the two arms
+    /// are not merely different spellings of one value here: `json_get_num` sees integer- and
+    /// double-typed JSON scalars, while a promoted column is always text, so the fallback is if
+    /// anything *more* capable than the column arm.)
     pub(crate) fn attr_num_field(&mut self, key: &str) -> String {
         if let Some(col) = builtin_column(key) {
             format!("TRY_CAST(CAST({col} AS VARCHAR) AS DOUBLE)")
         } else if self.promoted.iter().any(|c| c == key) {
+            let col = key.replace('"', "\"\"");
+            let json = self.str(key);
             format!(
-                "TRY_CAST(CAST(\"{}\" AS VARCHAR) AS DOUBLE)",
-                key.replace('"', "\"\"")
+                "CASE WHEN \"{col}\" IS NOT NULL THEN TRY_CAST(CAST(\"{col}\" AS VARCHAR) AS DOUBLE) \
+                 ELSE json_get_num(attributes, {json}) END"
             )
         } else {
             format!("json_get_num(attributes, {})", self.str(key))
@@ -105,6 +135,18 @@ impl SqlParams {
     /// Bind a signed-integer value (e.g. a nanosecond time bound), returning its `$N` placeholder.
     pub(crate) fn i64(&mut self, v: i64) -> String {
         self.bind(ScalarValue::Int64(Some(v)))
+    }
+
+    /// Bind raw id bytes as a `FixedSizeBinary(len)` value — the on-disk type of the `trace_id` /
+    /// `span_id` columns — returning its `$N` placeholder. Comparing the column to *raw bytes*
+    /// (rather than `hex(col) = '…'`) is what lets the query provider skip whole segments via their
+    /// Parquet bloom filter (ARCHITECTURE.md §8); the width must match the column's exactly, since
+    /// DataFusion infers the placeholder's type from the column and then type-checks the bound value.
+    pub(crate) fn id_bytes(&mut self, v: &[u8]) -> String {
+        self.bind(ScalarValue::FixedSizeBinary(
+            v.len() as i32,
+            Some(v.to_vec()),
+        ))
     }
 
     fn bind(&mut self, v: ScalarValue) -> String {

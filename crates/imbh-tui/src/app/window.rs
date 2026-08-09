@@ -5,7 +5,7 @@ use std::time::Duration;
 use imbh::Timestamp;
 
 use crate::app::App;
-use crate::model::{MAX_WINDOW_NS, MIN_WINDOW_NS, Mode, TIME_RANGES};
+use crate::model::{AbsTarget, MAX_WINDOW_NS, MIN_WINDOW_NS, Mode, TIME_RANGES};
 use crate::time::{format_datetime_ns, parse_datetime};
 use crate::ui::glyphs::Glyphs;
 
@@ -54,21 +54,52 @@ impl App {
         }
     }
 
-    /// Prefill the absolute-range form from the current effective window and open it.
+    /// Prefill the absolute-range form from the current effective query window and open it.
     pub(crate) fn open_absolute_form(&mut self) {
-        let (start, end) = self.effective_window();
-        self.abs_start = format_datetime_ns(start);
-        self.abs_end = format_datetime_ns(end);
+        self.open_abs_form(AbsTarget::Query, Some(self.effective_window()));
+    }
+
+    /// Open the same form against the **attribute** window (Enter on the focused attribute pane),
+    /// prefilled with the window the statistics currently cover.
+    ///
+    /// Empty fields when that window is "all of time", which is the same spelling the form accepts
+    /// back: the fields and the range say the same thing in both directions, so there is nothing extra
+    /// to learn and no third state to explain.
+    pub(crate) fn open_attr_range_form(&mut self) {
+        self.open_abs_form(AbsTarget::Attributes, self.attr_window);
+    }
+
+    fn open_abs_form(&mut self, target: AbsTarget, prefill: Option<(i64, i64)>) {
+        self.abs_target = target;
+        let (start, end) = match prefill {
+            Some((start, end)) => (format_datetime_ns(start), format_datetime_ns(end)),
+            None => (String::new(), String::new()),
+        };
+        self.abs_start = start;
+        self.abs_end = end;
         // Opens on the start field with the caret at its end, as the query box opens.
         self.focus_abs_field(0);
         self.abs_error = None;
         self.mode = Mode::AbsoluteRange;
     }
 
-    /// Parse and commit the absolute-range form. On success sets `abs_window`, returns to Normal, and
-    /// returns `true` (the caller triggers a refresh); on failure records `abs_error` and returns
-    /// `false`, keeping the form open.
+    /// Parse and commit the absolute-range form into whichever window it was opened against. On
+    /// success returns to Normal and returns `true` (the caller triggers a refresh); on failure
+    /// records `abs_error` and returns `false`, keeping the form open.
+    ///
+    /// Under [`AbsTarget::Attributes`], **clearing both fields** measures all of time — the pane's
+    /// default. It needs no second binding: an empty form is already the natural spelling of
+    /// "unbounded", and it is what the form shows when the range is unbounded.
     pub(crate) fn commit_absolute(&mut self) -> bool {
+        if self.abs_target == AbsTarget::Attributes
+            && self.abs_start.trim().is_empty()
+            && self.abs_end.trim().is_empty()
+        {
+            self.attr_window = None;
+            self.abs_error = None;
+            self.mode = Mode::Normal;
+            return true;
+        }
         match (
             parse_datetime(&self.abs_start),
             parse_datetime(&self.abs_end),
@@ -86,17 +117,23 @@ impl App {
                 false
             }
             (Some(start), Some(end)) => {
-                self.abs_window = Some((start, end));
+                match self.abs_target {
+                    AbsTarget::Query => {
+                        self.abs_window = Some((start, end));
+                        self.scroll = 0;
+                        self.selected = 0;
+                    }
+                    // The attribute window moves no cursor: it changes one block inside a pane the
+                    // user is already reading, not what the pane is showing.
+                    AbsTarget::Attributes => self.attr_window = Some((start, end)),
+                }
                 self.abs_error = None;
                 self.mode = Mode::Normal;
-                self.scroll = 0;
-                self.selected = 0;
                 true
             }
         }
     }
 
-    /// Pan the query window by `fraction` of its span (negative = earlier, positive = later). Freezes
     /// Pan the query window by `fraction` of its span (negative = earlier, positive = later). Freezes
     /// the current effective window into an absolute one so panning is stable against the wall clock —
     /// *except* that panning later far enough to reach `now` resumes the **live rolling window** (rather
@@ -179,6 +216,79 @@ mod tests {
         app.abs_window = Some((start, end));
         assert_eq!(app.effective_window(), (start, end));
         assert_eq!(app.range_summary(&g), "2026-07-21 14:00:00 → 14:30:00");
+    }
+
+    /// The attribute window is set from the same form but lands somewhere else, moves no cursor,
+    /// defaults to all of time, and is cleared back to it by emptying the fields.
+    #[test]
+    fn the_attribute_window_is_all_of_time_until_it_is_set() {
+        let mut app = App::new();
+        assert!(
+            app.attr_window.is_none(),
+            "a promote list is chosen from everything the database holds, not from the last 15m"
+        );
+
+        // Unbounded shows as an empty form — the same spelling the form accepts back.
+        app.open_attr_range_form();
+        assert_eq!(app.mode, Mode::AbsoluteRange);
+        assert_eq!(app.abs_target, AbsTarget::Attributes);
+        assert!(app.abs_start.is_empty() && app.abs_end.is_empty());
+
+        app.abs_start = "2026-07-01 00:00:00".to_owned();
+        app.abs_end = "2026-07-08 00:00:00".to_owned();
+        app.selected = 4;
+        assert!(app.commit_absolute());
+        let attr = app.attr_window.expect("a window of its own");
+        assert!(
+            app.abs_window.is_none(),
+            "the query window is untouched: that is the whole point"
+        );
+        assert_eq!(
+            app.selected, 4,
+            "the attribute window moves no cursor — the pane is still showing the same thing"
+        );
+
+        // Reopening prefills what it now covers, so the common edit is a small one.
+        app.open_attr_range_form();
+        assert_eq!(app.abs_start, "2026-07-01 00:00:00");
+
+        // The measurement is keyed on that window, so changing it invalidates the cache — and moving
+        // the *query* range does not, because the two are unrelated.
+        app.take_attr_stats(app.attr_key(), crate::fetch::attribute_placeholder());
+        assert!(!app.needs_attr_measure());
+        app.abs_window = Some((1, 2));
+        app.range_index = 0;
+        assert!(
+            !app.needs_attr_measure(),
+            "the query range is not this pane's range"
+        );
+        app.attr_window = Some((1, 2));
+        assert!(
+            app.needs_attr_measure(),
+            "a different window, a different answer"
+        );
+        app.attr_window = Some(attr);
+        assert!(!app.needs_attr_measure());
+
+        // Emptying both fields measures all of time again.
+        app.open_attr_range_form();
+        app.abs_start.clear();
+        app.abs_end.clear();
+        assert!(app.commit_absolute());
+        assert!(app.attr_window.is_none());
+        assert!(
+            app.needs_attr_measure(),
+            "and that is a different answer too"
+        );
+
+        // An empty form against the *query* window is still a parse error: a panel has to be
+        // evaluated over some window, so there is no unbounded state for it to fall back to.
+        app.open_absolute_form();
+        app.abs_start.clear();
+        app.abs_end.clear();
+        assert!(!app.commit_absolute());
+        assert!(app.abs_error.is_some());
+        assert_eq!(app.mode, Mode::AbsoluteRange, "the form stays open");
     }
 
     #[test]

@@ -313,6 +313,23 @@ pub async fn attribute_values(
     Ok(dto::Names { names })
 }
 
+/// Attribute cardinality and per-segment selectivity (sigma) over the daemon's database — the
+/// measurement behind a `promote` list.
+///
+/// The only head operation that **scans**: it reads the attribute columns of every sealed segment in
+/// range, so its cost is the corpus, not the answer. It takes no lock and writes nothing, so a
+/// writer keeps running underneath it; what a caller owes is a sensible
+/// [`range`](dto::AttrStatsRequest::range). `imbhd` wraps it in `offload` like every other operation,
+/// which keeps a long scan off the connection's runtime.
+pub async fn attribute_stats(
+    db: &Arc<Db>,
+    request: &dto::AttrStatsRequest,
+) -> Result<dto::AttrStats, HeadError> {
+    db.attribute_stats(request)
+        .await
+        .map_err(HeadError::from_db)
+}
+
 /// Database statistics: the per-table breakdown plus the engine-wide gauges.
 pub async fn stats(db: &Arc<Db>) -> Result<dto::Stats, HeadError> {
     let stats = db.stats().await.map_err(HeadError::from_db)?;

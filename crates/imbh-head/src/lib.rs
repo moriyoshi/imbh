@@ -34,9 +34,16 @@
 //!
 //! # Exposure
 //!
-//! Read-only: nothing here ingests, flushes, compacts, or applies retention. Like the rest of
-//! `imbhd` (ARCHITECTURE.md §10.16) the endpoints are unauthenticated, so a real deployment gates
-//! them; keep `imbhd` bound to `127.0.0.1` when the head is on the same machine.
+//! The head API is read-only: nothing under `/api/head` ingests, flushes, compacts, or applies
+//! retention. The **one** exception in this crate is deliberately not under that prefix —
+//! [`client::HeadClient::set_promoted`] drives `POST /admin/promote` (ARCHITECTURE.md §6.1), which
+//! seals the daemon's buffer and changes the schema every subsequent segment is written with. It sits
+//! on `imbhd`'s `/admin/*` surface beside `flush` and `compact` precisely so that a deployment gating
+//! writes gates it with them, rather than having to pick one write out of a read-only prefix. A head
+//! offering it should make plain that it acts on the database.
+//!
+//! Like the rest of `imbhd` (ARCHITECTURE.md §10.16) the endpoints are unauthenticated, so a real
+//! deployment gates them; keep `imbhd` bound to `127.0.0.1` when the head is on the same machine.
 
 #[cfg(feature = "client")]
 pub mod client;
@@ -67,6 +74,16 @@ pub mod path {
     pub const LOGS_LOGQL: &str = "/api/head/logs/logql";
     pub const ATTRIBUTES_KEYS: &str = "/api/head/attributes/keys";
     pub const ATTRIBUTES_VALUES: &str = "/api/head/attributes/values";
+    pub const ATTRIBUTES_STATS: &str = "/api/head/attributes/stats";
+
+    /// The promoted attribute keys (ARCHITECTURE.md §6.1): `GET` reads the set, `POST` replaces it.
+    ///
+    /// **Not under [`PREFIX`], and deliberately so.** Everything below `/api/head` is read-only;
+    /// replacing the promoted set seals the buffer and changes the schema every subsequent segment is
+    /// written with. It lives on `imbhd`'s `/admin/*` surface with `flush` and `compact`, so a
+    /// deployment that gates writes gates this with them rather than having to pick it out of a
+    /// read-only prefix.
+    pub const ADMIN_PROMOTE: &str = "/admin/promote";
 }
 
 /// Why a head operation did not answer.

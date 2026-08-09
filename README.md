@@ -268,7 +268,12 @@ Point a stock OTel SDK's OTLP/HTTP exporter at `http://ADDR` and query it:
 - **Ingest:** `POST /v1/logs` · `/v1/traces` · `/v1/metrics`
 - **Query:** `POST /api/query` (SQL body → JSON)
 - **Agents:** `POST /mcp` (Model Context Protocol — read-only telemetry tools)
-- **Ops:** `GET /stats` · `POST /admin/flush` · `/admin/compact` · `GET /health`
+- **Ops:** `GET /stats` · `POST /admin/flush` · `/admin/compact` · `GET`/`POST /admin/promote` · `GET /health`
+- **Housekeeping (queued):** `POST /admin/housekeeping` → `202 {"job_id": …}`; poll `GET /admin/housekeeping/<id>`.
+  Seal + commit pending rewrites + retention, and compaction with `{"compact": true}` — submitted
+  rather than performed, because a pass costs the corpus rather than the answer. One runs at a time.
+  `{"max_jobs": N}` bounds the partitions a pass rewrites, so a large corpus is drained a slice at a
+  time; the report's `compaction_complete` says whether anything was left.
 
 `imbhd` runs a **flush scheduler** (the library leaves that choice to the host). `IMBH_FLUSH` picks the
 strategy — triggers that OR together, e.g. `interval=5s,buffer=16MiB,rows=50000,wal=64MiB,idle=2s`, or
@@ -349,8 +354,15 @@ multi-arch tag on. See the [Docker log-driver guide](./docs/DOCKER_LOG_DRIVER.md
 `imbh-tui` is an optional, **read-only** terminal explorer for a local database — a worked example
 of a host built on the facade plus `imbh-lgtm`, not a required component. It opens a directory with
 `Db::open_read_only` (so it never contends with the writer) and renders overview stats, PromQL
-metric charts, TraceQL results with a client-side waterfall, and a log viewer with LogQL-derived
-count/rate charts. `Enter` drills down: a trace opens a full-screen scrollable waterfall with a span
+metric charts, TraceQL results with a client-side waterfall, a log viewer with LogQL-derived
+count/rate charts. Pointed at a daemon (`--url`) it can also **promote and demote attribute keys**
+from the attribute pane (`p`), which is the one thing it does that writes — a local session opens the
+database read-only and does not offer it. The Overview carries a second pane of **attribute
+statistics** — per-key
+cardinality, per-segment selectivity, and the two verdicts a `promote` list is picked from — measured
+in the background, so the screen is usable while the scan runs, over all sealed segments by default
+and over a narrower window of its own on request (Tab to the pane, Enter), unrelated to the range the
+panels are queried over. `Enter` drills down: a trace opens a full-screen scrollable waterfall with a span
 cursor, a span opens all of its fields, and `L` from either shows the logs correlated to that exact
 span:
 
@@ -381,7 +393,7 @@ in every [release archive and in the container image](#install-the-binaries) alo
 ## Workspace layout
 
 Dependency direction:
-`core ← {otlp, storage, index, query} ← imbh ← {lgtm, mcp, exporter, server, tracing} ← tui`.
+`core ← {otlp, storage, index, query, attrstats} ← imbh ← {lgtm, mcp, head, exporter, server, tracing} ← tui`.
 
 | Crate | Responsibility |
 |-------|----------------|
@@ -390,10 +402,11 @@ Dependency direction:
 | `imbh-storage` | WAL, mutable buffer, seal, Parquet segments, manifest IO, retention, compaction; owns the Arrow schemas |
 | `imbh-index` | Tantivy schema/build/search + the row-ordinal bridge (**only crate that knows Tantivy**) |
 | `imbh-query` | DataFusion providers, UDFs, session config, typed plans (**only crate that knows DataFusion**) |
+| `imbh-attrstats` | attribute cardinality and per-segment selectivity (sigma) over a database directory — the measurement behind a `promote` list; behind the facade's off-by-default `attrstats` feature |
 | `imbh` | the facade embedders use: `Db`, blocking + async API; optional stderr console renderer (`imbh::console`, `tracing-console` feature) |
 | `imbh-lgtm` | bounded PromQL/LogQL/TraceQL profiles: parser-independent models + reference evaluators (`model`) and source-positioned translators (`syntax`); native execution adapters under the optional `source` feature |
 | `imbh-tui` | optional read-only terminal explorer for metrics, traces, logs, and log-derived charts (Ratatui/Crossterm confined here); also hosts the MCP stdio transport |
-| `imbh-mcp` | the MCP server: protocol, the 15 read-only agent tools, and the stdio transport, shared by `imbhd`'s `POST /mcp` and `imbh-tui --mcp-stdio` |
+| `imbh-mcp` | the MCP server: protocol, the 20 agent tools (18 read-only; `set_promoted_attributes` and `run_housekeeping` write, and each is offered only where it can work), and the stdio transport, shared by `imbhd`'s `POST /mcp` and `imbh-tui --mcp-stdio` |
 | `imbh-proto` | protobuf wire types for the typed query-API inputs (Go/FFI binding surface); pulled only by the facade's `proto` feature, prost-only, optional |
 | `imbh-otel-exporter` | opentelemetry-rust SDK exporter adapters (span/log/metric), optional |
 | `imbh-tracing` | `tracing` plumbing: `DbLayer` sinking `tracing` into a `Db`, optional |
