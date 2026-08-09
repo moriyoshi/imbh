@@ -9,20 +9,24 @@ git history); this file tracks only what is still open.
 
 ## Open Items
 
-- [x] **v0.7.0 is prepared but not cut.** *(Closed 2026-08-09 — `v0.7.0` was tagged and released
-      2026-08-09, so the canonical-JSON codec swap and the two `imbh-tui` fixes have shipped.)* The
-      workspace was bumped, the changelog section closed and dated, `README.md` /
-      `docs/DOCKER_LOG_DRIVER.md` version strings corrected by hand, notices regenerated and every
-      gate green — see JOURNAL "Preparing v0.7.0".
+- [ ] **v0.8.0 is prepared but not cut.** The workspace is bumped to 0.8.0, the changelog section
+      closed and dated 2026-08-09, `README.md` / `docs/DOCKER_LOG_DRIVER.md` version strings corrected
+      by hand, notices regenerated and every gate green — see JOURNAL "Preparing v0.8.0". Nothing is
+      committed, tagged or published; that is the user's call.
 
-      *(v0.6.2 — the entry this replaces — was tagged and published on 2026-08-07T12:12Z with six
-      release assets, and `ghcr.io/moriyoshi/imbh-log-driver:0.6.2-{amd64,arm64}` are both on GHCR,
-      so the `auto` listener fix has shipped.)*
+      **A minor bump, and this time the signatures justify it.** Unlike v0.7.0, the release breaks the
+      published API in five places, all in the `[0.8.0]` `### Changed` entries: the promoted key set and
+      the retention policy both became durable database state (omitting the builder call now *inherits*
+      rather than resets), `Db::segment_files` returns `Result`, `CompactionReport` gained a field, and
+      `imbh-query`'s `SegmentInput`/`TableInput`/`SegmentTableProvider::new` changed shape.
 
-      **Why a minor, not a patch.** The canonical-JSON codec swap is a *stored-data* break — the
-      spelling of an integral `Double` changed — which semver does not describe and a patch number
-      would hide. The bump was the user's call; the accompanying release note (what mixed-vintage
-      data means, and that compaction is not a rewrite) is in the `[0.7.0]` `### Changed` entry.
+      **`imbh-attrstats` is a first-time publish.** The name is free on crates.io (checked
+      2026-08-09), and only `imbh` (optionally, behind its `attrstats` feature) and the unpublished
+      `attr-stats` example depend on it, so it needs a publish slot after `imbh-core`/`imbh-storage`
+      and before `imbh`.
+
+      *(v0.7.0 — the entry this replaces — was tagged and released 2026-08-09, so the canonical-JSON
+      codec swap and the two `imbh-tui` fixes have shipped.)*
 
 - [x] **Measure the promoted-column cost before setting any auto-promotion budget.** *(Closed
       2026-08-08 — `examples/bench --bin promote-cost`. The gate passes, and it moved the budget from
@@ -211,9 +215,9 @@ git history); this file tracks only what is still open.
       watching the test still pass. The guard stays for the day the built-in column set changes.
       — *source: design review, 2026-08-08; fixed 2026-08-09*
 
-- [ ] **`cargo release` still cannot be run as configured — five releases and counting.** Two
+- [ ] **`cargo release` still cannot be run as configured — six releases and counting.** Two
       independent defects in the root `Cargo.toml`, worked around by hand for v0.5.0, v0.6.0, v0.6.1,
-      v0.6.2 and v0.7.0 (JOURNAL "Preparing v0.6.0" / "Preparing v0.6.1"). (a) `pre-release-hook = ["git",
+      v0.6.2, v0.7.0 and v0.8.0 (JOURNAL "Preparing v0.6.0" / "Preparing v0.6.1"). (a) `pre-release-hook = ["git",
       "cliff", "-o", "CHANGELOG.md", …]` with no `cliff.toml` in the repo would replace the
       hand-written Keep a Changelog file — prose, migration notes, and the `<!-- next-url -->` anchors
       `crates/imbh/Cargo.toml` matches with `exactly = 1` — with a conventional-commit digest. Either
@@ -457,8 +461,21 @@ git history); this file tracks only what is still open.
       checked. Deliberately not done as part of the harvest, which was scoped to Appendix C.
       — *source: TODO sweep 2026-08-06*
 
-- [ ] **The next release's x86_64 `imbhd` is projected ~3 MB OVER the §2 target, and the local gate
-      cannot see it.** *(quantified 2026-08-06; needs a CD dry run to confirm, then a decision.)* The
+- [ ] **The shipped x86_64 `imbhd` is 3.7 MB OVER the §2 target — measured, not projected, and the
+      local gate cannot see it.** *(projection 2026-08-06; **confirmed by measurement 2026-08-09**, so
+      what is left is the decision.)* The projection below has been settled by the bytes GitHub is
+      serving: `imbh-0.7.0-x86_64-unknown-linux-gnu.tar.gz` unpacks to an `imbhd` of **45,691,560 B =
+      45.7 MB against the 42 MB §2 target**, well under the 55 MB hard limit. Against CD's v0.5.0
+      x86_64 baseline of 41,112,104 B that is **+4,579,456 B (+4.37 MiB)** for `docker-remap`, versus
+      the +4,024,312 B (+3.84 MiB) measured locally on aarch64 — so the item's own caveat held: x86_64
+      codegen is fatter, and the real overage (3.7 MB) is larger than the 3.1 MB projected. No CD dry
+      run is needed to establish this; **it has been shipping since v0.6.0**, the first release whose
+      Linux legs carried VRL. This is therefore a standing overage rather than a v0.8.0 regression, and
+      v0.8.0 will land ~0.2 MB above v0.7.0 (the local aarch64 `imbhd` moved 34,916,248 →
+      35,112,856 B). The decision is unchanged and now unblocked: raise the §2 target to a number that
+      ships, trim the VRL subtree, or move `docker-remap` to a separate artifact.
+
+      Original projection: The
       `docker-remap` delta is now measured **exactly** rather than estimated: two local aarch64 release
       builds differing only in the feature, 35,973,488 → 39,997,800 bytes = **+4,024,312 B (+3.84 MiB)**.
       The local baseline lands within **24 bytes** of CD's v0.5.0 aarch64 archive (35,973,464 B), so the

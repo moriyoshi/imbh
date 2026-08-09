@@ -29,7 +29,10 @@ use arrow::array::{
 use arrow::datatypes::{DataType, Int32Type, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::ArrowWriter;
-#[cfg(feature = "compaction")]
+// `compaction` reads segments back to rewrite them; the unit tests read them back to assert on what
+// seal wrote (bloom filters), which is independent of whether rewriting is compiled in. Hence `test`
+// beside the feature — without it a `--no-default-features` test build fails to compile.
+#[cfg(any(feature = "compaction", test))]
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::basic::{Compression as PqCompression, ZstdLevel};
 use parquet::file::properties::WriterProperties;
@@ -4020,7 +4023,7 @@ mod tests {
 
     /// The compaction twin: the merged-away *sources* are unlinked after the merged manifest is
     /// durable, so a reader pinning them across the pass must not fail it or lose a row.
-    #[cfg(feature = "search")]
+    #[cfg(all(feature = "search", feature = "compaction"))]
     #[test]
     fn compaction_reclaims_source_segments_pinned_by_an_open_and_mapped_reader() {
         let dir = tempfile::tempdir().unwrap();
@@ -4474,6 +4477,7 @@ mod tests {
         assert!(s2.take_pending_replay().is_empty());
     }
 
+    #[cfg(feature = "compaction")]
     #[test]
     fn compaction_merges_and_survives_reopen() {
         let dir = tempfile::tempdir().unwrap();
@@ -4527,6 +4531,7 @@ mod tests {
     /// schemas and that day's compaction failed forever. It must instead normalize every batch to
     /// the canonical schema of the live promote set, in both directions: null-fill a promoted column
     /// added after a segment was sealed, drop one that has since been de-promoted.
+    #[cfg(feature = "compaction")]
     #[test]
     fn compaction_merges_segments_sealed_under_different_promoted_keys() {
         const ATTRS: &str = r#"{"env":"prod","region":"us"}"#;
@@ -4627,6 +4632,7 @@ mod tests {
     /// `coerce_to_schema` matches by name (never by position), null-fills a missing *nullable*
     /// column, drops a source column the canonical schema lacks, and refuses to fabricate a value
     /// for a missing non-nullable column.
+    #[cfg(feature = "compaction")]
     #[test]
     fn coerce_to_schema_matches_by_name_null_fills_and_drops() {
         use arrow::array::{Int64Array, StringArray};
@@ -4681,6 +4687,7 @@ mod tests {
         assert!(coerce_to_schema(batch, &missing_required).is_err());
     }
 
+    #[cfg(feature = "compaction")]
     #[test]
     fn reconcile_preserves_concurrent_segments() {
         let seg = |p: &str| SegmentRef {

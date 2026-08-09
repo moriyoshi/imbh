@@ -10,7 +10,7 @@ regenerate with ./scripts/gen-notices.sh.
 ================================================================================
 License summary
 ================================================================================
-  Apache License 2.0 (Apache-2.0) — used by 343 crate(s)
+  Apache License 2.0 (Apache-2.0) — used by 344 crate(s)
   MIT License (MIT) — used by 130 crate(s)
   Unicode License v3 (Unicode-3.0) — used by 19 crate(s)
   BSD 3-Clause "New" or "Revised" License (BSD-3-Clause) — used by 10 crate(s)
@@ -7672,20 +7672,21 @@ Apache License 2.0 (Apache-2.0)
 ================================================================================
 
 Used by:
-  - imbh 0.7.0
-  - imbh-core 0.7.0
-  - imbh-head 0.7.0
-  - imbh-index 0.7.0
-  - imbh-lgtm 0.7.0
-  - imbh-mcp 0.7.0
-  - imbh-otel-exporter 0.7.0
-  - imbh-otlp 0.7.0
-  - imbh-proto 0.7.0
-  - imbh-query 0.7.0
-  - imbh-server 0.7.0
-  - imbh-storage 0.7.0
-  - imbh-tracing 0.7.0
-  - imbh-tui 0.7.0
+  - imbh 0.8.0
+  - imbh-attrstats 0.8.0
+  - imbh-core 0.8.0
+  - imbh-head 0.8.0
+  - imbh-index 0.8.0
+  - imbh-lgtm 0.8.0
+  - imbh-mcp 0.8.0
+  - imbh-otel-exporter 0.8.0
+  - imbh-otlp 0.8.0
+  - imbh-proto 0.8.0
+  - imbh-query 0.8.0
+  - imbh-server 0.8.0
+  - imbh-storage 0.8.0
+  - imbh-tracing 0.8.0
+  - imbh-tui 0.8.0
   - allocator-api2 0.2.21
   - anyhow 1.0.104
   - async-trait 0.1.91
