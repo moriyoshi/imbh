@@ -9,13 +9,11 @@ git history); this file tracks only what is still open.
 
 ## Open Items
 
-- [ ] **v0.7.0 is prepared but not cut.** The workspace is bumped to `0.7.0`, the changelog section
-      is closed and dated, `README.md` / `docs/DOCKER_LOG_DRIVER.md` version strings are corrected by
-      hand, notices are regenerated and every gate is green — see JOURNAL "Preparing v0.7.0". Open
-      because nothing is tagged or published, so neither the canonical-JSON codec swap (JOURNAL
-      2026-08-08) nor the two `imbh-tui` fixes have reached anyone. Close this once the `v0.7.0` tag
-      is pushed and the plugin job has published its tags. Releases are cut only when explicitly
-      asked.
+- [x] **v0.7.0 is prepared but not cut.** *(Closed 2026-08-09 — `v0.7.0` was tagged and released
+      2026-08-09, so the canonical-JSON codec swap and the two `imbh-tui` fixes have shipped.)* The
+      workspace was bumped, the changelog section closed and dated, `README.md` /
+      `docs/DOCKER_LOG_DRIVER.md` version strings corrected by hand, notices regenerated and every
+      gate green — see JOURNAL "Preparing v0.7.0".
 
       *(v0.6.2 — the entry this replaces — was tagged and published on 2026-08-07T12:12Z with six
       release assets, and `ghcr.io/moriyoshi/imbh-log-driver:0.6.2-{amd64,arm64}` are both on GHCR,
@@ -776,7 +774,7 @@ git history); this file tracks only what is still open.
       and still does the row-group narrowing. **Semver: this is a breaking change** to the published
       `imbh-query` (two new public fields on structs with public fields, plus an argument on
       `SegmentTableProvider::new`). Under Cargo's 0.x rules that requires a minor bump, which the
-      canonical-JSON item already puts on the table for 0.7.0 — it rides along at no extra cost, but
+      canonical-JSON item already puts on the table for the next minor — it rides along at no extra cost, but
       it must not ship as a patch. — *source: prune-bench A/B + implementation, 2026-08-08*
 
       Original finding: It was
@@ -930,7 +928,8 @@ git history); this file tracks only what is still open.
 
       Fixed by deriving from `read_disk_snapshot` on read-only handles — the same source the reader's
       query path already uses — and by making the accessor **fallible**: `Db::segment_files` now
-      returns `Result<Vec<PathBuf>>`. Breaking for the `imbh` facade, taken in the open 0.7.0 window,
+      returns `Result<Vec<PathBuf>>`. Breaking for the `imbh` facade, taken in the window after v0.7.0
+      (which shipped without it — the change is on the unmerged housekeeping branch),
       and the signature is the point: a reader must be able to report an I/O failure rather than mask
       it as an empty database, which the infallible form could not express. `BlockingDb` gained the
       mirroring `segment_files` it had been missing.
