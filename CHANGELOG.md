@@ -13,6 +13,75 @@ release aborts if it is missing or duplicated.
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-08-24
+
+### Added
+
+- **`Db::traces().get_many(ids, not_before)`** fetches every span of a list of trace ids in one
+  query, optionally bounded below by a start time. The bound is what makes it prunable: the
+  single-trace `get` carries only a raw-bytes id predicate, which a bloom probe can evaluate only by
+  opening each segment's Parquet footer, so with no range predicate the manifest's `min/max_time`
+  skip never fires and the cost tracks the corpus rather than the window.
+- **`imbh-lgtm`: `TraceSource::fetch_traces`**, a batched counterpart to `fetch_trace`, plus
+  `TRACE_FETCH_CHUNK`. It ships with a default implementation that loops over `fetch_trace`, so
+  existing implementors keep working unchanged; `TracesApi` overrides it with the batched query. The
+  evaluator's "peak memory is one trace" property is preserved by streaming the id list through in
+  chunks rather than materialising all candidates at once. The trait contract now requires an
+  implementation to return traces **in the order the ids were given** — the candidate list is ranked
+  by recency, and a batched fetch that reordered it would silently change which traces a `limit`
+  keeps.
+- **`imbh-head`: `dto::Series::new(labels, samples)`**, so callers that built the struct literally
+  have a constructor to move to.
+- **The TUI pauses input while a query it issued is in flight**, and puts a centred
+  `⠦ Loading… 2s` banner on screen once the wait passes two seconds — or immediately once a keystroke
+  has actually been refused, since a swallowed key with no visible cause reads as a hang. The pause
+  covers normal-mode operations only: the query editor, the range picker, the absolute-range form and
+  the menu stay live, and `q` is never refused. Auto-refresh ticks deliberately do **not** take the
+  keyboard — a background refresh the user never asked for would otherwise hold the UI for the length
+  of every query. While the pause is on, every footer hint except `q quit` is greyed out.
+
+### Changed
+
+- **BREAKING — `imbh-head`: `dto::Series` gained a public `query_index` field and is now
+  `#[non_exhaustive]`.** `EvalRequest` has always accepted a list of queries, but a PromQL
+  aggregation drops `__name__`, so a concatenated response was unattributable and callers had to send
+  one query per request. Each series now names the sub-query it came from, which collapses a TUI
+  metrics refresh from N HTTP round trips (and N catalog reads) to one. Construct with
+  `Series::new` or `..Default::default()`; struct literals and exhaustive destructuring need updating.
+  The Arrow-IPC encoding carries the index in schema metadata as `imbh.series.queries`, and decodes
+  leniently — a payload from an older head with the key absent reads back as all-zero rather than
+  failing.
+- **BREAKING — `imbh-lgtm`: `execute_traceql` now requires `S: Sync`.** `TraceSource::fetch_traces`'s
+  default body holds `&self` across an await, and that future is `Send` only if `Self` is `Sync`.
+  Every real implementor already satisfies it.
+
+### Fixed
+
+- **The metrics catalog no longer rescans the whole database on every request.** `metrics().catalog()`
+  ran five unbounded `SELECT DISTINCT` statements with no time predicate and no limit, `exec::promql`
+  read it once per request, and the TUI sent one request per checked metric — 30 whole-corpus distinct
+  scans to refresh six metrics. Sealed segments are now folded once into a cached set and only newly
+  arrived segments are scanned, with the mutable buffer rescanned every time so a fresh write is never
+  missed; the fold is exact for an append-only segment set, and a *removed* segment (retention or
+  compaction) forces a rebuild. At 640 segments the read went from 70.34 ms to 2.77 ms, and stopped
+  growing with the corpus.
+- **TraceQL no longer re-queries every trace it had already fetched.** `search` pulled all spans of
+  its top-N candidates, `fetch_candidates` discarded everything but the ids, and the evaluator then
+  issued one full query per candidate — roughly 101 queries to answer one screen at `max_rows = 100`.
+- **The TraceQL candidate search is now prunable.** Its trace-start filter compiled to a `HAVING`
+  clause, which runs *after* the aggregate, so the `FROM spans` scan was unbounded no matter how
+  narrow the window: at a fixed 2-segment window it grew 32× across a 64× corpus. A sound superset of
+  the predicate now runs as a `WHERE` (a trace whose start falls in the window necessarily has its
+  first span in the window, so no qualifying trace is dropped) with the exact test re-applied in Rust
+  after the spans are assembled. The narrowed set is then ranked and limited, so the result is
+  approximate in the same way the existing retry already was — over-fetching before the exact recheck
+  keeps a full page.
+- **The trace waterfall renders the visible rows instead of the whole trace.** Both the Traces preview
+  pane and the trace detail formatted every span in the trace on every frame, into a pane showing ten
+  lines, at the mascot's 100 ms redraw cadence.
+- Together these take a 640-segment / 665,600-row corpus at a fixed query window from 949.14 ms to
+  41.28 ms for a six-metric refresh (23×) and from 1612.96 ms to 46.25 ms for a traces refresh (35×).
+
 ## [0.8.0] - 2026-08-09
 
 ### Added
@@ -1128,6 +1197,7 @@ release aborts if it is missing or duplicated.
   All 12 crates published to crates.io (`imbh-test-support` is dev-only and stays unpublished).
 
 <!-- next-url -->
+[0.9.0]: https://github.com/moriyoshi/imbh/releases/tag/v0.9.0
 [0.8.0]: https://github.com/moriyoshi/imbh/releases/tag/v0.8.0
 [0.7.0]: https://github.com/moriyoshi/imbh/releases/tag/v0.7.0
 [0.6.2]: https://github.com/moriyoshi/imbh/releases/tag/v0.6.2

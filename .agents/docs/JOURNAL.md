@@ -7208,3 +7208,61 @@ no-Unicode guarantee. Footprint: no manifest changed and `imbhd` does not link `
 gated axes are untouched by construction; crate count re-measured at **275** to confirm.
 
 Nothing committed beyond the topic branch.
+
+## Preparing v0.9.0: a small release with two breaking signatures, and a changelog that had gone unwritten (2026-08-24)
+
+Three PRs since v0.8.0: #49 (the metrics/traces scan fixes), #50 (the CI disk fix), #51 (the TUI
+input lock and loading banner). 34 files, +2,372/-260 — the smallest release since v0.6.1, and the
+first in a while whose whole diff is one crate family.
+
+### What the version has to be
+
+**0.9.0, and the signatures leave no choice.** Two breaking changes, both in `[0.9.0]` `### Changed`:
+
+* `imbh-head`'s `dto::Series` gained a public `query_index` field and became `#[non_exhaustive]`.
+  The field is what makes a batched `EvalRequest` usable: `EvalRequest` has always taken a *list* of
+  queries, but a PromQL aggregation drops `__name__`, so the concatenated response was
+  unattributable and every caller sent one query per request anyway. Naming the sub-query per series
+  collapses a six-metric TUI refresh from six HTTP round trips to one.
+* `imbh-lgtm`'s `execute_traceql` gained an `S: Sync` bound, required by
+  `TraceSource::fetch_traces`'s default body — it holds `&self` across an await, and that future is
+  `Send` only if `Self` is `Sync`. Every real implementor already satisfies it.
+
+### The changelog had to be written, not just closed
+
+Unlike v0.8.0, where "the changelog needed no reconstruction", `## [Unreleased]` was **empty**.
+Neither #49 nor #51 wrote an entry as it landed, despite the file's own instruction to. So the
+`[0.9.0]` section was reconstructed from the two PR diffs rather than closed over existing prose.
+
+Worth naming as a process defect rather than a one-off: the CHANGELOG says "write new entries under
+`## [Unreleased]` as you go", and nothing enforces it. v0.7.0 shipped a feature silently for the same
+reason (PR #43). The reconstruction here was cheap because the release is three PRs old and both
+were freshly in hand; at v0.8.0's scale it would not have been.
+
+One claim in `TODO.md` did not survive checking: it said "the response DTOs now carry
+`#[non_exhaustive]`". Only `Series` does. The rest of `imbh-head`'s response structs are still
+exhaustive, so the next field added to any of them is another breaking change — corrected in place,
+and left as an open item.
+
+### Verified
+
+`fmt --all --check` clean; `clippy --workspace --all-targets -D warnings` clean; `test --workspace`
+**78 suites, 732 passed, 0 failed** (up from v0.8.0's 76 / 711). §3a `./scripts/license-gate.sh` OK.
+§3b notices regenerated — the diff is 15 version strings and nothing else, which is the expected
+shape for a release that changed no dependency. §3c packaging dry-run staged and verified **all 22
+members at 0.9.0**, exit 0, with `--allow-dirty` because the bump is uncommitted. Footprint gate
+**OK** and unchanged from v0.8.0: 275 crates (target 275), `imbhd` 33.5 MiB, plugin feature set 398
+crates / 38.5 MiB (informational), idle RSS 15.0 MB, steady RSS 104.9 MB, search-off lever
+275 → 218 → 76.
+
+No new workspace members and no dependency change, so the publish order is exactly v0.8.0's.
+
+### Not done here
+
+Nothing tagged, published or pushed. Note also that `[workspace.metadata.release]` still carries
+`pre-release-hook = ["git", "cliff", "-o", "CHANGELOG.md", "--tag", "{{version}}"]` while the repo
+has no `cliff.toml` and the changelog is hand-written prose — running `cargo release` end-to-end
+would regenerate `CHANGELOG.md` from conventional commits and destroy it, and the
+`exactly = 1` replacements would then fail against the regenerated file. Every release since v0.3.0
+has been a hand-made bump commit instead, which is why this has never fired. Left alone rather than
+fixed blind, but it should either be given a `cliff.toml` that preserves the file or be dropped.
