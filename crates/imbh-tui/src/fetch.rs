@@ -214,15 +214,15 @@ pub(crate) async fn load_snapshot(
                     detail: None,
                     list_from: None,
                     log_records: Vec::new(),
-                    table: Some(TableData {
-                        header: vec![
+                    table: Some(TableData::new(
+                        vec![
                             "Metric".to_owned(),
                             "Kind".to_owned(),
                             "Unit".to_owned(),
                             "Temporality".to_owned(),
                         ],
                         rows,
-                    }),
+                    )),
                     series: Vec::new(),
                     next_cursor: None,
                 });
@@ -235,26 +235,36 @@ pub(crate) async fn load_snapshot(
                 .filter(|q| !q.is_empty())
                 .map(str::to_owned)
                 .collect::<Vec<_>>();
-            // Each sub-query is evaluated on its own so its series stay attributable to it. PromQL
-            // aggregation drops `__name__` on purpose (`LabelSet::by`/`without` both do, which is
-            // Prometheus semantics), so a `sum by (…)` or `histogram_quantile(…)` series cannot say
-            // which metric produced it: run several together into one concatenated result and two
-            // selected metrics that share a label set become indistinguishable rows. Knowing the
-            // boundaries lets us put the name back below.
-            let mut series: Vec<(Option<String>, dto::Series)> = Vec::new();
-            for sub_query in &sub_queries {
-                let evaluated = backend
-                    .promql(sub_query, eval_range, limits)
-                    .await
-                    .map_err(|error| error.to_string())?;
-                // Only a multi-metric selection needs the name put back; a single query (including
-                // anything hand-typed) is already unambiguous, and naming it from a guess at its
-                // leading identifier would be a claim we cannot make about an arbitrary expression.
-                let name = (sub_queries.len() > 1)
-                    .then(|| query_metric_name(sub_query))
-                    .flatten();
-                series.extend(evaluated.into_iter().map(|item| (name.clone(), item)));
-            }
+            // All sub-queries in one request. PromQL aggregation drops `__name__` on purpose
+            // (`LabelSet::by`/`without` both do, which is Prometheus semantics), so a `sum by (…)`
+            // or `histogram_quantile(…)` series cannot say which metric produced it — but each
+            // returned series carries the index of the query that produced it, which is what puts
+            // the name back below. One round trip and one metric-catalog read for the whole refresh,
+            // rather than one of each per checked metric.
+            let evaluated = backend
+                .promql(&sub_queries, eval_range, limits)
+                .await
+                .map_err(|error| error.to_string())?;
+            // Only a multi-metric selection needs the name put back; a single query (including
+            // anything hand-typed) is already unambiguous, and naming it from a guess at its
+            // leading identifier would be a claim we cannot make about an arbitrary expression.
+            let names = if sub_queries.len() > 1 {
+                sub_queries
+                    .iter()
+                    .map(|q| query_metric_name(q))
+                    .collect::<Vec<_>>()
+            } else {
+                vec![None; sub_queries.len()]
+            };
+            let series: Vec<(Option<String>, dto::Series)> = evaluated
+                .into_iter()
+                .map(|item| {
+                    // A peer that predates `query_index` sends 0 for every series, which degrades to
+                    // the single-query behaviour rather than mislabelling anything.
+                    let name = names.get(item.query_index).cloned().flatten();
+                    (name, item)
+                })
+                .collect();
             // Build the summary rows and, in the same pass, retain each series' full
             // `(timestamp_ns, value)` history so the detailed viewer can plot the selected one.
             let mut rows = Vec::with_capacity(series.len());
@@ -332,8 +342,8 @@ pub(crate) async fn load_snapshot(
                 detail: None,
                 list_from: None,
                 log_records: Vec::new(),
-                table: Some(TableData {
-                    header: vec![
+                table: Some(TableData::new(
+                    vec![
                         "Series".to_owned(),
                         "Latest".to_owned(),
                         "Min".to_owned(),
@@ -341,7 +351,7 @@ pub(crate) async fn load_snapshot(
                         "Points".to_owned(),
                     ],
                     rows,
-                }),
+                )),
                 series: series_data,
                 next_cursor: None,
             })
@@ -734,7 +744,7 @@ pub(crate) fn attribute_table(report: &imbh::attrstats::Report, promoted: &[Stri
         }
     }
     PaneTable {
-        data: TableData { header, rows },
+        data: TableData::new(header, rows),
         kinds,
     }
 }

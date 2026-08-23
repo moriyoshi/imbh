@@ -125,21 +125,20 @@ impl Backend {
         .map(|result| result.dimensions)
     }
 
-    /// Evaluate one PromQL query.
+    /// Evaluate one or more PromQL queries in a single request.
     ///
-    /// The head API takes a batch (and a batch costs one metric-catalog read rather than one
-    /// apiece), but a batch answers with the series *concatenated* and PromQL aggregation drops
-    /// `__name__`, so the caller could no longer tell which query produced which series. The catalog
-    /// screen visualizes several metrics at once and must, so it issues them one at a time — a
-    /// handful of round trips on an interactive refresh, in exchange for a series list that names
-    /// what it is showing.
+    /// The catalog screen visualizes several metrics at once and used to issue them one at a time,
+    /// because a batch answers with the series *concatenated* and PromQL aggregation drops
+    /// `__name__` — so the caller could not tell which query produced which series. Now each series
+    /// carries its [`dto::Series::query_index`], so the batch is attributable and the whole refresh
+    /// is one round trip and one metric-catalog read instead of one of each per metric.
     pub(crate) async fn promql(
         &self,
-        query: &str,
+        queries: &[String],
         range: EvalRange,
         limits: EvalLimits,
     ) -> Result<Vec<dto::Series>, HeadError> {
-        let request = eval_request(std::slice::from_ref(&query.to_owned()), range, limits);
+        let request = eval_request(queries, range, limits);
         match self {
             Backend::Local(db) => exec::promql(db, &request).await,
             Backend::Remote(client) => client.promql(&request).await,

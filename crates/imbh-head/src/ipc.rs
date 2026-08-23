@@ -54,6 +54,9 @@ pub const CONTENT_TYPE: &str = "application/vnd.apache.arrow.stream";
 
 // Schema-metadata keys. Namespaced so they cannot collide with anything Arrow or DataFusion writes.
 const META_SERIES_STARTS: &str = "imbh.series.starts";
+/// Per-series `query_index`, parallel to [`META_SERIES_STARTS`]. Absent on a batch an older daemon
+/// wrote, which decodes as all-zero — the single-query answer, and what this always meant before.
+const META_SERIES_QUERIES: &str = "imbh.series.queries";
 const META_EFFECTIVE_START: &str = "imbh.traces.effective_start_ns";
 const META_LOG_STATS: &str = "imbh.logs.stats";
 const META_LOG_NEXT: &str = "imbh.logs.next_cursor";
@@ -121,11 +124,13 @@ pub fn series_to_batch(series: &[dto::Series]) -> RecordBatch {
     let mut timestamps: Vec<i64> = Vec::new();
     let mut values: Vec<f64> = Vec::new();
     let mut starts: Vec<String> = Vec::new();
+    let mut queries: Vec<String> = Vec::new();
     for item in series {
         if item.samples.is_empty() {
             continue;
         }
         starts.push(timestamps.len().to_string());
+        queries.push(item.query_index.to_string());
         for sample in &item.samples {
             for label in &item.labels {
                 labels.keys().append_value(&label.name);
@@ -144,7 +149,11 @@ pub fn series_to_batch(series: &[dto::Series]) -> RecordBatch {
             ("ts", col(TimestampNanosecondArray::from(timestamps))),
             ("value", col(Float64Array::from(values))),
         ],
-        [(META_SERIES_STARTS.to_owned(), starts.join(","))].into(),
+        [
+            (META_SERIES_STARTS.to_owned(), starts.join(",")),
+            (META_SERIES_QUERIES.to_owned(), queries.join(",")),
+        ]
+        .into(),
     )
 }
 
@@ -175,6 +184,22 @@ pub fn series_from_batch(batch: &RecordBatch) -> Result<Vec<dto::Series>, HeadEr
                 .collect::<Result<Vec<_>, _>>()
         })
         .transpose()?;
+    // Parallel to `starts`: the query each surviving series came from. A malformed or short list is
+    // treated as absent rather than an error — provenance is an accelerator for a head listing
+    // several metrics, and losing it degrades to the single-query reading instead of failing a
+    // query that otherwise decoded fine.
+    let queries: Vec<usize> = batch
+        .schema()
+        .metadata()
+        .get(META_SERIES_QUERIES)
+        .map(|encoded| {
+            encoded
+                .split(',')
+                .filter(|part| !part.is_empty())
+                .filter_map(|part| part.parse::<usize>().ok())
+                .collect()
+        })
+        .unwrap_or_default();
 
     let mut out: Vec<dto::Series> = Vec::new();
     // The recorded offsets are ascending, so one cursor walks them alongside the rows.
@@ -201,6 +226,7 @@ pub fn series_from_batch(batch: &RecordBatch) -> Result<Vec<dto::Series>, HeadEr
             _ => out.push(dto::Series {
                 labels: row_labels,
                 samples: vec![sample],
+                query_index: queries.get(out.len()).copied().unwrap_or(0),
             }),
         }
     }
@@ -735,15 +761,15 @@ mod tests {
     #[test]
     fn non_finite_sample_values_survive_the_wire() {
         // The reason this wire is Arrow and not JSON: all three specials are ordinary f64 bits here.
-        let series = vec![dto::Series {
-            labels: vec![label("__name__", "up"), label("service", "cart")],
-            samples: vec![
+        let series = vec![dto::Series::new(
+            vec![label("__name__", "up"), label("service", "cart")],
+            vec![
                 sample(1, 1.5),
                 sample(2, f64::NAN),
                 sample(3, f64::INFINITY),
                 sample(4, f64::NEG_INFINITY),
             ],
-        }];
+        )];
         let back = through_ipc(&series, |s| series_to_batch(s), series_from_batch);
         assert_eq!(back.len(), 1);
         assert_eq!(back[0].labels, series[0].labels);
@@ -760,19 +786,13 @@ mod tests {
     #[test]
     fn several_series_keep_their_grouping_and_order() {
         let series = vec![
-            dto::Series {
-                labels: vec![label("service", "cart")],
-                samples: vec![sample(1, 1.0), sample(2, 2.0)],
-            },
-            dto::Series {
-                labels: vec![label("service", "api")],
-                samples: vec![sample(1, 3.0)],
-            },
+            dto::Series::new(
+                vec![label("service", "cart")],
+                vec![sample(1, 1.0), sample(2, 2.0)],
+            ),
+            dto::Series::new(vec![label("service", "api")], vec![sample(1, 3.0)]),
             // No labels at all is a legitimate result (an aggregation with no `by`).
-            dto::Series {
-                labels: Vec::new(),
-                samples: vec![sample(9, 9.0)],
-            },
+            dto::Series::new(Vec::new(), vec![sample(9, 9.0)]),
         ];
         assert_eq!(
             through_ipc(&series, |s| series_to_batch(s), series_from_batch),
@@ -788,27 +808,45 @@ mod tests {
     #[test]
     fn two_series_with_the_same_labels_stay_two_series() {
         let series = vec![
-            dto::Series {
-                labels: Vec::new(),
-                samples: vec![sample(1, 1.0), sample(2, 2.0)],
-            },
-            dto::Series {
-                labels: Vec::new(),
-                samples: vec![sample(1, 3.0), sample(2, 4.0)],
-            },
+            dto::Series::new(Vec::new(), vec![sample(1, 1.0), sample(2, 2.0)]),
+            dto::Series::new(Vec::new(), vec![sample(1, 3.0), sample(2, 4.0)]),
             // Adjacent, identical, *and* the same samples: nothing about the rows tells them apart.
-            dto::Series {
-                labels: vec![label("service", "cart")],
-                samples: vec![sample(1, 5.0)],
-            },
-            dto::Series {
-                labels: vec![label("service", "cart")],
-                samples: vec![sample(1, 5.0)],
-            },
+            dto::Series::new(vec![label("service", "cart")], vec![sample(1, 5.0)]),
+            dto::Series::new(vec![label("service", "cart")], vec![sample(1, 5.0)]),
         ];
         assert_eq!(
             through_ipc(&series, |s| series_to_batch(s), series_from_batch),
             series
+        );
+    }
+
+    /// `query_index` survives the wire, which is what lets a head batch its metrics.
+    ///
+    /// It is the *only* thing distinguishing these series: same labels, same samples, different
+    /// source query. Losing it over IPC would make a remote head mislabel a multi-metric selection —
+    /// silently, and only in remote mode, since the local path hands the value over untouched.
+    #[test]
+    fn the_query_a_series_came_from_survives_the_wire() {
+        let series = vec![
+            dto::Series {
+                query_index: 0,
+                ..dto::Series::new(vec![label("host", "a")], vec![sample(1, 1.0)])
+            },
+            dto::Series {
+                query_index: 2,
+                ..dto::Series::new(vec![label("host", "a")], vec![sample(1, 1.0)])
+            },
+            dto::Series {
+                query_index: 1,
+                ..dto::Series::new(Vec::new(), vec![sample(3, 7.0), sample(4, 8.0)])
+            },
+        ];
+        let decoded = through_ipc(&series, |s| series_to_batch(s), series_from_batch);
+        assert_eq!(decoded, series);
+        assert_eq!(
+            decoded.iter().map(|s| s.query_index).collect::<Vec<_>>(),
+            [0, 2, 1],
+            "the index must follow its own series, not the position in the result"
         );
     }
 
@@ -817,14 +855,11 @@ mod tests {
     #[test]
     fn a_batch_without_boundary_metadata_falls_back_to_label_runs() {
         let series = vec![
-            dto::Series {
-                labels: vec![label("service", "cart")],
-                samples: vec![sample(1, 1.0), sample(2, 2.0)],
-            },
-            dto::Series {
-                labels: vec![label("service", "api")],
-                samples: vec![sample(1, 3.0)],
-            },
+            dto::Series::new(
+                vec![label("service", "cart")],
+                vec![sample(1, 1.0), sample(2, 2.0)],
+            ),
+            dto::Series::new(vec![label("service", "api")], vec![sample(1, 3.0)]),
         ];
         let batch = series_to_batch(&series);
         let stripped = RecordBatch::try_new(

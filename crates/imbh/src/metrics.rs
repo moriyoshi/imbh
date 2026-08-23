@@ -50,6 +50,90 @@ pub struct MetricsApi {
     pub(crate) db: Arc<Db>,
 }
 
+/// The metric tables the catalog covers, with the `kind` each reports. Every one carries the
+/// `metric`/`unit`/`temporality` identity columns; summaries leave `temporality` null.
+pub(crate) const CATALOG_TABLES: [(Table, &str); 5] = [
+    (Table::MetricsGauge, "gauge"),
+    (Table::MetricsSum, "sum"),
+    (Table::MetricsHistogram, "histogram"),
+    (Table::MetricsExpHistogram, "exponential_histogram"),
+    (Table::MetricsSummary, "summary"),
+];
+
+/// One distinct catalog row. Ordered (hence `Ord`) so the accumulated set yields a stable catalog
+/// order across calls regardless of which segment contributed a row first — without it the listing
+/// would reshuffle as segments sealed.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct CatalogEntry {
+    pub(crate) kind: &'static str,
+    pub(crate) metric: String,
+    pub(crate) unit: String,
+    pub(crate) temporality: Option<String>,
+}
+
+/// The same tables with each one's segment list filtered by `keep`, and the mutable buffer emptied
+/// for any table that keeps at least one segment.
+///
+/// This is what lets the catalog scan the sealed and unsealed halves separately: `keep` selecting
+/// new segments gives a segments-only pass whose result can be cached forever, and a `keep` that
+/// admits nothing gives the buffer-only pass that must run every call. The two are complementary —
+/// every row is scanned by exactly one of them — so the union is neither short nor double-counted.
+#[cfg(feature = "query")]
+fn narrow(
+    tables: &[imbh_query::TableInput],
+    keep: impl Fn(&std::path::Path) -> bool,
+) -> Vec<imbh_query::TableInput> {
+    tables
+        .iter()
+        .map(|table| {
+            let segments: Vec<_> = table
+                .segments
+                .iter()
+                .filter(|s| keep(&s.parquet_path))
+                .cloned()
+                .collect();
+            imbh_query::TableInput {
+                // An empty batch still carries the schema, so the table stays registerable and a
+                // query over it plans exactly as it would with rows.
+                buffer: if segments.is_empty() {
+                    table.buffer.clone()
+                } else {
+                    RecordBatch::new_empty(table.schema.clone())
+                },
+                segments,
+                ..table.clone()
+            }
+        })
+        .collect()
+}
+
+/// Run the catalog's `SELECT DISTINCT` against one narrowed table set.
+#[cfg(feature = "query")]
+async fn scan_catalog(
+    tables: Vec<imbh_query::TableInput>,
+    budget: usize,
+) -> Result<Vec<CatalogEntry>> {
+    let mut out = Vec::new();
+    for (table, kind) in CATALOG_TABLES {
+        let sql = format!(
+            "SELECT DISTINCT metric, unit, temporality FROM {}",
+            table.as_str()
+        );
+        let (_, batches, _) = imbh_query::run_sql(tables.clone(), budget, &sql, Vec::new()).await?;
+        for b in &batches {
+            for i in 0..b.num_rows() {
+                out.push(CatalogEntry {
+                    kind,
+                    metric: get_str(b.column(0).as_ref(), i).unwrap_or_default(),
+                    unit: get_str(b.column(1).as_ref(), i).unwrap_or_default(),
+                    temporality: get_str(b.column(2).as_ref(), i),
+                });
+            }
+        }
+    }
+    Ok(out)
+}
+
 impl MetricsApi {
     /// The database's metric duplicate-timestamp policy (issue #27), so a semantic layer evaluating
     /// PromQL over this namespace can honor it without reaching for the [`Db`] itself.
@@ -60,31 +144,89 @@ impl MetricsApi {
     /// The metric catalog: distinct (metric, unit, temporality) per kind (ARCHITECTURE.md §10.8). Covers all
     /// materialized tables — gauge, sum, histogram, exponential histogram, and summary (each carries
     /// the `metric`/`unit`/`temporality` identity columns; summaries leave `temporality` null).
+    ///
+    /// **Sealed segments are scanned once each, not once per call.** This is a `SELECT DISTINCT` with
+    /// no time predicate, so no segment is ever pruned and the naive cost is the whole corpus on
+    /// every call — and PromQL translation reads the catalog once per request to resolve each
+    /// selector's kind, so a head listing several metrics used to pay it several times over
+    /// (measured 70 ms per read at 640 segments). Each segment's contribution to a distinct-union is
+    /// fixed once written, so it is folded into [`MetricCatalogCache`](crate::MetricCatalogCache)
+    /// and never re-read; only segment *removal* (retention, compaction) forces a rebuild.
+    ///
+    /// The mutable buffer is scanned every call, deliberately: a metric ingested seconds ago exists
+    /// only there, and a live head must see it before the next seal. That scan is bounded by the
+    /// seal threshold, not by the corpus.
     pub async fn catalog(&self) -> Result<Vec<MetricMeta>> {
-        let mut out = Vec::new();
-        for (table, kind) in [
-            (Table::MetricsGauge, "gauge"),
-            (Table::MetricsSum, "sum"),
-            (Table::MetricsHistogram, "histogram"),
-            (Table::MetricsExpHistogram, "exponential_histogram"),
-            (Table::MetricsSummary, "summary"),
-        ] {
-            let sql = format!(
-                "SELECT DISTINCT metric, unit, temporality FROM {}",
-                table.as_str()
-            );
-            for b in &self.db.sql(&sql).collect().await? {
-                for i in 0..b.num_rows() {
-                    out.push(MetricMeta {
-                        metric: get_str(b.column(0).as_ref(), i).unwrap_or_default(),
-                        unit: get_str(b.column(1).as_ref(), i).unwrap_or_default(),
-                        temporality: get_str(b.column(2).as_ref(), i),
-                        kind: kind.to_owned(),
-                    });
+        let tables = self.db.query_tables()?;
+        let budget = self.db.mem_budget.total_bytes();
+
+        let live: std::collections::BTreeSet<std::path::PathBuf> = tables
+            .iter()
+            .filter(|t| {
+                CATALOG_TABLES
+                    .iter()
+                    .any(|(table, _)| table.as_str() == t.name)
+            })
+            .flat_map(|t| t.segments.iter().map(|s| s.parquet_path.clone()))
+            .collect();
+
+        // Decide what to scan under a short lock, then release it: the scans below await, and a
+        // `std::sync::MutexGuard` held across an await would make this future non-`Send` and block
+        // the executor. Two concurrent calls may therefore scan the same new segment — wasteful at
+        // worst, never wrong, because folding a segment twice is a set union with itself.
+        let (fresh, mut all) = {
+            let mut cache = self.db.metric_catalog.lock().unwrap();
+            // A folded segment that is no longer live was retained away or compacted: its rows may
+            // have been the only source of some entry, so the union is no longer sound.
+            if !cache.folded.is_subset(&live) {
+                cache.folded.clear();
+                cache.entries.clear();
+            }
+            let fresh: Vec<std::path::PathBuf> = live.difference(&cache.folded).cloned().collect();
+            (fresh, cache.entries.clone())
+        };
+
+        if !fresh.is_empty() {
+            let only_new = narrow(&tables, |segment| fresh.iter().any(|p| *p == segment));
+            let folded = scan_catalog(only_new, budget).await?;
+            let mut cache = self.db.metric_catalog.lock().unwrap();
+            // Re-check liveness rather than trusting the pre-scan decision: a concurrent retention
+            // may have cleared the cache while this scan ran, and re-adding a path whose segment is
+            // gone would resurrect the phantom the clear existed to remove.
+            for path in fresh {
+                if live.contains(&path) {
+                    cache.folded.insert(path);
                 }
             }
+            for entry in folded {
+                cache.entries.insert(entry.clone());
+                all.insert(entry);
+            }
         }
-        Ok(out)
+
+        // The unsealed half, every time. `narrow` with a predicate that admits nothing leaves each
+        // table as buffer-only, which is exactly the complement of the pass above.
+        let buffer_only = narrow(&tables, |_| false);
+        for entry in scan_catalog(buffer_only, budget).await? {
+            all.insert(entry);
+        }
+
+        Ok(all
+            .into_iter()
+            .map(
+                |CatalogEntry {
+                     kind,
+                     metric,
+                     unit,
+                     temporality,
+                 }| MetricMeta {
+                    metric,
+                    unit,
+                    temporality,
+                    kind: kind.to_owned(),
+                },
+            )
+            .collect())
     }
 
     /// Return raw, unaggregated metric points selected by the native typed query model.

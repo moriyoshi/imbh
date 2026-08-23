@@ -7022,3 +7022,120 @@ image that cannot run its own binaries. CD is unaffected — its Linux legs buil
 **context layout and the Dockerfile**, not the binaries' portability.
 
 Nothing committed, tagged or published.
+
+## The TUI's metrics and traces screens: three scans that never pruned, and a renderer that drew the whole trace (2026-08-23)
+
+The report was "the metrics and traces screens get awfully slow once datapoints and spans accumulate."
+The instinct behind it — "it almost looks like full scans always happen" — was right, and a benchmark
+built before any change made it precise.
+
+`examples/bench/src/bin/tui-bench.rs` drives `imbh_head::exec` rather than `Db`, because a screen
+refresh is not one statement: it is a catalog read plus a translation plus a query, or a candidate
+search plus a fetch per candidate, and the wrapper costs were the whole story. `--sweep` grows the
+corpus while holding the **query window fixed at two segments**, which is what separates a
+corpus-driven cost from a window-driven one without needing an argument about it. Scan counters come
+from `stream_with_stats`, so "the catalog pruned nothing" is `segments_pruned == 0`, not an inference
+from the clock.
+
+### Baseline, and what it showed
+
+Every column grew roughly linearly with corpus size at a fixed window (12 metrics, 40 traces/segment,
+best of 3, ms):
+
+| segments | rows | catalog | promql x1 | promql x6 | tq-search | traceql | trace-get |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 10 | 10,400 | 2.80 | 7.58 | 44.57 | 4.23 | 73.90 | 0.87 |
+| 640 | 665,600 | 70.34 | 157.57 | 949.14 | 134.22 | 1612.96 | 19.09 |
+
+One metrics refresh with six metrics checked was ~950 ms; one traces refresh ~1.6 s.
+
+**Five causes, three of which were visible in the source and two of which only the sweep found.**
+
+1. **`MetricsApi::catalog` is a whole-corpus scan run once per metric per refresh.** Five
+   `SELECT DISTINCT … FROM metrics_*` with no time predicate (nothing prunes, confirmed by
+   `pruned=0`), and `exec::promql` reads the catalog per *request* to resolve each selector's kind
+   while `imbh-tui` sent one request per checked metric. Six metrics meant thirty unbounded scans.
+2. **TraceQL re-fetched every trace the candidate search had already fetched.** `TracesApi::search`
+   phase 2 pulls all spans of the top-N candidates; `fetch_candidates` kept only the ids, and
+   `execute_traceql` then issued `traces().get(id)` per candidate — a fresh `SessionContext` and a
+   full query each. ~101 queries per refresh.
+3. **No column projection reaches the Parquet reader** — the partition yields full-schema batches.
+   Still true; see the follow-ups.
+4. **(sweep-only) `trace_start_range` compiles to a `HAVING`, so the candidate search cannot prune.**
+   A `HAVING` runs after the aggregate, so `FROM spans` read every span segment however narrow the
+   window; `tq-search` grew 32x across a 64x corpus at a fixed window.
+5. **(sweep-only) `traces().get()` has no time predicate**, so the raw-bytes bloom probe can only be
+   answered by opening every segment's Parquet footer — 640 x ~35 us ≈ 22 ms, against 19.09 measured.
+
+The negative finding mattered as much: **time-range pruning already worked.**
+`manifest_range_excludes` skips a segment with no file opened, and the typed builders emit the
+`CAST("time" AS BIGINT)` shape `stats_range_probe` recognizes. So the raw-point scan was already
+bounded by the window, and **rollups were not needed** — which is why none were built.
+
+### What changed
+
+**The catalog is folded, not rescanned** (`MetricCatalogCache` in `crates/imbh/src/lib.rs`). A
+distinct-union over an append-only segment set is monotone, so a segment's contribution is fixed once
+written: new segments are scanned and unioned in, and only *removal* (retention, compaction) forces a
+rebuild. The mutable buffer is deliberately excluded and rescanned every call — a metric ingested
+seconds ago lives only there, and caching it would hide a new metric until the next seal, which is a
+correctness bug wearing a performance costume. `Db::query_tables` was extracted so the sealed and
+unsealed halves can be queried as separate narrowed table sets.
+
+**TraceQL fetches in chunks** (`TraceSource::fetch_traces`, `TRACE_FETCH_CHUNK = 32`). The trait
+method has a default body that keeps the old per-trace loop, so an external implementor is not
+broken; `TracesApi` overrides it with `get_many`, one `trace_id IN (…)` scan per chunk. Chunking
+rather than one big query preserves the evaluator's "peak memory is one trace" property in spirit —
+resident traces stay capped at the chunk while per-query overhead falls by the chunk factor. The
+contract requires preserving the requested id order, because the candidate list is ranked by recency
+and that ranking is what the user sees; `get_many` groups by id, so the impl restores it.
+
+**The candidate search prunes, and stays exact.** A `WHERE start_time BETWEEN lo AND hi` was added
+alongside the `HAVING`. It is a sound *superset*: a trace that started in the window has its first
+span in the window, so no qualifying trace loses its last row before the `GROUP BY`. It is only a
+superset because a trace that started earlier and was still running also survives, and its *filtered*
+`min(start_time)` then lands inside the window — so the exact test moved to after phase 2, which
+refetches every span of each candidate unbounded by time and therefore knows the true start. Phase 1
+over-fetches (`2n + 16`) so those false positives come out of slack rather than out of the answer.
+`a_trace_that_merely_overlaps_the_window_is_not_a_match` pins it, and was checked against a build with
+the recheck disabled to confirm it is not vacuous.
+
+**A batched evaluation is attributable** (`dto::Series::query_index`). This is what let the TUI
+collapse its serial per-metric loop into one request. The field also had to reach the Arrow IPC
+codec — `META_SERIES_QUERIES`, parallel to the existing `META_SERIES_STARTS` — or remote mode would
+have mislabelled a multi-metric selection silently, and only remotely, since the local path hands the
+value over untouched. Absent metadata decodes as all-zero, i.e. the single-query reading.
+
+**Rendering is bounded by the viewport, not by the data.** `render_waterfall_window` replaces
+`render_waterfall` at both call sites: the preview pane rendered every span of the trace into a
+`Vec<String>` and joined it to display ~10 lines, and the detail view did the same for a scrolling
+list. The preview also dropped `Wrap`, which could not change what is drawn (rows are pre-fitted to
+the pane) but re-measured every line. `TableData` now measures its column widths once at construction
+instead of per frame — `draw` takes `&App`, which is why the renderer had nowhere to keep them. And
+the per-point `chart_point_cell` projection is gated on `show_mascot`, its only consumer.
+
+### Result
+
+| segments | rows | cat-api | promql x1 | prom x6/n | prom x6/1 | tq-search | traceql | trace-get |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 10 | 10,400 | 1.05 | 4.73 | 28.05 | 22.41 | 3.21 | 6.45 | 0.87 |
+| 640 | 665,600 | 2.77 | 9.37 | 55.51 | 41.28 | 38.85 | 46.25 | 19.39 |
+
+At 640 segments: the catalog read went 70.34 → 2.77 ms and is now **flat** rather than linear
+(1.05 → 2.77 across a 64x corpus); one metrics refresh 157.57 → 9.37 ms (**17x**); one traces refresh
+1612.96 → 46.25 ms (**35x**). The `cat-sql` control column still shows the unmitigated 70 ms, which is
+what keeps the comparison honest.
+
+### Verified
+
+`fmt --all --check` clean; `build --workspace`, `clippy --workspace --all-targets -D warnings`, and
+`test --workspace` clean — **718 passed, 0 failed** (up from 711), including six new tests: four on
+the catalog cache (buffer freshness, accumulation across seals, stability, rebuild on removal), the
+overlap-window trace boundary, the windowed-render equivalence, and the `query_index` IPC round trip.
+Footprint gate **OK** and unchanged: 275 crates, `imbhd` 33.5 MiB, idle RSS 15.0 MB, steady 105.1 MB,
+search-off lever 275 → 218 → 76.
+
+Nothing committed, tagged, or published. **`dto::Series` gained a public field, so this needs a
+0.8 → 0.9 bump before publishing** — left to `cargo release`, which owns version numbers here
+(`shared-version`, `dependent-version = "upgrade"`, and the README/docs replacements) and which a
+by-hand edit would only half-apply.

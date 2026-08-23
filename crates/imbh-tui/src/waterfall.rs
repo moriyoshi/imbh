@@ -218,12 +218,31 @@ pub(crate) fn build_trace_detail(trace: &imbh::Trace, ascii: bool) -> TraceDetai
     }
 }
 
-/// Paint a [`Waterfall`] into text lines whose bars span exactly `bar_cells` cells, so both the
-/// opening and closing `|` line up in a column and the bars stretch to fill the pane.
-pub(crate) fn render_waterfall(waterfall: &Waterfall, bar_cells: usize) -> Vec<String> {
-    (0..waterfall.rows.len())
+/// Paint rows `start..end` of a [`Waterfall`] into text lines whose bars span exactly `bar_cells`
+/// cells, so both the opening and closing `|` line up in a column and the bars stretch to fill the
+/// pane. `end` is clamped to the row count, so an over-long window is not an error.
+///
+/// **Callers should pass the visible window, not the whole trace.** Every row costs a `String` of
+/// pane width, and a deep trace has thousands of them while a pane shows tens; rendering all of them
+/// every frame made frame time track trace depth rather than viewport height. Bars are stored as
+/// fractions of the trace duration, so a row's rendering depends only on itself — nothing outside
+/// the window contributes to what is drawn inside it.
+pub(crate) fn render_waterfall_window(
+    waterfall: &Waterfall,
+    start: usize,
+    end: usize,
+    bar_cells: usize,
+) -> Vec<String> {
+    (start..end.min(waterfall.rows.len()))
         .map(|index| render_waterfall_row(waterfall, index, bar_cells, waterfall.marker))
         .collect()
+}
+
+/// [`render_waterfall_window`] over every row. Convenience for tests and for callers that genuinely
+/// need the whole trace; the renderers use the windowed form.
+#[cfg(test)]
+pub(crate) fn render_waterfall(waterfall: &Waterfall, bar_cells: usize) -> Vec<String> {
+    render_waterfall_window(waterfall, 0, waterfall.rows.len(), bar_cells)
 }
 
 /// One [`render_waterfall`] line, painted with `marker` as the bar glyph — so a caller that wants a
@@ -687,5 +706,54 @@ mod tests {
                 assert_eq!(field, "db.query.orders-by-…");
             }
         }
+    }
+
+    /// Rendering a window must produce exactly the corresponding slice of rendering everything.
+    ///
+    /// This is what makes the renderers' switch to windowed output invisible: bars are stored as
+    /// fractions of the trace duration, so no row's appearance depends on which other rows were
+    /// drawn. If that ever stopped holding — a bar scaled to the *visible* range, say — scrolling
+    /// would silently reshape the chart, and this is the test that would catch it.
+    #[test]
+    fn a_rendered_window_matches_the_same_slice_of_a_full_render() {
+        let spans = (0..200u8)
+            .map(|i| {
+                waterfall_span(
+                    i + 1,
+                    (i > 0).then_some(i), // a deep chain, so parents/indentation vary down the trace
+                    &format!("span-{i}"),
+                    i as i64 * 1_000,
+                    1_000,
+                )
+            })
+            .collect::<Vec<_>>();
+        let trace = imbh::Trace {
+            trace_id: TraceId([0xcc; 16]),
+            root_service: Some("api".to_owned()),
+            root_name: Some("root".to_owned()),
+            start_time: Timestamp(0),
+            duration_ns: imbh::DurationNs(200_000),
+            spans,
+        };
+        let waterfall = build_trace_detail(&trace, true).waterfall;
+        let full = render_waterfall(&waterfall, 40);
+        assert_eq!(full.len(), 200);
+
+        for (start, end) in [(0, 10), (37, 61), (190, 200), (0, 200)] {
+            assert_eq!(
+                render_waterfall_window(&waterfall, start, end, 40),
+                full[start..end],
+                "window {start}..{end} differs from the full render"
+            );
+        }
+        // An over-long window clamps to the row count rather than panicking — the pane can be taller
+        // than the trace is deep, and a short trace must not be an error.
+        assert_eq!(
+            render_waterfall_window(&waterfall, 195, 500, 40),
+            full[195..]
+        );
+        // An empty window is empty, not a panic: a zero-height pane is reachable on a tiny terminal.
+        assert!(render_waterfall_window(&waterfall, 200, 200, 40).is_empty());
+        assert!(render_waterfall_window(&waterfall, 500, 600, 40).is_empty());
     }
 }

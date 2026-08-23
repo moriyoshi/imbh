@@ -32,7 +32,7 @@ use crate::ui::logs::draw_log_detail;
 use crate::ui::metrics::{column_widths, draw_metric_detail, draw_metric_table, pad_cell};
 use crate::ui::overlays::{draw_absolute_range, draw_completion_popup, draw_time_range_picker};
 use crate::ui::traces::{draw_span_detail, draw_trace_detail};
-use crate::waterfall::{WATERFALL_NAME_W, WATERFALL_SUFFIX_W, render_waterfall};
+use crate::waterfall::{WATERFALL_NAME_W, WATERFALL_SUFFIX_W, render_waterfall_window};
 
 /// The smallest terminal the full UI lays out in; below either dimension `draw` shows a resize prompt
 /// instead (first-release acceptance criterion, TUI_PLAN.md §10). Kept at/under the smallest size the
@@ -662,6 +662,7 @@ pub(crate) fn draw(frame: &mut ratatui::Frame<'_>, app: &App, options: &Options)
         // The bare title line costs the pane's first row; the rest is where waterfall rows land.
         let visible = detail_area.height.saturating_sub(1) as usize;
         let mut title = detail.title.clone();
+        let is_waterfall = detail.waterfall.is_some();
         let detail_text = if let Some(waterfall) = &detail.waterfall {
             // The pane has no side borders, so the full width is usable text. Give the bar every cell
             // left after the fixed prefix (marker + name), the two `|`, and the trailing duration
@@ -669,16 +670,18 @@ pub(crate) fn draw(frame: &mut ratatui::Frame<'_>, app: &App, options: &Options)
             let bar_cells = (detail_area.width as usize)
                 .saturating_sub(1 + WATERFALL_NAME_W + 2 + WATERFALL_SUFFIX_W)
                 .max(1);
-            let rows = render_waterfall(waterfall, bar_cells);
-            // This preview pane is a fixed slice of the results area and does not scroll: say so when a
-            // deep trace overflows it, so the hidden spans are never silently dropped. The full,
-            // scrolling waterfall is one Enter away (`Route::TraceDetail`).
-            if rows.len() > visible {
+            // This preview pane is a fixed slice of the results area and does not scroll, so only
+            // the first `visible` rows can ever be seen — rendering the rest was work thrown away on
+            // every frame, and a deep trace has thousands of them. The total still comes from the
+            // row count, which needs no rendering.
+            let total = waterfall.rows.len();
+            let rows = render_waterfall_window(waterfall, 0, visible, bar_cells);
+            // Say so when a deep trace overflows the pane, so the hidden spans are never silently
+            // dropped. The full, scrolling waterfall is one Enter away (`Route::TraceDetail`).
+            if total > visible {
                 title = format!(
                     "Waterfall: {} of {} spans {} enter: all",
-                    visible,
-                    rows.len(),
-                    g.dash
+                    visible, total, g.dash
                 );
             }
             rows.join("\n")
@@ -687,14 +690,17 @@ pub(crate) fn draw(frame: &mut ratatui::Frame<'_>, app: &App, options: &Options)
         } else {
             detail.lines.join("\n")
         };
-        frame.render_widget(
-            Paragraph::new(detail_text)
-                .wrap(Wrap { trim: false })
-                // No border box on the waterfall pane: a bare title line keeps the trace id visible
-                // while freeing the left/right/bottom edge cells so the bars sit flush against them.
-                .block(Block::default().title(title)),
-            detail_area,
-        );
+        // Waterfall rows are already fitted to the pane width, so wrapping cannot change what is
+        // drawn — it would only re-measure every line, and a wrapped bar row would in fact spill
+        // onto a second line and push the rest of the waterfall off its axis. Free text still wraps.
+        let mut paragraph = Paragraph::new(detail_text)
+            // No border box on the waterfall pane: a bare title line keeps the trace id visible
+            // while freeing the left/right/bottom edge cells so the bars sit flush against them.
+            .block(Block::default().title(title));
+        if !is_waterfall {
+            paragraph = paragraph.wrap(Wrap { trim: false });
+        }
+        frame.render_widget(paragraph, detail_area);
     }
 
     let status = if let Some(error) = &app.last_error {
@@ -877,9 +883,9 @@ mod tests {
         use crate::model::{AttrRow, PaneTable, TableData};
 
         let table = PaneTable {
-            data: TableData {
-                header: vec!["Key".to_owned(), "Rows".to_owned()],
-                rows: vec![
+            data: TableData::new(
+                vec!["Key".to_owned(), "Rows".to_owned()],
+                vec![
                     vec![
                         "metrics_gauge - 1 segment, 488 rows, 2 keys".to_owned(),
                         String::new(),
@@ -887,7 +893,7 @@ mod tests {
                     vec!["Key".to_owned(), "Rows".to_owned()],
                     vec!["env".to_owned(), "488".to_owned()],
                 ],
-            },
+            ),
             kinds: vec![
                 AttrRow::Section,
                 AttrRow::Header,

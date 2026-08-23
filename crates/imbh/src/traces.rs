@@ -45,12 +45,40 @@ const SPAN_COLS: &str = "trace_id, span_id, parent_span_id, name, kind, start_ti
 /// literal. Semantically identical either way — the pushdown is `Inexact`, so DataFusion re-applies
 /// the predicate above the scan and pruning can only ever save I/O, never change the answer.
 fn spans_of_traces_sql(ids: &[TraceId], params: &mut SqlParams) -> String {
+    spans_of_traces_sql_since(ids, None, params)
+}
+
+/// [`spans_of_traces_sql`] with an optional `start_time >= not_before` bound.
+///
+/// The bloom probe can only rule a segment out by *reading its Parquet footer*, so an id predicate
+/// alone still costs one footer read per segment in the database — measured ~35 us each, which is
+/// 19 ms across 640 segments for a single trace and is paid once per candidate. A time bound is
+/// answered from the manifest instead, with no file opened at all, so it front-runs the bloom and
+/// most segments never reach it.
+///
+/// **Why a lower bound alone, and why it is exact.** A trace's start time *is* the minimum start
+/// time over its spans, so every span of a trace that began at `T` has `start_time >= T`. Bounding
+/// below by any `T` no greater than the trace's start therefore cannot drop a span — unlike an upper
+/// bound, which would need the trace's (unknown) duration and could silently truncate a long trace.
+/// Callers pass the window their candidates were selected in, which is a lower bound on every
+/// candidate's start by construction.
+fn spans_of_traces_sql_since(
+    ids: &[TraceId],
+    not_before: Option<i64>,
+    params: &mut SqlParams,
+) -> String {
     let in_list = ids
         .iter()
         .map(|id| params.id_bytes(&id.0))
         .collect::<Vec<_>>()
         .join(", ");
-    format!("SELECT {SPAN_COLS} FROM spans WHERE trace_id IN ({in_list})")
+    let since = match not_before {
+        // `CAST(start_time AS BIGINT)` is the shape the provider's range probe recognizes; a bare
+        // integer literal would not coerce against `Timestamp(ns, UTC)` and would prune nothing.
+        Some(t) => format!(" AND CAST(start_time AS BIGINT) >= {}", params.i64(t)),
+        None => String::new(),
+    };
+    format!("SELECT {SPAN_COLS} FROM spans WHERE trace_id IN ({in_list}){since}")
 }
 
 /// Traces query namespace, reached via [`Db::traces`].
@@ -77,6 +105,54 @@ impl TracesApi {
         }
     }
 
+    /// Assemble **several** traces in one query, keyed by trace id.
+    ///
+    /// One `trace_id IN (…)` scan instead of one query per id. A per-id loop pays the whole
+    /// per-query overhead — a fresh `SessionContext`, a fresh storage snapshot, and a footer read on
+    /// every segment whose bloom must be consulted — once per trace; at 100 candidates over 640
+    /// segments that measured ~1.5 s, which was the entire cost of a TraceQL search. Batching amortizes
+    /// all three across the group.
+    ///
+    /// `not_before` bounds the scan below (see `spans_of_traces_sql_since`): pass the start of the
+    /// window the ids were selected in, since a trace that began inside it can have no earlier span.
+    /// `None` scans unbounded, which is correct but forfeits manifest pruning.
+    ///
+    /// Traces absent from storage are simply missing from the map rather than mapping to `None`, and
+    /// the caller decides what a gap means. Peak memory is the whole group, so a caller with many
+    /// candidates should chunk — which is what the TraceQL evaluator does.
+    pub async fn get_many(
+        &self,
+        trace_ids: &[TraceId],
+        not_before: Option<Timestamp>,
+    ) -> Result<BTreeMap<TraceId, Trace>> {
+        if trace_ids.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        let mut params = SqlParams::with_promote(self.db.storage.promote().keys());
+        let sql = spans_of_traces_sql_since(trace_ids, not_before.map(|t| t.0), &mut params);
+        let spans = materialize_spans(
+            &self
+                .db
+                .sql_with_params(sql, params.into_values())
+                .collect()
+                .await?,
+        )?;
+
+        let mut by_trace: BTreeMap<TraceId, Vec<Span>> = BTreeMap::new();
+        for span in spans {
+            by_trace.entry(span.trace_id).or_default().push(span);
+        }
+        Ok(by_trace
+            .into_iter()
+            .map(|(id, mut spans)| {
+                // `get` gets its ordering from `ORDER BY start_time`; a grouped scan has to sort per
+                // trace instead, since one result set interleaves them.
+                spans.sort_by_key(|s| s.start_time.0);
+                (id, assemble_trace(id, spans))
+            })
+            .collect())
+    }
+
     /// The raw Arrow spans of one trace — the same scan as [`get`](Self::get) but *without*
     /// materializing `Span` DTOs (`materialize_spans` / `assemble_trace`). Column layout is the
     /// `SPAN_COLS` projection. Lets a caller read span fields directly from the batch buffers.
@@ -97,19 +173,38 @@ impl TracesApi {
         // does not shift the `min/max(start_time)` aggregates below — those stay over ALL of each
         // (matched) trace's spans, so the trace start is the true start.
         let span = q.span_conditions(&mut params);
-        let match_filter = if span.is_empty() {
+        let mut where_parts = Vec::new();
+        if !span.is_empty() {
+            where_parts.push(format!(
+                "hex(trace_id) IN (SELECT hex(trace_id) FROM spans WHERE {})",
+                span.join(" AND ")
+            ));
+        }
+        // The prunable superset of the trace-start `HAVING`. Admits traces that were merely *running*
+        // in the window as well as those that started in it; the exact start is checked below, once
+        // phase 2 has all of each candidate's spans.
+        let prefilter = q.trace_start_prefilter(&mut params);
+        let approximate = !prefilter.is_empty();
+        where_parts.extend(prefilter);
+        let match_filter = if where_parts.is_empty() {
             String::new()
         } else {
-            format!(
-                " WHERE hex(trace_id) IN (SELECT hex(trace_id) FROM spans WHERE {})",
-                span.join(" AND ")
-            )
+            format!(" WHERE {}", where_parts.join(" AND "))
         };
         let having_sql = q.trace_start_having(&mut params);
+        // Over-fetch when the prefilter is in play, so the false positives it admits are dropped
+        // from slack rather than from the answer. A false positive is a trace that straddles the
+        // window start, so their number tracks concurrency at that instant, not the limit — but the
+        // ranking is by most-recent activity, in which a straddling trace can outrank a qualifying
+        // one, so the slack is proportional rather than fixed.
+        let fetch_limit = if approximate {
+            q.limit.saturating_mul(2).saturating_add(16)
+        } else {
+            q.limit
+        };
         let list_sql = format!(
             "SELECT hex(trace_id) AS tid, max(CAST(start_time AS BIGINT)) AS latest \
-             FROM spans{match_filter} GROUP BY tid{having_sql} ORDER BY latest DESC LIMIT {}",
-            q.limit
+             FROM spans{match_filter} GROUP BY tid{having_sql} ORDER BY latest DESC LIMIT {fetch_limit}"
         );
         let list = self
             .db
@@ -154,11 +249,21 @@ impl TracesApi {
         }
         let mut out = Vec::new();
         for tid in &tids {
+            if out.len() == q.limit {
+                break;
+            }
             if let Some(spans) = by_trace.remove(tid) {
                 let Some(first) = spans.first() else { continue };
                 let trace_id = first.trace_id;
                 let error = spans.iter().any(|s| s.status_code == "ERROR");
                 let trace = assemble_trace(trace_id, spans);
+                // The exact trace-start test. Phase 1's `WHERE` narrowed the scan to the window and
+                // in doing so admitted traces that merely overlapped it; only here, with every span
+                // of the trace in hand, is the true start known. Skipped when no prefilter ran, in
+                // which case the `HAVING` was already exact.
+                if approximate && !q.trace_start_matches(trace.start_time) {
+                    continue;
+                }
                 out.push(TraceSummary {
                     trace_id,
                     root_service: trace.root_service,
@@ -601,6 +706,67 @@ impl TraceQuery {
     /// so they select traces that *contain* a matching span without shifting this aggregate onto only
     /// those spans (a trace whose root is in range but whose matching span is later must not be
     /// dropped — regression test in `tests/trace_search_boundary.rs`).
+    /// A `WHERE` on individual span start times covering the same interval as
+    /// [`Self::trace_start_having`] — a **sound superset** of it, used to make the candidate scan
+    /// prunable.
+    ///
+    /// The `HAVING` alone cannot prune anything: it is evaluated after the aggregate, so the
+    /// `FROM spans` scan underneath it reads every span segment in the database however narrow the
+    /// requested window is (measured: the candidate search grew 32x across a 64x corpus at a *fixed*
+    /// window). This predicate is a plain time comparison in the shape the provider's range probe
+    /// recognizes, so segments outside the window are skipped from the manifest with no file opened.
+    ///
+    /// **Why it drops no qualifying trace.** A trace's start *is* the minimum start time over its
+    /// spans, so a trace that started inside `[lo, hi]` has that very span inside `[lo, hi]` and
+    /// keeps at least one row here — its id still reaches the `GROUP BY`.
+    ///
+    /// **Why it is only a superset.** A trace that started before `lo` but was still running inside
+    /// the window also keeps rows, and its *filtered* `min(start_time)` then lands inside the window
+    /// even though its true start does not. Such a trace passes the `HAVING` as a false positive, so
+    /// the exact check has to happen where the true start is known — after phase 2 has refetched
+    /// every span of each candidate, unbounded by time. [`TracesApi::search`] does exactly that.
+    fn trace_start_prefilter(&self, params: &mut SqlParams) -> Vec<String> {
+        let Some(range) = &self.trace_start_range else {
+            return Vec::new();
+        };
+        let mut conditions = Vec::new();
+        if range.start.0 != i64::MIN {
+            conditions.push(format!(
+                "CAST(start_time AS BIGINT) >= {}",
+                params.i64(range.start.0)
+            ));
+        }
+        if range.end.0 != i64::MAX {
+            let operator = if self.trace_start_end_inclusive {
+                "<="
+            } else {
+                "<"
+            };
+            conditions.push(format!(
+                "CAST(start_time AS BIGINT) {operator} {}",
+                params.i64(range.end.0)
+            ));
+        }
+        conditions
+    }
+
+    /// Whether `start` — a trace's *true* start, assembled from all of its spans — satisfies this
+    /// query's trace-start range. The exact test [`Self::trace_start_prefilter`] can only approximate.
+    fn trace_start_matches(&self, start: Timestamp) -> bool {
+        let Some(range) = &self.trace_start_range else {
+            return true;
+        };
+        let above = range.start.0 == i64::MIN || start.0 >= range.start.0;
+        let below = if range.end.0 == i64::MAX {
+            true
+        } else if self.trace_start_end_inclusive {
+            start.0 <= range.end.0
+        } else {
+            start.0 < range.end.0
+        };
+        above && below
+    }
+
     fn trace_start_having(&self, params: &mut SqlParams) -> String {
         let Some(range) = &self.trace_start_range else {
             return String::new();

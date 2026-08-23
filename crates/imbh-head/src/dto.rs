@@ -66,12 +66,13 @@ pub struct EvalCaps {
 /// is one request and, more to the point, **one** metric-catalog read — the catalog is what PromQL
 /// translation resolves a selector's kind against, so a query apiece would re-read it apiece.
 ///
-/// The price is provenance: the result series are concatenated in request order and nothing marks
-/// where one query's answer ends. A *selector* keeps its `__name__`, but an aggregation drops it
-/// (Prometheus semantics — `sum by (…)` and `rate()` alike), so two queries can answer with series
-/// that are indistinguishable. A caller that must attribute each series to its query — as one
-/// listing several metrics side by side must — should send them one at a time and pay the extra
-/// catalog reads.
+/// Provenance rides on the answer: every returned series carries the
+/// [`query_index`](Series::query_index) of the query that produced it. That matters because the
+/// concatenated series are otherwise indistinguishable — a *selector* keeps its `__name__`, but an
+/// aggregation drops it (Prometheus semantics — `sum by (…)` and `rate()` alike), so two queries can
+/// answer with identical label sets. A caller that must attribute each series to its query — as one
+/// listing several metrics side by side must — therefore batches like any other, rather than paying
+/// a request and a catalog read per metric.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EvalRequest {
     pub queries: Vec<String>,
@@ -192,9 +193,32 @@ pub type AttrStats = imbh::attrstats::Report;
 /// One evaluated series, from either PromQL or LogQL. Labels are a sorted `(name, value)` list — the
 /// owned form of `imbh_lgtm::LabelSet`, which borrows from the Arrow batch it was read out of.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct Series {
     pub labels: Vec<Label>,
     pub samples: Vec<SamplePoint>,
+    /// Index into [`EvalRequest::queries`] of the query that produced this series.
+    ///
+    /// This is what makes a batched evaluation attributable, and therefore what lets a head listing
+    /// several metrics send **one** request instead of one per metric. Without it the concatenated
+    /// series carry no provenance: a selector keeps its `__name__`, but an aggregation drops it
+    /// (Prometheus semantics), so two queries can answer with indistinguishable label sets.
+    ///
+    /// Defaults to `0`, which is correct for the single-query case and for a peer that predates the
+    /// field.
+    #[serde(default)]
+    pub query_index: usize,
+}
+
+impl Series {
+    /// A series with no provenance — the shape a single-query evaluation produces.
+    pub fn new(labels: Vec<Label>, samples: Vec<SamplePoint>) -> Series {
+        Series {
+            labels,
+            samples,
+            query_index: 0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -452,12 +476,12 @@ mod tests {
 
     #[test]
     fn non_finite_sample_values_survive_the_round_trip() {
-        let series = Series {
-            labels: vec![Label {
+        let series = Series::new(
+            vec![Label {
                 name: "__name__".to_owned(),
                 value: "up".to_owned(),
             }],
-            samples: vec![
+            vec![
                 SamplePoint {
                     timestamp_ns: 1,
                     value: 1.5,
@@ -475,7 +499,7 @@ mod tests {
                     value: f64::NEG_INFINITY,
                 },
             ],
-        };
+        );
         let json = serde_json::to_string(&series).expect("serialize");
         // A finite value stays a JSON number; the three specials are spelled the way Prometheus' own
         // JSON API spells them, so the payload stays readable by eye.

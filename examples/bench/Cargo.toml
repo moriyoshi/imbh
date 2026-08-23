@@ -18,6 +18,11 @@ release = false
 
 [dependencies]
 imbh.workspace = true
+# `tui-bench` measures the head operations a TUI screen actually drives (`exec::promql`,
+# `exec::traceql`), not the facade calls underneath them — the per-request metric-catalog read and
+# the TraceQL per-candidate fetch both live in this layer, so timing the facade would miss them.
+# `exec` only; the HTTP client would pull reqwest for nothing.
+imbh-head = { workspace = true, features = ["exec"] }
 opentelemetry-proto.workspace = true
 prost.workspace = true
 tempfile.workspace = true

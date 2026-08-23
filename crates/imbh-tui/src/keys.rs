@@ -1013,14 +1013,14 @@ mod tests {
         // Shaped like a real pane: a section, its header, then the key. The section is load-bearing —
         // each one is a Tab stop, and the cursor belongs to the focused section.
         app.snapshot.detail.as_mut().expect("pane").table = Some(crate::model::PaneTable {
-            data: crate::model::TableData {
-                header: vec!["Key".to_owned(), "Scope".to_owned()],
-                rows: vec![
+            data: crate::model::TableData::new(
+                vec!["Key".to_owned(), "Scope".to_owned()],
+                vec![
                     vec!["ALL TABLES -- 1 segment".to_owned(), String::new()],
                     vec!["Key".to_owned(), "Scope".to_owned()],
                     vec!["service.name".to_owned(), "attributes".to_owned()],
                 ],
-            },
+            ),
             kinds: vec![
                 crate::model::AttrRow::Section,
                 crate::model::AttrRow::Header,
@@ -1134,14 +1134,14 @@ mod tests {
     fn table_selection_bounds_index_the_rows() {
         let mut app = App::new();
         app.route = Route::Metrics;
-        app.snapshot.table = Some(TableData {
-            header: vec!["Metric".into(), "Kind".into()],
-            rows: vec![
+        app.snapshot.table = Some(TableData::new(
+            vec!["Metric".into(), "Kind".into()],
+            vec![
                 vec!["a".into(), "gauge".into()],
                 vec!["b".into(), "sum".into()],
                 vec!["c".into(), "sum".into()],
             ],
-        });
+        ));
         // Table rows are indexed from 0 (not offset by a header line as lists are).
         assert_eq!(app.selectable_bounds(), Some((0, 2)));
 
@@ -1152,10 +1152,7 @@ mod tests {
         assert_eq!(app.selected, 2);
 
         // An empty table has no selectable rows.
-        app.snapshot.table = Some(TableData {
-            header: vec!["Metric".into()],
-            rows: vec![],
-        });
+        app.snapshot.table = Some(TableData::new(vec!["Metric".into()], vec![]));
         assert_eq!(app.selectable_bounds(), None);
     }
 }

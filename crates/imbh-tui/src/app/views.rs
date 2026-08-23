@@ -410,10 +410,10 @@ mod tests {
         // The catalog view (empty query, no retained series) must not open the viewer.
         let mut app = App::new();
         app.route = Route::Metrics;
-        app.snapshot.table = Some(TableData {
-            header: vec!["Metric".into()],
-            rows: vec![vec!["http.requests".into()]],
-        });
+        app.snapshot.table = Some(TableData::new(
+            vec!["Metric".into()],
+            vec![vec!["http.requests".into()]],
+        ));
         app.selected = 0;
         assert!(!app.open_metric_detail());
         assert!(app.route_metric_detail().is_none());

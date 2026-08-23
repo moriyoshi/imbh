@@ -182,6 +182,37 @@ pub struct Db {
     /// read-write handle (it queries live buffers under the storage lock instead).
     #[cfg(feature = "query")]
     reader_cache: Mutex<ReaderCache>,
+    /// The metric catalog accumulated over sealed segments, and the segments already folded into it.
+    /// See [`MetricCatalogCache`].
+    #[cfg(feature = "query")]
+    metric_catalog: Mutex<MetricCatalogCache>,
+}
+
+/// The sealed-segment half of the metric catalog, folded in once per segment.
+///
+/// `MetricsApi::catalog` answers "which metrics exist", which is a `SELECT DISTINCT` with no time
+/// predicate — so nothing prunes and its cost is the whole corpus, every call. It is also read once
+/// per PromQL *request* (translation resolves a selector's kind against it), which made it the
+/// dominant term in a metrics-screen refresh: measured 70 ms at 640 segments, and a head that sends
+/// one request per checked metric paid it once per metric.
+///
+/// Distinct-union over an append-only segment set is monotone, so a segment's contribution never
+/// changes once folded: the fold is exact, not an approximation, and the steady-state cost after a
+/// seal is one new segment rather than the corpus. Only *removal* (retention, compaction) can
+/// invalidate an entry, and that forces a full rebuild — rare, and the one case where a cheap
+/// generation counter would have been wrong.
+///
+/// The mutable buffer is deliberately **not** cached: a metric ingested a moment ago lives only
+/// there, and a live head must see it before the next seal. Scanning it per call is what keeps the
+/// answer current, and it is bounded by the seal threshold rather than by the corpus.
+#[cfg(feature = "query")]
+#[derive(Default)]
+struct MetricCatalogCache {
+    /// Parquet paths already folded into `entries`, so a rebuild can tell new segments from known
+    /// ones and detect removals.
+    folded: std::collections::BTreeSet<PathBuf>,
+    /// The accumulated distinct rows, ordered so the catalog's output is stable across calls.
+    entries: std::collections::BTreeSet<metrics::CatalogEntry>,
 }
 
 /// The read-only snapshot cache backing [`Db::reader_cache`] (ARCHITECTURE.md §5).
@@ -1137,6 +1168,8 @@ impl DbBuilder {
             refresh: self.refresh,
             #[cfg(feature = "query")]
             reader_cache: Mutex::new(ReaderCache::default()),
+            #[cfg(feature = "query")]
+            metric_catalog: Mutex::new(MetricCatalogCache::default()),
         });
         // Spawn the async-ingest worker onto the host runtime (`Ingest::Async` implies a tokio
         // `Handle`; never an owned OS thread). Its handle is kept so `close()` can drain the queue and
@@ -1893,6 +1926,24 @@ impl Db {
         let tables = build_reader_tables(self, &mut cache.cursor)?;
         cache.built = Some((tables, std::time::Instant::now()));
         Ok(())
+    }
+
+    /// The query inputs for the current point in time — the same buffers ∪ segments any query would
+    /// see, built the same way for a writer (one storage lock) or a reader (manifest ∪ WAL tail).
+    ///
+    /// Exposed so a caller that needs to query a *subset* of the snapshot can take the tables apart
+    /// and hand `imbh_query::run_sql` a narrowed set. [`MetricsApi::catalog`](metrics::MetricsApi::catalog)
+    /// is the one such caller: it scans new segments and the buffer separately so the sealed half
+    /// can be folded into [`MetricCatalogCache`] once and reused. Ordinary queries go through
+    /// [`Query::collect`], which also carries the read-during-delete retry this does not.
+    #[cfg(feature = "query")]
+    pub(crate) fn query_tables(&self) -> Result<Vec<TableInput>> {
+        self.ensure_open()?;
+        if self.access == Access::ReadOnly {
+            return self.reader_tables(false);
+        }
+        let snap = self.storage.query_snapshot()?;
+        Ok(writer_tables(&self.storage, &snap))
     }
 }
 
