@@ -163,7 +163,7 @@ impl App {
                     "Temporality".to_owned(),
                 ]
             });
-        self.snapshot.table = Some(TableData { header, rows });
+        self.snapshot.table = Some(TableData::new(header, rows));
         if let Some((first, last)) = self.selectable_bounds() {
             self.selected = self.selected.clamp(first, last);
         }
@@ -508,18 +508,18 @@ mod tests {
 
         // Navigate away to the series list and back: a fresh catalog snapshot arrives (raw rows) and
         // the tree is rebuilt. Expansion, discovered dims, and the checked series must all survive.
-        app.snapshot.table = Some(TableData {
-            header: vec![
+        app.snapshot.table = Some(TableData::new(
+            vec![
                 "Metric".into(),
                 "Kind".into(),
                 "Unit".into(),
                 "Temporality".into(),
             ],
-            rows: vec![
+            vec![
                 vec!["cpu".into(), "gauge".into(), "1".into(), "-".into()],
                 vec!["reqs".into(), "sum".into(), "1".into(), "cumulative".into()],
             ],
-        });
+        ));
         app.build_metric_tree();
 
         assert!(app.metric_tree[1].expanded, "expansion preserved");

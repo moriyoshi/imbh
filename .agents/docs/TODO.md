@@ -9,6 +9,61 @@ git history); this file tracks only what is still open.
 
 ## Open Items
 
+- [ ] **`dto::Series` gained `query_index`: 0.8 -> 0.9 before publishing.** A public field on a
+      struct with no `#[non_exhaustive]` is a breaking change for struct-literal callers (the derive
+      of `Default` covers `..Default::default()` users, and `Series::new` covers the rest). The
+      response DTOs now carry `#[non_exhaustive]` so the next such addition is free. Left to
+      `cargo release`, which owns version numbers here — a by-hand edit half-applies the
+      `shared-version` / `dependent-version` / README-replacement machinery. See JOURNAL
+      "The TUI's metrics and traces screens".
+
+- [ ] **No column projection reaches the Parquet reader.** `SegmentPartitionStream` yields
+      full-schema batches and lets `StreamingTableExec` project above it
+      (`crates/imbh-query/src/provider.rs`), so the wide `spans` attributes/resource/events/links
+      JSON is decoded on every traces query even when the plan needs two columns. Pushing a
+      `ProjectionMask` into `ParquetRecordBatchReaderBuilder` is the largest remaining constant
+      factor on the read path. Three constraints make it the riskiest change in the area, and the
+      reason it was not taken with the rest: the buffer snapshot batch must be projected identically;
+      pushdown is `Inexact`, so the `FilterExec` above the scan needs its predicate columns to
+      *survive* the mask (dropping one is a wrong-results bug, not a slow one); and the Tantivy
+      `RowSelection` and row-group subsets must still compose with it. Gate it behind a test that
+      runs the existing provider corpus with pushdown on and off and asserts batch-for-batch
+      equality.
+
+- [ ] **`traces().get()` still footer-reads every segment.** It carries no time predicate, so the
+      raw-bytes bloom probe can only be answered by opening each segment's Parquet footer — measured
+      19.4 ms at 640 segments, and paid once per cursor move on the Traces list. `get_many` already
+      takes a `not_before` and TraceQL passes it; the single-trace path needs the same, which means
+      an optional bound on the head's `TraceGetRequest` (the TUI always knows its search window).
+      Note the bound must be a *lower* one: a trace's start is the minimum over its spans, so
+      `start_time >= T` for any `T` at or below the true start is exact, whereas an upper bound would
+      need the trace's unknown duration and could truncate a long trace.
+
+- [ ] **The TraceQL candidate search is prunable but not flat.** `tq-search` went 134 -> 39 ms at 640
+      segments once phase 1 got its `WHERE`, but it still grows (3.2 -> 38.9 across a 64x corpus).
+      The residual is phase 2: it fetches `2n + 16` candidates' spans through a bloom-probed
+      `IN` list whose selectivity falls as the list grows, and it must stay *unbounded in time* so
+      the true trace start is recoverable for the exactness recheck. Worth measuring whether a
+      cheaper exact-start source exists (a per-segment min-start sketch?) before adding slack.
+
+- [ ] **One `SessionContext` per query.** Acknowledged at `crates/imbh-query/src/lib.rs:8-10`. UDF
+      registration and optimizer setup are per-query costs; providers would stay per-query since they
+      capture a snapshot. Note the `GreedyMemoryPool` becomes shared across concurrent queries, which
+      is arguably more correct for an RSS budget but changes allocation behaviour — re-run
+      `crates/imbh/tests/soak_rss.rs`.
+
+- [ ] **Per-cursor-move trace fetch is unthrottled and single-slot.** Holding down-arrow on the
+      Traces list issues one full `traces().get()` per row (`keys.rs` -> `tasks.rs::request_waterfall`).
+      A ~120 ms idle debounce plus a small LRU keyed by trace id would collapse a scroll into one
+      fetch. Prerequisite: keep `Vec<TraceMatch>` on the snapshot instead of re-parsing the id out of
+      the rendered row string (`fetch.rs` <-> `app/views.rs`), which is also worth doing on its own.
+
+- [ ] **`metrics().dimensions()` and `series()` are still unbounded scans.** Same missing time
+      predicate the catalog had (`crates/imbh/src/metrics.rs`). `dimensions` is fetched once per
+      metric by the TUI so it is not per-refresh, but it is still whole-corpus. Route them through
+      the catalog's fold or bound them to the eval window. `exemplars()` likewise takes only a metric
+      name and is filtered by window client-side.
+
 - [ ] **v0.8.0 is prepared but not cut.** The workspace is bumped to 0.8.0, the changelog section
       closed and dated 2026-08-09, `README.md` / `docs/DOCKER_LOG_DRIVER.md` version strings corrected
       by hand, notices regenerated and every gate green — see JOURNAL "Preparing v0.8.0". Nothing is

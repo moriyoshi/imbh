@@ -847,6 +847,37 @@ impl TraceSource for TracesApi {
             Ok(Some(pack))
         })
     }
+
+    /// One grouped scan for the whole chunk instead of the default's query per trace. `not_before`
+    /// becomes a manifest-level time bound, so segments older than the candidate window are skipped
+    /// without opening their Parquet footers to consult a bloom filter.
+    fn fetch_traces<'a>(
+        &'a self,
+        trace_ids: &'a [imbh_core::TraceId],
+        not_before: i64,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<TracePack>, SemanticError>> + Send + 'a>> {
+        Box::pin(async move {
+            let mut found = self
+                .get_many(trace_ids, Some(imbh_core::Timestamp(not_before)))
+                .await
+                .map_err(|error| SemanticError::Source(error.to_string()))?;
+            // Restore the caller's ranking: `get_many` groups by id, but the candidate order is by
+            // recency and is what the answer is displayed in.
+            let mut out = Vec::with_capacity(trace_ids.len());
+            for id in trace_ids {
+                let Some(trace) = found.remove(id) else {
+                    continue;
+                };
+                out.push(TracePack::try_new(Box::new(trace), |owner| {
+                    let trace = owner
+                        .downcast_ref::<imbh::Trace>()
+                        .expect("TracePack owner is imbh::Trace");
+                    Ok::<_, SemanticError>(semantic_trace(trace))
+                })?);
+            }
+            Ok(out)
+        })
+    }
 }
 
 fn semantic_trace(trace: &imbh::Trace) -> SemanticTrace<'_> {

@@ -461,6 +461,7 @@ version = "0.8.0"
 dependencies = [
  "futures",
  "imbh",
+ "imbh-head",
  "opentelemetry-proto",
  "prost 0.14.4",
  "tempfile",

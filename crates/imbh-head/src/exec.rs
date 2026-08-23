@@ -38,7 +38,7 @@ pub async fn promql(
     let context = metric_context(&catalog);
     let (range, caps) = (range(request.window), caps(request.caps));
     let mut out = Vec::new();
-    for query in &request.queries {
+    for (index, query) in request.queries.iter().enumerate() {
         let translated = translate_promql(query, &context)
             .map_err(|diagnostic| HeadError::bad_request(diagnostic.message))?;
         let ImbhQueryModel::Prom(expression) = translated.model else {
@@ -51,7 +51,10 @@ pub async fn promql(
             .execute_promql(&expression, range, caps)
             .await
             .map_err(HeadError::from_semantic)?;
-        out.extend(to_series(series.iter().map(|s| (&s.labels, &s.samples))));
+        out.extend(to_series(
+            series.iter().map(|s| (&s.labels, &s.samples)),
+            index,
+        ));
     }
     Ok(out)
 }
@@ -66,7 +69,7 @@ pub async fn logql(
     let schema = LogStreamSchema::service_only();
     let (range, caps) = (range(request.window), caps(request.caps));
     let mut out = Vec::new();
-    for query in &request.queries {
+    for (index, query) in request.queries.iter().enumerate() {
         let translated = translate_logql(query, &TranslateContext::default())
             .map_err(|diagnostic| HeadError::bad_request(diagnostic.message))?;
         let ImbhQueryModel::Log(expression) = translated.model else {
@@ -81,7 +84,10 @@ pub async fn logql(
             .execute_logql(&expression, range, caps, &schema)
             .await
             .map_err(HeadError::from_semantic)?;
-        out.extend(to_series(series.iter().map(|s| (&s.labels, &s.samples))));
+        out.extend(to_series(
+            series.iter().map(|s| (&s.labels, &s.samples)),
+            index,
+        ));
     }
     Ok(out)
 }
@@ -148,8 +154,11 @@ pub async fn traceql(
 /// Shared by PromQL and LogQL because their results are the same thing: a label set and a run of
 /// `(timestamp, value)` samples. The native forms (`PromSeries`/`LogSeries`) borrow their labels
 /// from the Arrow batch they were read out of, so the head's copy is owned.
+/// `query_index` tags every series with the request query it came from, so a batched evaluation
+/// stays attributable (see [`dto::Series::query_index`]).
 fn to_series<'a>(
     series: impl IntoIterator<Item = (&'a imbh_lgtm::LabelSet<'a>, &'a Vec<imbh_lgtm::FloatSample>)>,
+    query_index: usize,
 ) -> Vec<dto::Series> {
     series
         .into_iter()
@@ -168,6 +177,7 @@ fn to_series<'a>(
                     value: sample.value,
                 })
                 .collect(),
+            query_index,
         })
         .collect()
 }

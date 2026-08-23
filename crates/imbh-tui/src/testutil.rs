@@ -143,18 +143,18 @@ pub(crate) fn catalog_app() -> App {
     let mut app = App::new();
     app.route = Route::Metrics;
     app.query[1] = String::new(); // empty query -> catalog is showing
-    app.snapshot.table = Some(TableData {
-        header: vec![
+    app.snapshot.table = Some(TableData::new(
+        vec![
             "Metric".into(),
             "Kind".into(),
             "Unit".into(),
             "Temporality".into(),
         ],
-        rows: vec![
+        vec![
             vec!["cpu".into(), "gauge".into(), "1".into(), "-".into()],
             vec!["reqs".into(), "sum".into(), "1".into(), "cumulative".into()],
         ],
-    });
+    ));
     app.build_metric_tree();
     app
 }
@@ -163,10 +163,10 @@ pub(crate) fn metrics_app_with_series() -> App {
     let mut app = App::new();
     app.route = Route::Metrics;
     app.query[1] = "up".to_owned(); // non-empty query -> series view (not the catalog)
-    app.snapshot.table = Some(TableData {
-        header: vec!["Series".into(), "Latest".into()],
-        rows: vec![vec!["a".into()], vec!["b".into()]],
-    });
+    app.snapshot.table = Some(TableData::new(
+        vec!["Series".into(), "Latest".into()],
+        vec![vec!["a".into()], vec!["b".into()]],
+    ));
     app.snapshot.series = vec![
         SeriesData {
             labels: "svc=a".into(),

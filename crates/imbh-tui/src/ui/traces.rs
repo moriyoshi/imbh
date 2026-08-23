@@ -13,8 +13,8 @@ use crate::time::{format_duration_ns, format_timestamp_ns};
 use crate::ui::focus_border;
 use crate::ui::glyphs::Glyphs;
 use crate::waterfall::{
-    SpanRecord, TraceDetail, WATERFALL_NAME_W, WATERFALL_SUFFIX_W, render_waterfall,
-    render_waterfall_row, sticky_layout,
+    SpanRecord, TraceDetail, WATERFALL_NAME_W, WATERFALL_SUFFIX_W, render_waterfall_row,
+    render_waterfall_window, sticky_layout,
 };
 
 /// Height (rows, borders included) the selected-span summary pane claims on the trace detail. Below
@@ -112,7 +112,12 @@ pub(crate) fn draw_trace_detail(
             Style::default()
         }
     };
-    let lines = render_waterfall(&detail.waterfall, bar_cells);
+    // Only the rows the pane will actually show. `sticky_layout` guarantees the cursor lies inside
+    // `offset..offset + height`, so the selection below always resolves; a whole-trace render would
+    // build thousands of `String`s per frame for a pane displaying tens of them.
+    let window_start = layout.offset;
+    let window_end = window_start.saturating_add(layout.height);
+    let lines = render_waterfall_window(&detail.waterfall, window_start, window_end, bar_cells);
     let items = if detail.spans.is_empty() {
         // A trace with no spans is a real (if degenerate) result, not a blank pane.
         vec![ListItem::new(Span::styled(
@@ -123,7 +128,10 @@ pub(crate) fn draw_trace_detail(
         lines
             .iter()
             .enumerate()
-            .map(|(index, line)| ListItem::new(Span::styled(line.clone(), row_style(index))))
+            .map(|(offset, line)| {
+                let index = window_start + offset;
+                ListItem::new(Span::styled(line.clone(), row_style(index)))
+            })
             .collect::<Vec<_>>()
     };
     let title = if detail.spans.is_empty() {
@@ -190,9 +198,11 @@ pub(crate) fn draw_trace_detail(
             },
         );
     }
+    // `items` now starts at `window_start`, so the list's own offset is zero and the selection is
+    // relative. Keeping the absolute offset here would scroll past the end of a windowed item list.
     let mut state = ListState::default()
-        .with_offset(layout.offset)
-        .with_selected((!detail.spans.is_empty()).then_some(cursor));
+        .with_offset(0)
+        .with_selected((!detail.spans.is_empty()).then(|| cursor.saturating_sub(window_start)));
     frame.render_stateful_widget(
         List::new(items).highlight_style(
             Style::default()

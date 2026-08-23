@@ -249,6 +249,26 @@ pub(crate) const MAX_WINDOW_NS: i64 = 366 * 24 * 3_600 * 1_000_000_000;
 pub(crate) struct TableData {
     pub(crate) header: Vec<String>,
     pub(crate) rows: Vec<Vec<String>>,
+    /// Display width of the widest cell per column, measured once here rather than per frame.
+    ///
+    /// The measurement walks every cell of every row calling `UnicodeWidthStr::width`, and the rows
+    /// do not change between frames — but `draw` takes `&App`, so a renderer that measured them had
+    /// no way to keep the result. Computing it at construction moves the cost from once-per-frame to
+    /// once-per-result, which matters most on the catalog tree, whose row count grows with the
+    /// number of metrics and their expanded dimensions.
+    pub(crate) widths: Vec<usize>,
+}
+
+impl TableData {
+    /// Build a table, measuring its column widths up front.
+    pub(crate) fn new(header: Vec<String>, rows: Vec<Vec<String>>) -> TableData {
+        let widths = crate::ui::metrics::column_widths(&header, rows.iter());
+        TableData {
+            header,
+            rows,
+            widths,
+        }
+    }
 }
 
 /// A metric in the catalog tree, expandable to its groupable dimensions.

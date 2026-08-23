@@ -39,14 +39,11 @@ pub(crate) fn column_widths<'a>(
     widths
 }
 
-/// [`column_widths`] as ratatui constraints: every column but the last is fixed, and the last absorbs
-/// what is left.
-pub(crate) fn column_constraints<'a>(
-    header: &[String],
-    rows: impl Iterator<Item = &'a Vec<String>>,
-) -> Vec<Constraint> {
-    let column_count = header.len();
-    column_widths(header, rows)
+/// Measured [`column_widths`] as ratatui constraints: every column but the last is fixed, and the
+/// last absorbs what is left. Takes the widths rather than re-measuring, so a renderer can use the
+/// ones [`TableData`] computed when it was built.
+pub(crate) fn column_constraints(column_count: usize, widths: &[usize]) -> Vec<Constraint> {
+    widths
         .iter()
         .enumerate()
         .map(|(index, &width)| {
@@ -100,7 +97,7 @@ pub(crate) fn draw_metric_table(
     focused: bool,
     g: &Glyphs,
 ) {
-    let constraints = column_constraints(&table.header, table.rows.iter());
+    let constraints = column_constraints(table.header.len(), &table.widths);
     let header = table_header(table);
     // In the catalog tree the first column carries the branch marker (`v `/`> `). Split that leading
     // marker into a dark-grey span so it reads as chrome rather than content. Only the tree rows carry
@@ -325,20 +322,28 @@ pub(crate) fn draw_metric_detail(
 
         // Publish where each datapoint actually landed on screen, so the mascot's chart ride can walk
         // the rendered line (see `ChartRide`). Reproduces ratatui's `Chart` graph-area layout exactly.
-        let y_label_strs = [
-            format_metric_value(y_min),
-            format_metric_value((y_min + y_max) / 2.0),
-            format_metric_value(y_max),
-        ];
-        let x_first = clock_hms_ns(detail.points.first().unwrap().0);
-        let block_inner = g.block().inner(plot_area);
-        let geom = chart_graph_area(block_inner, &y_label_strs, &x_first).map(|graph| {
-            let cells = finite
-                .iter()
-                .filter_map(|&(x, y)| chart_point_cell(graph, x_min, x_max, y_min, y_max, x, y))
-                .collect();
-            ChartGeometry { graph, cells }
-        });
+        //
+        // Only when the mascot is actually visible: this is a per-point projection run on every
+        // frame, and its sole consumer is the ride. With the mascot off (the default) nothing reads
+        // the result, so computing it was pure waste on the hottest pane in the app.
+        let geom = if app.show_mascot {
+            let y_label_strs = [
+                format_metric_value(y_min),
+                format_metric_value((y_min + y_max) / 2.0),
+                format_metric_value(y_max),
+            ];
+            let x_first = clock_hms_ns(detail.points.first().unwrap().0);
+            let block_inner = g.block().inner(plot_area);
+            chart_graph_area(block_inner, &y_label_strs, &x_first).map(|graph| {
+                let cells = finite
+                    .iter()
+                    .filter_map(|&(x, y)| chart_point_cell(graph, x_min, x_max, y_min, y_max, x, y))
+                    .collect();
+                ChartGeometry { graph, cells }
+            })
+        } else {
+            None
+        };
         app.chart_geom.replace(geom);
     }
 

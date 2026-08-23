@@ -357,9 +357,18 @@ self_cell::self_cell! {
     }
 }
 
+/// How many traces the evaluator pulls per [`TraceSource::fetch_traces`] call.
+///
+/// The tension is per-query overhead against peak memory. One query per trace pays a fresh session,
+/// a fresh snapshot, and a bloom footer read per segment — once each, per trace. One query for all
+/// candidates amortizes that but holds the entire result set at once, which is exactly the "peak
+/// memory is one trace" property the streaming design was built for. A chunk keeps both bounded:
+/// overhead falls by the chunk factor while resident traces stay capped at the chunk.
+pub const TRACE_FETCH_CHUNK: usize = 32;
+
 /// A bounded, **streaming** source of complete traces: `fetch_candidates` selects trace ids in
-/// storage (cheap; ids only), then the evaluator pulls each trace on demand via `fetch_trace` and
-/// drops it before the next. Each trace is returned inside a self-owning [`TracePack`] so its span
+/// storage (cheap; ids only), then the evaluator pulls them in chunks via `fetch_traces` and drops
+/// each chunk before the next. Each trace is returned inside a self-owning [`TracePack`] so its span
 /// strings/attributes can borrow the source's backing store for that trace's evaluation.
 pub trait TraceSource {
     fn fetch_candidates<'a>(
@@ -371,6 +380,42 @@ pub trait TraceSource {
         &'a self,
         trace_id: TraceId,
     ) -> Pin<Box<dyn Future<Output = Result<Option<TracePack>, SemanticError>> + Send + 'a>>;
+
+    /// Fetch a group of traces at once. `not_before` is a lower bound on every id's start time —
+    /// the window the candidates were selected in — which a source may use to skip storage that
+    /// predates them; ignoring it stays correct.
+    ///
+    /// **Must preserve the order of `trace_ids`**, skipping ids that storage does not have. The
+    /// candidate list arrives ranked by recency and that ranking is what a caller displays, so a
+    /// source that grouped by id (the natural shape of a `WHERE id IN (…)` scan) has to restore the
+    /// requested order before returning.
+    ///
+    /// The default implementation is the per-trace loop, so an existing `TraceSource` keeps working
+    /// unchanged. A source backed by a query engine should override it with a single grouped scan:
+    /// that is where the win is, and the default deliberately does not pretend to deliver it.
+    fn fetch_traces<'a>(
+        &'a self,
+        trace_ids: &'a [TraceId],
+        not_before: i64,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<TracePack>, SemanticError>> + Send + 'a>>
+    where
+        // Only the *default body* needs this: awaiting `fetch_trace` in a loop holds `&self` across
+        // the await, and that future is `Send` only if `Self` is `Sync`. Every real implementor
+        // already is — the other methods hand out `Send` futures borrowing `&self`, which requires
+        // it — so the bound costs nothing and an override is free of it.
+        Self: Sync,
+    {
+        let _ = not_before;
+        Box::pin(async move {
+            let mut out = Vec::with_capacity(trace_ids.len());
+            for id in trace_ids {
+                if let Some(pack) = self.fetch_trace(*id).await? {
+                    out.push(pack);
+                }
+            }
+            Ok(out)
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -396,45 +441,54 @@ pub fn plan_trace_fetch(
     })
 }
 
-pub async fn execute_traceql<S: TraceSource + ?Sized>(
+// `Sync` is required by `TraceSource::fetch_traces`'s default body (see the bound there). It is not
+// a new restriction in practice: the trait's futures are `Send` while borrowing `&self`, which
+// already implies it for every implementor.
+pub async fn execute_traceql<S: TraceSource + Sync + ?Sized>(
     source: &S,
     expr: &SpansetExpr,
     bounds: crate::FetchBounds,
     limits: EvalLimits,
 ) -> Result<Vec<TraceQueryMatch>, SemanticError> {
     let request = plan_trace_fetch(bounds, limits, expr)?;
-    // Stream one trace at a time: candidate ids are selected in storage, then each trace is pulled,
-    // evaluated in isolation (TraceQL is per-trace independent), and dropped before the next — so
-    // peak memory is one trace, not the whole candidate set. Owned output (hex ids) is what escapes.
+    // Stream a chunk at a time: candidate ids are selected in storage, then traces are pulled
+    // [`TRACE_FETCH_CHUNK`] at a time, evaluated in isolation (TraceQL is per-trace independent),
+    // and dropped before the next chunk — so peak memory is one chunk, not the whole candidate set,
+    // while the per-query overhead is paid once per chunk rather than once per trace. Owned output
+    // (hex ids) is what escapes.
     let candidates = source.fetch_candidates(&request).await?;
     if candidates.len() > request.max_traces {
         return Err(SemanticError::LimitExceeded("TraceQL source traces"));
     }
     let mut seen = BTreeSet::new();
-    let mut span_count = 0usize;
-    let mut result = Vec::new();
-    for trace_id in candidates {
-        if !seen.insert(trace_id) {
+    for id in &candidates {
+        if !seen.insert(*id) {
             return Err(SemanticError::Malformed(
                 "TraceQL source returned a duplicate trace",
             ));
         }
-        let Some(pack) = source.fetch_trace(trace_id).await? else {
-            continue;
-        };
-        let trace = pack.borrow_dependent();
-        span_count = span_count
-            .checked_add(trace.spans.len())
-            .ok_or(SemanticError::LimitExceeded("TraceQL source spans"))?;
-        if span_count > request.max_spans {
-            return Err(SemanticError::LimitExceeded("TraceQL source spans"));
-        }
-        if let Some(spanset) = eval_trace_reference(trace, expr, limits)? {
-            result.push(TraceQueryMatch {
-                trace_id: trace_id.to_hex(),
-                start_time_ns: trace.start_time_ns,
-                spanset,
-            });
+    }
+    // Every candidate was selected for having started inside the fetch window, so no span of any of
+    // them can predate its start — a sound lower bound the source can prune storage with.
+    let not_before = request.bounds.start_ns;
+    let mut span_count = 0usize;
+    let mut result = Vec::new();
+    for chunk in candidates.chunks(TRACE_FETCH_CHUNK) {
+        for pack in source.fetch_traces(chunk, not_before).await? {
+            let trace = pack.borrow_dependent();
+            span_count = span_count
+                .checked_add(trace.spans.len())
+                .ok_or(SemanticError::LimitExceeded("TraceQL source spans"))?;
+            if span_count > request.max_spans {
+                return Err(SemanticError::LimitExceeded("TraceQL source spans"));
+            }
+            if let Some(spanset) = eval_trace_reference(trace, expr, limits)? {
+                result.push(TraceQueryMatch {
+                    trace_id: trace.trace_id.to_hex(),
+                    start_time_ns: trace.start_time_ns,
+                    spanset,
+                });
+            }
         }
     }
     Ok(result)
