@@ -10,11 +10,26 @@ use crate::backend::Backend;
 use crate::completion::LogCompletionRequest;
 use crate::fetch::{attribute_pane, build_waterfall_detail, discover_dims, load_snapshot};
 use crate::model::{
-    AttrWindow, DetailPane, DetailStyle, ExemplarMarker, Options, QueryResult, Screen, Update,
+    AttrWindow, DetailPane, DetailStyle, ExemplarMarker, Options, QueryResult, Refresh, Screen,
+    Update,
 };
 use crate::promql::metric_name_from_detail;
 
+/// Refresh on the user's behalf: this one locks the keyboard until the result lands.
+///
+/// The overwhelming majority of call sites are user actions, so they keep the short name; only the
+/// auto-refresh timer reaches for [`request_refresh_as`] to opt out of the lock.
 pub(crate) fn request_refresh(
+    app: &mut App,
+    backend: Backend,
+    options: Options,
+    sender: mpsc::UnboundedSender<Update>,
+) {
+    request_refresh_as(Refresh::Interactive, app, backend, options, sender);
+}
+
+pub(crate) fn request_refresh_as(
+    origin: Refresh,
     app: &mut App,
     backend: Backend,
     mut options: Options,
@@ -27,7 +42,12 @@ pub(crate) fn request_refresh(
     options.window = app.abs_window;
     if app.loading {
         // Keep `log_paging` intact so the coalesced refresh below still sees the paging intent.
-        app.pending_refresh = true;
+        // An interactive request always wins the slot: a user action queued behind a timer tick must
+        // still lock the keyboard when it is replayed.
+        app.pending_refresh = Some(match app.pending_refresh {
+            Some(Refresh::Interactive) => Refresh::Interactive,
+            _ => origin,
+        });
         return;
     }
     // Log paging is coherent only against a fixed query/window (offset cursors shift otherwise), so any
@@ -39,7 +59,7 @@ pub(crate) fn request_refresh(
         app.log_cursor_stack.clear();
         app.log_next_cursor = None;
     }
-    app.loading = true;
+    app.begin_loading(origin);
     app.generation = app.generation.wrapping_add(1);
     let generation = app.generation;
     let screen = app.screen();

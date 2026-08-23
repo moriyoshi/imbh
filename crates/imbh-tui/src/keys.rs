@@ -178,6 +178,29 @@ pub(crate) fn span_logs_drilldown(
 }
 
 /// Apply a single key press to the app, dispatching refreshes/screen switches as needed.
+/// Whether `key` still acts while a user-initiated query holds the keyboard.
+///
+/// The lock covers `Mode::Normal` and nothing else, because that is the mode in which every binding
+/// is an *operation against the snapshot on screen* — navigate, select, switch screen, drill down,
+/// page, promote. Replaying those against a result that has since been replaced is what makes a slow
+/// refresh feel broken, so they are refused outright.
+///
+/// The overlay modes stay fully live. Eating keystrokes out of a half-typed query would be worse than
+/// anything the lock prevents, and the range picker, the absolute-range form and the menu all read
+/// nothing from the in-flight result. Their commit paths dispatch through
+/// [`request_refresh`](crate::tasks::request_refresh), which already coalesces onto `pending_refresh`
+/// rather than racing. The mode check is load-bearing rather than defensive: a coalesced refresh
+/// replayed when its predecessor lands can arm the lock while the user is sitting in one of them.
+///
+/// `q` is never refused. A query that never lands must not become a trap, and `q` is the only way out
+/// — there is no Ctrl-C binding.
+fn survives_loading(app: &App, key: KeyEvent) -> bool {
+    if !app.input_locked || app.mode != Mode::Normal {
+        return true;
+    }
+    key.code == KeyCode::Char('q')
+}
+
 pub(crate) fn handle_key(
     app: &mut App,
     key: KeyEvent,
@@ -186,6 +209,13 @@ pub(crate) fn handle_key(
     sender: &mpsc::UnboundedSender<Update>,
 ) -> Control {
     if key.kind != KeyEventKind::Press {
+        return Control::Continue;
+    }
+    if !survives_loading(app, key) {
+        // Latch the banner on, so the user sees *why* the key did nothing rather than a UI that has
+        // apparently stopped responding. Refusing is the whole point — the alternative is a queue of
+        // navigations and screen switches replaying against a snapshot that has since been replaced.
+        app.input_refused = true;
         return Control::Continue;
     }
     match app.mode {
@@ -761,7 +791,7 @@ pub(crate) fn switch_screen(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::TableData;
+    use crate::model::{Refresh, TableData};
     use crate::testutil::app_with_discovered_dims;
 
     /// A backend and update channel for driving [`handle_key`]. `Backend::connect` contacts nothing,
@@ -1154,5 +1184,84 @@ mod tests {
         // An empty table has no selectable rows.
         app.snapshot.table = Some(TableData::new(vec!["Metric".into()], vec![]));
         assert_eq!(app.selectable_bounds(), None);
+    }
+
+    /// Press a key and report whether the loop was told to quit.
+    fn press_control(app: &mut App, code: KeyCode) -> Control {
+        let (backend, options, sender, _receiver) = harness();
+        handle_key(
+            app,
+            KeyEvent::new(code, KeyModifiers::NONE),
+            &backend,
+            &options,
+            &sender,
+        )
+    }
+
+    /// An app on the Traces screen with a user-initiated query in flight.
+    fn loading_normal() -> App {
+        let mut app = App::new();
+        app.route = Route::Traces;
+        app.begin_loading(Refresh::Interactive);
+        app
+    }
+
+    #[test]
+    fn a_user_initiated_query_refuses_operations_until_it_lands() {
+        let mut app = loading_normal();
+        // A screen switch, a history move, and a selection move: each would act on (or replace) the
+        // snapshot the in-flight query is about to overwrite.
+        press(&mut app, KeyCode::Char('1'), KeyModifiers::NONE);
+        assert_eq!(
+            app.screen(),
+            Screen::Traces,
+            "the screen switch was refused"
+        );
+        press(&mut app, KeyCode::Char('m'), KeyModifiers::NONE);
+        assert!(!app.show_mascot, "the display toggle was refused too");
+        assert!(
+            app.input_refused,
+            "the refusal is recorded, so the banner can explain itself"
+        );
+
+        // The same key acts again the moment the result lands. `m` rather than a screen switch: this
+        // half runs unlocked, so a dispatching key would spawn a real query task.
+        app.end_loading();
+        press(&mut app, KeyCode::Char('m'), KeyModifiers::NONE);
+        assert!(app.show_mascot);
+    }
+
+    #[test]
+    fn quitting_is_never_refused_while_a_query_is_in_flight() {
+        // `q` is the only way out of a query that never lands, so the lock must not eat it.
+        let mut app = loading_normal();
+        assert!(press_control(&mut app, KeyCode::Char('q')) == Control::Quit);
+    }
+
+    #[test]
+    fn a_background_refresh_does_not_take_the_keyboard() {
+        // The auto-refresh timer fires on its own schedule; locking the keyboard for its duration
+        // would hold the UI for most of a session on the slow corpus this guard is for.
+        let mut app = App::new();
+        app.route = Route::Traces;
+        app.begin_loading(Refresh::Background);
+        assert!(app.loading, "still a real load — the banner may yet appear");
+        // The switch itself dispatches a refresh, which coalesces onto `pending_refresh` behind the
+        // load already in flight rather than spawning a second one.
+        press(&mut app, KeyCode::Char('1'), KeyModifiers::NONE);
+        assert_eq!(app.screen(), Screen::Overview, "the switch went through");
+        assert_eq!(app.pending_refresh, Some(Refresh::Interactive));
+        assert!(!app.input_refused);
+    }
+
+    #[test]
+    fn the_lock_leaves_a_half_typed_query_alone() {
+        // A refresh replayed out of `pending_refresh` can arm the lock while the user is in the query
+        // box. Eating those keystrokes would mangle text the query in flight has no claim on.
+        let mut app = editing("up");
+        app.begin_loading(Refresh::Interactive);
+        press(&mut app, KeyCode::Char('x'), KeyModifiers::NONE);
+        assert_eq!(app.active_query(), "upx");
+        assert!(!app.input_refused);
     }
 }

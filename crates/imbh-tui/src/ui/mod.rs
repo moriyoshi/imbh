@@ -30,7 +30,9 @@ use crate::time::format_datetime_ns;
 use crate::ui::glyphs::Glyphs;
 use crate::ui::logs::draw_log_detail;
 use crate::ui::metrics::{column_widths, draw_metric_detail, draw_metric_table, pad_cell};
-use crate::ui::overlays::{draw_absolute_range, draw_completion_popup, draw_time_range_picker};
+use crate::ui::overlays::{
+    draw_absolute_range, draw_completion_popup, draw_loading_banner, draw_time_range_picker,
+};
 use crate::ui::traces::{draw_span_detail, draw_trace_detail};
 use crate::waterfall::{WATERFALL_NAME_W, WATERFALL_SUFFIX_W, render_waterfall_window};
 
@@ -40,6 +42,10 @@ use crate::waterfall::{WATERFALL_NAME_W, WATERFALL_SUFFIX_W, render_waterfall_wi
 pub(crate) const MIN_COLS: u16 = 40;
 
 pub(crate) const MIN_ROWS: u16 = 10;
+
+/// The key legend's first entry, and the only one that keeps working while a query holds the
+/// keyboard. Named so the footer's "dim everything else" split cannot drift from the text it splits.
+pub(crate) const QUIT_HINT: &str = "q quit";
 
 /// Border style for a pane: a bold cyan outline when it holds the focus ring, the default (dim) border
 /// otherwise. Applied via `Block::border_style` so the focused pane reads at a glance.
@@ -737,7 +743,7 @@ pub(crate) fn draw(frame: &mut ratatui::Frame<'_>, app: &App, options: &Options)
             format!(" {sep} m mascot")
         };
         format!(
-            "q quit {sep} F9 menu {sep} 1-4 screen {sep} tab focus {sep} {l}{r} back/fwd {sep} {scroll} move{detail_hint} {sep} r refresh {sep} R auto-refresh {sep} t range {sep} e edit{mascot_hint}{ascii}",
+            "{QUIT_HINT} {sep} F9 menu {sep} 1-4 screen {sep} tab focus {sep} {l}{r} back/fwd {sep} {scroll} move{detail_hint} {sep} r refresh {sep} R auto-refresh {sep} t range {sep} e edit{mascot_hint}{ascii}",
             l = g.left,
             r = g.right,
             scroll = g.scroll(),
@@ -748,10 +754,19 @@ pub(crate) fn draw(frame: &mut ratatui::Frame<'_>, app: &App, options: &Options)
             },
         )
     };
-    frame.render_widget(
-        Paragraph::new(status).wrap(Wrap { trim: true }),
-        status_area,
-    );
+    // While the keyboard is held, `q` is the only legend entry that still does anything — so every
+    // other one is greyed out. This is the whole signal that input is locked: the banner deliberately
+    // says nothing about the keyboard (it would only repeat this line), and dimming states which key
+    // survives without adding a word anywhere. Applied only to the key legend, since the error and
+    // menu variants of this line do not begin with the quit hint and have no `q` to keep lit.
+    let status = match status.strip_prefix(QUIT_HINT) {
+        Some(rest) if app.input_locked => Paragraph::new(Line::from(vec![
+            Span::raw(QUIT_HINT),
+            Span::styled(rest.to_owned(), Style::default().fg(Color::DarkGray)),
+        ])),
+        _ => Paragraph::new(status),
+    };
+    frame.render_widget(status.wrap(Wrap { trim: true }), status_area);
 
     // Overlays render last so they sit above the panels.
     draw_global_overlays(frame, app, indicator_area, area, options.ascii);
@@ -847,6 +862,11 @@ pub(crate) fn draw_global_overlays(
     if app.show_mascot && !ascii {
         draw_mascot(frame, app, area);
     }
+    // Below the pickers: those are only open because the user opened them, and a banner covering the
+    // form they are typing into would be exactly the interruption the banner exists to avoid.
+    if let Some(elapsed) = app.loading_banner() {
+        draw_loading_banner(frame, elapsed, area, &g);
+    }
     if app.mode == Mode::TimeRange {
         draw_time_range_picker(frame, app, indicator_area, area, &g);
     }
@@ -869,7 +889,11 @@ mod tests {
 
     use crate::completion::{Candidate, CandidateKind, Completion};
     use crate::mascot::MascotCtx;
-    use crate::model::{DetailPane, LogRecord, MetricDetail, Snapshot};
+    use std::time::Instant;
+
+    use crate::model::{
+        DetailPane, LOADING_BANNER_AFTER, LogRecord, MetricDetail, Refresh, Snapshot,
+    };
     use crate::testutil::{ascii_trace, nested_trace};
     use crate::waterfall::build_trace_detail;
 
@@ -938,6 +962,141 @@ mod tests {
     }
 
     #[test]
+    fn a_held_keyboard_greys_out_every_footer_hint_but_quit() {
+        use ratatui::backend::TestBackend;
+
+        // The dimming is the *only* thing on screen that says input is locked — the banner says
+        // nothing about the keyboard — so it is asserted on the rendered cell style, not on text.
+        let footer_styles = |app: &App| {
+            let mut terminal = Terminal::new(TestBackend::new(120, 20)).expect("a test terminal");
+            terminal
+                .draw(|frame| draw(frame, app, &Options::default()))
+                .expect("a draw");
+            let buffer = terminal.backend().buffer().clone();
+            // The legend starts on the first row below the panels; find it by its first entry.
+            let row = (0..20u16)
+                .find(|y| {
+                    (0..120)
+                        .map(|x| buffer[(x, *y)].symbol())
+                        .collect::<String>()
+                        .trim_start()
+                        .starts_with(QUIT_HINT)
+                })
+                .expect("the key legend is on screen");
+            (0..120)
+                .map(|x| {
+                    let cell = &buffer[(x, row)];
+                    (cell.symbol().to_owned(), cell.style().fg)
+                })
+                .collect::<Vec<_>>()
+        };
+
+        // Idle: nothing in the legend is greyed.
+        let idle = footer_styles(&App::new());
+        assert!(
+            !idle.iter().any(|(_, fg)| *fg == Some(Color::DarkGray)),
+            "the idle legend should not be dimmed"
+        );
+
+        let mut app = App::new();
+        app.begin_loading(Refresh::Interactive);
+        let locked = footer_styles(&app);
+        // `q quit` keeps its normal colour...
+        let quit: String = locked
+            .iter()
+            .take_while(|(symbol, _)| *symbol != " ")
+            .map(|(symbol, _)| symbol.as_str())
+            .collect();
+        assert_eq!(quit, "q");
+        assert!(
+            locked
+                .iter()
+                .take(QUIT_HINT.len())
+                .all(|(_, fg)| *fg != Some(Color::DarkGray)),
+            "the quit hint stayed lit"
+        );
+        // ...and the rest of the line is greyed.
+        let dimmed = locked
+            .iter()
+            .skip(QUIT_HINT.len())
+            .filter(|(symbol, _)| *symbol != " ")
+            .collect::<Vec<_>>();
+        assert!(!dimmed.is_empty(), "there are other hints to dim");
+        assert!(
+            dimmed.iter().all(|(_, fg)| *fg == Some(Color::DarkGray)),
+            "every other hint is greyed"
+        );
+
+        // A background load holds nothing, so the legend stays fully lit.
+        let mut app = App::new();
+        app.begin_loading(Refresh::Background);
+        let free = footer_styles(&app);
+        assert!(!free.iter().any(|(_, fg)| *fg == Some(Color::DarkGray)));
+    }
+
+    #[test]
+    fn a_long_wait_puts_the_banner_in_the_middle_of_the_screen() {
+        use ratatui::backend::TestBackend;
+
+        let mut app = App::new();
+        app.begin_loading(Refresh::Interactive);
+        // Nothing yet: the query has only just been issued.
+        let render = |app: &App| {
+            let mut terminal = Terminal::new(TestBackend::new(90, 20)).expect("a test terminal");
+            terminal
+                .draw(|frame| draw(frame, app, &Options::default()))
+                .expect("a draw");
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>()
+        };
+        assert!(
+            !render(&app).contains("Loading\u{2026}"),
+            "no banner before the delay"
+        );
+
+        // Past the delay it is there, centred: in a 20-row terminal the 3-row box occupies rows
+        // 8..11, so its text lands on row 9. Centred rather than tucked into the chrome because it
+        // is the only thing saying why the keys stopped working.
+        app.loading_since = Some(Instant::now() - LOADING_BANNER_AFTER);
+        let mut terminal = Terminal::new(TestBackend::new(90, 20)).expect("a test terminal");
+        terminal
+            .draw(|frame| draw(frame, &app, &Options::default()))
+            .expect("a draw");
+        let buffer = terminal.backend().buffer().clone();
+        let row = |y: u16| (0..90).map(|x| buffer[(x, y)].symbol()).collect::<String>();
+        assert!(row(9).contains("Loading\u{2026}"), "row 9: {:?}", row(9));
+        // And horizontally centred: past the pane's own border column, the blank runs either side
+        // of the box match. Measured in cells rather than by trimming the row string, which would
+        // stop at that border and pass for any placement at all.
+        let cells: Vec<&str> = (0..90).map(|x| buffer[(x, 9)].symbol()).collect();
+        let left = cells[1..].iter().take_while(|cell| **cell == " ").count();
+        let right = cells[..89]
+            .iter()
+            .rev()
+            .take_while(|cell| **cell == " ")
+            .count();
+        assert!(left.abs_diff(right) <= 1, "left {left}, right {right}");
+        assert!(left > 0, "the box is not flush against the pane border");
+
+        // A background load renders exactly the same banner: the text never mentioned the lock,
+        // so there is nothing here that could contradict an unlocked keyboard.
+        let locked = row(9);
+        app.input_locked = false;
+        let mut terminal = Terminal::new(TestBackend::new(90, 20)).expect("a test terminal");
+        terminal
+            .draw(|frame| draw(frame, &app, &Options::default()))
+            .expect("a draw");
+        let buffer = terminal.backend().buffer().clone();
+        let free = (0..90).map(|x| buffer[(x, 9)].symbol()).collect::<String>();
+        assert_eq!(locked, free);
+    }
+
+    #[test]
     fn ascii_mode_renders_only_ascii_across_the_ui() {
         use ratatui::backend::TestBackend;
 
@@ -984,6 +1143,15 @@ mod tests {
                 let mut app = App::new();
                 app.open_absolute_form();
                 app.abs_error = Some("start must be before end".to_owned());
+                app
+            }),
+            ("loading banner", {
+                // A wait long enough to have raised the banner, with the keyboard held — the state
+                // that renders the most banner text (spinner, elapsed, and the paused-input hint).
+                let mut app = App::new();
+                app.begin_loading(Refresh::Interactive);
+                app.loading_since = Some(Instant::now() - LOADING_BANNER_AFTER);
+                app.input_refused = true;
                 app
             }),
             ("scrolled list", {

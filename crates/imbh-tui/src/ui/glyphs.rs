@@ -84,4 +84,14 @@ impl Glyphs {
     pub(crate) fn scroll(&self) -> String {
         format!("{}{}", self.up, self.down)
     }
+
+    /// The loading spinner's frames. Braille normally (each frame is one cell wide, and the cycle
+    /// reads as rotation), the classic four-stroke ASCII cycle under `--ascii`.
+    pub(crate) fn spinner(&self) -> &'static [&'static str] {
+        if self.ascii {
+            &["|", "/", "-", "\\"]
+        } else {
+            &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+        }
+    }
 }

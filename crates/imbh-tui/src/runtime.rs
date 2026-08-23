@@ -13,8 +13,8 @@ use crate::app::App;
 use crate::backend::Backend;
 use crate::keys::{Control, handle_key};
 use crate::mascot::{MASCOT_IDLE_AFTER, MascotCtx, MascotEvent};
-use crate::model::{Mode, Options, Route, Update};
-use crate::tasks::{request_refresh, request_waterfall};
+use crate::model::{LOADING_BANNER_AFTER, Mode, Options, Refresh, Route, SPINNER_FRAME, Update};
+use crate::tasks::{request_refresh, request_refresh_as, request_waterfall};
 use crate::terminal::{TerminalGuard, input_reader, install_panic_hook};
 use crate::ui::draw;
 
@@ -132,6 +132,19 @@ async fn run_backend(backend: Backend, options: Options) -> io::Result<()> {
             } else {
                 tick
             };
+            // While a query is in flight, wake exactly when the loading banner becomes due — and
+            // then fast enough to turn its spinner. Without this the 1s clock tick would show the
+            // banner up to a second late and animate it a frame per second, which reads as frozen.
+            // Both bounds are still capped by `until_refresh`, so nothing here delays a refresh.
+            let until_refresh = match app.loading_since {
+                Some(_) if app.loading_banner().is_some() => until_refresh.min(SPINNER_FRAME),
+                Some(since) => until_refresh.min(
+                    LOADING_BANNER_AFTER
+                        .checked_sub(since.elapsed())
+                        .unwrap_or(SPINNER_FRAME),
+                ),
+                None => until_refresh,
+            };
 
             tokio::select! {
                 Some(update) = receiver.recv() => {
@@ -140,9 +153,8 @@ async fn run_backend(backend: Backend, options: Options) -> io::Result<()> {
                             app.apply(result);
                             // A fresh result: arm the mascot's refresh-triggered easter egg.
                             app.mascot_refresh_pending = true;
-                            if app.pending_refresh {
-                                app.pending_refresh = false;
-                                request_refresh(&mut app, backend.clone(), options.clone(), sender.clone());
+                            if let Some(origin) = app.pending_refresh.take() {
+                                request_refresh_as(origin, &mut app, backend.clone(), options.clone(), sender.clone());
                             }
                             // A fresh traces result: land on the focused trace (if navigated from a
                             // log) then fetch the selected/focused trace's waterfall.
@@ -256,7 +268,14 @@ async fn run_backend(backend: Backend, options: Options) -> io::Result<()> {
                         && app.mode == Mode::Normal
                         && app.last_refresh.elapsed() >= options.refresh_interval
                     {
-                        request_refresh(&mut app, backend.clone(), options.clone(), sender.clone());
+                        // `Background`: a tick the user never asked for must not take the keyboard.
+                        request_refresh_as(
+                            Refresh::Background,
+                            &mut app,
+                            backend.clone(),
+                            options.clone(),
+                            sender.clone(),
+                        );
                     }
                 }
             }

@@ -43,6 +43,34 @@ pub(crate) const TIME_RANGES: &[(&str, Duration, Duration)] = &[
     ),
 ];
 
+/// How long a query has to stay in flight before the loading banner appears.
+///
+/// Short enough that a wait the user notices is explained, long enough that the ordinary sub-second
+/// refresh never flashes a box on screen. The banner also appears immediately — whatever the elapsed
+/// time — once a keystroke has actually been refused, because a swallowed key with no visible cause
+/// reads as a hang. See [`App::loading_banner`](crate::app::App::loading_banner).
+pub(crate) const LOADING_BANNER_AFTER: Duration = Duration::from_secs(2);
+
+/// How long each frame of the loading banner's spinner is held.
+///
+/// Also the event loop's wake interval while the banner is up: the spinner is derived from elapsed
+/// time rather than a counter, so it only advances when something redraws.
+pub(crate) const SPINNER_FRAME: Duration = Duration::from_millis(120);
+
+/// Who asked for a refresh, which decides whether it takes the keyboard.
+///
+/// The distinction exists for one reason: an [`Interactive`](Refresh::Interactive) load locks input
+/// until it lands, and applying that to the auto-refresh timer would be a trap. A background tick the
+/// user never asked for would hold the keyboard for the length of every query, and on the slow corpus
+/// this guard is for, that is most of the session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Refresh {
+    /// The user asked for this one: Enter on a query, a screen switch, a range change, `r`.
+    Interactive,
+    /// The auto-refresh timer asked for this one. Never locks input.
+    Background,
+}
+
 /// Transient input overlays on top of the current [`Route`]. Only `Normal` lets background
 /// auto-refresh run, and overlays never participate in the navigation history.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
