@@ -14,7 +14,7 @@ mod window;
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use imbh::PageCursor;
 
@@ -23,8 +23,8 @@ use crate::completion::Completion;
 use crate::mascot::Mascot;
 use crate::model::{
     ATTR_MEASURE_INTERVAL, AbsTarget, AttrRow, AttrStats, AttrWindow, DetailPane, DetailStyle,
-    ExemplarMarker, Focus, LogCorrelation, MetricNode, Mode, NavEntry, PaneTable, QueryResult,
-    Route, Screen, Snapshot, TreeRowRef,
+    ExemplarMarker, Focus, LOADING_BANNER_AFTER, LogCorrelation, MetricNode, Mode, NavEntry,
+    PaneTable, QueryResult, Refresh, Route, Screen, Snapshot, TreeRowRef,
 };
 use crate::textfield::{TextField, caret_in};
 use crate::waterfall::TraceDetail;
@@ -85,7 +85,19 @@ pub(crate) struct App {
     /// always run regardless.
     pub(crate) auto_refresh: bool,
     pub(crate) loading: bool,
-    pub(crate) pending_refresh: bool,
+    /// When the in-flight query started, so the UI can tell an instant refresh from one the user is
+    /// actually waiting on. `None` whenever `loading` is false; the two are set and cleared together.
+    pub(crate) loading_since: Option<Instant>,
+    /// Whether the in-flight query holds the keyboard. Set for an [`Refresh::Interactive`] load and
+    /// left clear for a [`Refresh::Background`] one — see [`Refresh`] for why the timer is exempt.
+    pub(crate) input_locked: bool,
+    /// Whether a keystroke has already been refused during this load. Latches the banner on for the
+    /// rest of the load: once input has visibly stopped responding, the reason has to stay on screen
+    /// even if the query lands before [`LOADING_BANNER_AFTER`] would have shown it.
+    pub(crate) input_refused: bool,
+    /// A refresh that arrived while one was already in flight, replayed when that one lands. Carries
+    /// its origin so a coalesced *user* action still locks input and a coalesced timer tick does not.
+    pub(crate) pending_refresh: Option<Refresh>,
     pub(crate) generation: u64,
     pub(crate) snapshot: Snapshot,
     pub(crate) last_error: Option<String>,
@@ -221,7 +233,10 @@ impl App {
             can_promote: false,
             auto_refresh: false,
             loading: false,
-            pending_refresh: false,
+            loading_since: None,
+            input_locked: false,
+            input_refused: false,
+            pending_refresh: None,
             generation: 0,
             selected: 0,
             snapshot: Snapshot::message("Overview", "Loading..."),
@@ -430,8 +445,37 @@ impl App {
         self.snap_attr_cursor();
     }
 
-    pub(crate) fn apply(&mut self, result: QueryResult) {
+    /// Mark a query as in flight, taking the keyboard if the user is the one who asked.
+    ///
+    /// The four loading fields only ever move together, through here and [`App::end_loading`], so
+    /// there is no state in which the banner is armed but the lock is not (or the reverse).
+    pub(crate) fn begin_loading(&mut self, origin: Refresh) {
+        self.loading = true;
+        self.loading_since = Some(Instant::now());
+        self.input_locked = origin == Refresh::Interactive;
+        self.input_refused = false;
+    }
+
+    /// Release the keyboard and disarm the banner: the query landed (or was abandoned as stale).
+    pub(crate) fn end_loading(&mut self) {
         self.loading = false;
+        self.loading_since = None;
+        self.input_locked = false;
+        self.input_refused = false;
+    }
+
+    /// How long the current query has been in flight, when that is worth putting on screen.
+    ///
+    /// `None` means no banner: either nothing is loading, or it started recently enough that the
+    /// answer is about to arrive anyway. A refused keystroke overrides the delay — the user has
+    /// already seen the UI stop responding, so the explanation cannot wait for a timer.
+    pub(crate) fn loading_banner(&self) -> Option<Duration> {
+        let elapsed = self.loading_since?.elapsed();
+        (self.input_refused || elapsed >= LOADING_BANNER_AFTER).then_some(elapsed)
+    }
+
+    pub(crate) fn apply(&mut self, result: QueryResult) {
+        self.end_loading();
         if result.generation != self.generation || result.screen != self.screen() {
             return;
         }
@@ -800,5 +844,60 @@ mod tests {
             result: Ok(empty),
         });
         assert!(app.route_metric_detail().unwrap().points.is_empty());
+    }
+
+    #[test]
+    fn a_fast_refresh_never_flashes_the_banner() {
+        // The common case: the query lands well inside the delay, so nothing is ever drawn.
+        let mut app = App::new();
+        app.begin_loading(Refresh::Interactive);
+        assert!(app.loading_banner().is_none());
+        app.end_loading();
+        assert!(app.loading_banner().is_none(), "and nothing lingers after");
+    }
+
+    #[test]
+    fn a_wait_past_the_delay_raises_the_banner() {
+        let mut app = App::new();
+        app.begin_loading(Refresh::Interactive);
+        // Backdate the start rather than sleeping: the banner is a pure function of elapsed time.
+        app.loading_since = Some(Instant::now() - LOADING_BANNER_AFTER);
+        let elapsed = app.loading_banner().expect("the delay has passed");
+        assert!(elapsed >= LOADING_BANNER_AFTER);
+    }
+
+    #[test]
+    fn a_refused_key_raises_the_banner_without_waiting_out_the_delay() {
+        // A key that visibly did nothing has to be explained immediately — waiting for the timer
+        // would leave the user looking at a UI that has apparently frozen for no stated reason.
+        let mut app = App::new();
+        app.begin_loading(Refresh::Interactive);
+        app.input_refused = true;
+        assert!(app.loading_banner().is_some());
+    }
+
+    #[test]
+    fn a_background_load_arms_the_banner_but_not_the_lock() {
+        // The timer's tick is still worth announcing once it drags; it just does not take the keys.
+        let mut app = App::new();
+        app.begin_loading(Refresh::Background);
+        assert!(!app.input_locked);
+        app.loading_since = Some(Instant::now() - LOADING_BANNER_AFTER);
+        assert!(app.loading_banner().is_some());
+    }
+
+    #[test]
+    fn landing_a_stale_result_still_releases_the_keyboard() {
+        // `apply` bails out early on a superseded generation. The release happens first: the query
+        // this lock belonged to is over either way, and skipping it would strand the keyboard.
+        let mut app = App::new();
+        app.begin_loading(Refresh::Interactive);
+        app.apply(QueryResult {
+            generation: app.generation.wrapping_sub(1),
+            screen: Screen::Overview,
+            result: Ok(Snapshot::message("Overview", "")),
+        });
+        assert!(!app.loading && !app.input_locked);
+        assert!(app.loading_banner().is_none());
     }
 }

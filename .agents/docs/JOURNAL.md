@@ -7139,3 +7139,72 @@ Nothing committed, tagged, or published. **`dto::Series` gained a public field, 
 0.8 → 0.9 bump before publishing** — left to `cargo release`, which owns version numbers here
 (`shared-version`, `dependent-version = "upgrade"`, and the README/docs replacements) and which a
 by-hand edit would only half-apply.
+## 2026-08-24 — Input lock and loading banner for the TUI
+
+### What prompted it
+
+Slow refreshes on a large corpus do not just take time; they make the UI feel broken. Keys pressed
+during the wait queue up and replay against a snapshot that has since been replaced, and nothing on
+screen says why. The only existing affordance was the menu bar turning `DarkGray`, which nobody
+reads as "your input is being ignored".
+
+### What changed (imbh-tui only, no manifest changes)
+
+* **`Refresh::{Interactive, Background}`** (`model.rs`) now travels with every refresh.
+  `request_refresh` stays the short name for the ~19 user-initiated call sites; the auto-refresh
+  timer in `runtime.rs` is the only caller of `request_refresh_as(Refresh::Background, ..)`.
+  `pending_refresh` became `Option<Refresh>` so a coalesced refresh remembers its origin, and an
+  interactive request queued behind a timer tick wins the slot.
+* **The input lock** (`keys.rs::survives_loading`). An interactive load holds the keyboard until it
+  lands; `Mode::Normal` only, because that is the mode where every binding is an operation against
+  the snapshot on screen. The overlay modes (`Editing`, `TimeRange`, `AbsoluteRange`, `Menu`) stay
+  live — eating keystrokes out of a half-typed query would be worse than anything the lock prevents,
+  and their commit paths already coalesce. `q` is never refused: there is no `Ctrl-C` binding, so it
+  is the only way out of a query that never lands.
+* **The banner** (`overlays.rs::draw_loading_banner`), raised after `LOADING_BANNER_AFTER` (2s), or
+  immediately once a key has actually been refused — a swallowed key with no visible cause reads as
+  a hang, and that explanation cannot wait for a timer. Its text is spinner, word, elapsed and
+  nothing else, identical whether or not the lock is on. Two drafts spelled the lock out
+  (`input paused {sep} q quits`, then `keys paused except q`) and both were cut as redundant: the
+  first contradicted itself (if input is paused, why does `q` work?), and the second still repeated
+  the footer, which lists `q quit` on every frame. A spinner beside the word "Loading" is what
+  "wait" looks like; the banner *being there* is the signal, and words about the keyboard only
+  restate what the bottom of the screen already says. Centred on the
+  screen: it was first docked
+  under the menu bar to avoid covering content, but that put it half in the chrome and punched a box
+  through the pane's top border, and the user asked for the centre. The content behind it is by
+  definition about to be replaced by the result being waited on. Spinner frames are derived from
+  elapsed time rather than a counter, so the whole banner is a pure function of state the loop
+  already holds.
+
+* **The footer carries the lock signal instead** (`ui/mod.rs`). While `input_locked` is set, every
+  key-legend entry after `q quit` is greyed to `DarkGray`. That is the whole indication that input is
+  held: it states which key survives without adding a word anywhere, and it cannot go stale against
+  the legend because the split point is the `QUIT_HINT` const the legend itself is formatted from.
+  Asserted on rendered cell styles rather than on text, since there is no text to assert on.
+* **Wake scheduling** (`runtime.rs`): while loading, the loop wakes exactly when the banner becomes
+  due and then every `SPINNER_FRAME` (120 ms). Without it the 1s clock tick would show the banner up
+  to a second late and animate it one frame per second, which reads as frozen. Both bounds stay
+  capped by `until_refresh`, so nothing here delays a refresh.
+
+### Why background refreshes are exempt
+
+The trap this avoids: auto-refresh fires on its own schedule, and locking the keyboard for the
+duration of every tick would hold the UI for most of a session on exactly the slow corpus the guard
+is for. The user did not ask for that query, so it does not get their keyboard. It still raises the
+banner once it drags — worth announcing, just not worth blocking for.
+
+### Verified
+
+`fmt --all --check` clean; `clippy --workspace --all-targets -D warnings` clean; `test --workspace`
+**724 passed, 0 failed** (up from 711; `imbh-tui` 160 → 173). Both new behaviours were checked
+against a vacuous pass by disabling them (`if false && ..` on the banner call and the gate) and
+confirming `a_user_initiated_query_refuses_operations_until_it_lands` and
+`a_long_wait_puts_the_banner_in_the_middle_of_the_screen` FAIL, then restoring. The
+placement assertions were separately checked by shifting the box off-centre on each axis and
+confirming both fail. The banner is also
+folded into the existing `ascii_mode_renders_only_ascii_across_the_ui` sweep, so `--ascii` keeps its
+no-Unicode guarantee. Footprint: no manifest changed and `imbhd` does not link `imbh-tui`, so both
+gated axes are untouched by construction; crate count re-measured at **275** to confirm.
+
+Nothing committed beyond the topic branch.

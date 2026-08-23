@@ -9,6 +9,18 @@ git history); this file tracks only what is still open.
 
 ## Open Items
 
+- [ ] **`request_waterfall` is not covered by the input lock or the banner.** The per-cursor-move
+      trace fetch (`tasks.rs::request_waterfall`) sets no `loading` flag, so a slow waterfall neither
+      raises the banner nor pauses input; the preview pane just says "Loading waterfall...". It is a
+      different shape of load — one detail pane rather than the whole screen — so folding it into
+      `App::loading` would over-lock. Wants its own lighter treatment (a pane-local spinner) once the
+      debounce + LRU item below lands, since that changes when the fetch fires at all.
+
+- [ ] **There is no way to cancel an in-flight query.** With input locked, a query that never lands
+      leaves `q` as the only exit, which is why `survives_loading` special-cases it. The honest fix is
+      an interrupt (`Esc` cancelling the in-flight query, or a `Ctrl-C` binding — the TUI has none
+      today) that drops the result by generation and calls `App::end_loading`. Cheap on the client
+      side; the backend request keeps running either way until the head-side timeout.
 - [ ] **`dto::Series` gained `query_index`: 0.8 -> 0.9 before publishing.** A public field on a
       struct with no `#[non_exhaustive]` is a breaking change for struct-literal callers (the derive
       of `Default` covers `..Default::default()` users, and `Series::new` covers the rest). The

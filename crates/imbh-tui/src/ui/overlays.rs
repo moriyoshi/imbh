@@ -1,6 +1,8 @@
 //! The dropdown overlays: the time-range picker, the absolute-range form, and the completion
 //! popup.
 
+use std::time::Duration;
+
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -9,7 +11,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::app::App;
 use crate::completion::{CandidateKind, Completion};
-use crate::model::{AbsTarget, TIME_RANGES};
+use crate::model::{AbsTarget, SPINNER_FRAME, TIME_RANGES};
 use crate::time::humanize_secs;
 use crate::ui::glyphs::Glyphs;
 
@@ -292,6 +294,65 @@ pub(crate) fn draw_completion_popup(
     );
 }
 
+/// The loading banner's one line of text: spinner, the word, elapsed whole seconds. Nothing else.
+///
+/// It carries no hint about the keyboard, and does not vary with whether the lock is on. Two earlier
+/// drafts spelled the lock out (`input paused {sep} q quits`, then `keys paused except q`) and both
+/// were redundant: the footer already lists `q quit` on every frame, and a spinner beside the word
+/// "Loading" is what "wait" looks like. The banner's job is to be the visible reason keys are doing
+/// nothing; saying so in words adds a clause the user has already read at the bottom of the screen.
+///
+/// Split out from the drawing so the wording and the spinner's advance can be asserted without a
+/// terminal. The frame is derived from `elapsed` rather than from a counter, which keeps the whole
+/// banner a pure function of state the event loop already has.
+pub(crate) fn loading_banner_text(elapsed: Duration, g: &Glyphs) -> String {
+    let frames = g.spinner();
+    let frame = (elapsed.as_millis() / SPINNER_FRAME.as_millis()) as usize % frames.len();
+    format!(
+        "{} Loading{} {}s",
+        frames[frame],
+        g.ellipsis,
+        elapsed.as_secs()
+    )
+}
+
+/// Draw the loading banner: a small box centred on the screen.
+///
+/// The centre is where the eye already is, and this is the only thing on screen saying why the keys
+/// have stopped working — so it is placed where it cannot be missed rather than tucked into the
+/// chrome. It covers a few rows of whatever is underneath, which is the trade: the content behind it
+/// is by definition about to be replaced by the result being waited on.
+pub(crate) fn draw_loading_banner(
+    frame: &mut ratatui::Frame<'_>,
+    elapsed: Duration,
+    area: Rect,
+    g: &Glyphs,
+) {
+    let text = loading_banner_text(elapsed, g);
+    // Two columns of padding inside the borders, and never wider than the terminal.
+    let width = (text.width() as u16 + 4).min(area.width);
+    let height = 3u16.min(area.height);
+    let banner = Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+    frame.render_widget(Clear, banner);
+    // Yellow reads as "waiting on something", and is distinct from both the cyan focus ring and the
+    // red of `last_error` — this is not a failure, and must not be mistaken for one.
+    let style = Style::default().fg(Color::Yellow);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            text,
+            style.add_modifier(Modifier::BOLD),
+        )))
+        .block(g.block().border_style(style))
+        .alignment(ratatui::layout::Alignment::Center),
+        banner,
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -337,5 +398,42 @@ mod tests {
         let (text, caret) = rendered(&caret_spans("2026-07-21 15:00:00", 0, 10, style));
         assert_eq!(text, "2026-07-21");
         assert_eq!(caret, "2");
+    }
+
+    #[test]
+    fn the_banner_says_what_is_happening_and_for_how_long_and_no_more() {
+        let g = Glyphs::new(false);
+        let text = loading_banner_text(Duration::from_secs(4), &g);
+        assert!(text.contains("Loading"), "{text}");
+        assert!(text.contains("4s"), "{text}");
+        // No keyboard hint: the footer already lists `q quit` on every frame, so spelling the lock
+        // out here would repeat what the user has already read at the bottom of the screen.
+        assert!(!text.contains("paused"), "{text}");
+        assert!(!text.contains('q'), "{text}");
+    }
+
+    #[test]
+    fn the_spinner_turns_as_the_wait_goes_on() {
+        let g = Glyphs::new(false);
+        // Derived from elapsed time, so consecutive frames differ and the cycle comes back around.
+        let frames = g.spinner();
+        // The glyph alone: the rest of the line carries the elapsed seconds, which of course differ.
+        let at = |ms: u64| {
+            loading_banner_text(Duration::from_millis(ms), &g)
+                .chars()
+                .next()
+                .expect("the spinner leads the line")
+                .to_string()
+        };
+        assert_ne!(at(0), at(SPINNER_FRAME.as_millis() as u64));
+        let cycle = SPINNER_FRAME.as_millis() as u64 * frames.len() as u64;
+        assert_eq!(at(0), at(cycle), "one full turn returns to the first frame");
+    }
+
+    #[test]
+    fn the_ascii_banner_stays_ascii() {
+        // `--ascii` promises no Unicode anywhere in the chrome, and the banner is chrome.
+        let text = loading_banner_text(Duration::from_secs(3), &Glyphs::new(true));
+        assert!(text.is_ascii(), "{text}");
     }
 }
