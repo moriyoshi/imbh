@@ -26,8 +26,29 @@ jobs:
   gate:
     name: Rust gate + E2E
     runs-on: ubuntu-latest
+    # This job compiles the workspace four times over (default, `fault-injection`, `docker`,
+    # `docker,docker-remap`) into a single `target/`, and the DataFusion + Tantivy + VRL debug
+    # artifacts are large. On a stock `ubuntu-latest` that overran the disk and `rust-lld` died
+    # with SIGBUS (mmap of the output file past ENOSPC) while linking the last feature set. Two
+    # measures keep it inside the runner: reclaim the preinstalled toolchains below, and drop
+    # full debuginfo here. `line-tables-only` keeps `RUST_BACKTRACE=1` frames attributable to a
+    # file and line while shedding most of the object size. Scoped to this job so the footprint
+    # gate keeps measuring the profiles the release actually ships.
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # Nothing here needs .NET, Android, GHC, CodeQL, or the preloaded container images, and no
+      # test shells out to a Docker daemon (the log-driver suites speak to a Unix socket and a
+      # FIFO this process creates itself). Reclaiming them buys back roughly 25-30 GB.
+      - name: Reclaim runner disk
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup \
+                      /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force || true
+          df -h /
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           toolchain: stable
@@ -58,6 +79,13 @@ jobs:
         run: cargo clippy -p imbh-server --all-targets --features docker,docker-remap -- -D warnings
       - name: Test (docker log-driver + VRL remap)
         run: cargo test -p imbh-server --features docker,docker-remap
+      # Reported unconditionally so that if the linker ever dies with SIGBUS again the log says
+      # straight away whether the disk was the cause.
+      - name: Report disk usage
+        if: always()
+        run: |
+          df -h /
+          du -sh target 2>/dev/null || true
 
   feature-matrix:
     name: Feature matrix (producer / consumer)
