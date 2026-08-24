@@ -21,13 +21,13 @@ git history); this file tracks only what is still open.
       an interrupt (`Esc` cancelling the in-flight query, or a `Ctrl-C` binding — the TUI has none
       today) that drops the result by generation and calls `App::end_loading`. Cheap on the client
       side; the backend request keeps running either way until the head-side timeout.
-- [ ] **`dto::Series` gained `query_index`: 0.8 -> 0.9 before publishing.** A public field on a
-      struct with no `#[non_exhaustive]` is a breaking change for struct-literal callers (the derive
-      of `Default` covers `..Default::default()` users, and `Series::new` covers the rest). The
-      response DTOs now carry `#[non_exhaustive]` so the next such addition is free. Left to
-      `cargo release`, which owns version numbers here — a by-hand edit half-applies the
-      `shared-version` / `dependent-version` / README-replacement machinery. See JOURNAL
-      "The TUI's metrics and traces screens".
+- [x] **`dto::Series` gained `query_index`: 0.8 -> 0.9 before publishing.** *(Closed 2026-08-24 —
+      folded into the v0.9.0 preparation below.)* A public field is a breaking change for
+      struct-literal callers; the derive of `Default` covers `..Default::default()` users and
+      `Series::new` covers the rest. One correction to what this item used to claim: only `Series`
+      carries `#[non_exhaustive]`, not "the response DTOs" — the rest of `imbh-head`'s response
+      structs are still exhaustive, so the next field added to any of them is another breaking
+      change. Worth doing to all of them in some later bump.
 
 - [ ] **No column projection reaches the Parquet reader.** `SegmentPartitionStream` yields
       full-schema batches and lets `StreamingTableExec` project above it
@@ -76,24 +76,19 @@ git history); this file tracks only what is still open.
       the catalog's fold or bound them to the eval window. `exemplars()` likewise takes only a metric
       name and is filtered by window client-side.
 
-- [ ] **v0.8.0 is prepared but not cut.** The workspace is bumped to 0.8.0, the changelog section
-      closed and dated 2026-08-09, `README.md` / `docs/DOCKER_LOG_DRIVER.md` version strings corrected
-      by hand, notices regenerated and every gate green — see JOURNAL "Preparing v0.8.0". Nothing is
-      committed, tagged or published; that is the user's call.
+- [ ] **v0.9.0 is prepared but not cut.** The workspace is bumped to 0.9.0, the changelog section
+      closed and dated 2026-08-24, `README.md` / `docs/DOCKER_LOG_DRIVER.md` version strings stamped,
+      notices regenerated and every gate green — see JOURNAL "Preparing v0.9.0". Nothing is
+      committed, tagged or published beyond the prep branch; that is the user's call.
 
-      **A minor bump, and this time the signatures justify it.** Unlike v0.7.0, the release breaks the
-      published API in five places, all in the `[0.8.0]` `### Changed` entries: the promoted key set and
-      the retention policy both became durable database state (omitting the builder call now *inherits*
-      rather than resets), `Db::segment_files` returns `Result`, `CompactionReport` gained a field, and
-      `imbh-query`'s `SegmentInput`/`TableInput`/`SegmentTableProvider::new` changed shape.
+      **A minor bump the signatures require.** Two breaking changes, both in the `[0.9.0]`
+      `### Changed` entries: `imbh-head`'s `dto::Series` gained a public `query_index` field and
+      became `#[non_exhaustive]`, and `imbh-lgtm`'s `execute_traceql` gained an `S: Sync` bound.
 
-      **`imbh-attrstats` is a first-time publish.** The name is free on crates.io (checked
-      2026-08-09), and only `imbh` (optionally, behind its `attrstats` feature) and the unpublished
-      `attr-stats` example depend on it, so it needs a publish slot after `imbh-core`/`imbh-storage`
-      and before `imbh`.
+      **No new crates and no dependency change**, so the publish order is exactly v0.8.0's and the
+      footprint is unmoved (275 crates, `imbhd` 33.5 MiB).
 
-      *(v0.7.0 — the entry this replaces — was tagged and released 2026-08-09, so the canonical-JSON
-      codec swap and the two `imbh-tui` fixes have shipped.)*
+      *(v0.8.0 — the entry this replaces — was tagged and released 2026-08-09.)*
 
 - [x] **Measure the promoted-column cost before setting any auto-promotion budget.** *(Closed
       2026-08-08 — `examples/bench --bin promote-cost`. The gate passes, and it moved the budget from

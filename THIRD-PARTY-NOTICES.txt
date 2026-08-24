@@ -7672,21 +7672,21 @@ Apache License 2.0 (Apache-2.0)
 ================================================================================
 
 Used by:
-  - imbh 0.8.0
-  - imbh-attrstats 0.8.0
-  - imbh-core 0.8.0
-  - imbh-head 0.8.0
-  - imbh-index 0.8.0
-  - imbh-lgtm 0.8.0
-  - imbh-mcp 0.8.0
-  - imbh-otel-exporter 0.8.0
-  - imbh-otlp 0.8.0
-  - imbh-proto 0.8.0
-  - imbh-query 0.8.0
-  - imbh-server 0.8.0
-  - imbh-storage 0.8.0
-  - imbh-tracing 0.8.0
-  - imbh-tui 0.8.0
+  - imbh 0.9.0
+  - imbh-attrstats 0.9.0
+  - imbh-core 0.9.0
+  - imbh-head 0.9.0
+  - imbh-index 0.9.0
+  - imbh-lgtm 0.9.0
+  - imbh-mcp 0.9.0
+  - imbh-otel-exporter 0.9.0
+  - imbh-otlp 0.9.0
+  - imbh-proto 0.9.0
+  - imbh-query 0.9.0
+  - imbh-server 0.9.0
+  - imbh-storage 0.9.0
+  - imbh-tracing 0.9.0
+  - imbh-tui 0.9.0
   - allocator-api2 0.2.21
   - anyhow 1.0.104
   - async-trait 0.1.91
