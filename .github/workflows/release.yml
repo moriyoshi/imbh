@@ -132,7 +132,7 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      - uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.85.13
+      - uses: taiki-e/install-action@ba47c86ac325773530516bb756137ac718732518 # v2.86.5
         with:
           tool: cargo-deny,cargo-about
       - name: License-compatibility gate
@@ -483,7 +483,7 @@ jobs:
 
           find "${ctx}" -type f -printf '  %10s  %p\n'
 
-      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
       - name: Log in to GHCR
         if: needs.meta.outputs.publish == 'true'
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
@@ -585,7 +585,7 @@ jobs:
 
           find "${ctx}" -type f -printf '  %10s  %p\n'
 
-      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
 
       # A plugin needs the *flattened* filesystem, not an image, and buildx will hand that over
       # directly — no `docker create` + `docker export` round trip through a container, and nothing
