@@ -7266,3 +7266,46 @@ would regenerate `CHANGELOG.md` from conventional commits and destroy it, and th
 `exactly = 1` replacements would then fail against the regenerated file. Every release since v0.3.0
 has been a hand-made bump commit instead, which is why this has never fired. Left alone rather than
 fixed blind, but it should either be given a `cliff.toml` that preserves the file or be dropped.
+
+## The facade crate's shop window: description and README for readers who arrive from crates.io (2026-09-12)
+
+Two files, four lines, no code. `crates/imbh/Cargo.toml`'s `description` and the first three lines
+of `crates/imbh/README.md`.
+
+### What was wrong
+
+Every crate in the workspace writes its `description` for someone who already knows the project:
+`imbh-storage` says "mutable buffer, seal → Parquet segment, naive manifest", `imbh-query` cites
+"(ARCHITECTURE.md §9)". That register is right for the members — a reader who lands on
+`imbh-index` is looking for the Tantivy crate and wants to know exactly what it owns.
+
+It is wrong for `imbh`. The facade is the one crate whose crates.io page doubles as the project's
+front page: it is what `cargo search imbh` surfaces first, what lib.rs lists, and where a reader
+who has never heard of the project arrives. Its description read
+
+> The imbh facade: the embeddable Db handle wiring OTLP ingest → storage → query (ARCHITECTURE.md §10).
+
+which answers "what is this crate's role in the workspace" for someone who already knows there *is*
+a workspace, and never answers "what is this software". The `README.md` had the same inversion: an
+H1 of `imbh` and a lead sentence of "The IMBH facade: ...", with the actual pitch demoted into the
+blockquote below it.
+
+### What changed
+
+The description becomes the project tagline already used at the top of the root `README.md` —
+"A small-footprint, embeddable observability database for Rust" — and the README leads with the
+same line under an `IMBH` H1 matching the root, keeping the facade sentence as the *second* line:
+"This is the facade of imbh-* family: the embeddable `Db` handle wiring OTLP ingest → storage →
+query." Nothing is deleted; the role statement is demoted one line, not dropped, and the rest of
+the README (surface list, workspace role, links) is untouched.
+
+The general shape worth remembering: **member crates describe their role, the facade describes the
+product.** A reader of `imbh-otlp` has context; a reader of `imbh` may have none. The other 14
+descriptions were deliberately left alone for that reason.
+
+### Not verified here
+
+No Rust changed, so the build/clippy/test gate has nothing to say about this and was not re-run;
+`description` and `README.md` are packaging metadata that `cargo package` reads at publish time.
+The next release will carry the new description to crates.io — the current published 0.9.0 page
+still shows the old one.

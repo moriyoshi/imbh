@@ -1,6 +1,8 @@
-# imbh
+# IMBH
 
-The IMBH facade: the embeddable `Db` handle wiring OTLP ingest → storage → query.
+A small-footprint, embeddable observability database for Rust.
+
+This is the facade of imbh-* family: the embeddable `Db` handle wiring OTLP ingest → storage → query.
 
 > **[IMBH](https://github.com/moriyoshi/imbh)** is a small-footprint, embeddable observability
 > database for Rust that ingests OpenTelemetry logs, traces, and metrics and answers queries
