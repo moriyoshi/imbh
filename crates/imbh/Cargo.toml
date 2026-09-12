@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 publish.workspace = true
-description = "The imbh facade: the embeddable Db handle wiring OTLP ingest → storage → query (ARCHITECTURE.md §10)."
+description = "A small-footprint, embeddable observability database for Rust"
 
 # cargo-release stamps the single shared workspace CHANGELOG (at the repo root) here, on the facade
 # crate, so it runs exactly once per release rather than once per member. Paths are relative to this
