@@ -1327,7 +1327,8 @@ result — see §10.16 and `docs/EMBEDDING.md`.
 
 `imbh-server` / `imbhd` is a worked example, not the product: an HTTP/1.1 server on **axum over
 hyper** exposing OTLP/HTTP ingest on `/v1/{logs,traces,metrics}` (protobuf, `Content-Encoding: gzip`
-accepted), a SQL query endpoint `POST /api/query` (JSON rows or Arrow IPC out), an MCP endpoint
+accepted), a SQL query endpoint `POST /api/query` (JSON rows or Arrow IPC out; the request body is
+raw SQL, or a `{"query": "…"}` document when the request says `Content-Type: application/json`), an MCP endpoint
 `POST /mcp` (§10.16.1), `GET /stats`, admin `POST /admin/{flush,compact}`, `GET`/`POST
 /admin/promote` (§6.1), queued housekeeping at `/admin/housekeeping` (§10.16.2), and `GET /health`.
 

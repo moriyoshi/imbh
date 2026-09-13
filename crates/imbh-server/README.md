@@ -18,7 +18,10 @@ Routes:
 
 - `POST /v1/logs` · `/v1/traces` · `/v1/metrics` — OTLP/HTTP protobuf ingest. `Content-Encoding:
   gzip` is accepted, which the OpenTelemetry Collector's `otlphttp` exporter sends by default.
-- `POST /api/query` — a SQL string body → JSON rows.
+- `POST /api/query` — a SQL query → JSON rows. The body is **raw SQL** (`curl --data "SELECT …"`),
+  unless the request says `Content-Type: application/json`, in which case it is a JSON document —
+  `{"query": "SELECT …"}` (a bare JSON string is accepted too). Which shape is read is decided by
+  that header alone; nothing is sniffed.
 - `POST /mcp` — the Model Context Protocol endpoint (below). `GET`/`DELETE` there answer `405`.
 - `GET /stats` — DB operational stats (per-table counts + buffer/WAL bytes + durable LSN) as JSON.
 - `POST /admin/flush` · `/admin/compact` — maintenance actions. Unauthenticated by design; a real

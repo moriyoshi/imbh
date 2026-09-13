@@ -124,6 +124,37 @@ fn http_wire_ingest_query_stats_and_errors() {
     assert!(json.contains("\"service\":\"cart\""), "got {json}");
     assert!(json.contains("\"c\":1"), "got {json}");
 
+    // The same query as a JSON document, which is what a client that serializes its request body
+    // sends — `Content-Type: application/json` selects the wrapped shape, and the rows are identical.
+    let wrapped = http::post(
+        &addr,
+        "/api/query",
+        "application/json",
+        br#"{"query":"SELECT service, count(*) AS c FROM logs GROUP BY service"}"#,
+    )
+    .expect("POST /api/query (JSON)");
+    assert_eq!(wrapped.status, 200);
+    assert_eq!(
+        wrapped.text(),
+        json,
+        "the two body shapes must answer the same rows"
+    );
+
+    // A JSON body with no query in it is a 400 that says so, rather than a SQL syntax error.
+    let no_query = http::post(
+        &addr,
+        "/api/query",
+        "application/json",
+        br#"{"q":"SELECT 1"}"#,
+    )
+    .expect("POST /api/query (no query)");
+    assert_eq!(no_query.status, 400);
+    assert!(
+        no_query.text().contains(r#"\"query\" field"#),
+        "got {}",
+        no_query.text()
+    );
+
     let hist_q = http::post(
         &addr,
         "/api/query",
