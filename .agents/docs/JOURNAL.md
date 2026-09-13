@@ -7309,3 +7309,59 @@ No Rust changed, so the build/clippy/test gate has nothing to say about this and
 `description` and `README.md` are packaging metadata that `cargo package` reads at publish time.
 The next release will carry the new description to crates.io — the current published 0.9.0 page
 still shows the old one.
+
+## `cargo release` runs now: the workspace replacement table was aborting, not silently skipping (2026-09-13)
+
+`cargo release` failed with "unable to find file `crates/imbh-core/docs/DOCKER_LOG_DRIVER.md`". An
+strace pinned it to three syscalls: it opened `crates/imbh-core/README.md`, statted
+`crates/imbh-core/docs/DOCKER_LOG_DRIVER.md` (ENOENT), and exited 101 — with no output in between.
+
+**Cause, and the correction to what this journal recorded.** The `pre-release-replacements` sat in the
+root `[workspace.metadata.release]`. The entries here for v0.6.1 and v0.8.0 say they "never fired"
+because "cargo-release does not read replacements from the workspace table". That is wrong.
+cargo-release 1.1.3 reads that table and **merges it into every member**, then resolves each
+replacement's `file` relative to *that member's* manifest directory. So a root-relative
+`docs/DOCKER_LOG_DRIVER.md` is looked up under `crates/<member>/`, and the first crate in the release
+plan — `imbh-core`, first topologically — aborts the whole run. It was never a silent no-op: it was a
+hard failure on crate one, which is also why five releases in a row had to be hand-prepared and why
+nobody ever saw the rules misbehave. The proof of the resolution rule was already in the repo:
+`crates/imbh/Cargo.toml` spells its changelog rules `../../CHANGELOG.md`, and those are the ones that
+work.
+
+**Three further defects, invisible while the rules never ran.** Moving the rules to the facade crate
+fixes the paths but would have shipped these:
+
+- `replace = "$1{{version}}"`. cargo-release renders the template **before** handing the string to the
+  regex crate, so the replacement arrives as `$10.9.0`; `$` expansion takes the longest
+  `[0-9A-Za-z_]` run as the group name, reads capture group **10**, finds none, and expands to
+  nothing. Verified against `regex` 1: `VERSION=0.9.0` → `.10.0`. All four rules had it. The fix is
+  not `${1}` but dropping back-references entirely and repeating the literal prefix in the
+  replacement — that is immune to the templating order, which is the part easiest to get wrong.
+- `[^;]` and `[^ ]` match newlines in the regex crate (only `.` excludes them). `(VERSION=)[^;]+`
+  matched from README's *historical* "`VERSION=0.2.0` in the recipe above" through ~2 KB of following
+  prose to the next `;`, and `(ghcr.io/…/imbh:)[^ ]+` swallowed the `curl` line after the pull
+  command. Both would have **deleted** that content on release. Every negated class now excludes
+  `\s`, and the `VERSION=` rule requires the trailing `;` of the `VERSION=0.9.0; TARGET=…` recipe
+  line, which is what spares the historical mention a few lines below it.
+- The fully-qualified `ghcr.io/moriyoshi/imbh-log-driver:` pattern could only ever match one of the
+  two version strings in `DOCKER_LOG_DRIVER.md`; the other is written elided, `…-log-driver:0.9.0-arm64`.
+  Keying on the bare `log-driver:` catches both (and the README's one), while the required `[0-9]`
+  after the colon keeps it off `imbh/log-driver:latest`.
+
+**The cliff hook is dropped, not fixed.** `pre-release-hook = ["git", "cliff", "-o", "CHANGELOG.md", …]`
+with no `cliff.toml` committed would fall back to git-cliff's default config and overwrite the
+hand-written Keep a Changelog file — including the `<!-- next-url -->` anchor the `exactly = 1`
+replacements match, so it would then abort the very release that invoked it. Nothing else in the repo
+references git-cliff (checked across `*.toml`/`*.sh`/`*.yml`/`*.md`), and `CHANGELOG.md`'s own header
+documents the replacement mechanism as the intended one. The two are mutually exclusive; the repo had
+both and used neither.
+
+**Verified.** All six rules were run against the real files with the `regex` crate under
+cargo-release's own template-then-replace order, including the min/max/exactly accounting: 5 doc
+edits (README 3, `DOCKER_LOG_DRIVER.md` 2), the two changelog rules each `exactly = 1` and +1 line,
+no line deleted anywhere, no collateral match. The probe crate is scratch, under
+`.agents-workspace/tmp/`. `cargo metadata` re-parses both manifests cleanly; no Rust changed, so the
+build/clippy/test gate has nothing to say here and was not re-run. `cargo release` itself was not
+executed — that is the user's call, and the dry run (`cargo release <level>`, no `--execute`) is now
+documented in README "Releasing" as the thing that catches a stale replacement rule before anything
+is tagged.

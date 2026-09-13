@@ -277,18 +277,28 @@ git history); this file tracks only what is still open.
       watching the test still pass. The guard stays for the day the built-in column set changes.
       — *source: design review, 2026-08-08; fixed 2026-08-09*
 
-- [ ] **`cargo release` still cannot be run as configured — six releases and counting.** Two
-      independent defects in the root `Cargo.toml`, worked around by hand for v0.5.0, v0.6.0, v0.6.1,
-      v0.6.2, v0.7.0 and v0.8.0 (JOURNAL "Preparing v0.6.0" / "Preparing v0.6.1"). (a) `pre-release-hook = ["git",
-      "cliff", "-o", "CHANGELOG.md", …]` with no `cliff.toml` in the repo would replace the
-      hand-written Keep a Changelog file — prose, migration notes, and the `<!-- next-url -->` anchors
-      `crates/imbh/Cargo.toml` matches with `exactly = 1` — with a conventional-commit digest. Either
-      commit a `cliff.toml` that reproduces the current file, or drop the hook and keep the
-      `pre-release-replacements` mechanism that already works. (b) The `pre-release-replacements` for
-      the `VERSION=` / `ghcr.io/…` strings live under `[workspace.metadata.release]`, where
-      cargo-release does not read them; move them into `crates/imbh/Cargo.toml` alongside the
-      changelog ones. Until both are fixed, "run `cargo release`" in `README.md` "Releasing" is
-      advice that destroys the changelog.
+- [x] **`cargo release` could not be run as configured — six releases and counting.** Fixed
+      2026-09-13. Both defects lived in the root `Cargo.toml` and were worked around by hand for
+      v0.5.0 through v0.8.0 (JOURNAL "Preparing v0.6.0" / "Preparing v0.6.1"). (a) The
+      `pre-release-hook = ["git", "cliff", "-o", "CHANGELOG.md", …]` is **dropped** — no `cliff.toml`
+      is committed, so it would have replaced the hand-written Keep a Changelog file with a
+      conventional-commit digest, destroying the `<!-- next-url -->` anchor its own
+      `pre-release-replacements` then match with `exactly = 1`. Nothing else in the repo uses
+      git-cliff. (b) The `VERSION=` / `ghcr.io/…` replacements moved to
+      `crates/imbh/Cargo.toml`, spelled `../../<path>`.
+
+      **The recorded cause of (b) was wrong** and is corrected in JOURNAL 2026-09-13:
+      cargo-release *does* read `[workspace.metadata.release]` — it merges that table into **every**
+      member, and resolves each replacement's `file` relative to the member's own manifest directory.
+      So `docs/DOCKER_LOG_DRIVER.md` was looked up under `crates/imbh-core/` and the run **aborted**
+      on the first crate in the plan; it was never the silent no-op the note claimed. Three further
+      defects in those rules, invisible while they never ran, are fixed too: `$1{{version}}`
+      renders to `$10.9.0` and is read as capture group 10 (prefix silently eaten); `[^;]`/`[^ ]`
+      match newlines in the regex crate, so the `VERSION=` rule spanned ~2 KB of README prose from a
+      historical `VERSION=0.2.0` mention and would have deleted it; and the fully-qualified
+      `ghcr.io/…-log-driver:` pattern could never match the elided `…-log-driver:` form, the second
+      of the two strings in `DOCKER_LOG_DRIVER.md`. All six rules are now verified against the real
+      files with the regex crate under cargo-release's own template-then-replace order.
 
 - [ ] **Confirm `propagatedMount` survives `docker plugin upgrade`.** Persistence across
       `disable`/`enable` and destruction by `plugin rm` were both measured (JOURNAL 2026-08-06);
