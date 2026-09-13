@@ -8,16 +8,45 @@ repository.workspace = true
 publish.workspace = true
 description = "A small-footprint, embeddable observability database for Rust"
 
-# cargo-release stamps the single shared workspace CHANGELOG (at the repo root) here, on the facade
-# crate, so it runs exactly once per release rather than once per member. Paths are relative to this
-# manifest's directory (crates/imbh/), hence `../../CHANGELOG.md`. First replacement closes the
-# `## [Unreleased]` section into a dated version heading and opens a fresh empty one; the second
-# appends a release-tag link below the `<!-- next-url -->` sentinel. Neither depends on a previous
-# tag, so the very first release stamps cleanly.
+# cargo-release stamps every repo-root file here, on the facade crate, so each rule runs exactly once
+# per release rather than once per member. Paths are relative to THIS manifest's directory
+# (crates/imbh/), hence the `../../` prefix — that resolution rule is why these cannot live in the
+# root `[workspace.metadata.release]`, which is inherited by all members and would look each path up
+# under `crates/<member>/` (see the note there).
 [package.metadata.release]
 pre-release-replacements = [
+    # CHANGELOG.md. The first rule closes the `## [Unreleased]` section into a dated version heading
+    # and opens a fresh empty one; the second appends a release-tag link below the `<!-- next-url -->`
+    # sentinel. Neither depends on a previous tag, so the very first release stamps cleanly. Both are
+    # `exactly = 1`: a missing or duplicated anchor must abort the release, not be silently skipped.
     { file = "../../CHANGELOG.md", search = "(?m)^## \\[Unreleased\\]$", replace = "## [Unreleased]\n\n## [{{version}}] - {{date}}", exactly = 1 },
     { file = "../../CHANGELOG.md", search = "<!-- next-url -->", replace = "<!-- next-url -->\n[{{version}}]: https://github.com/moriyoshi/imbh/releases/tag/v{{version}}", exactly = 1 },
+    # The install/pull version strings in the operator-facing docs — the ones every release since
+    # v0.5.0 has had to correct by hand. Three conventions here, each load-bearing:
+    #
+    # 1. No `$1`-style back-references. cargo-release renders `{{version}}` into the replacement
+    #    FIRST and hands the result to the regex crate, so `replace = "$1{{version}}"` arrives as
+    #    `$10.10.0` — which the regex crate reads as capture group *10*, expands to nothing, and
+    #    silently eats the prefix (`VERSION=0.9.0` -> `.10.0`). Repeat the literal prefix instead.
+    # 2. Every negated class excludes whitespace. In the regex crate `[^;]` and `[^ ]` match newlines,
+    #    so `(VERSION=)[^;]+` ran from README's historical `VERSION=0.2.0` mention through ~2 KB of
+    #    following prose to the next `;` and would have deleted all of it.
+    # 3. `min = 1`: if a string these are meant to stamp is reworded away, the release must abort
+    #    rather than silently ship stale install instructions — which is the exact failure mode that
+    #    went unnoticed for six releases.
+    #
+    # The trailing `;` is what pins this to the `VERSION=0.9.0; TARGET=...` recipe line and spares the
+    # historical "`VERSION=0.2.0` in the recipe above" a few lines below it, which must not be bumped.
+    { file = "../../README.md", search = 'VERSION=[0-9][0-9.]*;', replace = "VERSION={{version}};", min = 1 },
+    { file = "../../README.md", search = 'ghcr\.io/moriyoshi/imbh:[0-9][^\s]*', replace = "ghcr.io/moriyoshi/imbh:{{version}}", min = 1 },
+    # The log-driver plugin is tagged `<version>-<arch>` (managed plugins have no manifest lists, so
+    # each architecture is its own tag): stop at the `-` so the arch suffix survives the bump. Keyed on
+    # the bare `log-driver:` rather than the full `ghcr.io/...` path so it also catches the elided
+    # `...-log-driver:0.9.0-arm64` form in DOCKER_LOG_DRIVER.md — the second string in that file,
+    # which the old fully-qualified pattern could never match. `[0-9]` after the colon keeps it off
+    # the `imbh/log-driver:latest` line, which carries no version.
+    { file = "../../README.md", search = 'log-driver:[0-9][^-\s]*', replace = "log-driver:{{version}}", min = 1 },
+    { file = "../../docs/DOCKER_LOG_DRIVER.md", search = 'log-driver:[0-9][^-\s]*', replace = "log-driver:{{version}}", min = 2 },
 ]
 
 [dependencies]

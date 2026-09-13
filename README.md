@@ -481,7 +481,7 @@ exits 0) when the tool is absent, so an offline dev container never breaks:
 
 | Tool | Install | What it does here |
 |------|---------|-------------------|
-| [`cargo-release`](https://github.com/crate-ci/cargo-release) | `cargo install cargo-release` | Bumps the shared workspace version in lockstep, upgrades internal dependency requirements, closes `## [Unreleased]` in [CHANGELOG.md](./CHANGELOG.md) into a dated heading, creates the `vX.Y.Z` tag, and publishes to crates.io. |
+| [`cargo-release`](https://github.com/crate-ci/cargo-release) | `cargo install cargo-release` | Bumps the shared workspace version in lockstep, upgrades internal dependency requirements, closes `## [Unreleased]` in [CHANGELOG.md](./CHANGELOG.md) into a dated heading, stamps the install/pull version strings in this file and [the log-driver guide](./docs/DOCKER_LOG_DRIVER.md), creates the `vX.Y.Z` tag, and publishes to crates.io. Every file it rewrites is declared in `[package.metadata.release]` on the `imbh` facade crate, with paths relative to `crates/imbh/` — **not** in the root `[workspace.metadata.release]`, which is inherited by every member and would resolve those paths under each member's own directory. |
 | [`cargo-about`](https://github.com/EmbarkStudios/cargo-about) | `cargo install cargo-about` | Renders [THIRD-PARTY-NOTICES.txt](./THIRD-PARTY-NOTICES.txt) for the shipped `imbhd` (`imbh-server`) binary graph via `scripts/gen-notices.sh` (repo-root `about.toml` + `about.hbs`), satisfying Apache-2.0 §4(d). Resolves license text from the crates.io index, so it must run in a networked env. |
 | [`cargo-deny`](https://github.com/EmbarkStudios/cargo-deny) | `cargo install cargo-deny` | License-compatibility gate via `scripts/license-gate.sh` (`cargo deny check licenses`); its `deny.toml` allowlist mirrors `about.toml`'s `accepted` list (keep the two in sync). |
 | [`cargo-bloat`](https://github.com/RazrFalcon/cargo-bloat) | `cargo install cargo-bloat` | Diagnoses where binary size goes (`cargo bloat --release --crates`) when the footprint gate flags a regression against the [budgets](#footprint). |
@@ -497,8 +497,12 @@ cargo install cargo-release cargo-about cargo-bloat cargo-deny   # networked env
 rm -rf target/package target/debug/.fingerprint/imbh-*   # avoid stale verify artifacts, see below
 cargo package --workspace        # dry-run: stage + verify every member before publishing
 
-cargo release <level>            # e.g. patch | minor | major — bump, tag, changelog, publish
+cargo release <level>            # e.g. patch | minor | major — dry run: prints the plan, changes nothing
+cargo release <level> --execute  # same, for real: bump, stamp, tag, publish
 ```
+
+The dry run is worth taking: it is what catches a `pre-release-replacements` rule whose file moved or
+whose anchor was reworded away, before anything is tagged or published.
 
 `cargo package` / `cargo release` verify each member against a temp registry
 (`target/package/tmp-registry`) rather than the workspace `path` deps. Cargo treats registry

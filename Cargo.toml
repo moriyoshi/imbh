@@ -44,17 +44,19 @@ publish = true
 shared-version = true
 tag-name = "v{{version}}"
 dependent-version = "upgrade"
-pre-release-replacements = [
-  {file="README.md", search="(VERSION=)[^;]+", replace="$1{{version}}", min=0},
-  {file="README.md", search="(ghcr.io/moriyoshi/imbh:)[^ ]+", replace="$1{{version}}", min=0},
-  # The log-driver plugin is tagged `<version>-<arch>` (managed plugins have no manifest lists, so
-  # each architecture is its own tag). Stop at the `-` so the arch suffix survives the bump. The
-  # `imbh:` rule above does not cover these: its literal ends in a colon, which `imbh-log-driver`
-  # does not match.
-  {file="README.md", search="(ghcr.io/moriyoshi/imbh-log-driver:)[0-9][^- ]*", replace="$1{{version}}", min=0},
-  {file="docs/DOCKER_LOG_DRIVER.md", search="(ghcr.io/moriyoshi/imbh-log-driver:)[0-9][^- ]*", replace="$1{{version}}", min=0},
-]
-pre-release-hook = ["git", "cliff", "-o", "CHANGELOG.md", "--tag", "{{version}}" ]
+# ❌ Do not put `pre-release-replacements` here. This table is inherited by *every* workspace
+# member, and cargo-release resolves a replacement's `file` relative to the manifest directory it
+# applies to — so a root-relative path like `docs/DOCKER_LOG_DRIVER.md` is looked up under
+# `crates/<member>/`, and the first member in the release plan (`imbh-core`) aborts with "unable to
+# find file". That is why the repo-root README/docs replacements never fired for five releases. They
+# live in `crates/imbh/Cargo.toml` now, spelled `../../<path>`, next to the changelog ones.
+#
+# ❌ Do not add a `pre-release-hook` that regenerates `CHANGELOG.md` (a `git cliff -o CHANGELOG.md`
+# hook lived here and was never runnable: no `cliff.toml` is committed, so it would fall back to
+# git-cliff's default config and replace the hand-written Keep a Changelog file — prose, migration
+# notes, and the `<!-- next-url -->` anchor `crates/imbh/Cargo.toml` matches with `exactly = 1`, which
+# would then abort the very same release). The changelog is maintained by hand under `## [Unreleased]`
+# and closed into a dated heading by those replacements; the two mechanisms are mutually exclusive.
 
 # Pinned per ARCHITECTURE.md Appendix A. Engine deps are trimmed to the M0-measured feature
 # set (ARCHITECTURE.md §8/§9.1, Appendix C) so the footprint gate reflects the shipping graph.
