@@ -7486,3 +7486,63 @@ gzip), `shutdown_e2e`, `timeouts_e2e`.
 **Gate.** `cargo fmt --all --check`, `cargo build --workspace`, `cargo clippy --workspace
 --all-targets -D warnings`, `cargo clippy -p imbh-server --all-targets` for each of `grpc` / `docker`
 / `docker-remap` / `tracing` / `--all-features`, and `cargo test --workspace` — all clean.
+
+## Re-cutting v0.9.0: the release that sat unreleased long enough to grow (2026-09-14)
+
+`CHANGELOG.md` and the `v0.9.0` TODO item. No code, no version change.
+
+### Why a re-cut and not a 0.10.0
+
+v0.9.0 was prepared on 2026-08-24 (see "Preparing v0.9.0"), merged as PR #52, and then left alone.
+Five PRs landed on top of it — #53/#54 (dependabot CI bumps), #55 (the facade crate description),
+#56 (`cargo release` made runnable), #57 (`POST /api/query`'s JSON body), #58 (OTLP/HTTP response
+compliance) — and the last two wrote `[Unreleased]` entries as they went, which is what the file
+asks for. So the repository was carrying a closed-and-dated `[0.9.0]` section plus a second section
+of unreleased work above it, at the same 0.9.0 version.
+
+Checked first, because it decides everything else: **0.9.0 was never tagged and never published.**
+`git ls-remote --tags origin` tops out at `v0.8.0`, and crates.io's version list for `imbh` tops out
+at 0.8.0 (2026-08-09). Nothing immutable exists for 0.9.0, so folding the new entries into it is
+editing an unreleased draft, not rewriting history. Had the tag existed, the only correct move would
+have been a 0.10.0 section — a released version's changelog entry is as immutable as the tag.
+
+This also corrects a claim in the 2026-09-12 journal entry, which said "the current published 0.9.0
+page still shows the old one" of the facade's `description`. There is no published 0.9.0 page. The
+old description is on the **0.8.0** page, and the new one ships whenever 0.9.0 does.
+
+### What the fold did
+
+`[Unreleased]`'s two `### Added` entries were appended to `[0.9.0]`'s `### Added` and its three
+`### Changed` entries to `[0.9.0]`'s `### Changed`, in landing order, leaving a bare `## [Unreleased]`
+heading — the shape cargo-release's `exactly = 1` replacement expects to find. The heading date moved
+2026-08-24 → 2026-09-14. Existing prose was not rewritten except to adopt the section's own
+convention: `[0.9.0]`'s `### Changed` flags breaking items with a leading **BREAKING —**, and the
+folded entries had expressed the same thing mid-paragraph, so the OTLP response and
+`imbh_server::Response` entries were re-prefixed. `imbh_test_support::http::HttpResponse` deliberately
+was **not** — that crate is dev-only and unpublished, so no consumer can be broken by it, and the
+entry now says so.
+
+The breaking-change count for the release therefore goes from two to four, which is the fact the
+version needs to be right about. It stays a minor bump: 0.x, and pre-1.0 minors carry breaking changes
+here by established practice.
+
+### What was deliberately left out of the changelog
+
+#53, #54 (CI action bumps), #56 (`cargo release` config) and #55 (crate `description` + facade
+README) got **no** entry. The precedent is the file itself: across all 13 sections there is not one
+entry for CI, release tooling, or documentation — PR #50, a CI disk fix, landed inside the v0.9.0
+range in August and was likewise not recorded. Adding a docs/tooling entry now would be a new policy
+for the file, not a correction to this release. #55 is the arguable one, since a crate `description`
+is what a crates.io visitor reads; it still ships with the release either way.
+
+### Verified
+
+`cargo fmt --all --check`, `cargo build --workspace`, `cargo clippy --workspace --all-targets -D
+warnings` and `cargo test --workspace` all clean on the re-cut tree (no Rust changed here; this
+confirms the merged `main`, which is what would be tagged). `Cargo.lock` untouched. The changelog's
+own footprint claim was re-measured with the gate's counting method: facade **275** (the gated axis,
+unchanged from August), `imbh-server` **298** default and **304** with `grpc` — exactly the numbers
+the `[0.9.0]` OTLP entry states. The `imbhd` binary size was not re-measured, so the 33.5 MiB figure
+in TODO.md remains the August one and is labelled as such.
+
+Not committed, not tagged, not published.

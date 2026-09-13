@@ -76,17 +76,25 @@ git history); this file tracks only what is still open.
       the catalog's fold or bound them to the eval window. `exemplars()` likewise takes only a metric
       name and is filtered by window client-side.
 
-- [ ] **v0.9.0 is prepared but not cut.** The workspace is bumped to 0.9.0, the changelog section
-      closed and dated 2026-08-24, `README.md` / `docs/DOCKER_LOG_DRIVER.md` version strings stamped,
-      notices regenerated and every gate green — see JOURNAL "Preparing v0.9.0". Nothing is
-      committed, tagged or published beyond the prep branch; that is the user's call.
+- [ ] **v0.9.0 is prepared but not cut.** The workspace is bumped to 0.9.0 and the prep is merged to
+      `main` (PR #52), but the release section has been **re-cut and re-dated 2026-09-14**: five more
+      PRs landed on top of the August prep (#53–#58), so the `[Unreleased]` entries they wrote were
+      folded into `[0.9.0]` rather than left for a 0.10.0 — see JOURNAL "Preparing v0.9.0" and
+      "Re-cutting v0.9.0". `README.md` / `docs/DOCKER_LOG_DRIVER.md` version strings and the notices
+      are still the August ones and still correct, because the version itself never moved. **Not
+      tagged and not published**: `v0.9.0` exists nowhere on the remote and crates.io still tops out
+      at 0.8.0. That is the user's call.
 
-      **A minor bump the signatures require.** Two breaking changes, both in the `[0.9.0]`
+      **A minor bump the signatures require.** Four breaking changes, all in the `[0.9.0]`
       `### Changed` entries: `imbh-head`'s `dto::Series` gained a public `query_index` field and
-      became `#[non_exhaustive]`, and `imbh-lgtm`'s `execute_traceql` gained an `S: Sync` bound.
+      became `#[non_exhaustive]`, `imbh-lgtm`'s `execute_traceql` gained an `S: Sync` bound,
+      `POST /v1/{logs,traces,metrics}` now answers the response the OTLP spec prescribes instead of
+      this server's own `{"accepted": …}` JSON, and `imbh_server::Response` gained a `headers` field.
 
       **No new crates and no dependency change**, so the publish order is exactly v0.8.0's and the
-      footprint is unmoved (275 crates, `imbhd` 33.5 MiB).
+      footprint is unmoved — re-measured 2026-09-14 on the re-cut tree: 275 crates for the facade
+      (the gated axis, unchanged), `imbh-server` 298 default / 304 with `grpc`. The `imbhd` 33.5 MiB
+      binary figure is the August measurement and was not re-taken.
 
       *(v0.8.0 — the entry this replaces — was tagged and released 2026-08-09.)*
 

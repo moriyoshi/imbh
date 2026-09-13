@@ -13,47 +13,7 @@ release aborts if it is missing or duplicated.
 
 ## [Unreleased]
 
-### Added
-
-- **`POST /api/query` accepts a JSON request body**, chosen by the request's `Content-Type`. With
-  `application/json` (parameters and `+json` suffixes included) the body is a document —
-  `{"query": "SELECT …"}`, or a bare JSON string; extra fields are ignored, and `query` is the only
-  name for the field. With anything else, including no `Content-Type` at all,
-  the body is **raw SQL** exactly as before, so `curl --data "SELECT …"` and every existing client
-  are unaffected. The header alone decides; the body is never sniffed. A JSON body with no query in
-  it is now a `400` that says which field was missing, instead of a SQL syntax error on the JSON
-  braces — which is how the wrapped-payload mistake used to present.
-- **`imbh_server::route_with_content_type`**, `route` with a request `Content-Type`, since that
-  header is now what selects `POST /api/query`'s body shape and a request built without one cannot
-  ask for the JSON form.
-
-### Changed
-
-- **`POST /v1/{logs,traces,metrics}` now answers the response the OTLP specification prescribes**,
-  instead of this server's own `{"accepted": …}` JSON. On success that is an
-  `Export<signal>ServiceResponse` — a **zero-byte body** for a full success, `partial_success`
-  carrying the count when records were rejected; on `4xx`/`5xx` it is a `google.rpc.Status`; and both
-  go out in the encoding the request declared (`application/x-protobuf` unless the request said
-  `application/json`). **Breaking for anything that parsed the old body.** The receipt counters moved
-  to response headers — `x-imbh-accepted`, `x-imbh-rejected`, `x-imbh-durable`, `x-imbh-queued` — so
-  `curl -i` keeps all four.
-
-  Why: a stock exporter parses that body. Against the old one,
-  `@opentelemetry/exporter-logs-otlp-proto` logged *"Export succeeded but could not deserialize
-  response - is the response specification compliant?"* on every batch (the export still counted as
-  successful, so no data was lost), and a rejected-record count had nowhere to go — the duplicate
-  signal OTLP/gRPC reports in `partial_success` was unreadable to every HTTP client. Footprint is
-  unchanged at 298 crates: prost and opentelemetry-proto were already in `imbh-server`'s default
-  graph through `imbh` → `imbh-otlp`; they are now named directly rather than only under the
-  `grpc`/`docker` features. OTLP/**JSON** ingest remains unimplemented (a JSON request is a `400`,
-  answered as a JSON `Status`).
-- **`imbh_server::Response` carries a `headers` field** (`Vec<(HeaderName, HeaderValue)>`) and a
-  `header()` accessor, which is how the ingest routes report their receipt counts. Breaking for code
-  that constructs `Response` as a struct literal.
-- **`imbh_test_support::http::HttpResponse` carries `headers`** and a `header()` accessor, so a wire
-  test can assert the `x-imbh-*` counters.
-
-## [0.9.0] - 2026-08-24
+## [0.9.0] - 2026-09-14
 
 ### Added
 
@@ -79,6 +39,17 @@ release aborts if it is missing or duplicated.
   the menu stay live, and `q` is never refused. Auto-refresh ticks deliberately do **not** take the
   keyboard — a background refresh the user never asked for would otherwise hold the UI for the length
   of every query. While the pause is on, every footer hint except `q quit` is greyed out.
+- **`POST /api/query` accepts a JSON request body**, chosen by the request's `Content-Type`. With
+  `application/json` (parameters and `+json` suffixes included) the body is a document —
+  `{"query": "SELECT …"}`, or a bare JSON string; extra fields are ignored, and `query` is the only
+  name for the field. With anything else, including no `Content-Type` at all, the body is **raw SQL**
+  exactly as before, so `curl --data "SELECT …"` and every existing client are unaffected. The header
+  alone decides; the body is never sniffed. A JSON body with no query in it is now a `400` that says
+  which field was missing, instead of a SQL syntax error on the JSON braces — which is how the
+  wrapped-payload mistake used to present.
+- **`imbh_server::route_with_content_type`**, `route` with a request `Content-Type`, since that
+  header is now what selects `POST /api/query`'s body shape and a request built without one cannot
+  ask for the JSON form.
 
 ### Changed
 
@@ -94,6 +65,29 @@ release aborts if it is missing or duplicated.
 - **BREAKING — `imbh-lgtm`: `execute_traceql` now requires `S: Sync`.** `TraceSource::fetch_traces`'s
   default body holds `&self` across an await, and that future is `Send` only if `Self` is `Sync`.
   Every real implementor already satisfies it.
+- **BREAKING — `POST /v1/{logs,traces,metrics}` now answers the response the OTLP specification
+  prescribes**, instead of this server's own `{"accepted": …}` JSON. On success that is an
+  `Export<signal>ServiceResponse` — a **zero-byte body** for a full success, `partial_success`
+  carrying the count when records were rejected; on `4xx`/`5xx` it is a `google.rpc.Status`; and both
+  go out in the encoding the request declared (`application/x-protobuf` unless the request said
+  `application/json`). Anything that parsed the old body must be updated. The receipt counters moved
+  to response headers — `x-imbh-accepted`, `x-imbh-rejected`, `x-imbh-durable`, `x-imbh-queued` — so
+  `curl -i` keeps all four.
+
+  Why: a stock exporter parses that body. Against the old one,
+  `@opentelemetry/exporter-logs-otlp-proto` logged *"Export succeeded but could not deserialize
+  response - is the response specification compliant?"* on every batch (the export still counted as
+  successful, so no data was lost), and a rejected-record count had nowhere to go — the duplicate
+  signal OTLP/gRPC reports in `partial_success` was unreadable to every HTTP client. Footprint is
+  unchanged at 298 crates: prost and opentelemetry-proto were already in `imbh-server`'s default
+  graph through `imbh` → `imbh-otlp`; they are now named directly rather than only under the
+  `grpc`/`docker` features. OTLP/**JSON** ingest remains unimplemented (a JSON request is a `400`,
+  answered as a JSON `Status`).
+- **BREAKING — `imbh_server::Response` carries a `headers` field** (`Vec<(HeaderName, HeaderValue)>`)
+  and a `header()` accessor, which is how the ingest routes report their receipt counts. Construction
+  as a struct literal needs updating.
+- **`imbh_test_support::http::HttpResponse` carries `headers`** and a `header()` accessor, so a wire
+  test can assert the `x-imbh-*` counters. (Dev-only crate, unpublished.)
 
 ### Fixed
 
