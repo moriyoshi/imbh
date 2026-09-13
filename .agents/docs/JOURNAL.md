@@ -7415,3 +7415,74 @@ to the raw answer, and a `{"q": …}` body that comes back `400` naming the `"qu
 `tracing`-feature startup banner — `tracing::info!` takes a format string), `cargo test --workspace`
 all clean. No dependency changed (`serde_json` was already in the graph), and the footprint numbers
 are unmoved: `imbh` 275 crates, `imbh-server` 298.
+
+## OTLP/HTTP ingest answered its own JSON where the spec fixes the body (2026-09-13)
+
+**The report, and whether it held.** The same user who hit the `/api/query` body shape said the
+ingest endpoints take protobuf but answer JSON, and that it confuses
+`@opentelemetry/exporter-logs-otlp-proto`. It held, and it was a specification violation rather than
+a matter of taste. OTLP/HTTP fixes the *response* as tightly as the request: `HTTP 200` with a
+protobuf `Export<signal>ServiceResponse` (`partial_success` left unset on a full success, so the body
+is **zero bytes**), `4xx`/`5xx` with a protobuf `google.rpc.Status`, `Content-Type:
+application/x-protobuf` on a binary body, and the same `Content-Type` in the response as the request
+carried. `ingest_response` answered `{"accepted":…,"rejected":…,"durable":…,"queued":…}` as
+`application/json` to every request regardless. Our own OTLP/gRPC handler had it right all along
+(`grpc.rs` returns `ExportLogsServiceResponse::default()`), so the HTTP path was the outlier inside
+this repo.
+
+**What the client actually does, precisely.** Less dramatic than "confuses", and worth pinning
+because it bounds the severity: current `OTLPExportDelegate` wraps `deserializeResponse` in a
+try/catch, comments *"No matter the response, we can consider the export still successful"*, and
+reports `SUCCESS` — **no data loss, no retry storm**. What the user sees is one warning per batch:
+*"Export succeeded but could not deserialize response - is the response specification compliant?"*
+(upstream `open-telemetry/opentelemetry-js#5548` is the same warning against a non-compliant server).
+That the parse throws is not a guess — decoding our exact body as protobuf wire format: `{` (`0x7b`)
+reads as field 15 / wire type 3 (start-group), then `"` (`0x22`) as field 4 length-delimited with
+length `0x61` = 97 bytes against 56 remaining → index out of range.
+
+**The half that cost more than noise.** `rejected` was invisible to every OTLP/HTTP client. gRPC
+reports duplicates in `partial_success.rejected_data_points` (the issue #27 signal), but over HTTP a
+compliant client could not read the count at all, because the body it would have to parse was not
+parseable. So "the responsible producer sees it at write time" held only for gRPC exporters.
+
+**The fix, and where the receipt went.** A new `src/otlp.rs` owns the response half: `Encoding`
+(protobuf unless the request said JSON — including when it said nothing, since protobuf is the only
+payload this server decodes), `Signal` (which `Export<signal>ServiceResponse` and which `rejected_*`
+field), and a two-field `Status` declared with prost's derive (`tonic-types` is not in the graph, and
+the `grpc` feature's `tonic::Status` is the gRPC status, a different thing). The receipt counters did
+not stop being useful, so they became `x-imbh-accepted` / `-rejected` / `-durable` / `-queued`
+**headers**: ignorable by construction, which is the right property for a value no OTLP client looks
+for, and `curl -i` still shows all four. `REJECTED_MESSAGE` is shared with `grpc.rs` so a rejection
+does not read differently depending on the port, and the `google.rpc.Code` values (3/5/13) match what
+`to_status` maps the same errors to.
+
+**Two things the change dragged in.** `Response` needed a headers field, and putting a `HeaderMap`
+inline pushed the struct past 128 bytes, which tripped `clippy::result_large_err` on every
+`Result<_, Response>` in the crate — a `Vec<(HeaderName, HeaderValue)>` is 24 bytes and a better fit
+for a response that carries none or four. `imbh-test-support`'s HTTP client parsed only
+`Content-Type`, so it now keeps every header and has a `header()` accessor; without it no wire test
+could see the counters.
+
+**Footprint: free.** prost and opentelemetry-proto were already in `imbh-server`'s default tree
+through `imbh` → `imbh-otlp` — they were merely declared `optional` and switched on by `grpc`/`docker`.
+Making them direct, unconditional deps moved nothing: `imbh-server` 298 → 298, `imbh` 275 (the gate's
+number) untouched.
+
+**Known gap, deliberately left.** OTLP/**JSON** ingest is still unimplemented — the decoder is
+protobuf-only, so a JSON request is a `400`. The spec puts accepting both encodings at SHOULD, and
+implementing it means a JSON→protobuf mapping for the request messages (pbjson or serde on the proto
+types), which is a real dependency decision rather than a bug fix. The encoding *mirror* holds
+meanwhile: a JSON request gets a JSON `google.rpc.Status`.
+
+**Tests.** `otlp_ingest_answers_the_spec_response` (empty message + content type + headers; a bare
+request with no `Content-Type`; a malformed body → decoded `google.rpc.Status` with
+`INVALID_ARGUMENT`; a JSON-declared request → JSON `Status`), `a_rejected_point_comes_back_as_partial_success`
+(ingest the same point twice into a `Duplicates::Reject` DB → `rejected_data_points: 1`), the five
+`otlp.rs` unit tests for the wire shapes (including the JSON mapping quoting `int64` counts, which the
+protobuf JSON rule requires), and the wire halves in `http_e2e.rs`. Four existing suites asserted
+`"accepted":1` in a raw socket dump and now assert `x-imbh-accepted: 1` — `protocol_e2e` (chunked and
+gzip), `shutdown_e2e`, `timeouts_e2e`.
+
+**Gate.** `cargo fmt --all --check`, `cargo build --workspace`, `cargo clippy --workspace
+--all-targets -D warnings`, `cargo clippy -p imbh-server --all-targets` for each of `grpc` / `docker`
+/ `docker-remap` / `tracing` / `--all-features`, and `cargo test --workspace` — all clean.

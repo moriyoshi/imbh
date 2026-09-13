@@ -163,7 +163,8 @@ fn an_in_flight_request_is_allowed_to_finish() {
         "in-flight request was cut off: {response:?}"
     );
     assert!(
-        response.contains("\"accepted\":1"),
+        // The accepted count is a header: an OTLP success body is the specification's empty message.
+        response.contains("x-imbh-accepted: 1"),
         "the ingest did not complete: {response:?}"
     );
 

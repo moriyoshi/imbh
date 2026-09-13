@@ -65,7 +65,10 @@ crate, so the footprint graph is unchanged). Unless noted, these run in the defa
 `cargo test --workspace` path:
 
 - **Server HTTP wire** — `crates/imbh-server/tests/http_e2e.rs`. Binds a real `127.0.0.1:0` loopback
-  socket, runs `serve()` on a thread, and drives it with the blocking HTTP/1.1 client: OTLP ingest →
+  socket, runs `serve()` on a thread, and drives it with the blocking HTTP/1.1 client: OTLP ingest
+  (asserting the **OTLP response contract** over the socket — an empty `Export<signal>ServiceResponse`
+  under `application/x-protobuf`, a `partial_success` count on a rejected duplicate, a `google.rpc.Status`
+  on a malformed body, and the receipt in `x-imbh-*` headers) →
   `/api/query` round-trip for all three signals (in both body shapes — raw SQL and, under
   `Content-Type: application/json`, a `{"query": …}` document, asserted to answer identical rows),
   `/stats` · `/health` · `/admin/*`, and the

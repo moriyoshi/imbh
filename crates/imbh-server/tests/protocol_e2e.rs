@@ -4,7 +4,7 @@
 //! Each test here pins something the move to hyper either fixed or newly bounded:
 //!
 //! - a **chunked** body is ingested. The old parser keyed entirely off `Content-Length`, so a chunked
-//!   upload read as zero bytes and came back `200 {"accepted":0}` — a success status for silently
+//!   upload read as zero bytes and came back `200` with an accepted count of zero — a success status for silently
 //!   dropped telemetry, which is the worst shape a bug can take. Go's `http.Client` sends chunked
 //!   whenever the body is not a sized reader, so this was reachable from a stock client.
 //! - a **gzip** body is inflated. The OTel Collector's `otlphttp` exporter sets
@@ -154,10 +154,11 @@ fn a_chunked_body_is_ingested_rather_than_read_as_empty() {
         reply.starts_with("HTTP/1.1 200 OK"),
         "a chunked upload was rejected: {reply:?}"
     );
-    // The regression this test exists for: the old parser answered 200 with `"accepted":0`, so the
-    // status alone proves nothing — the count is the assertion that matters.
+    // The regression this test exists for: the old parser answered 200 with an accepted count of
+    // zero, so the status alone proves nothing — the count is the assertion that matters. It rides
+    // in a header now, because the response *body* is the OTLP specification's (empty on success).
     assert!(
-        reply.contains("\"accepted\":1"),
+        reply.contains("x-imbh-accepted: 1"),
         "a chunked upload was read as an empty body: {reply:?}"
     );
     assert_eq!(
@@ -182,7 +183,7 @@ fn a_gzip_body_is_inflated_and_ingested() {
     let reply = server.exchange(&head, &compressed);
 
     assert!(
-        reply.starts_with("HTTP/1.1 200 OK") && reply.contains("\"accepted\":1"),
+        reply.starts_with("HTTP/1.1 200 OK") && reply.contains("x-imbh-accepted: 1"),
         "a gzip upload was not inflated: {reply:?}"
     );
     assert_eq!(logs_in(&server.db), 1, "the gzip upload's row is missing");

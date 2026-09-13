@@ -26,7 +26,8 @@
 //! `last_wins` collapses the duplicated instant at read time instead, so one bad point degrades one
 //! datapoint rather than the whole metric — the escape hatch for a database that already holds
 //! duplicates. `reject[,recent=N]` drops the repeat at ingest and reports it in the ingest response's
-//! `rejected` count (and in OTLP/gRPC `partial_success`), so the responsible producer sees it at write
+//! `rejected` count — `partial_success` in the OTLP response over both HTTP and gRPC, and an
+//! `x-imbh-rejected` header over HTTP — so the responsible producer sees it at write
 //! time; `recent` (default 262144) bounds both the guard's lookback and its memory, costing a fixed
 //! ~13 MB. Rejecting is opt-in on purpose: dropping a producer's data should never happen by accident.
 //!

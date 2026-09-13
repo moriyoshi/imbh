@@ -62,23 +62,26 @@ serde_json.workspace = true
 # gzip request bodies (`Content-Encoding: gzip`), which the OTel Collector's otlphttp exporter sends by
 # default. Already in the default graph via parquet — no new crate.
 flate2.workspace = true
+# The OTLP *response* messages `POST /v1/*` must answer with — `Export<signal>ServiceResponse` on
+# success, `google.rpc.Status` on failure (`src/otlp.rs`). Not optional, because the default HTTP
+# build is exactly the build that has to be spec-compliant; the `grpc` and `docker` features turn the
+# same two crates on for their own reasons. Footprint-neutral: both are already in this crate's
+# default tree through `imbh` → `imbh-otlp`, so naming them directly adds **no crate** (298 → 298).
+opentelemetry-proto.workspace = true
+prost.workspace = true
 # ── gRPC (optional, off by default) ──────────────────────────────────────────────────────
-# OTLP/gRPC ingest for the reference server. All three deps are optional and pulled ONLY by the
-# `grpc` feature, so the default build (the footprint gate) carries no tonic/hyper/h2 subtree.
+# OTLP/gRPC ingest for the reference server. tonic is optional and pulled ONLY by the `grpc`
+# feature, so the default build (the footprint gate) carries no tonic/h2 subtree.
 # `server`/`router`/`codegen` are the minimal tonic features to run the generated collector services;
-# no TLS, no client `channel`. opentelemetry-proto's `gen-tonic` turns on the tonic *service* codegen
-# (the workspace default is `gen-tonic-messages`, messages only); prost re-encodes the decoded request
-# back to bytes for the existing `Db::ingest_otlp_*` byte API.
+# no TLS, no client `channel`. The feature also turns on opentelemetry-proto's `gen-tonic` for the
+# collector *services* (the workspace default is `gen-tonic-messages`, messages only) on top of the
+# messages `src/otlp.rs` already uses; prost re-encodes the decoded request back to bytes for the
+# existing `Db::ingest_otlp_*` byte API.
 tonic = { workspace = true, optional = true, features = [
     "server",
     "router",
     "codegen",
 ] }
-# Shared by `grpc` (which additionally turns on `gen-tonic` for the collector *services*) and
-# `docker` (messages only — it builds `ExportLogsServiceRequest` values by hand). Cargo unifies the
-# features, so enabling both is the union, not a conflict.
-opentelemetry-proto = { workspace = true, optional = true }
-prost = { workspace = true, optional = true }
 # `TcpListenerStream`, so the Docker plugin's multi-address supervisor can hand tonic a listener it
 # bound itself (and filter the peers on it) instead of letting tonic bind its own. Optional, pulled
 # only when `docker` and `grpc` are both on. Footprint-neutral: tokio-stream is already in the
@@ -117,9 +120,7 @@ tracing = ["dep:tracing", "imbh/tracing", "imbh/tracing-console"]
 # HTTP listener, and the runtime features tonic needs (`rt-multi-thread`/`net`/`time`) are too.
 grpc = [
     "dep:tonic",
-    "dep:opentelemetry-proto",
     "opentelemetry-proto/gen-tonic",
-    "dep:prost",
     "dep:tokio-stream",
 ]
 # Docker logging-driver plugin: serve the `docker.logdriver/1.0` plugin API on a Unix socket, read
@@ -128,7 +129,7 @@ grpc = [
 # default so `cargo build -p imbh-server` (the footprint gate) stays at the measured crate count;
 # enable with `cargo build -p imbh-server --features docker`. Adds **no new crate** to the graph:
 # prost and opentelemetry-proto's message types are already in the default `imbh` tree via imbh-otlp.
-docker = ["dep:opentelemetry-proto", "dep:prost", "tokio-stream?/net"]
+docker = ["tokio-stream?/net"]
 # VRL remapping for the Docker log driver (docs/DOCKER_LOG_DRIVER.md): every container line runs
 # through a compiled Vector Remap Language program that maps the Docker log-driver data model onto the
 # OTel logs data model, with a built-in script covering JSON, logfmt, klog/glog and key=value. Off by

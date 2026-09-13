@@ -21,7 +21,12 @@
 //!
 //! Routes:
 //! - `POST /v1/logs` · `/v1/traces` · `/v1/metrics` — OTLP/HTTP protobuf ingest, `Content-Encoding:
-//!   gzip` accepted (the OTel Collector's `otlphttp` exporter compresses by default).
+//!   gzip` accepted (the OTel Collector's `otlphttp` exporter compresses by default). The response is
+//!   the one OTLP prescribes (see [`otlp`]): an `Export<signal>ServiceResponse` — empty on a full
+//!   success, `partial_success` populated when records were rejected — or a `google.rpc.Status` on
+//!   failure, in the encoding the request declared. The receipt counts ride in `x-imbh-accepted` /
+//!   `-rejected` / `-durable` / `-queued` headers, which is where they moved when the body became
+//!   the specification's.
 //! - `POST /api/query` — a SQL query → JSON rows. The body is **raw SQL**, unless the request says
 //!   `Content-Type: application/json`, in which case it is a JSON document — `{"query": "…"}` (or a
 //!   bare JSON string). Raw is the default so `curl --data "SELECT …"` keeps working; the JSON form
@@ -63,6 +68,7 @@ pub mod docker;
 pub mod grpc;
 pub mod head;
 pub mod jobs;
+mod otlp;
 pub mod shutdown;
 
 use std::borrow::Cow;
@@ -73,7 +79,7 @@ use std::time::Duration;
 use axum::Router;
 use axum::body::{Body, Bytes};
 use axum::extract::State;
-use axum::http::{Request, StatusCode, header};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, Request, StatusCode, header};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use http_body_util::BodyExt;
@@ -103,6 +109,14 @@ pub struct Response {
     pub status: u16,
     pub content_type: String,
     pub body: Vec<u8>,
+    /// Response headers beyond `Content-Type`. Empty for nearly every handler here; the OTLP ingest
+    /// routes use it for their `x-imbh-*` receipt counters, which is the one place this server has
+    /// something to say that its response *body* is not allowed to carry (see [`ingest_response`]).
+    ///
+    /// A `Vec` rather than a `HeaderMap` because a response here carries none or four of these, and
+    /// a `HeaderMap` inline would trip `clippy::result_large_err` on every `Result<_, Response>` in
+    /// the crate — a map's allocation table is a poor trade for four pairs.
+    pub headers: Vec<(HeaderName, HeaderValue)>,
 }
 
 impl IntoResponse for Response {
@@ -110,12 +124,16 @@ impl IntoResponse for Response {
         // An unmappable code would be a bug here (every construction site uses a real status), but a
         // 500 is a better answer than a panic on a connection thread.
         let status = StatusCode::from_u16(self.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-        (
+        let mut response = (
             status,
             [(header::CONTENT_TYPE, self.content_type)],
             self.body,
         )
-            .into_response()
+            .into_response();
+        for (name, value) in self.headers {
+            response.headers_mut().insert(name, value);
+        }
+        response
     }
 }
 
@@ -125,6 +143,7 @@ impl Response {
             status,
             content_type: "text/plain".to_owned(),
             body: s.as_bytes().to_vec(),
+            headers: Vec::new(),
         }
     }
     fn json(status: u16, body: Vec<u8>) -> Self {
@@ -132,17 +151,42 @@ impl Response {
             status,
             content_type: "application/json".to_owned(),
             body,
+            headers: Vec::new(),
         }
     }
-    /// A response with an explicit content type — used by the Docker plugin endpoint, which must
-    /// answer in `application/vnd.docker.plugins.v1.1+json`.
-    #[cfg(all(feature = "docker", unix))]
+    /// A response with an explicit content type — used by the OTLP ingest routes, which must answer
+    /// in the encoding the request arrived in, and by the Docker plugin endpoint, which must answer
+    /// in `application/vnd.docker.plugins.v1.1+json`.
     pub(crate) fn with_content_type(status: u16, content_type: &str, body: Vec<u8>) -> Self {
         Response {
             status,
             content_type: content_type.to_owned(),
             body,
+            headers: Vec::new(),
         }
+    }
+
+    /// Attach one response header. A name or value HTTP cannot carry is dropped rather than
+    /// panicking on a request path — every call site here builds both from a constant and a number,
+    /// so a drop would be a bug in this file rather than something a client can provoke.
+    pub(crate) fn with_header(mut self, name: &'static str, value: &str) -> Self {
+        if let (Ok(name), Ok(value)) = (
+            HeaderName::from_bytes(name.as_bytes()),
+            HeaderValue::from_str(value),
+        ) {
+            self.headers.push((name, value));
+        }
+        self
+    }
+
+    /// One header's value, matched case-insensitively (header names are lowercase by construction).
+    /// For callers driving handlers through [`route`], where the counters an OTLP body cannot carry
+    /// are the whole point of reading a header at all.
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(header, _)| header.as_str().eq_ignore_ascii_case(name))
+            .and_then(|(_, value)| value.to_str().ok())
     }
 }
 
@@ -951,19 +995,34 @@ async fn not_found() -> Response {
     Response::text(404, "not found")
 }
 
-async fn ingest_logs(State(db): State<Arc<Db>>, body: Bytes) -> Response {
-    ingest_response(offload(db.ingest_otlp_logs(&body)).await)
+async fn ingest_logs(State(db): State<Arc<Db>>, headers: HeaderMap, body: Bytes) -> Response {
+    let encoding = otlp::Encoding::of(&headers);
+    ingest_response(
+        otlp::Signal::Logs,
+        encoding,
+        offload(db.ingest_otlp_logs(&body)).await,
+    )
 }
 
-async fn ingest_traces(State(db): State<Arc<Db>>, body: Bytes) -> Response {
-    ingest_response(offload(db.ingest_otlp_traces(&body)).await)
+async fn ingest_traces(State(db): State<Arc<Db>>, headers: HeaderMap, body: Bytes) -> Response {
+    let encoding = otlp::Encoding::of(&headers);
+    ingest_response(
+        otlp::Signal::Traces,
+        encoding,
+        offload(db.ingest_otlp_traces(&body)).await,
+    )
 }
 
-async fn ingest_metrics(State(db): State<Arc<Db>>, body: Bytes) -> Response {
-    ingest_response(offload(db.ingest_otlp_metrics(&body)).await)
+async fn ingest_metrics(State(db): State<Arc<Db>>, headers: HeaderMap, body: Bytes) -> Response {
+    let encoding = otlp::Encoding::of(&headers);
+    ingest_response(
+        otlp::Signal::Metrics,
+        encoding,
+        offload(db.ingest_otlp_metrics(&body)).await,
+    )
 }
 
-async fn query(State(db): State<Arc<Db>>, headers: axum::http::HeaderMap, body: Bytes) -> Response {
+async fn query(State(db): State<Arc<Db>>, headers: HeaderMap, body: Bytes) -> Response {
     let content_type = headers
         .get(header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok());
@@ -975,11 +1034,7 @@ async fn stats(State(db): State<Arc<Db>>) -> Response {
 }
 
 /// `POST /mcp` — one MCP message in, one JSON-RPC message out (see [`mcp`]).
-async fn mcp_post(
-    State(state): State<AppState>,
-    headers: axum::http::HeaderMap,
-    body: Bytes,
-) -> Response {
+async fn mcp_post(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
     let db = Arc::clone(&state.db);
     let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
 
@@ -1260,6 +1315,13 @@ pub async fn route_with_content_type(
         .and_then(|value| value.to_str().ok())
         .unwrap_or("text/plain")
         .to_owned();
+    // Carried through so a caller sees the same headers a socket would — the OTLP ingest routes
+    // report their receipt counts there, since the response *body* is the spec's, not ours.
+    let headers = response
+        .headers()
+        .iter()
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect();
     // Handler bodies are all in memory already, so there is nothing to bound here.
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
@@ -1269,6 +1331,7 @@ pub async fn route_with_content_type(
         status,
         content_type,
         body,
+        headers,
     }
 }
 
@@ -1301,21 +1364,50 @@ async fn stats_response(db: &Arc<Db>) -> Response {
     }
 }
 
-fn ingest_response(result: imbh::Result<imbh::IngestReceipt>) -> Response {
+/// Answer an OTLP/HTTP export the way the specification prescribes: an `Export<signal>ServiceResponse`
+/// on success and a `google.rpc.Status` on failure, both in the encoding the request declared (see
+/// [`otlp`]). A full success is a zero-byte body; `partial_success` appears only when records were
+/// rejected, which is how a client learns that some of what it sent did not land.
+///
+/// The receipt's counters ride along in `x-imbh-*` headers, since the response *message* has no
+/// field for them and a stock exporter parses that message: this endpoint's old `{"accepted":…}`
+/// body made every export log a deserialization warning and gave the rejected count nowhere to go.
+fn ingest_response(
+    signal: otlp::Signal,
+    encoding: otlp::Encoding,
+    result: imbh::Result<imbh::IngestReceipt>,
+) -> Response {
     match result {
-        Ok(r) => Response::json(
+        Ok(r) => Response::with_content_type(
             200,
-            format!(
-                "{{\"accepted\":{},\"rejected\":{},\"durable\":{},\"queued\":{}}}",
-                r.accepted,
-                r.rejected,
-                r.durable,
-                r.is_queued()
-            )
-            .into_bytes(),
-        ),
-        Err(e) => error_response(&e),
+            encoding.content_type(),
+            signal.response(encoding, r.rejected),
+        )
+        .with_header(otlp::ACCEPTED, &r.accepted.to_string())
+        .with_header(otlp::REJECTED, &r.rejected.to_string())
+        .with_header(otlp::DURABLE, &r.durable.to_string())
+        .with_header(otlp::QUEUED, &r.is_queued().to_string()),
+        Err(e) => otlp_error_response(encoding, &e),
     }
+}
+
+/// An ingest failure as OTLP defines it: the §10.3 HTTP status, and a body that is a
+/// `google.rpc.Status` rather than this crate's `{"error": …}` JSON — which the rest of the server
+/// keeps, since only the `/v1/*` routes are bound by the OTLP contract.
+fn otlp_error_response(encoding: otlp::Encoding, e: &imbh::Error) -> Response {
+    let code = if e.is_not_found() {
+        otlp::CODE_NOT_FOUND
+    } else if e.is_user_error() {
+        otlp::CODE_INVALID_ARGUMENT
+    } else {
+        otlp::CODE_INTERNAL
+    };
+    let status = otlp::Status::new(code, &e.to_string());
+    Response::with_content_type(
+        error_status(e),
+        encoding.content_type(),
+        status.body(encoding),
+    )
 }
 
 async fn query_response(db: &Arc<Db>, content_type: Option<&str>, body: &[u8]) -> Response {
@@ -1397,17 +1489,23 @@ fn query_sql_from_json(body: &[u8]) -> Result<String, Response> {
 }
 
 /// Map an imbh error to an HTTP status using the §10.3 classifiers: 404 not-found, 400 user
-/// error, 500 otherwise.
-fn error_response(e: &imbh::Error) -> Response {
-    let status = if e.is_not_found() {
+/// error, 500 otherwise. Shared with [`otlp_error_response`], so the OTLP routes and the rest of the
+/// server disagree about the response *body* only, never about the status.
+fn error_status(e: &imbh::Error) -> u16 {
+    if e.is_not_found() {
         404
     } else if e.is_user_error() {
         400
     } else {
         500
-    };
+    }
+}
+
+/// An error in this crate's own `{"error": …}` JSON shape — every endpoint except OTLP ingest, whose
+/// failures are a protobuf `google.rpc.Status` instead ([`otlp_error_response`]).
+fn error_response(e: &imbh::Error) -> Response {
     Response::json(
-        status,
+        error_status(e),
         format!("{{\"error\":{}}}", json_string(&e.to_string())).into_bytes(),
     )
 }
@@ -1624,6 +1722,117 @@ mod tests {
         let stats = route(&db, "GET", "/stats?pretty=1", b"").await;
         assert_eq!(stats.status, 200);
         assert_eq!(stats.content_type, "application/json");
+    }
+
+    /// `POST /v1/*` answers the **OTLP** response, not this server's own JSON: an
+    /// `Export<signal>ServiceResponse` in the encoding the request declared, a `google.rpc.Status` on
+    /// failure, and the receipt counters moved to `x-imbh-*` headers.
+    ///
+    /// The bug this pins: the endpoint used to answer `{"accepted":…}` with
+    /// `Content-Type: application/json` to every request, protobuf ones included, so a stock exporter
+    /// logged a deserialization warning on every batch and could not read a rejection at all.
+    #[tokio::test(flavor = "current_thread")]
+    async fn otlp_ingest_answers_the_spec_response() {
+        use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceResponse;
+        use prost::Message;
+
+        let db = Db::in_memory().open().unwrap();
+        let logs = otlp_log("cart", "hello", 1);
+
+        // Full success: an empty `ExportLogsServiceResponse` — zero bytes on the wire — under the
+        // protobuf content type, with `partial_success` unset once decoded.
+        let ok =
+            route_with_content_type(&db, "POST", "/v1/logs", Some(otlp::PROTOBUF), &logs).await;
+        assert_eq!(ok.status, 200);
+        assert_eq!(ok.content_type, otlp::PROTOBUF);
+        assert!(ok.body.is_empty(), "a full success is an empty message");
+        let decoded = ExportLogsServiceResponse::decode(ok.body.as_slice())
+            .expect("the body is an ExportLogsServiceResponse");
+        assert!(decoded.partial_success.is_none());
+
+        // The receipt did not disappear — it moved to headers, where a client that does not know to
+        // look is unaffected and `curl -i` still sees all of it.
+        assert_eq!(ok.header(otlp::ACCEPTED), Some("1"));
+        assert_eq!(ok.header(otlp::REJECTED), Some("0"));
+        assert_eq!(ok.header(otlp::QUEUED), Some("false"));
+        assert!(ok.header(otlp::DURABLE).is_some());
+
+        // A request that declares no `Content-Type` is protobuf too: it is the only payload this
+        // server decodes, so it is the only thing the body it just parsed could have been.
+        let bare = route(&db, "POST", "/v1/traces", b"").await;
+        assert_eq!(bare.status, 200);
+        assert_eq!(bare.content_type, otlp::PROTOBUF);
+        assert!(bare.body.is_empty());
+
+        // A failure is a `google.rpc.Status`, not this crate's `{"error": …}` JSON, and carries the
+        // same code the gRPC transport maps the same error to.
+        let bad =
+            route_with_content_type(&db, "POST", "/v1/logs", Some(otlp::PROTOBUF), &[0x08, 0x80])
+                .await;
+        assert_eq!(bad.status, 400);
+        assert_eq!(bad.content_type, otlp::PROTOBUF);
+        let status =
+            otlp::Status::decode(bad.body.as_slice()).expect("the body is a google.rpc.Status");
+        assert_eq!(status.code, otlp::CODE_INVALID_ARGUMENT);
+        assert!(!status.message.is_empty(), "a status explains itself");
+
+        // A request that declares JSON is answered in JSON — the spec's "same Content-Type as the
+        // request" rule. OTLP/JSON *ingest* is not implemented (the decoder is protobuf-only), so the
+        // reachable JSON answer is the failure one, and it is a JSON `google.rpc.Status`.
+        let json = route_with_content_type(
+            &db,
+            "POST",
+            "/v1/logs",
+            Some("application/json"),
+            br#"{"resourceLogs":[]}"#,
+        )
+        .await;
+        assert_eq!(json.status, 400);
+        assert_eq!(json.content_type, "application/json");
+        let value: Value = serde_json::from_slice(&json.body).expect("a JSON body");
+        assert_eq!(value["code"], otlp::CODE_INVALID_ARGUMENT);
+        assert!(value["message"].is_string(), "got {value}");
+    }
+
+    /// A rejected record reaches an OTLP/HTTP client the way it already reached a gRPC one: in
+    /// `partial_success`, which is the only field the spec gives a server to say "not all of it
+    /// landed". Before this, the count existed only in a JSON body no exporter could parse.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_rejected_point_comes_back_as_partial_success() {
+        use imbh_test_support::otlp::otlp_sum;
+        use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceResponse;
+        use prost::Message;
+
+        let db = Db::in_memory()
+            .duplicates(imbh::Duplicates::reject())
+            .open()
+            .unwrap();
+        let body = otlp_sum("cart", "m", 2, &[(10, 1.0)]);
+
+        let first =
+            route_with_content_type(&db, "POST", "/v1/metrics", Some(otlp::PROTOBUF), &body).await;
+        assert_eq!(first.status, 200);
+        assert!(
+            ExportMetricsServiceResponse::decode(first.body.as_slice())
+                .expect("decode")
+                .partial_success
+                .is_none(),
+            "a full success leaves partial_success unset"
+        );
+
+        // The same point again: accepted 0, rejected 1 — still a 200, because a duplicate is not a
+        // request error.
+        let second =
+            route_with_content_type(&db, "POST", "/v1/metrics", Some(otlp::PROTOBUF), &body).await;
+        assert_eq!(second.status, 200);
+        let partial = ExportMetricsServiceResponse::decode(second.body.as_slice())
+            .expect("decode")
+            .partial_success
+            .expect("a rejection is reported in partial_success");
+        assert_eq!(partial.rejected_data_points, 1);
+        assert_eq!(partial.error_message, otlp::REJECTED_MESSAGE);
+        assert_eq!(second.header(otlp::ACCEPTED), Some("0"));
+        assert_eq!(second.header(otlp::REJECTED), Some("1"));
     }
 
     fn otlp_log(service: &str, body_text: &str, time: u64) -> Vec<u8> {
@@ -1861,14 +2070,12 @@ mod tests {
         assert_eq!(route(&db, "GET", "/health", b"").await.status, 200);
         assert_eq!(route(&db, "GET", "/nope", b"").await.status, 404);
 
-        // OTLP/HTTP logs ingest.
+        // OTLP/HTTP logs ingest. The body is the spec's empty `ExportLogsServiceResponse`; the
+        // receipt is in the `x-imbh-*` headers (see `otlp_ingest_answers_the_spec_response`).
         let r = route(&db, "POST", "/v1/logs", &otlp_log("cart", "hello", 1)).await;
         assert_eq!(r.status, 200);
-        assert!(
-            String::from_utf8(r.body)
-                .unwrap()
-                .contains("\"accepted\":1")
-        );
+        assert!(r.body.is_empty(), "got {:?}", r.body);
+        assert_eq!(r.header(otlp::ACCEPTED), Some("1"));
 
         // SQL query → JSON rows.
         let q = route(
