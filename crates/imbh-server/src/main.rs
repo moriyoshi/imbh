@@ -2,7 +2,8 @@
 //!
 //! Usage: `imbhd [DB_DIR] [ADDR] [GRPC_ADDR]` (defaults: `./imbh-data`, `127.0.0.1:4318`,
 //! `127.0.0.1:4317`). Point a stock OTel SDK's OTLP/HTTP exporter at `http://ADDR` and query via
-//! `POST /api/query` with a SQL body. `GRPC_ADDR` is only used when built with `--features grpc`,
+//! `POST /api/query` with a SQL body (or a `{"query": "…"}` document, with `Content-Type:
+//! application/json`). `GRPC_ADDR` is only used when built with `--features grpc`,
 //! which additionally serves OTLP/gRPC (the OTel SDK default) on that port.
 //!
 //! Both addresses also read from the environment — `IMBH_LISTEN_ADDR` and `IMBH_GRPC_LISTEN_ADDR` —
@@ -366,7 +367,9 @@ fn banner(
             Some(addr) => {
                 tracing::info!(%addr, %dir, "imbhd listening");
                 tracing::info!("OTLP/HTTP: POST /v1/logs, /v1/traces, /v1/metrics");
-                tracing::info!("query: POST /api/query (SQL body -> JSON)");
+                tracing::info!(
+                    "query: POST /api/query (SQL body, or {{\"query\": ...}} as JSON -> JSON)"
+                );
                 tracing::info!("mcp: POST /mcp (Model Context Protocol, read-only tools)");
                 tracing::info!(
                     "housekeeping: POST /admin/housekeeping (queued; poll the job id it returns)"
@@ -395,7 +398,9 @@ fn banner(
             Some(addr) => {
                 println!("imbhd listening on http://{addr}  (data dir: {dir})");
                 println!("  OTLP/HTTP: POST /v1/logs · /v1/traces · /v1/metrics");
-                println!("  query:     POST /api/query  (SQL body → JSON)");
+                println!(
+                    "  query:     POST /api/query  (SQL body, or {{\"query\": …}} as JSON → JSON)"
+                );
                 println!("  mcp:       POST /mcp  (Model Context Protocol, read-only tools)");
                 println!(
                     "  cleanup:   POST /admin/housekeeping  (queued → job id; poll it for the result)"

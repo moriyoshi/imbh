@@ -7365,3 +7365,53 @@ build/clippy/test gate has nothing to say here and was not re-run. `cargo releas
 executed — that is the user's call, and the dry run (`cargo release <level>`, no `--execute`) is now
 documented in README "Releasing" as the thing that catches a stale replacement rule before anything
 is tagged.
+
+## `POST /api/query` takes a JSON body now, chosen by `Content-Type` (2026-09-13)
+
+**The report.** A user expected `POST /api/query` to take a JSON-wrapped payload and found it takes a
+raw SQL string. The raw form is what the endpoint has always documented (`curl --data "SELECT …"`),
+so this is not a bug — but it is a real papercut, and the way it fails is the problem: a client that
+serializes its body posts `{"query":"SELECT 1"}`, DataFusion parses that as SQL, and the answer is a
+`400` complaining about a token at the `{`. That reads like a broken query rather than a wrapped one,
+so the reporter has no way to see what actually went wrong.
+
+**The fix is a body shape selected by the request's `Content-Type`, and nothing else.** With
+`application/json` — parameters (`; charset=utf-8`) and `+json` structured suffixes included,
+case-insensitively, plus the unregistered `text/json` a few clients send — the body is a JSON
+document; with anything else, *including no `Content-Type` at all*, it is raw SQL exactly as before.
+Every existing client is unaffected by construction: `curl --data` sends
+`application/x-www-form-urlencoded`, OTel SDKs and the docs' examples send text or nothing. The body
+is never sniffed — a JSON document posted without a JSON content type is still read as SQL, which is
+what the request said it was. Sniffing would have made the endpoint's behaviour depend on the first
+byte of a user's query, and `{` is a legal thing to find there once someone writes a JSON literal
+into SQL.
+
+**What the JSON document may be.** `{"query": "…"}`, and only that: the endpoint is `/api/query`, so
+the body says what the path says, and one name for one thing beats a set of accepted spellings every
+later reader has to learn. (An earlier draft took `sql` as an alias — the name the `query_sql` MCP
+tool uses. Dropped: a second spelling buys one client one saved guess and costs every reader of the
+endpoint afterwards, and the `400` names the field, so a wrong guess is answered once and learned.) A
+bare JSON string is accepted because it is unambiguous and rejecting it would be a technicality. Unknown fields are ignored rather than rejected, so a document written for a
+richer future version of this endpoint still runs. A JSON body with no query in it is now a `400`
+naming what was missing — the failure the reporter should have seen in the first place.
+
+**`route_with_content_type`.** `imbh_server::route` builds its request by hand and set no headers, so
+through it the JSON form was unreachable — for the tests *and* for a host that owns its own transport
+and drives the handlers directly. Added as a sibling rather than a fifth parameter on `route`, so the
+many calls that do not care keep reading as they did.
+
+**Tests.** `query_body_shape_follows_content_type` (lib) drives all four raw variants and all four
+JSON documents and asserts the JSON form answers *byte-identical* rows to the raw one — the property
+that keeps the two shapes from drifting into two serializers — plus the five malformed-document `400`s
+(each a JSON `{"error": …}` body, the missing-field ones — `{"statement": …}` and `{"sql": …}` alike
+— naming `"query"`) and the boundary in the other direction.
+`json_content_types_are_recognised` pins the header classifier itself, `x-www-form-urlencoded`
+included, since that one is what protects `curl --data`. The wire half is in
+`http_wire_ingest_query_stats_and_errors`: the same query as a JSON document over a real socket, equal
+to the raw answer, and a `{"q": …}` body that comes back `400` naming the `"query"` field.
+
+**Gate.** `cargo fmt --all --check`, `cargo build --workspace`, `cargo clippy --workspace
+--all-targets -D warnings` (and `-p imbh-server --all-features`, which caught an unescaped `{` in the
+`tracing`-feature startup banner — `tracing::info!` takes a format string), `cargo test --workspace`
+all clean. No dependency changed (`serde_json` was already in the graph), and the footprint numbers
+are unmoved: `imbh` 275 crates, `imbh-server` 298.

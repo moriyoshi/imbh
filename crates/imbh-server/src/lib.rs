@@ -22,7 +22,10 @@
 //! Routes:
 //! - `POST /v1/logs` · `/v1/traces` · `/v1/metrics` — OTLP/HTTP protobuf ingest, `Content-Encoding:
 //!   gzip` accepted (the OTel Collector's `otlphttp` exporter compresses by default).
-//! - `POST /api/query` — a SQL string body → JSON rows.
+//! - `POST /api/query` — a SQL query → JSON rows. The body is **raw SQL**, unless the request says
+//!   `Content-Type: application/json`, in which case it is a JSON document — `{"query": "…"}` (or a
+//!   bare JSON string). Raw is the default so `curl --data "SELECT …"` keeps working; the JSON form
+//!   is for the clients that serialize their request bodies and set that header without being asked.
 //! - `POST`/`GET /api/head/…` — the **head API** (see [`head`] and ARCHITECTURE.md §10.19): the
 //!   typed, read-only query surface a UI with no database of its own drives this daemon over —
 //!   PromQL/LogQL/TraceQL evaluation, log paging, waterfalls, exemplars, catalog and attribute
@@ -62,6 +65,7 @@ pub mod head;
 pub mod jobs;
 pub mod shutdown;
 
+use std::borrow::Cow;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, PoisonError};
 use std::time::Duration;
@@ -959,8 +963,11 @@ async fn ingest_metrics(State(db): State<Arc<Db>>, body: Bytes) -> Response {
     ingest_response(offload(db.ingest_otlp_metrics(&body)).await)
 }
 
-async fn query(State(db): State<Arc<Db>>, body: Bytes) -> Response {
-    query_response(&db, &body).await
+async fn query(State(db): State<Arc<Db>>, headers: axum::http::HeaderMap, body: Bytes) -> Response {
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok());
+    query_response(&db, content_type, &body).await
 }
 
 async fn stats(State(db): State<Arc<Db>>) -> Response {
@@ -1217,14 +1224,28 @@ fn json_error(status: u16, message: &str) -> Response {
 /// because the second call's registry never issued that id. Hold one [`app`] and drive it with
 /// `oneshot`, or use [`serve`], for a sequence that depends on server-side state.
 pub async fn route(db: &Arc<Db>, method: &str, path: &str, body: &[u8]) -> Response {
-    let request = match Request::builder()
-        .method(method)
-        .uri(path)
-        .body(Body::from(body.to_vec()))
-    {
+    route_with_content_type(db, method, path, None, body).await
+}
+
+/// [`route`], with a request `Content-Type`. Separate rather than a fifth parameter on `route` so
+/// the calls that do not care keep reading as they did; needed because `POST /api/query` reads its
+/// body as raw SQL or as a JSON document *by* that header (see `query_sql`), which a request built
+/// without one cannot ask for.
+pub async fn route_with_content_type(
+    db: &Arc<Db>,
+    method: &str,
+    path: &str,
+    content_type: Option<&str>,
+    body: &[u8],
+) -> Response {
+    let mut builder = Request::builder().method(method).uri(path);
+    if let Some(content_type) = content_type {
+        builder = builder.header(header::CONTENT_TYPE, content_type);
+    }
+    let request = match builder.body(Body::from(body.to_vec())) {
         Ok(request) => request,
-        // A method or URI that is not well-formed at all; hyper would have rejected it before the
-        // router ever saw it, so this only reaches a caller building requests by hand.
+        // A method, URI, or header value that is not well-formed at all; hyper would have rejected it
+        // before the router ever saw it, so this only reaches a caller building requests by hand.
         Err(_) => return Response::text(400, "malformed request"),
     };
     let response = app(db.clone())
@@ -1297,16 +1318,81 @@ fn ingest_response(result: imbh::Result<imbh::IngestReceipt>) -> Response {
     }
 }
 
-async fn query_response(db: &Arc<Db>, body: &[u8]) -> Response {
-    let sql = match std::str::from_utf8(body) {
-        Ok(s) => s,
-        Err(_) => return Response::text(400, "query body is not UTF-8"),
+async fn query_response(db: &Arc<Db>, content_type: Option<&str>, body: &[u8]) -> Response {
+    let sql = match query_sql(content_type, body) {
+        Ok(sql) => sql,
+        Err(response) => return response,
     };
     // The heaviest offload in the crate: a scan is blocking parquet and tantivy I/O from start to
     // finish, so this is the call that would park a worker for whole seconds.
-    match offload(db.sql(sql).collect()).await {
+    match offload(db.sql(&sql).collect()).await {
         Ok(batches) => Response::json(200, batches_to_json(&batches)),
         Err(e) => error_response(&e),
+    }
+}
+
+/// The SQL a `POST /api/query` body carries, in whichever of the two shapes the request declared.
+///
+/// The body is a **raw SQL string** unless the request says `Content-Type: application/json`, in
+/// which case it is a JSON document: `{"query": "…"}`, or a bare JSON string. The raw form is what
+/// `curl --data` sends and the only one this endpoint used to accept, so it stays the default —
+/// including when there is no `Content-Type` at all. The JSON form exists because every client that
+/// serializes a request body (a `fetch` with `JSON.stringify`, `requests(json=…)`, an SDK) sets that
+/// header, and posting `{"query": …}` to a raw-SQL endpoint fails as a *syntax error* on the JSON
+/// braces, which reads like a broken query rather than a wrapped one.
+fn query_sql<'body>(
+    content_type: Option<&str>,
+    body: &'body [u8],
+) -> Result<Cow<'body, str>, Response> {
+    if content_type.is_some_and(is_json_content_type) {
+        return query_sql_from_json(body).map(Cow::Owned);
+    }
+    match std::str::from_utf8(body) {
+        Ok(sql) => Ok(Cow::Borrowed(sql)),
+        Err(_) => Err(Response::text(400, "query body is not UTF-8")),
+    }
+}
+
+/// Whether a `Content-Type` names a JSON document — `application/json` and the `+json` structured
+/// suffix, case-insensitively and with any parameters (`; charset=utf-8`) ignored, per RFC 9110
+/// §8.3. `text/json` is not a registered type but is what a few clients send anyway.
+fn is_json_content_type(value: &str) -> bool {
+    let essence = value.split(';').next().unwrap_or_default().trim();
+    essence.eq_ignore_ascii_case("application/json")
+        || essence.eq_ignore_ascii_case("text/json")
+        || essence
+            .rsplit_once('+')
+            .is_some_and(|(_, suffix)| suffix.eq_ignore_ascii_case("json"))
+}
+
+/// Pull the SQL out of a JSON request document. The field is `query`, and only `query` — this
+/// endpoint is `/api/query`, so the body says what the path does, and one name for one thing beats a
+/// set of accepted spellings that every later reader has to learn. Any other field is ignored, so a
+/// client may send the same document to a future, richer version of this endpoint; a document with
+/// no `query` in it is a `400` that names the field, which is the answer that teaches the shape.
+fn query_sql_from_json(body: &[u8]) -> Result<String, Response> {
+    let document: Value = serde_json::from_slice(body)
+        .map_err(|e| json_error(400, &format!("query body is not valid JSON: {e}")))?;
+    match document {
+        // A bare string: the raw form, sent with a JSON content type. It *is* a valid JSON document
+        // and there is exactly one thing it can mean, so answering it beats a 400 on a technicality.
+        Value::String(sql) => Ok(sql),
+        Value::Object(mut fields) => match fields.remove("query") {
+            Some(Value::String(sql)) => Ok(sql),
+            Some(_) => Err(json_error(
+                400,
+                "the query body's \"query\" is not a string",
+            )),
+            None => Err(json_error(
+                400,
+                "the JSON query body has no \"query\" field (a raw SQL body needs no JSON \
+                 content type)",
+            )),
+        },
+        _ => Err(json_error(
+            400,
+            "a JSON query body must be an object with a \"query\" field, or a SQL string",
+        )),
     }
 }
 
@@ -1606,6 +1692,138 @@ mod tests {
             }],
         }
         .encode_to_vec()
+    }
+
+    /// The `Content-Type` values that select the JSON body shape. Everything else — including no
+    /// header at all, and the `application/x-www-form-urlencoded` that `curl --data` sends — is the
+    /// raw-SQL body this endpoint has always taken.
+    #[test]
+    fn json_content_types_are_recognised() {
+        for value in [
+            "application/json",
+            "application/JSON",
+            "application/json; charset=utf-8",
+            "  application/json  ",
+            "text/json",
+            "application/vnd.imbh.query+json",
+        ] {
+            assert!(is_json_content_type(value), "{value}");
+        }
+        for value in [
+            "text/plain",
+            "application/x-www-form-urlencoded",
+            "application/sql",
+            "application/x-protobuf",
+            "",
+            "application/jsonp",
+            "json",
+        ] {
+            assert!(!is_json_content_type(value), "{value}");
+        }
+    }
+
+    /// `POST /api/query` reads its body as raw SQL or as a JSON document according to the request's
+    /// `Content-Type` — the raw form stays the default, so every existing client keeps working, and a
+    /// client that serializes its body (and therefore says `application/json`) is answered rather
+    /// than failing with a syntax error on the JSON braces.
+    #[tokio::test(flavor = "current_thread")]
+    async fn query_body_shape_follows_content_type() {
+        let db = Db::in_memory().open().unwrap();
+        assert_eq!(
+            route(&db, "POST", "/v1/logs", &otlp_log("cart", "hello", 1))
+                .await
+                .status,
+            200
+        );
+        const SQL: &str = "SELECT service, count(*) AS c FROM logs GROUP BY service";
+        let rows = |r: Response| {
+            assert_eq!(r.status, 200);
+            let json = String::from_utf8(r.body).unwrap();
+            assert!(json.contains("\"service\":\"cart\""), "got {json}");
+            json
+        };
+
+        // The raw form: with no `Content-Type`, with a textual one, and with the
+        // `x-www-form-urlencoded` that `curl --data` sends without being asked.
+        let raw = rows(route(&db, "POST", "/api/query", SQL.as_bytes()).await);
+        for content_type in [
+            "text/plain",
+            "application/x-www-form-urlencoded",
+            "application/sql",
+        ] {
+            let r = route_with_content_type(
+                &db,
+                "POST",
+                "/api/query",
+                Some(content_type),
+                SQL.as_bytes(),
+            )
+            .await;
+            assert_eq!(rows(r), raw, "{content_type}");
+        }
+
+        // The JSON form, in the documents it accepts: a `query` field, and a bare JSON string. Both
+        // answer the same rows as the raw body.
+        let json_body = |content_type: &'static str, body: String| {
+            let db = &db;
+            async move {
+                route_with_content_type(
+                    db,
+                    "POST",
+                    "/api/query",
+                    Some(content_type),
+                    body.as_bytes(),
+                )
+                .await
+            }
+        };
+        for (content_type, body) in [
+            ("application/json", json!({"query": SQL}).to_string()),
+            (
+                "application/json; charset=utf-8",
+                json!({"query": SQL}).to_string(),
+            ),
+            // Extra fields are ignored rather than rejected, so a document written for a richer
+            // version of this endpoint still runs here.
+            (
+                "application/json",
+                json!({"query": SQL, "max_rows": 10}).to_string(),
+            ),
+            ("application/json", json!(SQL).to_string()),
+        ] {
+            let r = json_body(content_type, body.clone()).await;
+            assert_eq!(rows(r), raw, "{content_type} {body}");
+        }
+
+        // A JSON body that does not carry a query is a request error naming what was missing, not a
+        // SQL syntax error — the failure the reporter of this behaviour actually saw.
+        for body in [
+            r#"{"statement":"SELECT 1"}"#,
+            // `sql` is not an alias: there is one name for this field, and a document that uses
+            // another gets the same 400 naming it.
+            r#"{"sql":"SELECT 1"}"#,
+            r#"{"query":42}"#,
+            r#"{"query":"SELECT 1""#,
+            "[]",
+        ] {
+            let bad = route_with_content_type(
+                &db,
+                "POST",
+                "/api/query",
+                Some("application/json"),
+                body.as_bytes(),
+            )
+            .await;
+            assert_eq!(bad.status, 400, "{body}");
+            assert_eq!(bad.content_type, "application/json", "{body}");
+            let error: Value = serde_json::from_slice(&bad.body).expect("a JSON error body");
+            assert!(error["error"].is_string(), "{error} for {body}");
+        }
+
+        // And the boundary holds in the other direction: a JSON document sent *without* a JSON
+        // content type is still read as SQL, which is what it says it is.
+        let unwrapped = route(&db, "POST", "/api/query", br#"{"query":"SELECT 1"}"#).await;
+        assert_eq!(unwrapped.status, 400);
     }
 
     #[tokio::test(flavor = "current_thread")]

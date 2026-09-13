@@ -66,8 +66,10 @@ crate, so the footprint graph is unchanged). Unless noted, these run in the defa
 
 - **Server HTTP wire** — `crates/imbh-server/tests/http_e2e.rs`. Binds a real `127.0.0.1:0` loopback
   socket, runs `serve()` on a thread, and drives it with the blocking HTTP/1.1 client: OTLP ingest →
-  `/api/query` round-trip for all three signals, `/stats` · `/health` · `/admin/*`, and the
-  `400` (malformed protobuf / bad SQL) and `404` error paths. Loopback only — no external network or
+  `/api/query` round-trip for all three signals (in both body shapes — raw SQL and, under
+  `Content-Type: application/json`, a `{"query": …}` document, asserted to answer identical rows),
+  `/stats` · `/health` · `/admin/*`, and the
+  `400` (malformed protobuf / bad SQL / a JSON body with no query in it) and `404` error paths. Loopback only — no external network or
   daemon, so it stays within the hermetic rule.
 - **Crash / recovery** — `crates/imbh/tests/crash_recovery.rs` re-execs a writer process, SIGKILLs it
   after durable ingest, and asserts exactly-once WAL replay on reopen. Deterministic *mid-seal*

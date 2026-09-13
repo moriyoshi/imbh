@@ -13,6 +13,20 @@ release aborts if it is missing or duplicated.
 
 ## [Unreleased]
 
+### Added
+
+- **`POST /api/query` accepts a JSON request body**, chosen by the request's `Content-Type`. With
+  `application/json` (parameters and `+json` suffixes included) the body is a document —
+  `{"query": "SELECT …"}`, or a bare JSON string; extra fields are ignored, and `query` is the only
+  name for the field. With anything else, including no `Content-Type` at all,
+  the body is **raw SQL** exactly as before, so `curl --data "SELECT …"` and every existing client
+  are unaffected. The header alone decides; the body is never sniffed. A JSON body with no query in
+  it is now a `400` that says which field was missing, instead of a SQL syntax error on the JSON
+  braces — which is how the wrapped-payload mistake used to present.
+- **`imbh_server::route_with_content_type`**, `route` with a request `Content-Type`, since that
+  header is now what selects `POST /api/query`'s body shape and a request built without one cannot
+  ask for the JSON form.
+
 ## [0.9.0] - 2026-08-24
 
 ### Added

@@ -266,7 +266,8 @@ cargo run -p imbh-server --features grpc -- ./imbh-data 127.0.0.1:4318 127.0.0.1
 Point a stock OTel SDK's OTLP/HTTP exporter at `http://ADDR` and query it:
 
 - **Ingest:** `POST /v1/logs` · `/v1/traces` · `/v1/metrics`
-- **Query:** `POST /api/query` (SQL body → JSON)
+- **Query:** `POST /api/query` (raw SQL body → JSON; a `{"query": "…"}` document with
+  `Content-Type: application/json` works too)
 - **Agents:** `POST /mcp` (Model Context Protocol — read-only telemetry tools)
 - **Ops:** `GET /stats` · `POST /admin/flush` · `/admin/compact` · `GET`/`POST /admin/promote` · `GET /health`
 - **Housekeeping (queued):** `POST /admin/housekeeping` → `202 {"job_id": …}`; poll `GET /admin/housekeeping/<id>`.
