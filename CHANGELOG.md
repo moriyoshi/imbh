@@ -27,6 +27,32 @@ release aborts if it is missing or duplicated.
   header is now what selects `POST /api/query`'s body shape and a request built without one cannot
   ask for the JSON form.
 
+### Changed
+
+- **`POST /v1/{logs,traces,metrics}` now answers the response the OTLP specification prescribes**,
+  instead of this server's own `{"accepted": …}` JSON. On success that is an
+  `Export<signal>ServiceResponse` — a **zero-byte body** for a full success, `partial_success`
+  carrying the count when records were rejected; on `4xx`/`5xx` it is a `google.rpc.Status`; and both
+  go out in the encoding the request declared (`application/x-protobuf` unless the request said
+  `application/json`). **Breaking for anything that parsed the old body.** The receipt counters moved
+  to response headers — `x-imbh-accepted`, `x-imbh-rejected`, `x-imbh-durable`, `x-imbh-queued` — so
+  `curl -i` keeps all four.
+
+  Why: a stock exporter parses that body. Against the old one,
+  `@opentelemetry/exporter-logs-otlp-proto` logged *"Export succeeded but could not deserialize
+  response - is the response specification compliant?"* on every batch (the export still counted as
+  successful, so no data was lost), and a rejected-record count had nowhere to go — the duplicate
+  signal OTLP/gRPC reports in `partial_success` was unreadable to every HTTP client. Footprint is
+  unchanged at 298 crates: prost and opentelemetry-proto were already in `imbh-server`'s default
+  graph through `imbh` → `imbh-otlp`; they are now named directly rather than only under the
+  `grpc`/`docker` features. OTLP/**JSON** ingest remains unimplemented (a JSON request is a `400`,
+  answered as a JSON `Status`).
+- **`imbh_server::Response` carries a `headers` field** (`Vec<(HeaderName, HeaderValue)>`) and a
+  `header()` accessor, which is how the ingest routes report their receipt counts. Breaking for code
+  that constructs `Response` as a struct literal.
+- **`imbh_test_support::http::HttpResponse` carries `headers`** and a `header()` accessor, so a wire
+  test can assert the `x-imbh-*` counters.
+
 ## [0.9.0] - 2026-08-24
 
 ### Added

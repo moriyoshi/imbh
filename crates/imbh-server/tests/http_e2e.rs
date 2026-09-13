@@ -66,12 +66,12 @@ fn http_wire_ingest_query_stats_and_errors() {
     )
     .expect("POST /v1/logs");
     assert_eq!(logs.status, 200);
-    assert_eq!(logs.content_type, "application/json");
-    assert!(
-        logs.text().contains("\"accepted\":1"),
-        "got {}",
-        logs.text()
-    );
+    // The OTLP response contract over the wire: the encoding the request declared, an empty
+    // `ExportLogsServiceResponse` for a full success, and the receipt in `x-imbh-*` headers.
+    assert_eq!(logs.content_type, "application/x-protobuf");
+    assert!(logs.body.is_empty(), "got {:?}", logs.body);
+    assert_eq!(logs.header("x-imbh-accepted"), Some("1"));
+    assert_eq!(logs.header("x-imbh-rejected"), Some("0"));
 
     let traces = http::post(
         &addr,
@@ -81,7 +81,7 @@ fn http_wire_ingest_query_stats_and_errors() {
     )
     .expect("POST /v1/traces");
     assert_eq!(traces.status, 200);
-    assert!(traces.text().contains("\"accepted\":1"));
+    assert_eq!(traces.header("x-imbh-accepted"), Some("1"));
 
     let metrics = http::post(
         &addr,
@@ -92,11 +92,7 @@ fn http_wire_ingest_query_stats_and_errors() {
     .expect("POST /v1/metrics");
     assert_eq!(metrics.status, 200);
     // cpu (gauge) + requests (sum) = 2 scalar points accepted.
-    assert!(
-        metrics.text().contains("\"accepted\":2"),
-        "got {}",
-        metrics.text()
-    );
+    assert_eq!(metrics.header("x-imbh-accepted"), Some("2"));
 
     // A List-typed column (histogram bucket_counts) must serialize to JSON over the wire.
     assert_eq!(
@@ -194,12 +190,12 @@ fn http_wire_ingest_query_stats_and_errors() {
     // Malformed protobuf → decode error → user error → 400.
     let bad_proto = http::post(&addr, "/v1/logs", "application/x-protobuf", &[0x08, 0x80])
         .expect("POST bad proto");
-    assert_eq!(
-        bad_proto.status,
-        400,
-        "malformed protobuf: {}",
-        bad_proto.text()
-    );
+    assert_eq!(bad_proto.status, 400, "malformed protobuf");
+    // An OTLP failure body is a `google.rpc.Status` in the request's encoding — not this server's
+    // `{"error": …}` JSON, which every other endpoint still answers with.
+    assert_eq!(bad_proto.content_type, "application/x-protobuf");
+    assert_eq!(bad_proto.body[0], 0x08, "field 1 (code) as a varint");
+    assert_eq!(bad_proto.body[1], 3, "google.rpc.Code::INVALID_ARGUMENT");
     // Bad SQL → query error → user error → 400.
     let bad_sql = http::post(
         &addr,
@@ -220,11 +216,7 @@ fn http_wire_ingest_query_stats_and_errors() {
     // An empty body is a well-formed empty request, not an error: accepted 0, still 200.
     let empty = http::post(&addr, "/v1/logs", "application/x-protobuf", b"").expect("POST empty");
     assert_eq!(empty.status, 200);
-    assert!(
-        empty.text().contains("\"accepted\":0"),
-        "got {}",
-        empty.text()
-    );
+    assert_eq!(empty.header("x-imbh-accepted"), Some("0"));
 }
 
 /// The scheduler wiring `imbhd`'s `main` builds — `IMBH_FLUSH` → [`imbh_server::flush_policy`] →
@@ -293,11 +285,15 @@ fn ingested_rows_are_sealed_without_an_admin_flush() {
 }
 
 /// A duplicate `(series, timestamp)` reaching a `Duplicates::Reject` database is reported on the
-/// wire in the ingest response's `rejected` count — the field that was dead before issue #27, and
-/// the signal the reporter never got while their producer republished 1136 unreadable points.
+/// wire — the signal that was dead before issue #27, and the one the reporter never got while their
+/// producer republished 1136 unreadable points. It now travels the way OTLP defines, in the response
+/// message's `partial_success`, so a stock exporter can actually read it (an `x-imbh-*` header
+/// carries the same count for anything that is not an OTLP client).
 #[test]
 fn http_ingest_reports_rejected_duplicate_points() {
     use imbh_test_support::otlp::otlp_sum;
+    use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceResponse;
+    use prost::Message;
 
     let addr = start_server_with(
         Db::in_memory()
@@ -309,20 +305,28 @@ fn http_ingest_reports_rejected_duplicate_points() {
 
     let first = http::post(&addr, "/v1/metrics", "application/x-protobuf", &body).expect("post");
     assert_eq!(first.status, 200);
-    assert!(first.text().contains("\"accepted\":1"), "{}", first.text());
-    assert!(first.text().contains("\"rejected\":0"), "{}", first.text());
+    assert_eq!(first.header("x-imbh-accepted"), Some("1"));
+    assert_eq!(first.header("x-imbh-rejected"), Some("0"));
+    assert!(
+        ExportMetricsServiceResponse::decode(first.body.as_slice())
+            .expect("an ExportMetricsServiceResponse body")
+            .partial_success
+            .is_none(),
+        "a full success leaves partial_success unset"
+    );
 
     let second = http::post(&addr, "/v1/metrics", "application/x-protobuf", &body).expect("post");
     assert_eq!(second.status, 200, "a duplicate is not a request error");
+    assert_eq!(second.header("x-imbh-accepted"), Some("0"));
+    assert_eq!(second.header("x-imbh-rejected"), Some("1"));
+    let partial = ExportMetricsServiceResponse::decode(second.body.as_slice())
+        .expect("an ExportMetricsServiceResponse body")
+        .partial_success
+        .expect("the rejection is reported in partial_success");
+    assert_eq!(partial.rejected_data_points, 1);
     assert!(
-        second.text().contains("\"accepted\":0"),
-        "{}",
-        second.text()
-    );
-    assert!(
-        second.text().contains("\"rejected\":1"),
-        "{}",
-        second.text()
+        !partial.error_message.is_empty(),
+        "a rejection explains itself"
     );
 }
 

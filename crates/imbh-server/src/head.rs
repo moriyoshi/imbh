@@ -187,11 +187,7 @@ fn respond_ipc<T>(
 ) -> Response {
     let encoded = result.and_then(|value| ipc::encode(&to_batch(&value)?));
     match encoded {
-        Ok(body) => Response {
-            status: 200,
-            content_type: ipc::CONTENT_TYPE.to_owned(),
-            body,
-        },
+        Ok(body) => Response::with_content_type(200, ipc::CONTENT_TYPE, body),
         Err(e) => error(&e),
     }
 }

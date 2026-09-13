@@ -17,7 +17,13 @@ was.
 Routes:
 
 - `POST /v1/logs` · `/v1/traces` · `/v1/metrics` — OTLP/HTTP protobuf ingest. `Content-Encoding:
-  gzip` is accepted, which the OpenTelemetry Collector's `otlphttp` exporter sends by default.
+  gzip` is accepted, which the OpenTelemetry Collector's `otlphttp` exporter sends by default. The
+  response is the one the OTLP specification defines, in the encoding the request declared: an
+  `Export<signal>ServiceResponse` — an **empty body** on a full success, `partial_success` carrying
+  the count when records were rejected — or a `google.rpc.Status` on `4xx`/`5xx`. The receipt counts
+  travel in `x-imbh-accepted` / `x-imbh-rejected` / `x-imbh-durable` / `x-imbh-queued` headers, so
+  `curl -i` still sees them while a stock exporter reads a body it can parse. (OTLP/**JSON** ingest
+  is not implemented — a JSON request is a `400`, answered as a JSON `Status`.)
 - `POST /api/query` — a SQL query → JSON rows. The body is **raw SQL** (`curl --data "SELECT …"`),
   unless the request says `Content-Type: application/json`, in which case it is a JSON document —
   `{"query": "SELECT …"}` (a bare JSON string is accepted too). Which shape is read is decided by

@@ -6,18 +6,31 @@
 use std::io::{Read, Write};
 use std::net::TcpStream;
 
-/// A parsed HTTP response: status code, the `Content-Type` header (lowercased name match), and body.
+/// A parsed HTTP response: status code, the `Content-Type` header (lowercased name match), every
+/// header as a `(lowercased name, value)` pair, and the body.
 #[derive(Debug, Clone)]
 pub struct HttpResponse {
     pub status: u16,
     pub content_type: String,
     pub body: Vec<u8>,
+    /// Every response header, names lowercased. Needed because `imbhd`'s OTLP ingest routes report
+    /// their receipt counters in `x-imbh-*` headers — the response *body* there is the OTLP
+    /// specification's, which has no field for them.
+    pub headers: Vec<(String, String)>,
 }
 
 impl HttpResponse {
     /// The body decoded as UTF-8 (panics if the body is not valid UTF-8 — fine for test JSON/text).
     pub fn text(&self) -> String {
         String::from_utf8(self.body.clone()).expect("response body is valid UTF-8")
+    }
+
+    /// One header's value, matched case-insensitively.
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(header, _)| header.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
     }
 }
 
@@ -83,9 +96,19 @@ fn parse(raw: &[u8]) -> HttpResponse {
         })
         .unwrap_or_default();
 
+    let headers = head
+        .split("\r\n")
+        .skip(1)
+        .filter_map(|line| {
+            line.split_once(':')
+                .map(|(name, value)| (name.trim().to_ascii_lowercase(), value.trim().to_owned()))
+        })
+        .collect();
+
     HttpResponse {
         status,
         content_type,
         body,
+        headers,
     }
 }

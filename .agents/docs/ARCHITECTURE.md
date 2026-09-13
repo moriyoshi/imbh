@@ -1332,6 +1332,22 @@ raw SQL, or a `{"query": "…"}` document when the request says `Content-Type: a
 `POST /mcp` (§10.16.1), `GET /stats`, admin `POST /admin/{flush,compact}`, `GET`/`POST
 /admin/promote` (§6.1), queued housekeeping at `/admin/housekeeping` (§10.16.2), and `GET /health`.
 
+**The ingest routes answer OTLP, not this server's own JSON** (`src/otlp.rs`). The specification
+fixes the response as tightly as the request: `HTTP 200` with a protobuf `Export<signal>ServiceResponse`
+whose `partial_success` is *unset* on a full success — so the body is zero bytes — and `4xx`/`5xx`
+with a protobuf `google.rpc.Status`, both under the `Content-Type` the request arrived with. This
+matters because a stock exporter parses that body: against the old `{"accepted": …}` JSON,
+`@opentelemetry/exporter-logs-otlp-proto` logged *"Export succeeded but could not deserialize
+response - is the response specification compliant?"* on every batch, and — the functional half — a
+rejected-record count had nowhere to go, so the duplicate signal §10.3 gives OTLP/gRPC through
+`partial_success` was unreadable to every HTTP client. The receipt's own counters live in
+`x-imbh-accepted` / `-rejected` / `-durable` / `-queued` response headers: a header is ignorable,
+which is the right property for a value no OTLP client looks for, and `curl -i` keeps the whole
+receipt. Costs nothing in footprint — prost and opentelemetry-proto are already in `imbh-server`'s
+default graph through `imbh` → `imbh-otlp` (298 crates, unchanged). Known gap: OTLP/**JSON** ingest
+is still unimplemented (the decoder is protobuf-only), which the spec puts at SHOULD; a JSON request
+is a `400` carrying a JSON `Status`, so at least the encoding mirror holds.
+
 **Why a framework here does not cost the footprint claim.** The §11 crate budget is written against
 the *library* graph, and `scripts/footprint-gate.sh` measures exactly that (`cargo tree -p imbh`).
 The dependency direction is `imbh ← imbh-server`, so nothing this crate links is in that number: the

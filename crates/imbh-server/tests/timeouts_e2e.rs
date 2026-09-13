@@ -226,7 +226,8 @@ fn a_slow_but_progressing_body_is_not_cut_off() {
         "a slow-but-progressing upload was cut off: {reply:?}"
     );
     assert!(
-        reply.contains("\"accepted\":1"),
+        // The accepted count is a header: an OTLP success body is the specification's empty message.
+        reply.contains("x-imbh-accepted: 1"),
         "the ingest did not complete: {reply:?}"
     );
     assert_eq!(logs_in(&server.db), 1, "the slow upload's row is missing");

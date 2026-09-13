@@ -97,9 +97,9 @@ impl MetricsService for OtlpGrpc {
         // compliant client is entitled to log.
         let partial_success = (receipt.rejected > 0).then(|| ExportMetricsPartialSuccess {
             rejected_data_points: receipt.rejected as i64,
-            error_message:
-                "duplicate (series, timestamp) rejected by the database's duplicate policy"
-                    .to_owned(),
+            // One wording, both transports: `crate::otlp` builds the same `partial_success` for
+            // OTLP/HTTP, and a rejection should not read differently depending on the port.
+            error_message: crate::otlp::REJECTED_MESSAGE.to_owned(),
         });
         Ok(Response::new(ExportMetricsServiceResponse {
             partial_success,
