@@ -76,27 +76,23 @@ git history); this file tracks only what is still open.
       the catalog's fold or bound them to the eval window. `exemplars()` likewise takes only a metric
       name and is filtered by window client-side.
 
-- [ ] **v0.9.0 is prepared but not cut.** The workspace is bumped to 0.9.0 and the prep is merged to
-      `main` (PR #52), but the release section has been **re-cut and re-dated 2026-09-14**: five more
-      PRs landed on top of the August prep (#53–#58), so the `[Unreleased]` entries they wrote were
-      folded into `[0.9.0]` rather than left for a 0.10.0 — see JOURNAL "Preparing v0.9.0" and
-      "Re-cutting v0.9.0". `README.md` / `docs/DOCKER_LOG_DRIVER.md` version strings and the notices
-      are still the August ones and still correct, because the version itself never moved. **Not
-      tagged and not published**: `v0.9.0` exists nowhere on the remote and crates.io still tops out
-      at 0.8.0. That is the user's call.
+- [x] **v0.9.0 is cut and published — but its Release carries no archives.** *(Closed 2026-09-15.)*
+      Tagged `v0.9.0` at `f483785` and published: all 12 crates are on crates.io at 0.9.0, and
+      `ghcr.io/moriyoshi/imbh:0.9.0` / `0.9` / `latest` plus the log-driver plugin tags are on GHCR.
 
-      **A minor bump the signatures require.** Four breaking changes, all in the `[0.9.0]`
-      `### Changed` entries: `imbh-head`'s `dto::Series` gained a public `query_index` field and
-      became `#[non_exhaustive]`, `imbh-lgtm`'s `execute_traceql` gained an `S: Sync` bound,
-      `POST /v1/{logs,traces,metrics}` now answers the response the OTLP spec prescribes instead of
-      this server's own `{"accepted": …}` JSON, and `imbh_server::Response` gained a `headers` field.
+      **The GitHub Release was created and published by hand shortly before the tag was pushed**, so
+      when release run 34788914182 finished building all five targets the `publish` job had nowhere
+      to upload: an immutable release accepts no assets after publication, and the job's preflight
+      refused rather than let anyone burn the tag name by deleting it. The archives were recovered
+      from the run's workflow artifacts and published under the companion tag
+      [`dist-v0.9.0`](https://github.com/moriyoshi/imbh/releases/tag/dist-v0.9.0) on the same commit;
+      the binaries in them are byte-identical to those in the published image. `README.md`,
+      `CHANGELOG.md` and the v0.9.0 Release notes all point there. See the JOURNAL entry "v0.9.0
+      shipped without its archives" for the mechanism and the rule it implies.
 
-      **No new crates and no dependency change**, so the publish order is exactly v0.8.0's and the
-      footprint is unmoved — re-measured 2026-09-14 on the re-cut tree: 275 crates for the facade
-      (the gated axis, unchanged), `imbh-server` 298 default / 304 with `grpc`. The `imbhd` 33.5 MiB
-      binary figure is the August measurement and was not re-taken.
-
-      *(v0.8.0 — the entry this replaces — was tagged and released 2026-08-09.)*
+      *(The minor-bump rationale and the 2026-09-14 footprint re-measurement this item used to carry
+      are in the `[0.9.0]` CHANGELOG section and the JOURNAL "Re-cutting v0.9.0" entry. The `imbhd`
+      33.5 MiB binary figure quoted there is still the August measurement.)*
 
 - [x] **Measure the promoted-column cost before setting any auto-promotion budget.** *(Closed
       2026-08-08 — `examples/bench --bin promote-cost`. The gate passes, and it moved the budget from
