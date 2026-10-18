@@ -7546,3 +7546,89 @@ the `[0.9.0]` OTLP entry states. The `imbhd` binary size was not re-measured, so
 in TODO.md remains the August one and is labelled as such.
 
 Not committed, not tagged, not published.
+
+## v0.9.0 shipped without its archives, and what got them back (2026-09-15)
+
+The `v0.9.0` GitHub Release page has no assets, and it never will. Release run
+[34788914182](https://github.com/moriyoshi/imbh/actions/runs/34788914182) built and smoke-tested all
+five targets, then `publish` failed in five seconds at its preflight. The archives were recovered
+and published under the companion tag `dist-v0.9.0`.
+
+### What actually happened
+
+The Release was created **and published** by hand, ahead of the tag push, to stop CD creating one by
+accident. Under GitHub's immutable releases that is the one irreversible move available: publishing
+freezes the asset set at the moment of publication. By the time the five build legs finished there
+was a published, frozen, empty Release sitting on the tag, and `release.yml`'s `published)` branch
+refused rather than attempt an upload.
+
+The refusal was correct on every count, and worth recording precisely because each half of it is
+counter-intuitive:
+
+* `gh api repos/moriyoshi/imbh/releases/tags/v0.9.0` reports `"immutable": true`. An upload returns
+  HTTP 422 `Cannot upload assets to an immutable release`. GitHub's wording is "Once you publish a
+  release as immutable, its assets can't be added, modified, or deleted" — *added* included, so this
+  is not a case of replacing a bad asset, it is a closed set.
+* Turning the repository setting off does **not** unfreeze a release that was published while it was
+  on. The flag is stamped on the release, not read from the setting.
+* Deleting the release to retry burns the name: "you cannot reuse the same tag name", and the
+  reservation survives repository deletion. Both the workflow error text and `README.md` already said
+  so in capitals; they were right.
+
+### The gap the draft-first order does not cover
+
+`release.yml` has published into a draft since the 0.3.0 incident, and that order is what protects
+the pipeline from itself. It cannot protect against a Release that is already frozen *before the run
+starts*. 0.3.0 and 0.9.0 are the same failure reached from opposite directions — CD publishing too
+early, and a human publishing too early — and only the first one is a pipeline bug.
+
+**The rule that generalises: never create a *published* Release for a version tag ahead of CD. If
+one has to exist early, leave it a draft.** `release.yml:119` already handles that case explicitly —
+it reuses an existing draft, fills it, and publishes it. A draft created early costs nothing; a
+published one spends the version number.
+
+### Why recovery was possible at all, and why 0.3.0 could not be
+
+Only the *Release* was lost, not the binaries. Workflow artifacts have a 90-day retention, and the
+run's `dist-*` artifacts were still live (expiring 2026-12-12). 0.3.0 was never recoverable because
+by the time anyone looked its artifacts were long gone. That makes retention the real clock on this
+class of incident: the window to rescue a frozen release is 90 days from the run, not from the
+discovery.
+
+The archives were pulled with `gh run download`, `SHA256SUMS` was rebuilt with the same
+`cat ./*.sha256 | sort -k2` the `publish` job uses so the asset set is identical in shape to every
+prior release, and the whole set went into a **draft** that was verified before publishing — the new
+release is immutable too, so it also got exactly one attempt.
+
+### Choosing the tag name
+
+`dist-v0.9.0`, not `v0.9.0-dist`, and the prefix is load-bearing three times over:
+
+* `release.yml` triggers on `push: tags: ['v*']`. A `v`-prefixed companion tag would have fired a
+  second full release run at publish time — five fat-LTO build legs, plus `image` and `plugin`
+  jobs pushing `0.9.0-dist` tags to GHCR as pollution.
+* The `Version tags` ruleset scopes to `refs/tags/v*` and requires signatures and blocks deletion.
+  Outside it, the tag stayed deletable right up until the release was published, which is what made
+  the draft genuinely re-runnable.
+* `v0.9.0-dist` is a semver *pre-release of 0.9.0* — it sorts as older than the release it carries
+  the binaries for.
+
+### Verified
+
+`sha256sum -c SHA256SUMS` passes 5/5; each archive carries `imbhd`, `imbh-tui`, `LICENSE` and
+`THIRD-PARTY-NOTICES.txt`. The recovered `imbhd`, `imbh-tui` and notices are **byte-identical** to
+the ones extracted from the published `ghcr.io/moriyoshi/imbh:0.9.0` (arm64) — so the archives are
+provably the shipped artifacts, not a rebuild. The linux-gnu binaries pass the build job's own
+assertions (`nothing to serve`, the `imbh-tui` usage line) and report a glibc floor of 2.34, under
+the 2.36 limit. End to end from the public URL: `curl` + `sha256sum --ignore-missing -c` + `tar xzf`
++ run, clean. `v0.9.0` is still the repository's latest release, and the tag push triggered no
+workflow.
+
+### Left alone
+
+`release.yml` is unchanged. It already does the right thing and already fails fast with an
+explicit message; the failure was outside the pipeline. The run's separate
+`THIRD-PARTY-NOTICES.txt differs from the checked-in copy` warning is untouched and still open — the
+archives carry the run-generated copy, so it does not affect what was published here.
+
+Docs not committed.

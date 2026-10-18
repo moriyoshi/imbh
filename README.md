@@ -184,7 +184,7 @@ the reference server `imbhd` and the terminal explorer `imbh-tui`.
 
 Every `vX.Y.Z` [GitHub release](https://github.com/moriyoshi/imbh/releases) carries a prebuilt
 archive per platform, containing both binaries plus `LICENSE` and `THIRD-PARTY-NOTICES.txt` (with
-one exception — see the note under the download recipe below about 0.3.0):
+two exceptions — see the notes under the download recipe below about 0.9.0 and 0.3.0):
 
 | Platform | Archive | `docker` log driver |
 |---|---|---|
@@ -208,6 +208,16 @@ sha256sum --ignore-missing -c SHA256SUMS
 tar xzf imbh-${VERSION}-${TARGET}.tar.gz
 ./imbh-${VERSION}-${TARGET}/imbhd ./imbh-data      # then point an OTLP exporter at :4318
 ```
+
+**0.9.0's archives are under a different tag.** Its GitHub Release was published by hand before the
+CD run could attach the assets, and an [immutable
+release](https://docs.github.com/en/code-security/concepts/supply-chain-security/immutable-releases)
+accepts none after it is published — so they were recovered from the release run's artifacts and
+published at [`dist-v0.9.0`](https://github.com/moriyoshi/imbh/releases/tag/dist-v0.9.0), a
+companion tag on the same commit. The release itself is otherwise complete. To use the recipe above
+for 0.9.0, set `BASE=https://github.com/moriyoshi/imbh/releases/download/dist-v0.9.0`: the archive
+names and `SHA256SUMS` are unchanged, and the binaries are byte-identical to the ones in the 0.9.0
+[container image](#container-image).
 
 **0.3.0 has no archives.** Its release run created the GitHub Release before uploading the assets;
 under [immutable releases](https://docs.github.com/en/code-security/concepts/supply-chain-security/immutable-releases)
@@ -539,6 +549,15 @@ This is why step 2 above publishes last rather than first, and why the workflow 
 build when the tag's Release is already published. To recover from a failed CD run, re-run the failed
 jobs instead — the draft is reused and `--clobber` replaces a partial asset set. v0.3.0 lost its
 Release to exactly this mistake, before the draft-first order was in place.
+
+⚠️ **Never create the Release for a version tag ahead of CD either — or if you must, leave it a
+draft.** The draft-first order protects the pipeline from itself; it cannot help when the Release
+is already frozen before the run starts. v0.9.0 was published by hand shortly before its tag was
+pushed, so every archive the run built had nowhere to go and `publish` failed at the preflight.
+The workflow *fills and publishes an existing draft*, so a draft created early costs nothing. Those
+archives were recovered from the run's artifacts and published under the companion tag
+[`dist-v0.9.0`](https://github.com/moriyoshi/imbh/releases/tag/dist-v0.9.0), which only worked
+because it happened inside the 90-day artifact retention window.
 
 ## FAQ
 

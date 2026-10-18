@@ -15,6 +15,16 @@ release aborts if it is missing or duplicated.
 
 ## [0.9.0] - 2026-09-14
 
+> **The archives are at [`dist-v0.9.0`](https://github.com/moriyoshi/imbh/releases/tag/dist-v0.9.0),
+> not on the `v0.9.0` Release.** The Release was created and published by hand shortly before the tag
+> was pushed, so when CD finished building it had nowhere to upload: an immutable release accepts no
+> assets once published, and deleting it to retry would have reserved the `v0.9.0` name permanently.
+> The `publish` job refused for exactly that reason. Everything else shipped normally — all 12 crates
+> are on crates.io at 0.9.0, and the container image and log-driver plugin are published. The
+> archives were recovered from the release run's workflow artifacts and published under a companion
+> tag on the same commit; the binaries in them are byte-identical to those in the 0.9.0 image. See
+> the note under the download recipe in `README.md`.
+
 ### Added
 
 - **`Db::traces().get_many(ids, not_before)`** fetches every span of a list of trace ids in one
