@@ -581,8 +581,7 @@ impl LogQuery {
             conds.push(format!("span_id = X'{}'", id.to_hex()));
         }
         for (k, v) in &self.attr_eq {
-            let field = p.attr_field(k);
-            conds.push(format!("{field} = {}", p.str(v)));
+            conds.push(p.attr_eq_sql(k, v));
         }
         for k in &self.attr_exists {
             let field = p.attr_field(k);
@@ -633,6 +632,22 @@ impl LogQuery {
             conds.push(format!("regexp_like({field}, {})", p.str(pat)));
         }
         for predicate in &self.string_predicates {
+            // A non-empty `=` on a service/attribute field is a plain equality: `coalesce(f, '') = v`
+            // and `f = v` reject exactly the same rows when `v != ''` (they differ only in FALSE vs
+            // NULL for a missing key, which a `WHERE` conjunct cannot tell apart), so it compiles to
+            // the cast-free [`SqlParams::attr_eq_sql`] predicate. `= ""` keeps the `coalesce` form:
+            // it must also match a missing key.
+            if predicate.op == StringPredicate::Eq && !predicate.value.is_empty() {
+                let key = match &predicate.field {
+                    LogStringField::Service => Some("service"),
+                    LogStringField::Attribute(key) => Some(key.as_str()),
+                    LogStringField::Body | LogStringField::ResourceAttribute(_) => None,
+                };
+                if let Some(key) = key {
+                    conds.push(p.attr_eq_sql(key, &predicate.value));
+                    continue;
+                }
+            }
             let field = match &predicate.field {
                 LogStringField::Body => "body".to_owned(),
                 LogStringField::Service => "CAST(service AS VARCHAR)".to_owned(),

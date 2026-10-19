@@ -32,6 +32,11 @@ self_cell = "1.3.0"
 tokio = { workspace = true, features = ["rt", "macros"] }
 # OTLP fixture builders for the native-execution (`source`) end-to-end tests.
 imbh-test-support = { workspace = true }
+# Non-optional for tests only, so `tests/promql_duplicate_agreement.rs` can hold `imbh`'s typed
+# metrics dedup against the *real* `collapse_duplicate_samples` without the `source` feature. Free in
+# the dev graph: `imbh-test-support` above already depends on `imbh`. (It cannot live in `imbh`: this
+# crate depends on `imbh`, so the reverse would be a dev-dependency cycle.)
+imbh = { workspace = true }
 
 # These examples benchmark the raw-Arrow (Level 2) read paths against the `imbh` facade DTOs, so they
 # need the `source`-gated surface. Declared explicitly so a focused `cargo clippy/test -p imbh-lgtm

@@ -529,7 +529,15 @@ enum LabelOp {
 /// resolves `service` / `service.name` to the built-in `service` column, a promoted attribute key to
 /// its dictionary column (pushdown), and everything else to a `json_get_str` scan — all identical in
 /// result (ARCHITECTURE.md §6.1).
+///
+/// A non-empty `=` compiles to the cast-free [`SqlParams::attr_eq_sql`] predicate instead: when
+/// `value != ""`, `coalesce(f, '') = v` and `f = v` reject exactly the same rows (they differ only in
+/// FALSE vs NULL for a missing label, which a `WHERE` conjunct — every `label_cond` site — cannot
+/// tell apart). `= ""` keeps the `coalesce` form, since it must also match a missing label.
 fn label_cond(key: &str, op: LabelOp, value: &str, p: &mut SqlParams) -> String {
+    if op == LabelOp::Eq && !value.is_empty() {
+        return p.attr_eq_sql(key, value);
+    }
     let field = p.attr_field(key);
     let actual = format!("coalesce({field}, '')");
     let v = p.str(value);
@@ -1734,6 +1742,44 @@ mod native_point_query_tests {
     use super::*;
     use datafusion::scalar::ScalarValue;
 
+    /// A PromQL-style `=` label filter on a promoted key compares in dictionary space (no `CAST`),
+    /// for both the raw-point and the aggregated query; `=""` (which must also match a missing label)
+    /// and the other operators keep the `coalesce(attr_field)` form.
+    #[test]
+    fn promoted_label_equality_compiles_without_cast() {
+        let promote = vec!["env".to_owned()];
+        let mut params = SqlParams::with_promote(&promote);
+        let sql = MetricPointsQuery::sum("m")
+            .filter("env", "prod")
+            .filter("service", "cart")
+            .to_sql(&mut params);
+        let where_clause = sql.split(" WHERE ").nth(1).expect("has a WHERE");
+        assert!(!where_clause.contains("CAST(\"env\""), "{sql}");
+        assert!(where_clause.contains("\"env\" = $"), "{sql}");
+        assert!(where_clause.contains("service = $"), "{sql}");
+
+        // The aggregated range query: its `AS g{i}` group-by projection keeps `attr_field` (and its
+        // cast), but the filter does not.
+        let mut params = SqlParams::with_promote(&promote);
+        let sql = MetricQuery::gauge("m")
+            .filter("env", "prod")
+            .range_sql(&mut params, true);
+        assert!(!sql.contains("CAST(\"env\""), "{sql}");
+        assert!(sql.contains("\"env\" = $"), "{sql}");
+        let mut params = SqlParams::with_promote(&promote);
+        let conds = HistogramQuery::new("m")
+            .filter("env", "prod")
+            .conds(&mut params)
+            .join(" AND ");
+        assert!(!conds.contains("CAST"), "{conds}");
+
+        let mut params = SqlParams::with_promote(&promote);
+        let empty = label_cond("env", LabelOp::Eq, "", &mut params);
+        assert!(empty.starts_with("coalesce("), "{empty}");
+        let ne = label_cond("env", LabelOp::Ne, "prod", &mut params);
+        assert!(ne.starts_with("coalesce("), "{ne}");
+    }
+
     #[test]
     fn raw_point_query_binds_metric_label_and_regex_inputs() {
         let metric = "metric' OR TRUE --";
@@ -1772,7 +1818,6 @@ mod duplicate_collapse_tests {
     use super::*;
     use crate::Db;
     use imbh_core::Duplicates;
-    use std::cmp::Ordering;
     use std::sync::Arc;
 
     /// One gauge data point to ingest: `(time_unix_nano, value, datapoint attributes)`.
@@ -2096,84 +2141,7 @@ mod duplicate_collapse_tests {
         assert_eq!(v.0[0].sample.value, 9.0);
     }
 
-    // --- Agreement with the PromQL collapse (`imbh-lgtm`'s `collapse_duplicate_samples`) ---------
-    //
-    // `imbh-lgtm` depends on `imbh`, so importing it here would be a dev-dependency cycle. The two
-    // functions below are a verbatim mirror of `crates/imbh-lgtm/src/model/promql.rs`
-    // (`duplicate_value_cmp` / `collapse_duplicate_samples`); the test asserts the SQL path agrees
-    // with them over the same multiset. Keep them in sync if that file changes.
-
-    fn duplicate_value_cmp(left: f64, right: f64) -> Ordering {
-        left.is_nan()
-            .cmp(&right.is_nan())
-            .reverse()
-            .then_with(|| left.total_cmp(&right))
-    }
-
-    fn collapse_duplicate_samples(samples: &mut Vec<(i64, f64)>) {
-        samples.sort_unstable_by(|left, right| {
-            left.0
-                .cmp(&right.0)
-                .then_with(|| duplicate_value_cmp(left.1, right.1).reverse())
-        });
-        samples.dedup_by(|later, kept| later.0 == kept.0);
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn range_dedup_agrees_with_the_promql_collapse() {
-        // One series (one resource, one service, no datapoint attributes) with duplicated instants
-        // covering every branch of `duplicate_value_cmp`: plain ties, a strict ordering, NaN vs a
-        // real number, NaN vs +INFINITY, and negative values.
-        let raw: &[(u64, f64)] = &[
-            (10, 7.0),
-            (10, 7.0),
-            (20, 2.0),
-            (20, 9.0),
-            (20, -1.0),
-            (30, f64::NAN),
-            (30, 4.0),
-            (40, f64::NAN),
-            (40, f64::INFINITY),
-            (50, f64::NAN),
-            (50, f64::NAN),
-            (60, -5.0),
-            (60, -2.0),
-            (70, 1.0),
-        ];
-        let points: Vec<Point<'_>> = raw.iter().map(|(t, v)| (*t, *v, &[][..])).collect();
-
-        let db = db_with(Duplicates::LastWins);
-        db.ingest_otlp_metrics(&otlp_gauge("cpu", &[Block::new(&points)]))
-            .await
-            .unwrap();
-
-        // One bucket per nanosecond → the SQL bucket key is the raw timestamp, so `max(value)` per
-        // bucket is exactly "the surviving sample at that instant".
-        let m = db
-            .metrics()
-            .range(
-                MetricQuery::gauge("cpu")
-                    .aggregation(Aggregation::Sum)
-                    .step(Duration::from_nanos(1)),
-            )
-            .await
-            .unwrap();
-        assert_eq!(m.0.len(), 1);
-        let actual: Vec<(i64, f64)> = m.0[0].samples.iter().map(|s| (s.time.0, s.value)).collect();
-
-        let mut expected: Vec<(i64, f64)> = raw.iter().map(|(t, v)| (*t as i64, *v)).collect();
-        collapse_duplicate_samples(&mut expected);
-
-        assert_eq!(actual.len(), expected.len(), "{actual:?} vs {expected:?}");
-        for (a, e) in actual.iter().zip(expected.iter()) {
-            assert_eq!(a.0, e.0, "timestamps differ: {actual:?} vs {expected:?}");
-            assert!(
-                a.1.total_cmp(&e.1) == Ordering::Equal,
-                "value at {}: SQL {} vs PromQL {}",
-                a.0,
-                a.1,
-                e.1
-            );
-        }
-    }
+    // The agreement check against PromQL's `collapse_duplicate_samples` lives in
+    // `crates/imbh-lgtm/tests/promql_duplicate_agreement.rs`, where the real function is in scope
+    // (`imbh-lgtm` depends on `imbh`, so it cannot be called from here).
 }
