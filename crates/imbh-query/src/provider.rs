@@ -20,6 +20,14 @@
 //! only ever prove a row group *cannot* match, so this never drops a row — and the `FilterExec` above
 //! the scan re-checks the predicate regardless. A segment without statistics for the column is always
 //! read.
+//!
+//! **Column projection.** The `projection` DataFusion hands `scan()` is pushed into each segment's
+//! Parquet reader as a `ProjectionMask` (resolved by column *name* against that file's own schema)
+//! and applied to the buffer snapshot by name, so a two-column traces query never decodes the wide
+//! `attributes`/`resource`/`events`/`links` JSON. Because every pushed predicate is `Inexact`, the
+//! `FilterExec` above the scan keeps its columns in that projection; nothing inside the scan needs
+//! any other column (blooms and statistics are footer metadata, the `RowSelection` comes from the
+//! `.tidx`, and a column mask never renumbers rows).
 
 use std::fmt;
 use std::path::PathBuf;
@@ -37,6 +45,7 @@ use datafusion::logical_expr::expr::InList;
 use datafusion::logical_expr::{
     BinaryExpr, Cast, Expr, Operator, TableProviderFilterPushDown, TableType,
 };
+use datafusion::parquet::arrow::ProjectionMask;
 use datafusion::parquet::arrow::arrow_reader::{
     ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder, RowSelection, RowSelector,
 };
@@ -120,7 +129,9 @@ pub struct ScanStats {
     /// Rows materialized from the buffer ∪ segments — after the Tantivy `RowSelection` pruned each
     /// segment — i.e. the rows the `matches`/`json_get_str` UDF filters actually evaluated.
     pub rows_scanned: u64,
-    /// Approximate in-memory bytes of those materialized rows.
+    /// Approximate in-memory bytes of those materialized rows — of the **projected** columns only,
+    /// since the scan's projection is pushed into the Parquet reader (an unprojected column is never
+    /// decoded, so it is not counted). A `count(*)` therefore reports ~0 bytes.
     pub bytes_scanned: u64,
     /// Whether a segment's Tantivy `.tidx` was searched (a `matches`/attr-equality pushdown fired).
     pub index_searched: bool,
@@ -165,6 +176,12 @@ pub struct SegmentTableProvider {
     bloom_columns: Vec<String>,
     time_column: Option<String>,
     stats: Arc<ScanAccum>,
+    /// Whether `scan()`'s `projection` is pushed into the Parquet reader as a [`ProjectionMask`]
+    /// (and applied to the buffer snapshot by name), so unprojected columns are never decoded.
+    /// Always `true` in production; the `false` path is the pre-pushdown behavior (full-schema
+    /// batches, projected by the enclosing `StreamingTableExec`) kept so a test can run the same
+    /// corpus both ways and assert identical results.
+    projection_pushdown: bool,
 }
 
 impl SegmentTableProvider {
@@ -185,7 +202,15 @@ impl SegmentTableProvider {
             text_column,
             bloom_columns,
             stats,
+            projection_pushdown: true,
         }
+    }
+
+    /// Turn the Parquet column-projection pushdown on (the default) or off. Crate-internal: the off
+    /// path exists only so the equivalence tests can compare both read paths over one corpus.
+    pub(crate) fn with_projection_pushdown(mut self, on: bool) -> Self {
+        self.projection_pushdown = on;
+        self
     }
 
     /// Whether this table's segments carry a `.tidx` sidecar with the `attrs` JSON field, so an
@@ -300,15 +325,37 @@ impl TableProvider for SegmentTableProvider {
 
         let has_constraint = !terms.is_empty() || !not_terms.is_empty() || !attr_probes.is_empty();
 
+        // Column projection pushdown. `projection` is exactly the set of columns every operator above
+        // this scan consumes: DataFusion's `optimize_projections` derives it from the parents'
+        // requirements, and because every predicate here is claimed `Inexact` (never `Exact`), the
+        // `Filter` it was pushed from stays above the scan and its columns are part of that
+        // requirement. (This was already load-bearing before the pushdown: `StreamingTableExec`
+        // applied the very same `projection` to the full-schema batches, so a `FilterExec` above it
+        // never saw any other column.) Nothing *inside* the scan needs an unprojected column either —
+        // the bloom probes and row-group range probes read footer metadata, and the Tantivy
+        // `RowSelection` reads the `.tidx` sidecar — so the projection can be pushed as-is.
+        //
+        // The partition then emits batches already shaped to the projected schema: segments through a
+        // Parquet `ProjectionMask` resolved **by column name** against each file's own schema (so an
+        // older segment lacking a promoted column, or storing columns in another order, still maps
+        // correctly — `coerce` null-fills/casts the rest), and the buffer snapshot through the same
+        // by-name `coerce`. The exec gets `projection = None` over that projected schema, so its
+        // output schema is identical to what it produced before.
+        let (out_schema, exec_projection, mask_columns) = match projection {
+            Some(p) if self.projection_pushdown => (Arc::new(self.schema.project(p)?), None, true),
+            _ => (self.schema.clone(), projection, false),
+        };
+
         // Lazy scan (ARCHITECTURE.md §10.12, prescription I-4a): rather than reading every segment
         // into a `MemTable` here (during physical planning, before the first batch is polled), hand a
         // `PartitionStream` to `StreamingTableExec`, which reads **one Parquet batch per `poll_next`**.
-        // The exec applies `projection`, `limit` (via a `LimitStream` that stops polling early — so a
-        // `LIMIT` never reads past segments), and cooperative yielding itself; our partition yields
-        // full-schema batches. Pushdown is `Inexact`, so a `FilterExec` above re-checks predicates —
-        // laziness never changes results.
+        // The exec applies `limit` (via a `LimitStream` that stops polling early — so a `LIMIT` never
+        // reads past segments) and cooperative yielding itself (plus `projection` when the pushdown
+        // is off). Pushdown is `Inexact`, so a `FilterExec` above re-checks predicates — laziness
+        // never changes results.
         let partition = Arc::new(SegmentPartitionStream {
-            schema: self.schema.clone(),
+            schema: out_schema.clone(),
+            mask_columns,
             buffer: self.buffer.clone(),
             segments: self.segments.clone(),
             terms,
@@ -321,9 +368,9 @@ impl TableProvider for SegmentTableProvider {
             stats: self.stats.clone(),
         });
         let exec = StreamingTableExec::try_new(
-            self.schema.clone(),
+            out_schema,
             vec![partition],
-            projection,
+            exec_projection,
             None::<LexOrdering>,
             false, // finite/bounded source
             limit,
@@ -338,7 +385,12 @@ impl TableProvider for SegmentTableProvider {
 /// self-rooting — it does not borrow the `Db` or the `SessionContext` (prescription I-4).
 #[derive(Debug)]
 struct SegmentPartitionStream {
+    /// The schema of every emitted batch: the table schema, or its projection when the projection
+    /// pushdown is in effect.
     schema: SchemaRef,
+    /// Read only `schema`'s columns from each segment (a by-name [`ProjectionMask`]) instead of
+    /// every column in the file.
+    mask_columns: bool,
     buffer: RecordBatch,
     segments: Vec<SegmentInput>,
     terms: Vec<String>,
@@ -359,6 +411,7 @@ impl PartitionStream for SegmentPartitionStream {
     fn execute(&self, _ctx: Arc<TaskContext>) -> SendableRecordBatchStream {
         let iter = SegmentBatchIter {
             schema: self.schema.clone(),
+            mask_columns: self.mask_columns,
             stats: self.stats.clone(),
             // Emit the (single) buffer snapshot batch first, only if it has rows.
             buffer: (self.buffer.num_rows() > 0).then(|| self.buffer.clone()),
@@ -383,11 +436,14 @@ impl PartitionStream for SegmentPartitionStream {
 
 /// The lazy per-batch scan state machine (prescription I-4a). Yields the buffer batch first, then
 /// walks the segments, opening each one's `ParquetRecordBatchReader` only when reached and pulling a
-/// single batch per `next()`. Emits **full-schema** batches (projection is applied by the enclosing
+/// single batch per `next()`. Emits batches of `schema` — the projected schema when the projection
+/// pushdown is in effect, else the full table schema (then projected by the enclosing
 /// [`StreamingTableExec`]). Read-side [`ScanAccum`] counters are bumped here, on the poll path, so
 /// they are final only once the iterator is fully consumed.
 struct SegmentBatchIter {
     schema: SchemaRef,
+    /// Push `schema`'s column names into each segment's Parquet reader as a [`ProjectionMask`].
+    mask_columns: bool,
     stats: Arc<ScanAccum>,
     /// The buffer snapshot batch, emitted first; `take()`n on the first `next()`.
     buffer: Option<RecordBatch>,
@@ -404,9 +460,11 @@ struct SegmentBatchIter {
 }
 
 impl SegmentBatchIter {
-    /// Coerce a batch to the canonical schema and account its rows/bytes (buffer and segment batches
+    /// Coerce a batch to the output schema and account its rows/bytes (buffer and segment batches
     /// alike). Buffer and `parquet`-crate segment batches both arrive `Utf8` (not `Utf8View`), so
-    /// `coerce` is usually an identity (see [`crate::coerce`]).
+    /// `coerce` is usually an identity (see [`crate::coerce`]). `coerce` matches columns **by name**,
+    /// so under the projection pushdown it is also what projects the full-schema buffer snapshot
+    /// down to the projected schema — the exact shape the masked segment batches are coerced to.
     fn account(&self, b: RecordBatch) -> DFResult<RecordBatch> {
         let b = coerce(b, &self.schema).map_err(df_err)?;
         self.stats
@@ -509,11 +567,13 @@ impl Iterator for SegmentBatchIter {
                     Ok(s) => s,
                     Err(e) => return Some(Err(e)),
                 };
+            let columns = self.mask_columns.then_some(&self.schema);
             match open_segment(
                 &seg.parquet_path,
                 selection,
                 &self.bloom_probes,
                 &self.range_probes,
+                columns,
             ) {
                 Ok(None) => {
                     self.stats.segments_pruned.fetch_add(1, Relaxed);
@@ -1129,8 +1189,9 @@ fn row_selection_from_sorted(sorted_hits: &[u64], total: u64) -> RowSelection {
     RowSelection::from(selectors)
 }
 
-/// Open a Parquet segment (all columns) for **lazy** reading, optionally restricted to a
-/// `RowSelection`. Returns the `parquet`-crate reader (an `Iterator` yielding one batch per `next()`,
+/// Open a Parquet segment for **lazy** reading, optionally restricted to a `RowSelection` and — when
+/// `columns` is given — to the root columns named by that schema (a [`ProjectionMask`]; all columns
+/// otherwise). Returns the `parquet`-crate reader (an `Iterator` yielding one batch per `next()`,
 /// which [`SegmentBatchIter`] pulls one-at-a-time), or `None` when a bloom filter proves the segment
 /// can be skipped. Reads via the `parquet` crate directly (not DataFusion), which yields `Utf8` — not
 /// `Utf8View` — string columns matching the canonical schema.
@@ -1148,11 +1209,17 @@ fn row_selection_from_sorted(sorted_hits: &[u64], total: u64) -> RowSelection {
 /// are ruled out the read is narrowed to the survivors; if a Tantivy `selection` is also in play the
 /// narrowing is expressed as a whole-file `RowSelection` and intersected with it, because
 /// `with_row_groups` would silently re-base the selection's row ordinals onto the kept groups.
+///
+/// The column mask is orthogonal to all of that: bloom filters and statistics come from the footer,
+/// and a `RowSelection` / row-group subset addresses *rows*, which a column mask does not renumber.
+/// It is resolved by **name** against this file's own root columns ([`segment_projection_mask`]), so
+/// it is correct for a segment written under an older or differently-ordered schema.
 fn open_segment(
     path: &PathBuf,
     selection: Option<RowSelection>,
     bloom_probes: &[(String, Vec<Vec<u8>>)],
     range_probes: &[ColumnRangeProbe],
+    columns: Option<&SchemaRef>,
 ) -> DFResult<Option<ParquetRecordBatchReader>> {
     let file = std::fs::File::open(path)
         .map_err(|e| DataFusionError::Execution(format!("open segment {}: {e}", path.display())))?;
@@ -1176,10 +1243,70 @@ fn open_segment(
             }
         },
     }
+    if let Some(columns) = columns {
+        let mask = segment_projection_mask(&builder, columns);
+        builder = builder.with_projection(mask);
+    }
     let reader = builder
         .build()
         .map_err(|e| DataFusionError::Execution(format!("parquet build: {e}")))?;
+    #[cfg(test)]
+    projected_reads::record(&reader);
     Ok(Some(reader))
+}
+
+/// The [`ProjectionMask`] selecting, from this segment file, every **root** column whose name is a
+/// field of `columns` (the scan's projected schema). Matching is by name against the file's own
+/// Parquet schema — never by index into the table schema — so a segment whose column order differs
+/// from the current schema, or that predates a promoted column, is still projected correctly. A
+/// projected column the file does not carry is simply not selected; [`crate::coerce`] then null-fills
+/// it (nullable) or reports it (non-nullable), exactly as for a full read. Root-level selection keeps
+/// nested columns (`List` histogram buckets) whole. An empty projection (`count(*)`) selects no
+/// column at all, and the reader still yields correctly-sized, zero-column batches.
+fn segment_projection_mask(
+    builder: &ParquetRecordBatchReaderBuilder<std::fs::File>,
+    columns: &SchemaRef,
+) -> ProjectionMask {
+    let roots = builder
+        .parquet_schema()
+        .root_schema()
+        .get_fields()
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| columns.fields().iter().any(|c| c.name() == f.name()))
+        .map(|(i, _)| i);
+    ProjectionMask::roots(builder.parquet_schema(), roots)
+}
+
+/// Test-only record of the columns each opened segment reader actually decodes (its projected Arrow
+/// schema), so a test can assert that a narrow query never reads the wide JSON columns. Thread-local:
+/// the tests run on a `current_thread` runtime, where every poll happens on the test's own thread, so
+/// concurrent tests cannot pollute each other's record.
+#[cfg(test)]
+pub(crate) mod projected_reads {
+    use std::cell::RefCell;
+
+    use datafusion::arrow::record_batch::RecordBatchReader;
+    use datafusion::parquet::arrow::arrow_reader::ParquetRecordBatchReader;
+
+    thread_local! {
+        static READS: RefCell<Vec<Vec<String>>> = const { RefCell::new(Vec::new()) };
+    }
+
+    pub(crate) fn record(reader: &ParquetRecordBatchReader) {
+        let names = reader
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect();
+        READS.with(|r| r.borrow_mut().push(names));
+    }
+
+    /// Drain the per-segment column lists recorded on this thread so far.
+    pub(crate) fn take() -> Vec<Vec<String>> {
+        READS.with(|r| std::mem::take(&mut *r.borrow_mut()))
+    }
 }
 
 /// `true` iff some probe `(column, values)` has its **whole candidate set** *proven absent* from the
@@ -1507,6 +1634,9 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod projection_tests;
 
 /// Bloom-filter segment pruning (ARCHITECTURE.md §8). Feature-independent: blooms live in the
 /// Parquet file, so this path compiles and runs with or without `search`.
@@ -2229,27 +2359,45 @@ mod range_tests {
             probe: RangeProbe { op, value },
         };
         let probes = vec![probe(RangeOp::GtEq, 200), probe(RangeOp::LtEq, 300)];
-        let reader = open_segment(&seg.parquet_path, Some(selection), &[], &probes)
+        // The same composition must hold under a column mask: a mask selects columns, never
+        // renumbers rows, so the selection ∩ row-group subset still lands on row 3.
+        let body_only: SchemaRef =
+            Arc::new(Schema::new(vec![Field::new("body", DataType::Utf8, false)]));
+        for columns in [None, Some(&body_only)] {
+            let reader = open_segment(
+                &seg.parquet_path,
+                Some(selection.clone()),
+                &[],
+                &probes,
+                columns,
+            )
             .unwrap()
             .expect("the segment holds matching rows");
-        let mut bodies: Vec<String> = Vec::new();
-        for batch in reader {
-            let batch = batch.unwrap();
-            let c = batch
-                .column(1)
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .unwrap()
-                .clone();
-            for i in 0..c.len() {
-                bodies.push(c.value(i).to_owned());
+            let mut bodies: Vec<String> = Vec::new();
+            for batch in reader {
+                let batch = batch.unwrap();
+                assert_eq!(
+                    batch.num_columns(),
+                    if columns.is_some() { 1 } else { 2 },
+                    "the mask decodes only the projected column"
+                );
+                let c = batch
+                    .column_by_name("body")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap()
+                    .clone();
+                for i in 0..c.len() {
+                    bodies.push(c.value(i).to_owned());
+                }
             }
+            assert_eq!(
+                bodies,
+                vec!["row-300"],
+                "the intersection of the selection {{1,3,4}} with the surviving group {{2,3}}"
+            );
         }
-        assert_eq!(
-            bodies,
-            vec!["row-300"],
-            "the intersection of the selection {{1,3,4}} with the surviving group {{2,3}}"
-        );
     }
 
     /// A segment carrying no statistics for the probed column must be read, never skipped —

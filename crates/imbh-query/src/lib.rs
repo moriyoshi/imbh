@@ -20,7 +20,7 @@ use datafusion::arrow::array::{
     ListArray, StringArray, UInt64Array,
 };
 use datafusion::arrow::datatypes::{DataType, SchemaRef};
-use datafusion::arrow::record_batch::RecordBatch;
+use datafusion::arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use datafusion::error::DataFusionError;
 use datafusion::execution::memory_pool::GreedyMemoryPool;
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
@@ -503,6 +503,19 @@ async fn plan_query(
     sql: &str,
     params: Vec<ScalarValue>,
 ) -> Result<(SessionContext, DataFrame, Arc<provider::ScanAccum>)> {
+    plan_query_with(tables, pool_bytes, sql, params, true).await
+}
+
+/// [`plan_query`] with the provider's Parquet column-projection pushdown switchable. Production
+/// always passes `true`; `false` (full-schema reads, projected above the scan) exists for the
+/// pushdown-on/off equivalence tests.
+async fn plan_query_with(
+    tables: Vec<TableInput>,
+    pool_bytes: usize,
+    sql: &str,
+    params: Vec<ScalarValue>,
+    projection_pushdown: bool,
+) -> Result<(SessionContext, DataFrame, Arc<provider::ScanAccum>)> {
     let ctx = session_context(pool_bytes)?;
     // One accumulator shared by every table's provider, snapshotted after execution (read-side
     // pruning stats → the typed API's `QueryStats`).
@@ -516,7 +529,8 @@ async fn plan_query(
             t.bloom_columns.iter().map(|c| (*c).to_owned()).collect(),
             t.time_column.map(str::to_owned),
             stats.clone(),
-        );
+        )
+        .with_projection_pushdown(projection_pushdown);
         ctx.register_table(t.name, Arc::new(provider))
             .map_err(|e| Error::query_ctx(format!("register table `{}`", t.name), e))?;
     }
@@ -576,7 +590,11 @@ pub(crate) fn coerce(batch: RecordBatch, schema: &SchemaRef) -> Result<RecordBat
         };
         columns.push(col);
     }
-    RecordBatch::try_new(schema.clone(), columns).map_err(|e| Error::coerce(None, e))
+    // The row count is carried explicitly so a zero-column target (an empty projection pushed into
+    // the scan for `count(*)`) still yields a batch of the source's length.
+    let options = RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
+    RecordBatch::try_new_with_options(schema.clone(), columns, &options)
+        .map_err(|e| Error::coerce(None, e))
 }
 
 #[cfg(test)]
