@@ -306,13 +306,29 @@ pub(crate) fn draw_completion_popup(
 /// terminal. The frame is derived from `elapsed` rather than from a counter, which keeps the whole
 /// banner a pure function of state the event loop already has.
 pub(crate) fn loading_banner_text(elapsed: Duration, g: &Glyphs) -> String {
-    let frames = g.spinner();
-    let frame = (elapsed.as_millis() / SPINNER_FRAME.as_millis()) as usize % frames.len();
     format!(
         "{} Loading{} {}s",
-        frames[frame],
+        spinner_frame(elapsed, g),
         g.ellipsis,
         elapsed.as_secs()
+    )
+}
+
+/// The spinner glyph `elapsed` into a wait. Shared by the banner and the waterfall preview pane, so
+/// the two turn at the same rate and look like the same kind of wait.
+pub(crate) fn spinner_frame(elapsed: Duration, g: &Glyphs) -> &'static str {
+    let frames = g.spinner();
+    frames[(elapsed.as_millis() / SPINNER_FRAME.as_millis()) as usize % frames.len()]
+}
+
+/// The Traces preview pane's body while it waits for a waterfall — through the cursor debounce and
+/// the fetch alike. Pane-local on purpose: the keyboard stays live and the screen-wide banner stays
+/// down, since one detail pane catching up is not something to stop the user for.
+pub(crate) fn waterfall_wait_text(elapsed: Duration, g: &Glyphs) -> String {
+    format!(
+        "{} Loading waterfall{}",
+        spinner_frame(elapsed, g),
+        g.ellipsis
     )
 }
 

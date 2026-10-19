@@ -9,12 +9,12 @@ use crossterm::event::KeyEvent;
 use ratatui::layout::Rect;
 use tokio::sync::mpsc;
 
-use crate::app::App;
+use crate::app::{App, WaterfallFetch};
 use crate::backend::Backend;
 use crate::keys::{Control, handle_key};
 use crate::mascot::{MASCOT_IDLE_AFTER, MascotCtx, MascotEvent};
 use crate::model::{LOADING_BANNER_AFTER, Mode, Options, Refresh, Route, SPINNER_FRAME, Update};
-use crate::tasks::{request_refresh, request_refresh_as, request_waterfall};
+use crate::tasks::{fire_due_waterfall, request_refresh, request_refresh_as, request_waterfall};
 use crate::terminal::{TerminalGuard, input_reader, install_panic_hook};
 use crate::ui::draw;
 
@@ -59,6 +59,10 @@ async fn run_backend(backend: Backend, options: Options) -> io::Result<()> {
 
     let outcome: io::Result<()> = async {
         loop {
+            // A preview-pane fetch whose debounce has run out goes now, whichever wake brought us
+            // here — a key, a result, or the timer armed for exactly this deadline below.
+            fire_due_waterfall(&mut app, &backend, &sender, options.ascii);
+
             // Drive the mascot from state deltas before drawing (the draw is `&App`, so the controller
             // must be advanced here where we hold `&mut app`). Only while it is actually visible.
             if app.show_mascot && app.mode == Mode::Normal && !options.ascii {
@@ -145,21 +149,29 @@ async fn run_backend(backend: Backend, options: Options) -> io::Result<()> {
                 ),
                 None => until_refresh,
             };
+            // The waterfall preview has its own clock: wake when its debounced fetch is due, and turn
+            // the pane's spinner while it waits. Like the banner's, these only ever shorten the sleep.
+            let until_refresh = match app.waterfall_wake(Instant::now()) {
+                Some(wake) => until_refresh.min(wake),
+                None => until_refresh,
+            };
 
             tokio::select! {
                 Some(update) = receiver.recv() => {
                     match update {
-                        Update::Query(result) => {
-                            app.apply(result);
+                        // A cancelled query's late answer changes nothing (`apply` returns false), so
+                        // none of the follow-ups below may run for it either.
+                        Update::Query(result) => if app.apply(result) {
                             // A fresh result: arm the mascot's refresh-triggered easter egg.
                             app.mascot_refresh_pending = true;
                             if let Some(origin) = app.pending_refresh.take() {
                                 request_refresh_as(origin, &mut app, backend.clone(), options.clone(), sender.clone());
                             }
                             // A fresh traces result: land on the focused trace (if navigated from a
-                            // log) then fetch the selected/focused trace's waterfall.
+                            // log) then fetch the selected/focused trace's waterfall — at once, since
+                            // this is not a scroll that might move on.
                             app.focus_select_trace();
-                            request_waterfall(&mut app, &backend, &sender, options.ascii);
+                            request_waterfall(&mut app, &backend, &sender, options.ascii, WaterfallFetch::Immediate);
                             // A log→trace / exemplar→trace jump wants the trace's *detail*, not the
                             // Traces list it routes through: open it right away when the waterfall was
                             // already retained (no fetch was issued above), else on its arrival below.
@@ -227,24 +239,10 @@ async fn run_backend(backend: Backend, options: Options) -> io::Result<()> {
                             // arrive independently, and either may be stale.
                             app.take_attr_stats(key, pane);
                         }
-                        Update::Waterfall { generation, trace_id, detail, trace } => {
-                            // Apply only if still current: same query generation and the selection has
-                            // not moved to a different trace since the fetch was issued.
-                            if generation == app.generation
-                                && app.detail_trace_id.as_deref() == Some(trace_id.as_str())
-                            {
-                                app.snapshot.detail = Some(detail);
-                                app.trace_detail = trace;
-                                // An Enter pressed while this fetch was in flight opens the full trace
-                                // detail now that the data is here — either the Traces-list Enter
-                                // (`pending_trace_open`) or a log/exemplar→trace jump.
-                                if app.pending_trace_open {
-                                    app.pending_trace_open = false;
-                                    app.open_trace_detail();
-                                } else {
-                                    app.open_focused_trace_detail();
-                                }
-                            }
+                        Update::Waterfall { ticket, trace_id, detail, trace } => {
+                            // Cached either way; shown (and any Enter waiting on it honoured) only if it
+                            // is the fetch the pane is still waiting for.
+                            app.land_waterfall(ticket, trace_id, detail, trace);
                         }
                     }
                 }

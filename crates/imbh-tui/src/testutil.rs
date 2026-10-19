@@ -116,6 +116,7 @@ pub(crate) fn traces_app_with_trace() -> App {
             "1 matching traces".into(),
             format!("{}  ts", detail.trace_id),
         ],
+        trace_ids: vec![detail.trace_id.clone()],
         list_from: Some(1),
         ..Default::default()
     };

@@ -92,21 +92,16 @@ impl App {
             .map(|marker| marker.trace_id.clone())
     }
 
-    /// The trace id of the currently selected row on the Traces screen, parsed from the leading
-    /// whitespace-delimited token of the row (rows are `"{trace_id} selected=…"`). `None` on other
-    /// screens or when nothing is selectable.
+    /// The trace id of the currently selected row on the Traces screen, read from the snapshot's
+    /// structured `trace_ids` (aligned to the selectable rows) rather than parsed back out of the
+    /// rendered row. `None` on other screens or when nothing is selectable.
     pub(crate) fn selected_trace_id(&self) -> Option<String> {
         if self.screen() != Screen::Traces {
             return None;
         }
         let (first, last) = self.selectable_bounds()?;
-        let selected = self.selected.clamp(first, last);
-        self.snapshot
-            .lines
-            .get(selected)?
-            .split_whitespace()
-            .next()
-            .map(str::to_owned)
+        let index = self.selected.clamp(first, last) - first;
+        self.snapshot.trace_ids.get(index).cloned()
     }
 
     /// The structured log record for the currently selected row on the Logs screen.
@@ -266,15 +261,12 @@ impl App {
         if self.screen() != Screen::Traces {
             return;
         }
-        let Some((first, last)) = self.selectable_bounds() else {
+        let Some((first, _)) = self.selectable_bounds() else {
             return;
         };
-        for index in first..=last {
-            if self.snapshot.lines[index].split_whitespace().next() == Some(focus.as_str()) {
-                self.selected = index;
-                self.focus_trace_id = None;
-                return;
-            }
+        if let Some(index) = self.snapshot.trace_ids.iter().position(|id| *id == focus) {
+            self.selected = first + index;
+            self.focus_trace_id = None;
         }
     }
 }
@@ -469,6 +461,7 @@ mod tests {
             "aaaa selected=1".into(),
             "bbbb selected=2".into(),
         ];
+        app.snapshot.trace_ids = vec!["aaaa".into(), "bbbb".into()];
         app.snapshot.list_from = Some(1);
 
         app.focus_trace_id = Some("bbbb".into());
@@ -489,11 +482,14 @@ mod tests {
     fn selected_trace_id_reads_the_highlighted_row() {
         let mut app = App::new();
         app.route = Route::Traces;
+        // The rendered rows deliberately do *not* lead with the id: the id comes from the structured
+        // `trace_ids`, so a change to the row format can never break the cursor's trace resolution.
         app.snapshot.lines = vec![
             "2 matching traces".into(),
-            "aabbccdd selected=1,2".into(),
-            "eeff0011 selected=3".into(),
+            "12:00:00  aabbccdd  selected=1,2".into(),
+            "12:00:01  eeff0011  selected=3".into(),
         ];
+        app.snapshot.trace_ids = vec!["aabbccdd".into(), "eeff0011".into()];
         app.snapshot.list_from = Some(1);
 
         app.selected = 1;

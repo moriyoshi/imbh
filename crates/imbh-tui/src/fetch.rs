@@ -178,6 +178,7 @@ pub(crate) async fn load_snapshot(
                 detail: Some(attribute_placeholder()),
                 list_from: None,
                 log_records: Vec::new(),
+                trace_ids: Vec::new(),
                 table: None,
                 series: Vec::new(),
                 next_cursor: None,
@@ -214,6 +215,7 @@ pub(crate) async fn load_snapshot(
                     detail: None,
                     list_from: None,
                     log_records: Vec::new(),
+                    trace_ids: Vec::new(),
                     table: Some(TableData::new(
                         vec![
                             "Metric".to_owned(),
@@ -342,6 +344,7 @@ pub(crate) async fn load_snapshot(
                 detail: None,
                 list_from: None,
                 log_records: Vec::new(),
+                trace_ids: Vec::new(),
                 table: Some(TableData::new(
                     vec![
                         "Series".to_owned(),
@@ -389,8 +392,13 @@ pub(crate) async fn load_snapshot(
             lines.push(format!("{} matching traces", search.matches.len()));
             // Rows below the header count are the selectable trace entries.
             let list_from = lines.len();
-            // The trace id stays the leading whitespace-delimited token (`selected_trace_id` /
-            // `focus_select_trace` parse it), so the trace's start time is appended after it.
+            // The ids travel structured, aligned to the rows, so the cursor resolves a trace without
+            // re-parsing it out of the rendered text (`selected_trace_id` / `focus_select_trace`).
+            let trace_ids = search
+                .matches
+                .iter()
+                .map(|item| item.trace_id.clone())
+                .collect::<Vec<_>>();
             lines.extend(search.matches.into_iter().map(|item| {
                 format!(
                     "{}  {}  selected={}",
@@ -424,6 +432,7 @@ pub(crate) async fn load_snapshot(
                 detail,
                 list_from: Some(list_from),
                 log_records: Vec::new(),
+                trace_ids,
                 table: None,
                 series: Vec::new(),
                 next_cursor: None,
@@ -569,6 +578,7 @@ pub(crate) async fn load_snapshot(
                 detail: None,
                 list_from: Some(list_from),
                 log_records,
+                trace_ids: Vec::new(),
                 table: None,
                 series: Vec::new(),
                 next_cursor: page_next,
