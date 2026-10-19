@@ -13,6 +13,54 @@ release aborts if it is missing or duplicated.
 
 ## [Unreleased]
 
+### Added
+
+- **`Db::compression()` and `imbh::read_compression` / `imbh_storage::read_compression`.** The first
+  reports the codec a handle resolved; the second reads the codec a database directory recorded.
+- **The TUI can cancel an in-flight query.** `Ctrl-C` cancels in every mode and never quits; `Esc`
+  cancels when a query holds the keyboard, and keeps its other meanings otherwise. A cancelled
+  query's late result is dropped by generation, and the footer reads `q quit · esc cancel` while the
+  keyboard is locked.
+- **The TUI's waterfall pane has its own spinner**, without the banner or the input lock.
+- **An opt-in test runs the Docker plugin against a real daemon** (`build.sh` → `plugin create` →
+  `enable` → a container logging through it → `docker logs`). It is `#[ignore]`d and also requires
+  `IMBH_DOCKER_DAEMON_E2E=1`, so the default test path stays daemon-free:
+  `IMBH_DOCKER_DAEMON_E2E=1 cargo test -p imbh-server --test docker_plugin_daemon -- --ignored --nocapture`.
+  `docker-plugin/build.sh` now honours `CARGO_TARGET_DIR` and an optional `PLUGIN_STAMP`.
+
+### Changed
+
+- **The compression codec is durable database state**, like the promote set and retention: recorded
+  in `db.info`, inherited when `DbBuilder::compression` is omitted, overridden (and re-recorded) when
+  it is given, and always taken from disk on a read-only open. The housekeeper and in-process
+  compaction write with it, so rewritten segments no longer fall back to the default codec. A
+  database without the line (anything written by 0.9.0) opens with `Compression::default()`, as
+  before.
+- **A capped housekeeping pass takes the oldest partitions first.** `prepare_pending`'s `max_jobs`
+  and `Db::compact_bounded` share one deterministic order — UTC day, then earliest segment time, then
+  table order — instead of exhausting every logs partition before any spans one.
+- **Equality filters on a promoted attribute compare in dictionary space**, without the
+  `CAST(… AS VARCHAR)` the value expression carries (measured ~0.1–0.5 ms per 100k rows). Results
+  are unchanged, including for segments sealed before the key was promoted. LogQL/PromQL `=` matchers
+  on un-promoted keys now take the same bare `json_get_str(…) = $v` form as `attr_eq`, so the attrs
+  index can prune them.
+- **Queries read only the columns they need from Parquet.** The scan's projection is now pushed into
+  each segment's reader (matched by column name, so schema-evolved segments are unaffected), so a
+  narrow traces query no longer decodes the attributes/resource/events/links JSON. Measured: logs
+  `count(*)` ~4.9x faster and spans `hex(trace_id) = …` ~3.1x faster at 60 segments. As a
+  consequence `ScanStats::bytes_scanned` now counts only the projected columns, and reads ~0 for a
+  `count(*)`.
+- **The TUI fetches a trace's waterfall once the cursor settles** (a 120 ms debounce, which `Enter`
+  skips) and keeps the last 16 in an LRU, so holding down-arrow on the Traces list no longer issues
+  one `traces().get()` per row.
+
+### Fixed
+
+- **A Docker remap script's `.resource` now reflects the container's current resource.** It was
+  frozen at `StartLogging`, so after a network refresh the script saw no `container.network.*`
+  attributes — and a script that set `.resource` built its override from that stale copy, silently
+  dropping those attributes from every record stored afterwards.
+
 ## [0.9.0] - 2026-09-14
 
 > **The archives are at [`dist-v0.9.0`](https://github.com/moriyoshi/imbh/releases/tag/dist-v0.9.0),

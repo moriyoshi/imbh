@@ -106,6 +106,10 @@ pub use imbh_core::{
 pub use imbh_attrstats as attrstats;
 
 pub use imbh_storage::pending::PendingRewrite;
+/// The durable segment compression codec recorded for a database directory — what
+/// [`prepare_pending`] should be handed to write rewritten segments the way the host does (see
+/// [`DbBuilder::compression`]).
+pub use imbh_storage::read_compression;
 #[cfg(feature = "compaction")]
 pub use imbh_storage::{CompactionReport, prepare_pending};
 pub use imbh_storage::{FlushGauges, PendingReport, SnapshotInfo, TableStats};
@@ -242,7 +246,7 @@ impl Db {
             path: Some(path.as_ref().to_path_buf()),
             in_memory: false,
             memory_budget: MemoryBudget::default(),
-            compression: Compression::default(),
+            compression: None,
             wal: WalMode::default(),
             retention: None,
             maintenance: Maintenance::default(),
@@ -274,7 +278,7 @@ impl Db {
             path: None,
             in_memory: true,
             memory_budget: MemoryBudget::default(),
-            compression: Compression::default(),
+            compression: None,
             wal: WalMode::Off,
             retention: None,
             maintenance: Maintenance::default(),
@@ -662,6 +666,13 @@ impl Db {
         self.storage.retention()
     }
 
+    /// The segment compression codec this handle writes with — for an on-disk database, the
+    /// database's durable codec (see [`DbBuilder::compression`]), so a seal, an in-process
+    /// [`Db::compact`], and an out-of-process preparer handed [`read_compression`] all agree.
+    pub fn compression(&self) -> Compression {
+        self.storage.compression()
+    }
+
     /// Compact small segments within each UTC-day partition into one, rebuilding the search index
     /// (ARCHITECTURE.md §7/§10.11). Optional maintenance — a DB that never compacts is still correct.
     #[cfg(feature = "compaction")]
@@ -883,7 +894,10 @@ pub struct DbBuilder {
     path: Option<PathBuf>,
     in_memory: bool,
     memory_budget: MemoryBudget,
-    compression: Compression,
+    /// `None` means the host did not call [`DbBuilder::compression`], which inherits the database's
+    /// own codec (or [`Compression::default`] when it has none recorded); `Some` sets it. Same
+    /// distinction as `retention` and `promote`.
+    compression: Option<Compression>,
     wal: WalMode,
     /// `None` means the host did not call [`DbBuilder::retention`], which inherits the database's
     /// own policy; `Some` sets it. Same distinction as `promote`.
@@ -946,8 +960,23 @@ impl DbBuilder {
         self
     }
 
+    /// Segment compression codec (ARCHITECTURE.md §7/§10.2). Default [`Compression::default`]
+    /// (zstd level 3).
+    ///
+    /// **The codec is durable database state** (after 0.9.0), like the promoted key set and the
+    /// retention policy. Calling this on a read-write handle *sets* the database's codec and records
+    /// it in `db.info`; **not** calling it adopts whatever the database already records, falling back
+    /// to the default for a database that records none (which is what every handle used before). It
+    /// is durable so the writers that are not this handle — `imbh-housekeeper` preparing rewrites
+    /// out of process, via [`read_compression`] — write segments the way the host does instead of
+    /// with their own process's default. Segments are self-describing, so a mismatch was only ever a
+    /// size difference, never a read problem.
+    ///
+    /// On a **read-only** handle the durable codec always wins and anything passed here is ignored —
+    /// a reader writes no segments. An in-memory database writes none either, and uses what is
+    /// passed here (or the default).
     pub fn compression(mut self, c: Compression) -> Self {
-        self.compression = c;
+        self.compression = Some(c);
         self
     }
 
@@ -1060,7 +1089,7 @@ impl DbBuilder {
         });
         // An in-memory DB has nothing durable to inherit from, so an unset builder means empty.
         let storage = if self.in_memory {
-            Storage::in_memory(self.compression, self.memory_budget)
+            Storage::in_memory(self.compression.unwrap_or_default(), self.memory_budget)
                 .with_promote(self.promote.clone().unwrap_or_default())
         } else {
             let path = self.path.ok_or_else(Error::missing_database_path)?;
@@ -1076,7 +1105,10 @@ impl DbBuilder {
                     // The durable set wins outright on a reader: it cannot write one, and a reader
                     // disagreeing with the writer about column layout is the defect this replaced.
                     let durable = imbh_storage::read_promote(&path);
-                    Storage::open_read_only(path, self.compression, self.memory_budget)?
+                    // Likewise the codec, though a reader never writes with it: what
+                    // `Db::compression()` reports should be the database's, not this builder's.
+                    let compression = imbh_storage::read_compression(&path);
+                    Storage::open_read_only(path, compression, self.memory_budget)?
                         .with_promote(durable)
                 }
                 Access::ReadWrite => {
@@ -1090,15 +1122,17 @@ impl DbBuilder {
                     // disagree about when data is deleted. Omitting `retention()` inherits.
                     let durable_retention = imbh_storage::read_retention(&path);
                     let retention = self.retention.unwrap_or(durable_retention);
-                    let changed = effective != durable || retention != durable_retention;
-                    let storage = Storage::open(
-                        path,
-                        self.compression,
-                        self.wal,
-                        retention,
-                        self.memory_budget,
-                    )?
-                    .with_promote(effective);
+                    // And the codec: an out-of-process preparer writes segments into this database
+                    // too, and should write them the way the host does. Omitting `compression()`
+                    // inherits (the default when none is recorded, as in a database last written by 0.9.0).
+                    let durable_compression = imbh_storage::read_compression(&path);
+                    let compression = self.compression.unwrap_or(durable_compression);
+                    let changed = effective != durable
+                        || retention != durable_retention
+                        || compression != durable_compression;
+                    let storage =
+                        Storage::open(path, compression, self.wal, retention, self.memory_budget)?
+                            .with_promote(effective);
                     if changed {
                         storage.persist_promote()?;
                     }

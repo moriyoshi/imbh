@@ -374,6 +374,40 @@ pub fn otlp_gauge_attrs(
     .encode_to_vec()
 }
 
+/// An OTLP Gauge `metric_name` for `service` with one attribute-less data point per `(time, value)`,
+/// in order — duplicated instants included, so it can feed duplicate-timestamp tests.
+pub fn otlp_gauge_points(service: &str, metric_name: &str, points: &[(u64, f64)]) -> Vec<u8> {
+    use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
+    use opentelemetry_proto::tonic::metrics::v1::{
+        Gauge, Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics, metric, number_data_point,
+    };
+
+    let dps = points
+        .iter()
+        .map(|(t, v)| NumberDataPoint {
+            time_unix_nano: *t,
+            value: Some(number_data_point::Value::AsDouble(*v)),
+            ..Default::default()
+        })
+        .collect();
+    ExportMetricsServiceRequest {
+        resource_metrics: vec![ResourceMetrics {
+            resource: Some(service_resource(service)),
+            scope_metrics: vec![ScopeMetrics {
+                metrics: vec![Metric {
+                    name: metric_name.to_owned(),
+                    unit: "1".to_owned(),
+                    data: Some(metric::Data::Gauge(Gauge { data_points: dps })),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+    }
+    .encode_to_vec()
+}
+
 /// An OTLP monotonic Sum with one point per `(time, value)` and the given `temporality`
 /// (1=DELTA, 2=CUMULATIVE).
 pub fn otlp_sum(

@@ -99,6 +99,52 @@ impl SqlParams {
         }
     }
 
+    /// A boolean SQL **predicate** for "record-`attributes` key `key` equals `value`" — the
+    /// filter-site twin of [`attr_field`](Self::attr_field), for equality filters only. It is
+    /// equivalent to `{attr_field(key)} = $value` row for row, NULLs included, but never `CAST`s a
+    /// dictionary column to text: the compare runs in dictionary space, which `attr-bench` measured at
+    /// 0.20–0.31 ms per 100k rows cheaper than the `CAST` (more than the JSON fallback costs).
+    ///
+    /// `attr_field` cannot do this itself: it returns a *value*, and a `CASE` whose arms are
+    /// `Dictionary` and `Utf8` is coerced back to `Utf8`, reintroducing the cast. Projection sites
+    /// (`… AS g{i}`) must keep using `attr_field`, so a result column's type does not depend on the
+    /// promote set.
+    ///
+    /// - built-in column ([`builtin_column`]): `service = $v`.
+    /// - promoted key: `(("k" IS NOT NULL AND "k" = $v) OR ("k" IS NULL AND json_get_str(attributes,
+    ///   $k) = $v))` — the `attr_field` `CASE` lifted to predicate level. The two `IS [NOT] NULL`
+    ///   guards make the arms mutually exclusive exactly as the `WHEN` does: a row with a non-NULL
+    ///   column is decided by the column alone (it never additionally matches via the JSON), and a
+    ///   row with a NULL column (a segment sealed before promotion, or a row lacking the key) falls
+    ///   back to the JSON. The `IS NOT NULL` guard on the column arm is what keeps the three-valued
+    ///   result identical too (a NULL-column row yields the JSON compare's own TRUE/FALSE/NULL, not
+    ///   `NULL OR FALSE` = NULL), so the helper is safe even under a `NOT`. Batches never span
+    ///   segments, so `AND`'s short-circuit skips `json_get_str` on every batch of a post-promotion
+    ///   segment (`"k" IS NULL` is uniformly false there).
+    /// - otherwise: `json_get_str(attributes, $k) = $v`, unchanged — this exact top-level shape is
+    ///   what the provider's `attrs`-index `RowSelection` pushdown recognises.
+    ///
+    /// `value` is bound once per arm (never interpolated): each arm's `$N` is type-inferred from its
+    /// own comparison (`Dictionary` vs `Utf8`), and sharing one placeholder across both would ask
+    /// DataFusion to give it two types.
+    pub(crate) fn attr_eq_sql(&mut self, key: &str, value: &str) -> String {
+        if let Some(col) = builtin_column(key) {
+            format!("{col} = {}", self.str(value))
+        } else if self.promoted.iter().any(|c| c == key) {
+            let col = key.replace('"', "\"\"");
+            let json = self.str(key);
+            let v_json = self.str(value);
+            let v_col = self.str(value);
+            format!(
+                "((\"{col}\" IS NOT NULL AND \"{col}\" = {v_col}) OR \
+                 (\"{col}\" IS NULL AND json_get_str(attributes, {json}) = {v_json}))"
+            )
+        } else {
+            let json = self.str(key);
+            format!("json_get_str(attributes, {json}) = {}", self.str(value))
+        }
+    }
+
     /// A `Float64` SQL expression reading record-`attributes` key `key` **as a number**, the numeric
     /// twin of [`attr_field`](SqlParams::attr_field) used by the `attr_gt`/`ge`/`lt`/`le` matchers. A
     /// promoted key reads the dictionary column (text) through `TRY_CAST(... AS DOUBLE)` — string-typed
@@ -157,5 +203,101 @@ impl SqlParams {
     /// The collected values, positionally matching `$1..$N`.
     pub(crate) fn into_values(self) -> Vec<ScalarValue> {
         self.values
+    }
+}
+
+#[cfg(test)]
+mod attr_eq_sql_tests {
+    use super::*;
+
+    fn promoted(keys: &[&str]) -> SqlParams {
+        let keys: Vec<String> = keys.iter().map(|k| (*k).to_owned()).collect();
+        SqlParams::with_promote(&keys)
+    }
+
+    /// The point of the helper: a promoted-key equality compares in dictionary space, so no `CAST`
+    /// appears anywhere in the predicate — while keeping the JSON fallback for column-NULL rows.
+    #[test]
+    fn promoted_equality_has_no_cast_and_keeps_the_json_fallback() {
+        let mut p = promoted(&["env"]);
+        let sql = p.attr_eq_sql("env", "prod");
+        assert!(!sql.contains("CAST"), "no cast in a filter: {sql}");
+        assert_eq!(
+            sql,
+            "((\"env\" IS NOT NULL AND \"env\" = $3) OR \
+             (\"env\" IS NULL AND json_get_str(attributes, $1) = $2))"
+        );
+        assert_eq!(
+            p.into_values(),
+            vec![
+                ScalarValue::Utf8(Some("env".into())),
+                ScalarValue::Utf8(Some("prod".into())),
+                ScalarValue::Utf8(Some("prod".into())),
+            ]
+        );
+    }
+
+    /// The built-in column compares bare (it is a dictionary column too); a non-promoted key keeps the
+    /// exact `json_get_str(attributes, $k) = $v` shape the `attrs`-index pushdown recognises, with the
+    /// key bound before the value as `attr_field` + `str` did.
+    #[test]
+    fn builtin_and_unpromoted_keys_keep_their_shapes() {
+        let mut p = promoted(&["env"]);
+        assert_eq!(p.attr_eq_sql("service.name", "cart"), "service = $1");
+        assert_eq!(p.attr_eq_sql("service", "cart"), "service = $2");
+        assert_eq!(
+            p.attr_eq_sql("http.route", "/x"),
+            "json_get_str(attributes, $3) = $4"
+        );
+        assert_eq!(
+            p.into_values()[2..],
+            [
+                ScalarValue::Utf8(Some("http.route".into())),
+                ScalarValue::Utf8(Some("/x".into())),
+            ]
+        );
+    }
+
+    /// Values and keys are bound, never interpolated; the only key text that reaches the SQL is the
+    /// promoted column identifier, `"`-escaped exactly as `attr_field` escapes it.
+    #[test]
+    fn user_input_is_bound_and_identifiers_escaped() {
+        let key = "e\"nv') OR TRUE --";
+        let value = "x' OR 1 = 1 --";
+        let mut p = promoted(&[key]);
+        let sql = p.attr_eq_sql(key, value);
+        assert!(!sql.contains(value), "{sql}");
+        assert!(sql.contains("\"e\"\"nv') OR TRUE --\""), "{sql}");
+        let mut p = promoted(&[]);
+        let sql = p.attr_eq_sql(key, value);
+        assert!(!sql.contains(key) && !sql.contains(value), "{sql}");
+    }
+
+    /// Typed query builders route their equality filters through the helper: the full `WHERE` of a
+    /// logs query filtering a promoted key by `attr_eq` and by a LogQL-style `=` has no `CAST`.
+    #[test]
+    fn log_equality_filters_on_a_promoted_key_compile_without_cast() {
+        use crate::logs::{LogQuery, LogStringField, StringPredicate};
+        let q = LogQuery::new()
+            .attr_eq("env", "prod")
+            .attr_eq("service.name", "cart")
+            .string_predicate(
+                LogStringField::Attribute("env".into()),
+                StringPredicate::Eq,
+                "prod",
+            )
+            .string_predicate(LogStringField::Service, StringPredicate::Eq, "cart");
+        let mut p = promoted(&["env"]);
+        let sql = q.where_sql(&mut p);
+        assert!(!sql.contains("CAST"), "{sql}");
+        assert!(sql.contains("\"env\" = $"), "{sql}");
+        // `= ""` must also match a missing key, so it keeps the coalesce (and its cast).
+        let q = LogQuery::new().string_predicate(
+            LogStringField::Attribute("env".into()),
+            StringPredicate::Eq,
+            "",
+        );
+        let sql = q.where_sql(&mut promoted(&["env"]));
+        assert!(sql.contains("coalesce("), "{sql}");
     }
 }

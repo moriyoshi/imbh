@@ -7632,3 +7632,70 @@ explicit message; the failure was outside the pipeline. The run's separate
 archives carry the run-generated copy, so it does not affect what was published here.
 
 Docs not committed.
+
+## tackle-todos sweep: ten open items closed across five parallel units (2026-10-18)
+
+Source scan found **no** `// TODO`, `// FIXME`, `todo!()` or `unimplemented!()` in any `*.rs`, so
+the sweep worked entirely from `TODO.md` (28 open items, all re-verified as still applicable). Ten
+were dispatched as five non-overlapping units; the API-changing items (`traces().get()` lower bound,
+time-bounding `metrics().dimensions()`/`series()`/`exemplars()`, `#[non_exhaustive]` on `DbStats`)
+were **deferred by user decision** to a deliberate 0.10 API pass. Design items, the two the user left
+open on 2026-08-06, the differential runner and the daemon measurements were not touched.
+
+### U1 — imbh-tui
+
+* `Snapshot::trace_ids` replaces re-parsing the id out of the rendered row.
+* New `app/preview.rs`: 120 ms debounce (Enter expedites), 16-entry LRU keyed by trace id, a ticket
+  per fetch so a superseded arrival is dropped (and still cached if real). The pane draws its own
+  spinner; `App::loading` is untouched.
+* `App::cancel_loading`: `Ctrl-C` in every mode, `Esc` only while a query holds the keyboard.
+  **Behaviour change:** `App::apply` now returns `bool` and only a current-generation result releases
+  the lock — otherwise a cancelled query's late answer would unlock a newer query still running.
+* Trade-off taken: every fresh snapshot (auto-refresh included) clears the LRU, so cached data never
+  outlives a refresh but the cache only helps within one result set.
+
+### U2 — imbh-query: projection pushdown
+
+* By-name `ProjectionMask::roots` per segment; buffer coerced to the identical projected schema;
+  `coerce` now passes an explicit row count so a zero-column target (`count(*)`) works.
+* Checked against DataFusion 54.1: with every claim `Inexact`, `push_down_filter` keeps a `Filter`
+  above the scan and `optimize_projections` includes its columns, so no union-and-reproject was
+  needed. This was already load-bearing before — `StreamingTableExec` applied the same projection.
+* Guard: `pushdown_on_and_off_return_identical_batches` (35 queries over schema-evolved logs/spans/
+  metrics with `.tidx`, blooms, multi-row-group files) and `narrow_traces_query_skips_the_json_columns`.
+  A positional-mask mutation fails both.
+* Measured (release, pinned to big cores): logs `count(*)` 8.1 → 1.68 ms, spans `hex(trace_id) = …`
+  7.1 → 2.3 ms (60 segments); `matches(name, 'op0')` 15.7 → 7.7 / 10.8 → 4.0 / 7.9 → 3.0 ms at
+  low/mid/high cardinality. `bytes_scanned` now means projected bytes.
+
+### U3 — imbh: cast-free equality, PromQL test move
+
+* `attr_eq_sql` adds an `IS NOT NULL` guard on the column arm beyond the TODO's form, so it agrees
+  with the old `CASE` under three-valued logic (only observable under a `NOT`); cost within noise.
+* Side effect: LogQL/PromQL `=` on un-promoted keys dropped its `coalesce` wrapper (non-empty values
+  only — `= ""` must still match a missing label), so the attrs index now prunes them too.
+* Finding (new TODO): the fallback arm inside the `OR` never reaches the attrs-index recognizer, so
+  pre-promotion segments pay a full JSON scan — true of the old `CASE` form as well.
+* The PromQL-agreement test now lives in `imbh-lgtm/tests/` against the real functions; `imbh` became
+  a dev-dependency there at no graph cost (`imbh-test-support` already pulled it).
+
+### U4 — imbh/storage: durable codec, oldest-first pacing
+
+* `compression\t<none|lz4|zstd\t<level>>` in `db.info`; same precedence as retention. Old reader
+  ignores the tag; a 0.9.0 writer drops it on refresh (size-only consequence).
+* `plan_rewrites` orders by (UTC day, earliest segment time, `Table::ALL`) and is shared by
+  `prepare_pending` and `Db::compact_bounded` — the latter previously drained all logs partitions
+  first.
+
+### U5 — imbh-server docker
+
+* `Remapper` refreshes its `.resource` seed on `Arc::ptr_eq` change. The bug was worse than the TODO
+  said: a script that *set* `.resource` built its override from the stale seed, so stored records lost
+  `container.network.*` after a refresh.
+* Opt-in `tests/docker_plugin_daemon.rs` (`#[ignore]` + `IMBH_DOCKER_DAEMON_E2E=1`, so a blanket
+  `--ignored` soak run never touches the daemon). `build.sh` gained `CARGO_TARGET_DIR` support (it
+  hard-coded `target/release/`) and `PLUGIN_STAMP`, because the plugin store is content-addressed and
+  refuses a second name for an identical rootfs. Not yet run against a daemon.
+
+Docs updated: ARCHITECTURE §5/§7/§7.1/§7.2/§9.2/§10/§10.16.2, CHANGELOG `[Unreleased]`,
+`docs/DOCKER_LOG_DRIVER.md`. Nothing committed.

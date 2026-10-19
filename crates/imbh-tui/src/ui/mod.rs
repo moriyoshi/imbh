@@ -32,6 +32,7 @@ use crate::ui::logs::draw_log_detail;
 use crate::ui::metrics::{column_widths, draw_metric_detail, draw_metric_table, pad_cell};
 use crate::ui::overlays::{
     draw_absolute_range, draw_completion_popup, draw_loading_banner, draw_time_range_picker,
+    waterfall_wait_text,
 };
 use crate::ui::traces::{draw_span_detail, draw_trace_detail};
 use crate::waterfall::{WATERFALL_NAME_W, WATERFALL_SUFFIX_W, render_waterfall_window};
@@ -46,6 +47,12 @@ pub(crate) const MIN_ROWS: u16 = 10;
 /// The key legend's first entry, and the only one that keeps working while a query holds the
 /// keyboard. Named so the footer's "dim everything else" split cannot drift from the text it splits.
 pub(crate) const QUIT_HINT: &str = "q quit";
+
+/// The legend entries that stay lit while a query holds the keyboard: quitting, and cancelling the
+/// wait (`Esc`, or `Ctrl-C`; see `keys::is_interrupt`).
+pub(crate) fn locked_hint(g: &Glyphs) -> String {
+    format!("{QUIT_HINT} {} esc cancel", g.sep)
+}
 
 /// Border style for a pane: a bold cyan outline when it holds the focus ring, the default (dim) border
 /// otherwise. Applied via `Block::border_style` so the focused pane reads at a glance.
@@ -691,6 +698,10 @@ pub(crate) fn draw(frame: &mut ratatui::Frame<'_>, app: &App, options: &Options)
                 );
             }
             rows.join("\n")
+        } else if let Some(wait) = app.waterfall_wait() {
+            // The pane is waiting on its waterfall (debounce or fetch): say so with a spinner of its
+            // own, without the banner or the input lock a query takes.
+            waterfall_wait_text(wait, &g)
         } else if detail.lines.is_empty() {
             "No data".to_owned()
         } else {
@@ -754,14 +765,15 @@ pub(crate) fn draw(frame: &mut ratatui::Frame<'_>, app: &App, options: &Options)
             },
         )
     };
-    // While the keyboard is held, `q` is the only legend entry that still does anything — so every
-    // other one is greyed out. This is the whole signal that input is locked: the banner deliberately
-    // says nothing about the keyboard (it would only repeat this line), and dimming states which key
-    // survives without adding a word anywhere. Applied only to the key legend, since the error and
-    // menu variants of this line do not begin with the quit hint and have no `q` to keep lit.
+    // While the keyboard is held, `q` and the interrupt are the only legend entries that still do
+    // anything — so every other one is greyed out, and the interrupt (which the idle legend has no
+    // reason to list) is spliced in lit beside `q`. This is the whole signal that input is locked: the
+    // banner deliberately says nothing about the keyboard (it would only repeat this line), and
+    // dimming states which keys survive. Applied only to the key legend, since the error and menu
+    // variants of this line do not begin with the quit hint and have no `q` to keep lit.
     let status = match status.strip_prefix(QUIT_HINT) {
         Some(rest) if app.input_locked => Paragraph::new(Line::from(vec![
-            Span::raw(QUIT_HINT),
+            Span::raw(locked_hint(&g)),
             Span::styled(rest.to_owned(), Style::default().fg(Color::DarkGray)),
         ])),
         _ => Paragraph::new(status),
@@ -889,7 +901,7 @@ mod tests {
 
     use crate::completion::{Candidate, CandidateKind, Completion};
     use crate::mascot::MascotCtx;
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     use crate::model::{
         DetailPane, LOADING_BANNER_AFTER, LogRecord, MetricDetail, Refresh, Snapshot,
@@ -1001,24 +1013,26 @@ mod tests {
         let mut app = App::new();
         app.begin_loading(Refresh::Interactive);
         let locked = footer_styles(&app);
-        // `q quit` keeps its normal colour...
-        let quit: String = locked
+        // `q quit` and the interrupt keep their normal colour...
+        let lit_cells = locked_hint(&Glyphs::new(false)).width();
+        let lit: String = locked
             .iter()
-            .take_while(|(symbol, _)| *symbol != " ")
+            .take(lit_cells)
             .map(|(symbol, _)| symbol.as_str())
             .collect();
-        assert_eq!(quit, "q");
+        assert_eq!(lit, locked_hint(&Glyphs::new(false)));
+        assert!(lit.contains("esc cancel"), "{lit:?}");
         assert!(
             locked
                 .iter()
-                .take(QUIT_HINT.len())
+                .take(lit_cells)
                 .all(|(_, fg)| *fg != Some(Color::DarkGray)),
-            "the quit hint stayed lit"
+            "the quit and cancel hints stayed lit"
         );
         // ...and the rest of the line is greyed.
         let dimmed = locked
             .iter()
-            .skip(QUIT_HINT.len())
+            .skip(lit_cells)
             .filter(|(symbol, _)| *symbol != " ")
             .collect::<Vec<_>>();
         assert!(!dimmed.is_empty(), "there are other hints to dim");
@@ -1032,6 +1046,89 @@ mod tests {
         app.begin_loading(Refresh::Background);
         let free = footer_styles(&app);
         assert!(!free.iter().any(|(_, fg)| *fg == Some(Color::DarkGray)));
+    }
+
+    /// The waterfall preview says it is waiting — with a spinner of its own, in the pane — from the
+    /// first cursor move through the fetch, and stops saying so once the waterfall lands. None of it
+    /// raises the screen-wide banner or greys the legend: the keyboard was never taken.
+    #[test]
+    fn the_waterfall_pane_shows_its_own_spinner_while_it_waits() {
+        use crate::app::WaterfallFetch;
+        use ratatui::backend::TestBackend;
+
+        let render = |app: &App| {
+            let mut terminal = Terminal::new(TestBackend::new(100, 24)).expect("a test terminal");
+            terminal
+                .draw(|frame| draw(frame, app, &Options::default()))
+                .expect("a draw");
+            let buffer = terminal.backend().buffer().clone();
+            (0..24u16)
+                .map(|y| {
+                    (0..100)
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+        };
+        let trace = build_trace_detail(&ascii_trace(), false);
+        let mut app = App::new();
+        app.route = Route::Traces;
+        app.snapshot = Snapshot {
+            title: "TraceQL".to_owned(),
+            lines: vec![
+                "1 matching traces".into(),
+                format!("{}  ts", trace.trace_id),
+            ],
+            trace_ids: vec![trace.trace_id.clone()],
+            list_from: Some(1),
+            ..Default::default()
+        };
+        app.selected = 1;
+        let now = Instant::now();
+        app.select_waterfall(now, WaterfallFetch::Debounced);
+
+        let spinner = Glyphs::new(false).spinner();
+        let waiting = render(&app);
+        let line = waiting
+            .iter()
+            .find(|line| line.contains("Loading waterfall"))
+            .unwrap_or_else(|| panic!("the pane says it is waiting: {waiting:#?}"));
+        assert!(
+            spinner.iter().any(|frame| line.contains(frame)),
+            "with a spinner: {line:?}"
+        );
+        assert!(
+            waiting
+                .iter()
+                .any(|line| line.contains(&format!("Waterfall: {}", trace.trace_id))),
+            "titled with the trace it is waiting for"
+        );
+        assert!(app.loading_banner().is_none() && !app.input_locked);
+
+        // Through the fetch, too.
+        let request = app
+            .take_due_waterfall(now + Duration::from_secs(1))
+            .expect("due");
+        assert!(
+            render(&app)
+                .iter()
+                .any(|line| line.contains("Loading waterfall"))
+        );
+
+        // Landed: the bars replace the spinner.
+        let pane = DetailPane {
+            title: format!("Waterfall: {}  (enter: detail)", trace.trace_id),
+            lines: Vec::new(),
+            waterfall: Some(trace.waterfall.clone()),
+            table: None,
+            style: DetailStyle::Preview,
+        };
+        assert!(app.land_waterfall(request.ticket, trace.trace_id.clone(), pane, Some(trace)));
+        let landed = render(&app);
+        assert!(
+            !landed.iter().any(|line| line.contains("Loading waterfall")),
+            "{landed:#?}"
+        );
     }
 
     #[test]
@@ -1216,6 +1313,21 @@ mod tests {
                 };
                 app
             }),
+            ("traces list waiting on its waterfall", {
+                // The pane's own spinner must come from the ASCII cycle too.
+                let mut app = App::new();
+                app.route = Route::Traces;
+                app.snapshot = Snapshot {
+                    title: "TraceQL".to_owned(),
+                    lines: vec!["1 matching traces".into(), "aaaa  ts".into()],
+                    trace_ids: vec!["aaaa".into()],
+                    list_from: Some(1),
+                    ..Default::default()
+                };
+                app.selected = 1;
+                app.select_waterfall(Instant::now(), crate::app::WaterfallFetch::Debounced);
+                app
+            }),
             ("traces list with a waterfall preview", {
                 let mut app = App::new();
                 let detail = build_trace_detail(&ascii_trace(), true);
@@ -1226,6 +1338,7 @@ mod tests {
                         "1 matching traces".into(),
                         format!("{}  ts", detail.trace_id),
                     ],
+                    trace_ids: vec![detail.trace_id.clone()],
                     list_from: Some(1),
                     // A deeper trace than the short preview pane fits, so the truncation note renders.
                     detail: Some(DetailPane {

@@ -433,6 +433,10 @@ pub(crate) struct Snapshot {
     /// Structured log records, aligned to the selectable rows (`log_records[i]` ↔ `lines[list_from+i]`).
     /// Populated only on the Logs screen; drives the detail view and trace-id navigation.
     pub(crate) log_records: Vec<LogRecord>,
+    /// The matched trace ids, aligned to the selectable rows (`trace_ids[i]` ↔ `lines[list_from+i]`).
+    /// Populated only on the Traces screen; what the row cursor resolves to, so the trace id is never
+    /// re-parsed out of the rendered row text.
+    pub(crate) trace_ids: Vec<String>,
     /// When `Some`, the primary pane renders as a selectable table (the Metrics screen). Takes
     /// precedence over `list_from`; the selection cursor then indexes `table.rows`.
     pub(crate) table: Option<TableData>,
@@ -508,7 +512,20 @@ pub(crate) struct ExemplarMarker {
     pub(crate) trace_id: String,
 }
 
+/// The text of the placeholder a screen switch puts up while the new screen's query is in flight.
+pub(crate) const LOADING_TEXT: &str = "Loading...";
+
 impl Snapshot {
+    /// The placeholder shown while a screen's first result is in flight.
+    pub(crate) fn loading(title: impl Into<String>) -> Self {
+        Self::message(title, LOADING_TEXT)
+    }
+
+    /// Whether this is the [`Snapshot::loading`] placeholder rather than a result.
+    pub(crate) fn is_loading_placeholder(&self) -> bool {
+        self.list_from.is_none() && self.table.is_none() && self.lines == [LOADING_TEXT]
+    }
+
     pub(crate) fn message(title: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
             title: title.into(),
@@ -517,6 +534,7 @@ impl Snapshot {
             detail: None,
             list_from: None,
             log_records: Vec::new(),
+            trace_ids: Vec::new(),
             table: None,
             series: Vec::new(),
             next_cursor: None,
@@ -536,12 +554,13 @@ pub(crate) enum Update {
     Query(QueryResult),
     /// Completion vocabulary (metric names) fetched from the catalog.
     Vocabulary(Vec<String>),
-    /// The waterfall for the selected trace, fetched on demand. `generation`/`trace_id` guard against
-    /// applying a stale result after the selection or query moved on. `trace` is the materialized trace
-    /// behind the pane (`None` when the fetch failed or the trace is gone); retained by the app so
-    /// Enter can open the full trace detail without a second fetch.
+    /// The waterfall for the selected trace, fetched on demand. `ticket` identifies the fetch, so only
+    /// the one the preview pane is still waiting for is shown (`App::land_waterfall`); `trace_id`
+    /// keys the cache it is also kept in. `trace` is the materialized trace behind the pane (`None`
+    /// when the fetch failed or the trace is gone); retained by the app so Enter can open the full
+    /// trace detail without a second fetch.
     Waterfall {
-        generation: u64,
+        ticket: u64,
         trace_id: String,
         detail: DetailPane,
         trace: Option<TraceDetail>,

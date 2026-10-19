@@ -90,9 +90,15 @@ const LOCK_FILE: &str = "writer.lock";
 /// A small human-readable marker the writer persists at open so a *reader* process — which cannot see
 /// the writer's in-RAM config — can learn whether the writer maintains a WAL. A reader needs the WAL
 /// tail for near-real-time freshness; if the writer's WAL is off, the reader sees only seal-interval
-/// freshness, so `Db::open_read_only` uses this to reject-by-default (ARCHITECTURE.md §5). One line,
-/// `wal_mode\t<off|interval|always>`. Absent / unparseable ⇒ "unknown", which never rejects (a
+/// freshness, so `Db::open_read_only` uses this to reject-by-default (ARCHITECTURE.md §5): the
+/// `wal_mode\t<off|interval|always>` line. Absent / unparseable ⇒ "unknown", which never rejects (a
 /// pre-marker DB reads as before).
+///
+/// It also carries the **durable database state** every handle must agree on: the promoted key set
+/// (`promote\t<key>` lines), the retention policy (`retain_max_age_secs` / `retain_max_disk_bytes`),
+/// and the segment codec (`compression\tnone`, `compression\tlz4`, `compression\tzstd\t<level>`).
+/// Lines are tab-separated and tagged; a reader ignores tags it does not know, and a missing line
+/// means "unrecorded" (see each `read_*`).
 const INFO_FILE: &str = "db.info";
 
 /// How many times `read_disk_snapshot` re-reads the manifest when a concurrent seal moves the
@@ -384,6 +390,12 @@ impl Storage {
         self.retention
     }
 
+    /// The segment compression codec this handle writes with — for an on-disk database, the durable
+    /// codec the facade resolved at open (see [`read_compression`]).
+    pub fn compression(&self) -> Compression {
+        self.compression
+    }
+
     /// The promoted attribute keys in effect (empty when nothing is promoted).
     ///
     /// Returns a clone rather than a borrow because the set is mutable at runtime through
@@ -399,7 +411,8 @@ impl Storage {
         self.promote.read().unwrap().keys().to_vec()
     }
 
-    /// Write the current promoted set to [`INFO_FILE`], making it the database's durable state.
+    /// Write the current promoted set — together with this handle's retention policy and compression
+    /// codec — to [`INFO_FILE`], making them the database's durable state.
     ///
     /// **Fallible, unlike the WAL-mode marker.** That one is a hint a reader may ignore; this is the
     /// set every handle on the directory must agree on, so a silent failure would leave two handles
@@ -413,6 +426,7 @@ impl Storage {
             self.wal_mode,
             &self.promote.read().unwrap(),
             self.retention,
+            Some(self.compression),
         )
         .map_err(|e| Error::open_ctx("persist promoted key set", e))
     }
@@ -1668,12 +1682,17 @@ impl Storage {
     /// queryable — so a capped pass is not a partial one. There is nothing to resume: run it again
     /// and the next slice is done. A pass that rewrites **nothing** is how a caller learns there was
     /// nothing left to do, which is what a drain loop stops on.
+    ///
+    /// **The slice is the oldest work**, chosen across every table at once in the same order as
+    /// [`prepare_pending`] (`plan_rewrites`): oldest UTC-day partition first, then the earliest
+    /// segment time, then table order. A bounded pass therefore converges history ahead of the
+    /// partition that is still filling, and an in-process drain and an out-of-process preparer agree
+    /// on what "the next slice" is.
     #[cfg(feature = "compaction")]
     pub fn compact_bounded(&self, max_partitions: usize) -> Result<CompactionReport> {
         let Some(dir) = self.dir.clone() else {
             return Ok(CompactionReport::default());
         };
-        let mut budget = max_partitions;
 
         // 1. Snapshot the segment lists under the lock (a cheap `Vec<SegmentRef>` clone — the segment
         //    *metadata*, not the Parquet data), then release. The read/concat/sort/write below runs
@@ -1688,8 +1707,29 @@ impl Storage {
             )
         };
 
-        // 2. Compute the merges off-lock. `compact_partition` is schema-agnostic (concat + sort by
-        //    time, optional Tantivy index) so it merges scalar and List-column metric tables alike.
+        // 2. Choose this pass's partitions — every eligible one when unbounded, otherwise the
+        //    `max_partitions` oldest across all tables — then compute the merges off-lock.
+        //    `compact_partition` is schema-agnostic (concat + sort by time, optional Tantivy index) so
+        //    it merges scalar and List-column metric tables alike.
+        let promote = self.promote_keys();
+        let mut selected: std::collections::HashSet<(Table, String)> =
+            std::collections::HashSet::new();
+        {
+            let tables = [
+                (Table::Logs, logs_snap.as_slice()),
+                (Table::Spans, spans_snap.as_slice()),
+            ]
+            .into_iter()
+            .chain(metrics_snap.iter().map(|(t, v)| (*t, v.as_slice())));
+            for cand in plan_rewrites(tables) {
+                if selected.len() >= max_partitions {
+                    break;
+                }
+                if cand.eligible(&dir, &promote)? {
+                    selected.insert((cand.table, cand.day));
+                }
+            }
+        }
         let mut report = CompactionReport::default();
         let mut deferred_deletes: Vec<SegmentRef> = Vec::new();
         let new_logs = self.compact_partition(
@@ -1700,7 +1740,7 @@ impl Storage {
             logs_snap,
             &mut report,
             &mut deferred_deletes,
-            &mut budget,
+            &selected,
         )?;
         let new_spans = self.compact_partition(
             &dir,
@@ -1710,7 +1750,7 @@ impl Storage {
             spans_snap,
             &mut report,
             &mut deferred_deletes,
-            &mut budget,
+            &selected,
         )?;
         let mut new_metrics: Vec<(Table, Vec<SegmentRef>)> = Vec::new();
         for (table, segs) in metrics_snap {
@@ -1722,7 +1762,7 @@ impl Storage {
                 segs,
                 &mut report,
                 &mut deferred_deletes,
-                &mut budget,
+                &selected,
             )?;
             new_metrics.push((table, merged));
         }
@@ -1761,7 +1801,8 @@ impl Storage {
         Ok(report)
     }
 
-    /// Merge each day-partition group of `>1` segments into a single sorted segment.
+    /// Rewrite each of `table`'s day-partition groups named in `selected` (the pass's plan, see
+    /// [`Storage::compact_bounded`]) into a single sorted segment; every other group passes through.
     #[allow(clippy::too_many_arguments)]
     #[cfg(feature = "compaction")]
     fn compact_partition(
@@ -1773,9 +1814,11 @@ impl Storage {
         segs: Vec<SegmentRef>,
         report: &mut CompactionReport,
         deferred_deletes: &mut Vec<SegmentRef>,
-        // Partitions this pass may still rewrite, shared across every table so the bound is on the
-        // *pass* rather than on each table's share of it.
-        budget: &mut usize,
+        // The partitions this pass rewrites, planned across every table at once so the bound is on
+        // the *pass* (and spent oldest-first) rather than on each table's share of it. Only eligible
+        // groups are in it — a merge, or a lone segment whose schema lags — so membership is the
+        // whole decision here.
+        selected: &std::collections::HashSet<(Table, String)>,
     ) -> Result<Vec<SegmentRef>> {
         let mut by_day: BTreeMap<String, Vec<SegmentRef>> = BTreeMap::new();
         for s in segs {
@@ -1787,34 +1830,14 @@ impl Storage {
 
         let mut result = Vec::new();
         let promote = self.promote_keys();
-        for group in by_day.into_values() {
-            // Out of budget: pass the rest through untouched, so this table's segment list stays
-            // complete and the partitions are exactly as they were. `continue` rather than `break`
-            // because every remaining group still has to reach `result`.
-            if *budget == 0 {
+        for (day, group) in by_day {
+            // Not in this pass's plan — ineligible, or past the bound: pass it through untouched, so
+            // this table's segment list stays complete and the partition is exactly as it was.
+            // (Eligibility, including why a lone lagging segment is rewritten, is
+            // `RewriteCandidate::eligible`.)
+            if !selected.contains(&(table, day)) {
                 result.extend(group);
                 continue;
-            }
-            // A partition with one segment is normally nothing to merge — but it is still rewritten
-            // when its schema **lags the live promote set**, because that rewrite is the only way
-            // such a partition ever converges. A day that will never gain a second segment (an old
-            // partition, a low-volume signal, a database that seals rarely) would otherwise keep
-            // paying the JSON fallback forever, no matter how often compaction runs.
-            //
-            // Merging and converging are deliberately the *same* pass, not two jobs: compaction
-            // already projects promoted columns while it rewrites (see `backfill_promoted`), so
-            // separating them would rewrite the same bytes twice and — under the out-of-process
-            // design in ARCHITECTURE.md §7.2 — have two pending records claiming the
-            // same input segment, where whichever committed first would invalidate the other.
-            if group.len() <= 1 {
-                let lags = match group.first() {
-                    Some(s) => segment_schema_lags(&dir.join(&s.relative_path), &promote)?,
-                    None => false,
-                };
-                if !lags {
-                    result.extend(group);
-                    continue;
-                }
             }
             // Segments in one day partition can have been sealed under *different* promoted key
             // sets (ARCHITECTURE.md §6.1 allows the embedder to change `promote` between runs), so
@@ -1873,7 +1896,6 @@ impl Storage {
                 report.segments_merged += group.len() as u64;
             }
             report.segments_created += 1;
-            *budget -= 1;
             // Defer deleting the merged-away sources until the manifest that points at the new
             // merged segment is durable (see `compact`). Deleting them now would risk losing every
             // row if a crash struck before the manifest was persisted.
@@ -2088,7 +2110,15 @@ fn rewrite_segment_set(
 ///
 /// `max_jobs` bounds one pass. Promotion triggers convergence on *every* segment lacking the new
 /// column, so an unbounded pass on a large database is one rewrite storm; pacing belongs here, in the
-/// planner, rather than in the engine.
+/// planner, rather than in the engine. **The jobs a bounded pass takes are the oldest ones**, across
+/// every table at once: oldest UTC-day partition first, ties broken by the partition's earliest
+/// segment time and then by [`Table::ALL`] order. Repeated passes therefore converge history in a
+/// fixed, reproducible order, and two passes over an unchanged database pick the same work.
+///
+/// `compression` is the codec the output segments are written with. Pass [`read_compression`]`(dir)`
+/// to write them the way the database's own writer does (what `imbh-housekeeper` does); the argument
+/// stays explicit so a caller that deliberately wants a different codec for rewritten history can
+/// have one — segments are self-describing, so mixing codecs is always readable.
 ///
 /// Safe to run against a live writer: nothing here takes a lock, mutates the manifest, or deletes
 /// anything. The worst outcome of racing the writer is a record the writer later discards.
@@ -2102,11 +2132,7 @@ pub fn prepare_pending(
     let snap = read_disk_snapshot(dir)?;
     let promote = read_promote(dir);
     let keys = promote.keys();
-    let mut out = Vec::new();
-    for table in Table::ALL {
-        if out.len() >= max_jobs {
-            break;
-        }
+    let tables = Table::ALL.into_iter().map(|table| {
         let segs: &[SegmentRef] = match table {
             Table::Logs => &snap.logs_segments,
             Table::Spans => &snap.spans_segments,
@@ -2116,6 +2142,110 @@ pub fn prepare_pending(
                 .map(|v| v.as_slice())
                 .unwrap_or(&[]),
         };
+        (table, segs)
+    });
+    let mut out = Vec::new();
+    // Oldest first. Eligibility is checked lazily, in plan order, so a bounded pass probes only as
+    // many lone-segment footers as it needs to fill its quota.
+    for (i, cand) in plan_rewrites(tables).into_iter().enumerate() {
+        if out.len() >= max_jobs {
+            break;
+        }
+        if !cand.eligible(dir, keys)? {
+            continue;
+        }
+        let RewriteCandidate { table, group, .. } = cand;
+        // `unique` only has to avoid colliding with a concurrently-written segment name; the
+        // nanosecond timestamp does the real work.
+        let unique = 900_000 + i as u64;
+        let Some(output) = rewrite_segment_set(dir, table, &group, keys, compression, unique)?
+        else {
+            continue;
+        };
+        let rec = pending::PendingRewrite {
+            table,
+            inputs: group.iter().map(|s| s.relative_path.clone()).collect(),
+            output_digest: pending::digest_file(&dir.join(&output.relative_path))?,
+            output,
+            promote: promote.clone(),
+        };
+        pending::write(dir, &rec)?;
+        out.push(rec);
+    }
+    Ok(out)
+}
+
+/// One rewrite candidate: a single table's segments within one UTC-day partition.
+#[cfg(feature = "compaction")]
+struct RewriteCandidate {
+    table: Table,
+    day: String,
+    group: Vec<SegmentRef>,
+}
+
+#[cfg(feature = "compaction")]
+impl RewriteCandidate {
+    /// The earliest row time in the partition — the secondary sort key of [`plan_rewrites`].
+    fn min_time(&self) -> i64 {
+        self.group
+            .iter()
+            .map(|s| s.min_time_unix_nano)
+            .min()
+            .unwrap_or(i64::MAX)
+    }
+
+    /// Whether this partition is worth rewriting under `promote`: a **merge** when it holds more than
+    /// one segment, a **convergence** when its lone segment's schema lags the promoted set.
+    ///
+    /// A partition with one segment is normally nothing to merge — but it is still rewritten when
+    /// its schema lags, because that rewrite is the only way such a partition ever converges. A day
+    /// that will never gain a second segment (an old partition, a low-volume signal, a database that
+    /// seals rarely) would otherwise keep paying the JSON fallback forever, no matter how often
+    /// compaction runs.
+    ///
+    /// Merging and converging are deliberately the *same* job, not two: a rewrite already projects
+    /// promoted columns (see `backfill_promoted`), so separating them would rewrite the same bytes
+    /// twice and — under the out-of-process design in ARCHITECTURE.md §7.2 — have two pending
+    /// records claiming the same input segment, where whichever committed first would invalidate the
+    /// other.
+    ///
+    /// Costs one Parquet footer read for a lone segment, nothing for a merge.
+    fn eligible(&self, dir: &Path, promote: &[String]) -> Result<bool> {
+        match self.group.as_slice() {
+            [] => Ok(false),
+            [only] => segment_schema_lags(&dir.join(&only.relative_path), promote),
+            _ => Ok(true),
+        }
+    }
+}
+
+/// Group every table's segments into day partitions and order them **oldest first** — the order in
+/// which both bounded rewriters ([`prepare_pending`]'s `max_jobs`, [`Storage::compact_bounded`]'s
+/// `max_partitions`) spend their quota.
+///
+/// The order is total and deterministic:
+///
+/// 1. **UTC-day partition**, ascending — the `<table>/<day>/` directory, which is the unit retention
+///    drops and the unit a rewrite produces;
+/// 2. **earliest segment time** in the partition (`min_time_unix_nano`), ascending — within one day,
+///    across tables, the partition whose data starts earlier goes first;
+/// 3. **table**, in [`Table::ALL`] order (logs, spans, then the metric tables) — the final tiebreak,
+///    and unique, because a (table, day) pair names exactly one partition.
+///
+/// Oldest-first because the old partitions are the ones nothing else will ever touch again: the
+/// current day keeps gaining segments (merging it now just means merging it again later), while a
+/// past day's segment set is final, so converging it is work done once. It also means a database
+/// working through a post-`set_promote` backlog loses the JSON fallback from its history in a fixed
+/// order rather than in whichever order a table happens to be listed.
+///
+/// Eligibility is not decided here (see [`RewriteCandidate::eligible`]): a caller filters lazily, in
+/// this order, so a bounded pass reads only the footers it needs.
+#[cfg(feature = "compaction")]
+fn plan_rewrites<'a>(
+    tables: impl IntoIterator<Item = (Table, &'a [SegmentRef])>,
+) -> Vec<RewriteCandidate> {
+    let mut out = Vec::new();
+    for (table, segs) in tables {
         let mut by_day: BTreeMap<String, Vec<SegmentRef>> = BTreeMap::new();
         for s in segs {
             by_day
@@ -2123,38 +2253,25 @@ pub fn prepare_pending(
                 .or_default()
                 .push(s.clone());
         }
-        for (i, group) in by_day.into_values().enumerate() {
-            if out.len() >= max_jobs {
-                break;
-            }
-            if group.len() <= 1 {
-                let lags = match group.first() {
-                    Some(s) => segment_schema_lags(&dir.join(&s.relative_path), keys)?,
-                    None => false,
-                };
-                if !lags {
-                    continue;
-                }
-            }
-            // `unique` only has to avoid colliding with a concurrently-written segment name; the
-            // nanosecond timestamp does the real work.
-            let unique = 900_000 + i as u64;
-            let Some(output) = rewrite_segment_set(dir, table, &group, keys, compression, unique)?
-            else {
-                continue;
-            };
-            let rec = pending::PendingRewrite {
-                table,
-                inputs: group.iter().map(|s| s.relative_path.clone()).collect(),
-                output_digest: pending::digest_file(&dir.join(&output.relative_path))?,
-                output,
-                promote: promote.clone(),
-            };
-            pending::write(dir, &rec)?;
-            out.push(rec);
-        }
+        out.extend(
+            by_day
+                .into_iter()
+                .map(|(day, group)| RewriteCandidate { table, day, group }),
+        );
     }
-    Ok(out)
+    let rank = |t: Table| {
+        Table::ALL
+            .iter()
+            .position(|x| *x == t)
+            .unwrap_or(usize::MAX)
+    };
+    out.sort_by(|a, b| {
+        a.day
+            .cmp(&b.day)
+            .then_with(|| a.min_time().cmp(&b.min_time()))
+            .then_with(|| rank(a.table).cmp(&rank(b.table)))
+    });
+    out
 }
 
 #[cfg(feature = "compaction")]
@@ -3560,9 +3677,29 @@ fn unescape_field(s: &str) -> String {
     out
 }
 
+/// The `compression` line's value fields in [`INFO_FILE`]: `none`, `lz4`, or `zstd\t<level>`.
+fn compression_fields(c: Compression) -> String {
+    match c {
+        Compression::None => "none".to_owned(),
+        Compression::Lz4 => "lz4".to_owned(),
+        Compression::Zstd(level) => format!("zstd\t{level}"),
+    }
+}
+
 /// Render the [`INFO_FILE`] body: the writer's WAL mode plus the **durable promoted key set**, one
-/// `promote` line per key in column order.
-fn db_info_text(wal_mode: WalMode, promote: &Promote, retention: Retention) -> String {
+/// `promote` line per key in column order, the durable retention policy, and the durable segment
+/// compression codec.
+///
+/// `compression` is `None` when no handle has resolved one yet (a database written before the line
+/// existed, carried through an open that did not change it); the line is then omitted, exactly as
+/// retention's lines are when it has no limit, so the file keeps saying "unknown" rather than
+/// inventing a value.
+fn db_info_text(
+    wal_mode: WalMode,
+    promote: &Promote,
+    retention: Retention,
+    compression: Option<Compression>,
+) -> String {
     let mut text = format!("wal_mode\t{}\n", wal_mode_token(wal_mode));
     for key in promote.keys() {
         text.push_str("promote\t");
@@ -3575,6 +3712,9 @@ fn db_info_text(wal_mode: WalMode, promote: &Promote, retention: Retention) -> S
     if let Some(bytes) = retention.disk_budget() {
         text.push_str(&format!("retain_max_disk_bytes\t{bytes}\n"));
     }
+    if let Some(c) = compression {
+        text.push_str(&format!("compression\t{}\n", compression_fields(c)));
+    }
     text
 }
 
@@ -3584,10 +3724,11 @@ fn write_db_info_at(
     wal_mode: WalMode,
     promote: &Promote,
     retention: Retention,
+    compression: Option<Compression>,
 ) -> std::io::Result<()> {
     let tmp = dir.join(format!("{INFO_FILE}.tmp"));
     let final_path = dir.join(INFO_FILE);
-    let text = db_info_text(wal_mode, promote, retention);
+    let text = db_info_text(wal_mode, promote, retention, compression);
     let wrote =
         std::fs::write(&tmp, text.as_bytes()).and_then(|()| std::fs::rename(&tmp, &final_path));
     if wrote.is_err() {
@@ -3606,7 +3747,48 @@ fn write_db_info_at(
 /// of this wrote `Promote::default()` here, so reopening a promoted database wiped the marker before
 /// the facade had a chance to read it, and a reader then saw no promoted columns at all.)
 fn write_db_info(dir: &Path, wal_mode: WalMode) {
-    let _ = write_db_info_at(dir, wal_mode, &read_promote(dir), read_retention(dir));
+    let _ = write_db_info_at(
+        dir,
+        wal_mode,
+        &read_promote(dir),
+        read_retention(dir),
+        read_compression_recorded(dir),
+    );
+}
+
+/// The **durable** segment compression codec recorded for `dir`, or [`Compression::default`] when the
+/// marker has none — which is what a host that never chose one genuinely wrote, and what every
+/// handle used before the codec was recorded.
+///
+/// Durable for the same reason as the promoted set and retention: an out-of-process preparer
+/// ([`prepare_pending`]) writes segments into the host's database and should write them the way the
+/// host does, rather than with whatever codec its own process defaults to. Segments are
+/// self-describing, so a disagreement was never a correctness problem — only a size difference — but
+/// it is the same reader/writer incoherence the other two fields removed.
+///
+/// An unrecognised codec token (a future version's) also reads as the default: the value only
+/// decides how *new* bytes are written, never how existing ones are read.
+pub fn read_compression(dir: impl AsRef<Path>) -> Compression {
+    read_compression_recorded(dir.as_ref()).unwrap_or_default()
+}
+
+/// [`read_compression`] without the fallback: `None` when [`INFO_FILE`] records no (parseable) codec.
+/// The open-time marker refresh carries this through as-is, so a database nobody has resolved a codec
+/// for keeps reading as "unrecorded" rather than gaining a line nobody chose.
+fn read_compression_recorded(dir: &Path) -> Option<Compression> {
+    let text = std::fs::read_to_string(dir.join(INFO_FILE)).ok()?;
+    text.lines().find_map(|line| {
+        let mut it = line.split('\t');
+        if it.next() != Some("compression") {
+            return None;
+        }
+        match it.next()? {
+            "none" => Some(Compression::None),
+            "lz4" => Some(Compression::Lz4),
+            "zstd" => it.next()?.parse().ok().map(Compression::Zstd),
+            _ => None,
+        }
+    })
 }
 
 /// The **durable** retention policy recorded for `dir`, or [`Retention::none`] when the marker is
@@ -4326,6 +4508,121 @@ mod tests {
         assert!(
             !writer_wal_disabled(dir.path()),
             "interval WAL is not disabled"
+        );
+    }
+
+    /// The codec line round-trips every [`Compression`] variant (zstd's level included), an absent or
+    /// unrecognised line reads as the default, and the open-time marker refresh carries the line
+    /// through — or carries its *absence* through, rather than inventing a codec nobody chose.
+    #[test]
+    fn db_info_records_the_compression_codec() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        assert_eq!(
+            read_compression(d),
+            Compression::default(),
+            "no marker at all"
+        );
+
+        for c in [Compression::None, Compression::Lz4, Compression::Zstd(11)] {
+            write_db_info_at(
+                d,
+                WalMode::Always,
+                &Promote::default(),
+                Retention::none(),
+                Some(c),
+            )
+            .unwrap();
+            assert_eq!(read_compression(d), c);
+            // The open-time refresh rewrites the WAL-mode line and must keep the codec.
+            write_db_info(d, WalMode::Off);
+            assert_eq!(read_compression(d), c, "refresh carried {c:?} through");
+            assert!(writer_wal_disabled(d));
+        }
+
+        // A 0.9.0-shaped marker: no codec line. Reads as the default, and a refresh keeps it absent.
+        std::fs::write(d.join(INFO_FILE), "wal_mode\tinterval\npromote\tenv\n").unwrap();
+        assert_eq!(read_compression(d), Compression::default());
+        write_db_info(d, WalMode::Always);
+        assert_eq!(read_compression_recorded(d), None, "nothing invented");
+        assert_eq!(read_promote(d).keys(), ["env"]);
+
+        // A future codec this version does not know: the default, never an error.
+        std::fs::write(
+            d.join(INFO_FILE),
+            "wal_mode\tinterval\ncompression\tbrotli\t5\n",
+        )
+        .unwrap();
+        assert_eq!(read_compression(d), Compression::default());
+        std::fs::write(d.join(INFO_FILE), "compression\tzstd\tnot-a-level\n").unwrap();
+        assert_eq!(read_compression(d), Compression::default());
+    }
+
+    /// `persist_promote` (the fallible writer of the whole marker) records the handle's codec, so a
+    /// `set_promote` on a live database cannot drop it.
+    #[test]
+    fn persisting_the_marker_records_the_handles_codec() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Storage::open(
+            dir.path(),
+            Compression::Lz4,
+            WalMode::Always,
+            Retention::none(),
+            MemoryBudget::default(),
+        )
+        .unwrap();
+        assert_eq!(s.compression(), Compression::Lz4);
+        assert_eq!(
+            read_compression_recorded(dir.path()),
+            None,
+            "open alone records nothing"
+        );
+        s.set_promote(Promote::new(["env"])).unwrap();
+        assert_eq!(read_compression(dir.path()), Compression::Lz4);
+        assert_eq!(read_promote(dir.path()).keys(), ["env"]);
+    }
+
+    /// The rewrite planner's order is oldest UTC-day first, then the partition's earliest segment
+    /// time, then [`Table::ALL`] order — regardless of the order tables are handed in.
+    #[cfg(feature = "compaction")]
+    #[test]
+    fn plan_rewrites_orders_oldest_first_with_deterministic_tiebreaks() {
+        const DAY: i64 = 86_400_000_000_000;
+        let seg = |table: Table, day: &str, min: i64| SegmentRef {
+            relative_path: format!("{}/{day}/x-{min}.parquet", table.as_str()),
+            min_time_unix_nano: min,
+            max_time_unix_nano: min + 1,
+            rows: 1,
+        };
+        let logs = vec![
+            seg(Table::Logs, "1970-01-03", 2 * DAY + 50),
+            seg(Table::Logs, "1970-01-02", DAY + 10),
+            seg(Table::Logs, "1970-01-02", DAY + 5),
+        ];
+        let spans = vec![
+            seg(Table::Spans, "1970-01-02", DAY + 5), // ties logs/01-02 on time: table order decides
+            seg(Table::Spans, "1970-01-03", 2 * DAY + 20), // same day as logs/01-03, earlier data
+        ];
+        let gauge = vec![seg(Table::MetricsGauge, "1970-01-01", 7)];
+        // Handed in deliberately out of Table::ALL order.
+        let plan = plan_rewrites([
+            (Table::MetricsGauge, gauge.as_slice()),
+            (Table::Spans, spans.as_slice()),
+            (Table::Logs, logs.as_slice()),
+        ]);
+        let order: Vec<(Table, &str, usize)> = plan
+            .iter()
+            .map(|c| (c.table, c.day.as_str(), c.group.len()))
+            .collect();
+        assert_eq!(
+            order,
+            [
+                (Table::MetricsGauge, "1970-01-01", 1),
+                (Table::Logs, "1970-01-02", 2),
+                (Table::Spans, "1970-01-02", 1),
+                (Table::Spans, "1970-01-03", 1),
+                (Table::Logs, "1970-01-03", 1),
+            ]
         );
     }
 

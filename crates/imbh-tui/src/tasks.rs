@@ -3,9 +3,11 @@
 //! Each `request_*` spawns the work off the event-loop thread and delivers it back as an
 //! [`Update`](crate::model::Update), so a slow query never blocks a redraw.
 
+use std::time::Instant;
+
 use tokio::sync::mpsc;
 
-use crate::app::App;
+use crate::app::{App, WaterfallFetch, WaterfallRequest};
 use crate::backend::Backend;
 use crate::completion::LogCompletionRequest;
 use crate::fetch::{attribute_pane, build_waterfall_detail, discover_dims, load_snapshot};
@@ -212,40 +214,39 @@ pub(crate) fn request_vocabulary(
     });
 }
 
-/// If the selected trace differs from the one shown in the waterfall pane, fetch its waterfall off
-/// the event-loop thread and deliver it as an `Update::Waterfall`. No-op on non-Traces screens or
-/// when the selected trace is already shown/in flight.
+/// Point the Traces preview pane at the selected (or focused) trace: served from the cache when it
+/// can be, otherwise its fetch is scheduled per `when` — after the cursor has rested for a debounce
+/// on a cursor move, at once for a freshly landed result. Then issue whatever fetch is due. A no-op
+/// off the Traces screen or when the selected trace is already shown or awaited.
 pub(crate) fn request_waterfall(
     app: &mut App,
     backend: &Backend,
     sender: &mpsc::UnboundedSender<Update>,
     ascii: bool,
+    when: WaterfallFetch,
 ) {
-    // A pending log→trace focus wins over the row selection until the cursor moves or the focused
-    // trace is found in the list.
-    let Some(trace_id) = app
-        .focus_trace_id
-        .clone()
-        .or_else(|| app.selected_trace_id())
-    else {
+    app.select_waterfall(Instant::now(), when);
+    fire_due_waterfall(app, backend, sender, ascii);
+}
+
+/// Issue the preview pane's scheduled waterfall fetch if its debounce has run out, off the event-loop
+/// thread, delivering it as an `Update::Waterfall` stamped with its ticket. Called on every turn of
+/// the event loop, which wakes in time for the deadline (`App::waterfall_wake`).
+pub(crate) fn fire_due_waterfall(
+    app: &mut App,
+    backend: &Backend,
+    sender: &mpsc::UnboundedSender<Update>,
+    ascii: bool,
+) {
+    let Some(WaterfallRequest { trace_id, ticket }) = app.take_due_waterfall(Instant::now()) else {
         return;
     };
-    if app.detail_trace_id.as_deref() == Some(trace_id.as_str()) {
-        return;
-    }
-    app.detail_trace_id = Some(trace_id.clone());
-    // The retained trace belongs to the *previous* selection; drop it so Enter cannot open a detail for
-    // a trace the cursor has already left. A fetch is only issued when the selection actually moved, so
-    // this is also where a pending Enter intent is abandoned (it was meant for the trace just left).
-    app.trace_detail = None;
-    app.pending_trace_open = false;
-    let generation = app.generation;
     let backend = backend.clone();
     let sender = sender.clone();
     tokio::spawn(async move {
         let (detail, trace) = build_waterfall_detail(&backend, &trace_id, ascii).await;
         let _ = sender.send(Update::Waterfall {
-            generation,
+            ticket,
             trace_id,
             detail,
             trace,

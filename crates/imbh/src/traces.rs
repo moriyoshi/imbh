@@ -427,8 +427,7 @@ impl SpanMetricsQuery {
             conds.push(format!("status_code = {}", p.str(s)));
         }
         for (k, v) in &self.attr_eq {
-            let field = p.attr_field(k);
-            conds.push(format!("{field} = {}", p.str(v)));
+            conds.push(p.attr_eq_sql(k, v));
         }
         let where_clause = if conds.is_empty() {
             String::new()
@@ -834,8 +833,7 @@ impl TraceQuery {
             c.push(format!("kind = {}", p.str(k)));
         }
         for (k, v) in &self.attr_eq {
-            let field = p.attr_field(k);
-            c.push(format!("{field} = {}", p.str(v)));
+            c.push(p.attr_eq_sql(k, v));
         }
         for k in &self.attr_exists {
             let field = p.attr_field(k);
@@ -1026,6 +1024,36 @@ mod native_trace_query_tests {
                 ScalarValue::FixedSizeBinary(16, Some(vec![0x11; 16])),
                 ScalarValue::FixedSizeBinary(16, Some(vec![0x22; 16])),
             ]
+        );
+    }
+
+    /// Trace search and span-metrics equality filters on a promoted key compare in dictionary space:
+    /// neither compiled `WHERE` contains a `CAST` (the span-metrics group-by projection keeps
+    /// `attr_field`, so its `AS g{i}` output type stays independent of the promote set).
+    #[test]
+    fn promoted_equality_filters_compile_without_cast() {
+        let promote = vec!["env".to_owned()];
+        let mut params = SqlParams::with_promote(&promote);
+        let conds = TraceQuery::new()
+            .attr_eq("env", "prod")
+            .attr_eq("service.name", "cart")
+            .span_conditions(&mut params)
+            .join(" AND ");
+        assert!(!conds.contains("CAST"), "{conds}");
+        assert!(conds.contains("\"env\" = $"), "{conds}");
+
+        let mut params = SqlParams::with_promote(&promote);
+        let sql = SpanMetricsQuery::new()
+            .attr_eq("env", "prod")
+            .to_sql(&mut params);
+        let where_clause = sql.split(" WHERE ").nth(1).expect("has a WHERE");
+        assert!(!where_clause.contains("CAST("), "{sql}");
+
+        let mut params = SqlParams::with_promote(&promote);
+        let sql = SpanMetricsQuery::new().group_by("env").to_sql(&mut params);
+        assert!(
+            sql.contains("CAST(\"env\" AS VARCHAR)"),
+            "projection keeps the cast: {sql}"
         );
     }
 

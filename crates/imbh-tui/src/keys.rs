@@ -6,7 +6,7 @@ use std::time::Instant;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use tokio::sync::mpsc;
 
-use crate::app::App;
+use crate::app::{App, WaterfallFetch};
 use crate::backend::Backend;
 use crate::model::{
     Focus, LogCorrelation, Mode, Options, Route, Screen, Snapshot, TIME_RANGES, Update,
@@ -177,7 +177,6 @@ pub(crate) fn span_logs_drilldown(
     );
 }
 
-/// Apply a single key press to the app, dispatching refreshes/screen switches as needed.
 /// Whether `key` still acts while a user-initiated query holds the keyboard.
 ///
 /// The lock covers `Mode::Normal` and nothing else, because that is the mode in which every binding
@@ -192,15 +191,39 @@ pub(crate) fn span_logs_drilldown(
 /// rather than racing. The mode check is load-bearing rather than defensive: a coalesced refresh
 /// replayed when its predecessor lands can arm the lock while the user is sitting in one of them.
 ///
-/// `q` is never refused. A query that never lands must not become a trap, and `q` is the only way out
-/// — there is no Ctrl-C binding.
+/// `q` is never refused, and neither are the two interrupts, `Esc` and `Ctrl-C` (see
+/// [`is_interrupt`]): a query that never lands must not become a trap, and those are the ways out of
+/// it — leaving the program, or just the wait.
 fn survives_loading(app: &App, key: KeyEvent) -> bool {
     if !app.input_locked || app.mode != Mode::Normal {
         return true;
     }
-    key.code == KeyCode::Char('q')
+    key.code == KeyCode::Char('q') || key.code == KeyCode::Esc || is_ctrl_c(key)
 }
 
+fn is_ctrl_c(key: KeyEvent) -> bool {
+    key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL)
+}
+
+/// Whether `key` cancels the query in flight rather than doing what it would otherwise do.
+///
+/// - **`Ctrl-C`** cancels any in-flight query, locked or not, in every mode, and is otherwise a
+///   no-op. It never quits: in raw mode it is an ordinary key rather than a signal, and making the
+///   reflex for "stop that" also end the session would cost the user their navigation history the
+///   first time they reached for it. In the text-input modes it was already inert (the field
+///   declines Ctrl-letters it has no binding for), so it cannot mangle a half-typed query either.
+/// - **`Esc`** cancels only while a query **holds the keyboard** in `Mode::Normal` — exactly when it
+///   would otherwise have been refused. Everywhere else it keeps its meaning: Back on a content pane,
+///   and closing an overlay (the editor, the range picker and form, the menu), including during a
+///   background refresh, which never took the keyboard and so has nothing to interrupt.
+fn is_interrupt(app: &App, key: KeyEvent) -> bool {
+    if !app.loading {
+        return false;
+    }
+    is_ctrl_c(key) || (key.code == KeyCode::Esc && app.input_locked && app.mode == Mode::Normal)
+}
+
+/// Apply a single key press to the app, dispatching refreshes/screen switches as needed.
 pub(crate) fn handle_key(
     app: &mut App,
     key: KeyEvent,
@@ -209,6 +232,17 @@ pub(crate) fn handle_key(
     sender: &mpsc::UnboundedSender<Update>,
 ) -> Control {
     if key.kind != KeyEventKind::Press {
+        return Control::Continue;
+    }
+    if is_interrupt(app, key) {
+        // The answer is dropped by generation when it turns up; the backend may keep working on it.
+        app.cancel_loading();
+        return Control::Continue;
+    }
+    // A Ctrl-C with nothing to interrupt does nothing at all, rather than falling through to a
+    // binding that ignores modifiers (`c` has none today, but the global map matches on the bare
+    // character).
+    if is_ctrl_c(key) {
         return Control::Continue;
     }
     if !survives_loading(app, key) {
@@ -477,6 +511,8 @@ pub(crate) fn handle_key(
         KeyCode::Enter if matches!(app.route, Route::Traces) => {
             if !app.open_trace_detail() {
                 app.pending_trace_open = app.detail_trace_id.is_some();
+                // An explicit Enter does not sit out the rest of a debounce meant for a scroll.
+                app.expedite_waterfall(Instant::now());
             }
         }
         // Space expands/collapses the selected metric or dimension in the catalog tree, lazily
@@ -645,8 +681,15 @@ pub(crate) fn handle_key(
         }
         _ => {}
     }
-    // If the row cursor moved to a different trace, refresh the waterfall pane (no-op otherwise).
-    request_waterfall(app, backend, sender, options.ascii);
+    // If the row cursor moved to a different trace, point the waterfall pane at it (no-op otherwise).
+    // Debounced: a held arrow key is a stream of these, and only the row it stops on is worth a fetch.
+    request_waterfall(
+        app,
+        backend,
+        sender,
+        options.ascii,
+        WaterfallFetch::Debounced,
+    );
     Control::Continue
 }
 
@@ -767,8 +810,10 @@ pub(crate) fn switch_screen(
     app.span_cursor = 0;
     app.completion = None;
     app.focus = Focus::Primary;
-    // A trace-open intent is scoped to the Traces list it was issued from.
+    // A trace-open intent is scoped to the Traces list it was issued from, and so is the preview's
+    // pending fetch: the snapshot it was for is about to be replaced.
     app.pending_trace_open = false;
+    app.drop_waterfall_fetch();
     // A log→trace jump sets `focus_trace_id` (and the intent to open its detail) just before switching
     // to Traces; drop a stale focus when switching anywhere else.
     if screen != Screen::Traces {
@@ -784,7 +829,7 @@ pub(crate) fn switch_screen(
     if screen == Screen::Metrics && app.metric_names.is_empty() {
         request_vocabulary(screen, backend.clone(), sender.clone());
     }
-    app.snapshot = Snapshot::message(screen.title(), "Loading...");
+    app.snapshot = Snapshot::loading(screen.title());
     request_refresh(app, backend, options, sender);
 }
 
@@ -1233,7 +1278,8 @@ mod tests {
 
     #[test]
     fn quitting_is_never_refused_while_a_query_is_in_flight() {
-        // `q` is the only way out of a query that never lands, so the lock must not eat it.
+        // `q` is one way out of a query that never lands (the interrupts are the other), so the lock
+        // must not eat it.
         let mut app = loading_normal();
         assert!(press_control(&mut app, KeyCode::Char('q')) == Control::Quit);
     }
@@ -1252,6 +1298,160 @@ mod tests {
         assert_eq!(app.screen(), Screen::Overview, "the switch went through");
         assert_eq!(app.pending_refresh, Some(Refresh::Interactive));
         assert!(!app.input_refused);
+    }
+
+    /// Press a key with modifiers and report whether the loop was told to quit.
+    fn press_with(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> Control {
+        let (backend, options, sender, _receiver) = harness();
+        handle_key(
+            app,
+            KeyEvent::new(code, modifiers),
+            &backend,
+            &options,
+            &sender,
+        )
+    }
+
+    /// A Traces list of `ids` with the cursor on the first row and nothing fetched yet.
+    fn traces_list(ids: &[&str]) -> App {
+        let mut app = App::new();
+        app.route = Route::Traces;
+        let mut lines = vec![format!("{} matching traces", ids.len())];
+        lines.extend(ids.iter().map(|id| format!("{id}  ts")));
+        app.snapshot = Snapshot {
+            lines,
+            trace_ids: ids.iter().map(|id| (*id).to_owned()).collect(),
+            list_from: Some(1),
+            ..Default::default()
+        };
+        app.selected = 1;
+        app
+    }
+
+    /// Holding ↓ is a stream of cursor moves; none of them may fetch. What is left behind is one
+    /// scheduled fetch, for the row the cursor stopped on. (The exact once-only firing against a clock
+    /// is pinned in `app::preview`; this is the same path driven through the real key handler.)
+    #[tokio::test]
+    async fn holding_down_on_the_traces_list_fetches_only_where_it_stops() {
+        let mut app = traces_list(&["a", "b", "c", "d", "e"]);
+        for _ in 0..4 {
+            press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+            assert_eq!(app.preview.in_flight, None, "no fetch mid-scroll");
+        }
+        assert_eq!(app.selected, 5);
+        assert_eq!(app.detail_trace_id.as_deref(), Some("e"));
+        assert!(app.preview.due.is_some(), "one fetch is scheduled");
+        let request = app
+            .take_due_waterfall(Instant::now() + std::time::Duration::from_secs(1))
+            .expect("the rested cursor's fetch");
+        assert_eq!(request.trace_id, "e");
+        assert_eq!(
+            app.take_due_waterfall(Instant::now() + std::time::Duration::from_secs(10)),
+            None
+        );
+        // The preview never touched the query lock.
+        assert!(!app.loading && !app.input_locked);
+    }
+
+    /// Enter while the debounce is still running wants that trace now: the fetch fires at once and the
+    /// detail opens on its arrival.
+    #[tokio::test]
+    async fn enter_mid_debounce_fires_the_fetch_and_opens_on_arrival() {
+        let mut app = traces_list(&["a", "b"]);
+        press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+        assert!(app.preview.due.is_some() && app.preview.in_flight.is_none());
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(app.pending_trace_open);
+        assert!(app.preview.in_flight.is_some(), "fired without waiting");
+        assert_eq!(app.preview.due, None);
+    }
+
+    #[test]
+    fn esc_while_a_query_holds_the_keyboard_cancels_it() {
+        let mut app = App::new();
+        app.push_history(); // somewhere for a Back to go, so a Back would be visible
+        app.route = Route::Traces;
+        app.begin_loading(Refresh::Interactive);
+        let cancelled = app.generation;
+
+        assert!(press_with(&mut app, KeyCode::Esc, KeyModifiers::NONE) == Control::Continue);
+        assert!(!app.loading && !app.input_locked, "the wait is over");
+        assert!(
+            matches!(app.route, Route::Traces),
+            "it cancelled, not went Back"
+        );
+        assert_eq!(app.back.len(), 1);
+        assert!(!app.input_refused);
+
+        // The answer arrives anyway and is ignored.
+        assert!(!app.apply(crate::model::QueryResult {
+            generation: cancelled,
+            screen: Screen::Traces,
+            result: Ok(Snapshot::message("late", "late")),
+        }));
+        assert_ne!(app.snapshot.title, "late");
+    }
+
+    #[test]
+    fn ctrl_c_cancels_a_query_in_flight_and_never_quits() {
+        // Locked.
+        let mut app = loading_normal();
+        assert!(
+            press_with(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL) == Control::Continue
+        );
+        assert!(!app.loading && !app.input_locked);
+
+        // A background refresh never took the keyboard, but Ctrl-C still stops the wait.
+        let mut app = App::new();
+        app.begin_loading(Refresh::Background);
+        press_with(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(!app.loading);
+
+        // Nothing loading: nothing happens at all — no quit, no navigation, no message.
+        let mut app = App::new();
+        app.push_history();
+        app.route = Route::Traces;
+        assert!(
+            press_with(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL) == Control::Continue
+        );
+        assert!(matches!(app.route, Route::Traces));
+        assert!(app.last_error.is_none());
+    }
+
+    #[test]
+    fn ctrl_c_in_the_query_box_cancels_without_touching_the_text() {
+        let mut app = editing("up");
+        app.begin_loading(Refresh::Interactive);
+        press_with(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(!app.loading, "cancelled");
+        assert_eq!(app.mode, Mode::Editing, "still editing");
+        assert_eq!(app.active_query(), "up", "and nothing typed");
+
+        // With nothing in flight it is as inert in the box as it always was.
+        press_with(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert_eq!((app.mode, app.active_query()), (Mode::Editing, "up"));
+    }
+
+    #[test]
+    fn esc_keeps_its_meanings_when_no_query_holds_the_keyboard() {
+        // In the editor, Esc closes the editor even with a locked query in flight (the lock does not
+        // cover the overlay modes) — and does not cancel that query.
+        let mut app = editing("up");
+        app.begin_loading(Refresh::Interactive);
+        press_with(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(app.loading, "closing the editor is not a cancel");
+
+        // During a background refresh, Esc is still Back. (The Back's own refresh coalesces behind the
+        // load in flight, so nothing is spawned.)
+        let mut app = App::new();
+        app.push_history();
+        app.route = Route::Logs;
+        app.begin_loading(Refresh::Background);
+        press_with(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(app.screen(), Screen::Overview, "went Back");
+        assert!(app.loading, "and the background load was left alone");
+        assert!(app.last_error.is_none());
     }
 
     #[test]

@@ -9,14 +9,28 @@ git history); this file tracks only what is still open.
 
 ## Open Items
 
-- [ ] **`request_waterfall` is not covered by the input lock or the banner.** The per-cursor-move
+- [ ] **The promoted-key equality fallback misses the attrs-index pushdown.** On segments sealed
+      before a key was promoted, `attr_eq_sql`'s fallback arm (`"k" IS NULL AND json_get_str(...) = $v`)
+      sits inside an `OR`, which the provider's attrs-index recognizer does not match — so those
+      segments run the full JSON scan, 2–4x slower than a bare indexed `json_get_str = v` when matches
+      are sparse (k=100: ~11 ms vs 4.3 ms). Not a regression (the old `CASE` form missed it too).
+      Options: have the provider recognise the fallback disjunct, or emit the bare JSON form for
+      segments known to lack the column. — *source: tackle-todos U3, 2026-10-18*
+
+- [ ] **Run the opt-in Docker plugin daemon test once.** It compiles and skips by default but has never
+      been run against a real daemon:
+      `IMBH_DOCKER_DAEMON_E2E=1 cargo test -p imbh-server --test docker_plugin_daemon -- --ignored --nocapture`
+      (prefix `DOCKER="sudo docker"` for a rootful daemon; `BASE=debian:trixie-slim` if host glibc is
+      newer than bookworm's). Then decide whether it becomes a CI leg. — *source: tackle-todos U5, 2026-10-18*
+
+- [x] **`request_waterfall` is not covered by the input lock or the banner.** *(Closed 2026-10-18 — the waterfall pane draws its own `<spinner> Loading waterfall…` through the debounce and the fetch (`App::waterfall_wait`, `ui/mod.rs`); no banner, no input lock, `App::loading` untouched.)* The per-cursor-move
       trace fetch (`tasks.rs::request_waterfall`) sets no `loading` flag, so a slow waterfall neither
       raises the banner nor pauses input; the preview pane just says "Loading waterfall...". It is a
       different shape of load — one detail pane rather than the whole screen — so folding it into
       `App::loading` would over-lock. Wants its own lighter treatment (a pane-local spinner) once the
       debounce + LRU item below lands, since that changes when the fetch fires at all.
 
-- [ ] **There is no way to cancel an in-flight query.** With input locked, a query that never lands
+- [x] **There is no way to cancel an in-flight query.** *(Closed 2026-10-18 — `App::cancel_loading`: `Ctrl-C` cancels in every mode and never quits; `Esc` cancels only while a query holds the keyboard. `App::apply` now releases the lock only for a current-generation result, so a cancelled query's late answer cannot unlock a newer one still in flight.)* With input locked, a query that never lands
       leaves `q` as the only exit, which is why `survives_loading` special-cases it. The honest fix is
       an interrupt (`Esc` cancelling the in-flight query, or a `Ctrl-C` binding — the TUI has none
       today) that drops the result by generation and calls `App::end_loading`. Cheap on the client
@@ -29,7 +43,7 @@ git history); this file tracks only what is still open.
       structs are still exhaustive, so the next field added to any of them is another breaking
       change. Worth doing to all of them in some later bump.
 
-- [ ] **No column projection reaches the Parquet reader.** `SegmentPartitionStream` yields
+- [x] **No column projection reaches the Parquet reader.** *(Closed 2026-10-18 — `scan()` builds a by-name `ProjectionMask::roots` per segment and coerces the buffer to the same projected schema; guarded by `pushdown_on_and_off_return_identical_batches` (35 queries, batch-for-batch) and `narrow_traces_query_skips_the_json_columns`. `bytes_scanned` now counts projected columns only. See ARCHITECTURE §9.2.)* `SegmentPartitionStream` yields
       full-schema batches and lets `StreamingTableExec` project above it
       (`crates/imbh-query/src/provider.rs`), so the wide `spans` attributes/resource/events/links
       JSON is decoded on every traces query even when the plan needs two columns. Pushing a
@@ -64,7 +78,7 @@ git history); this file tracks only what is still open.
       is arguably more correct for an RSS budget but changes allocation behaviour — re-run
       `crates/imbh/tests/soak_rss.rs`.
 
-- [ ] **Per-cursor-move trace fetch is unthrottled and single-slot.** Holding down-arrow on the
+- [x] **Per-cursor-move trace fetch is unthrottled and single-slot.** *(Closed 2026-10-18 — `Snapshot::trace_ids` replaces re-parsing the row text; `app/preview.rs` adds a 120 ms debounce (Enter skips it) and a 16-entry LRU keyed by trace id. A fresh snapshot, including an auto-refresh, clears the cache, so it helps within one result set only — relax that if it proves too eager.)* Holding down-arrow on the
       Traces list issues one full `traces().get()` per row (`keys.rs` -> `tasks.rs::request_waterfall`).
       A ~120 ms idle debounce plus a small LRU keyed by trace id would collapse a scroll into one
       fetch. Prerequisite: keep `Vec<TraceMatch>` on the snapshot instead of re-parsing the id out of
@@ -200,7 +214,7 @@ git history); this file tracks only what is still open.
       index cost — the clean index-cost number is the 0.28 ms from `attr-bench`.
       — *source: metricattr-bench, 2026-08-08*
 
-- [ ] **The `CAST(col AS VARCHAR)` in `attr_field` is pure overhead for equality filters — measured.**
+- [x] **The `CAST(col AS VARCHAR)` in `attr_field` is pure overhead for equality filters — measured.** *(Closed 2026-10-18 — `SqlParams::attr_eq_sql` emits `(("k" IS NOT NULL AND "k" = $v) OR ("k" IS NULL AND json_get_str(attributes,$k) = $v))` at the equality sites only; re-measured 0.12–0.49 ms faster per 100k rows on segments with the column. Guarded by `crates/imbh/tests/attr_eq_filters.rs`. See the follow-up on the fallback arm below.)*
       A promoted key compiles to `CAST("k" AS VARCHAR)` so the fragment's Arrow type is the same
       whether or not the key is promoted; that matters for the *projection* sites (`… AS g{i}` group-by
       outputs, where dropping it would make a result column's type depend on the promote set) but not
@@ -326,14 +340,14 @@ git history); this file tracks only what is still open.
       afterwards. Not a correctness issue — the probe re-runs every refresh precisely because this is
       unknown — but it is what the operator guide should promise.
 
-- [ ] **A remap script sees a pre-discovery `.resource`.** `Bound`'s resource seed is built once at
+- [x] **A remap script sees a pre-discovery `.resource`.** *(Closed 2026-10-18 — `Remapper` caches `(Arc<Resource>, Value)` and rebuilds it only when `container.resource()` changes by `Arc::ptr_eq`. The bug also stripped `container.network.*` from records whose script set `.resource` after a refresh; both are pinned by tests in `docker/remap.rs`.)* `Bound`'s resource seed is built once at
       `StartLogging`, so when a later network refresh swaps the container's resource
       (`Container::set_networks`), the *stored* record gets the new one but a script's `.resource`
       still shows the old. Harmless today — the built-in script never reads `.resource`, and
       `.info.networks` *is* refreshed per line — but it is a real inconsistency to fix before
       anything depends on it. (JOURNAL 2026-08-07.)
 
-- [ ] **Nothing exercises the plugin against a real daemon.** `docker_plugin_config.rs` now guards the
+- [x] **Nothing exercises the plugin against a real daemon.** *(Closed 2026-10-18 — `crates/imbh-server/tests/docker_plugin_daemon.rs`, `#[ignore]` plus `IMBH_DOCKER_DAEMON_E2E=1`. Not yet run against a daemon; see the follow-up below.)* `docker_plugin_config.rs` now guards the
       shipped `config.json` statically, but the packaging path (`build.sh` → `plugin create` →
       `enable` → a container logging through it) is still only ever run by hand. This class of bug —
       valid config, valid binary, fails at `enable` — is invisible to every existing test. An opt-in
@@ -431,7 +445,7 @@ git history); this file tracks only what is still open.
       timeout layer would add is itself a footprint question, which is part of why this stays a
       conditional item rather than a pending fix.
 
-- [ ] **The PromQL-agreement test compares against a transcription, not the real function.**
+- [x] **The PromQL-agreement test compares against a transcription, not the real function.** *(Closed 2026-10-18 — moved to `crates/imbh-lgtm/tests/promql_duplicate_agreement.rs`, calling the real `collapse_duplicate_samples` and `imbh`'s typed dedup; the copy in `imbh/src/metrics.rs` is gone.)*
       `range_dedup_agrees_with_the_promql_collapse` (`crates/imbh/src/metrics.rs`) verifies that the
       typed metrics dedup resolves duplicates the same way PromQL does — but it carries a **verbatim
       copy** of `duplicate_value_cmp` / `collapse_duplicate_samples` rather than calling them, because
@@ -1107,14 +1121,14 @@ git history); this file tracks only what is still open.
         relocation, and every fallback path depends on the JSON still being there.
       — *source: design note consolidation, 2026-08-09*
 
-- [ ] **Pacing is only `--max-jobs`.** Convergence is triggered by schema lag, so the first pass after
+- [x] **Pacing is only `--max-jobs`.** *(Closed 2026-10-18 — oldest-first by user decision: UTC day, then earliest segment time, then `Table::ALL` order, shared by `prepare_pending` and `Db::compact_bounded`. `Db::compact()` stays uncapped; `compact_bounded` is the cap.)* Convergence is triggered by schema lag, so the first pass after
       a `set_promote` makes **every** segment lacking the new column eligible. `--max-jobs` bounds one
       pass but nothing orders the work — oldest-first, or smallest-first, would both be defensible and
       neither is implemented; the planner takes tables and days in iteration order. Also worth deciding
       whether in-process `Db::compact()` needs a cap of its own, since it has none.
       — *source: housekeeper implementation, 2026-08-09*
 
-- [ ] **`Compression` is still per-handle config, unlike `promote` and `retention`.** The housekeeper
+- [x] **`Compression` is still per-handle config, unlike `promote` and `retention`.** *(Closed 2026-10-18 — a `compression` line in `db.info`, inherited when the builder call is omitted; the housekeeper reads it per pass via `read_compression`. A 0.9.0 writer reopening the DB drops the line, which only costs segment size.)* The housekeeper
       writes its output with `Compression::default()`, which may differ from what the host writes.
       Segments are self-describing so this is *correct* — it costs a size difference and nothing more,
       which is what the binary's comment says — but it is the same incoherence that made a reader and

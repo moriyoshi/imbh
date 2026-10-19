@@ -4,13 +4,17 @@
 //! [`App::apply`] (landing a query result). The rest of the behaviour is split by concern into the
 //! submodules: [`nav`] (menu bar, focus ring, back/forward history), [`window`] (the time range and
 //! pan/zoom), [`catalog`] (the Metrics catalog tree), [`views`] (route accessors, row selection, and
-//! opening the detail views), and [`completion`] (the query completion popup).
+//! opening the detail views), [`completion`] (the query completion popup), and [`preview`] (the
+//! Traces list's debounced, cached waterfall preview).
 
 mod catalog;
 mod completion;
 mod nav;
+mod preview;
 mod views;
 mod window;
+
+pub(crate) use preview::{WaterfallFetch, WaterfallPreview, WaterfallRequest};
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
@@ -128,6 +132,9 @@ pub(crate) struct App {
     /// Set when Enter is pressed on the Traces list before the selected trace has finished loading: the
     /// full trace detail then opens as soon as the fetch lands. Cleared by any navigation.
     pub(crate) pending_trace_open: bool,
+    /// When the preview pane's next waterfall fetch fires, which one is in flight, and the cache of
+    /// ones already fetched. See [`preview`].
+    pub(crate) preview: WaterfallPreview,
     /// The selected span row in an open `Route::TraceDetail` (view context, so the history captures it
     /// while it lives flat here — the same shape as `metric_cursor`).
     pub(crate) span_cursor: usize,
@@ -239,7 +246,7 @@ impl App {
             pending_refresh: None,
             generation: 0,
             selected: 0,
-            snapshot: Snapshot::message("Overview", "Loading..."),
+            snapshot: Snapshot::loading("Overview"),
             last_error: None,
             last_refresh: Instant::now(),
             scroll: 0,
@@ -251,6 +258,7 @@ impl App {
             detail_trace_id: None,
             trace_detail: None,
             pending_trace_open: false,
+            preview: WaterfallPreview::new(),
             span_cursor: 0,
             metric_cursor: 0,
             focus_trace_id: None,
@@ -474,10 +482,56 @@ impl App {
         (self.input_refused || elapsed >= LOADING_BANNER_AFTER).then_some(elapsed)
     }
 
-    pub(crate) fn apply(&mut self, result: QueryResult) {
+    /// Abandon the query in flight: release the keyboard and make sure its answer, whenever it
+    /// arrives, is dropped. Returns whether there was anything to cancel.
+    ///
+    /// The request itself is not stopped — the backend keeps working on it until it finishes or the
+    /// head's own timeout ends it. What is cancelled is the *wait*: the generation moves on, so the
+    /// late result fails [`App::apply`]'s generation check like any superseded one, and does not
+    /// release (or land under) whatever query the user starts next.
+    ///
+    /// Everything that was only waiting for that result goes with it: a refresh coalesced behind it
+    /// (the user asked for the waiting to stop, not to be replaced by the next wait), a log-paging step
+    /// (the page it was moving to never arrived, so paging restarts from the next refresh), and a
+    /// trace-detail jump or Enter that was going to open on arrival. `last_refresh` is reset so the
+    /// auto-refresh timer waits a full interval rather than re-issuing the query on its next tick.
+    pub(crate) fn cancel_loading(&mut self) -> bool {
+        if !self.loading {
+            return false;
+        }
+        self.generation = self.generation.wrapping_add(1);
         self.end_loading();
-        if result.generation != self.generation || result.screen != self.screen() {
-            return;
+        self.pending_refresh = None;
+        self.last_refresh = Instant::now();
+        self.log_cursor_stack.clear();
+        self.log_next_cursor = None;
+        self.pending_trace_open = false;
+        self.clear_trace_focus();
+        // A screen switch put a "Loading..." placeholder up; it is not loading any more.
+        if self.snapshot.is_loading_placeholder() {
+            self.snapshot = Snapshot::message(
+                self.snapshot.title.clone(),
+                "Cancelled. Press r to run the query again.",
+            );
+        }
+        self.last_error = Some("query cancelled (r runs it again)".to_owned());
+        true
+    }
+
+    /// Land a query result. Returns whether it was the answer to the query in flight — `false` for a
+    /// cancelled or superseded one, which changes nothing at all.
+    ///
+    /// Only the in-flight generation releases the keyboard. A stale answer belongs to a query the user
+    /// cancelled, and the lock now held (if any) is a newer query's: releasing it here would hand the
+    /// keyboard back while that one is still running. The in-flight answer releases it whatever
+    /// screen it was for — that query is over either way.
+    pub(crate) fn apply(&mut self, result: QueryResult) -> bool {
+        if result.generation != self.generation {
+            return false;
+        }
+        self.end_loading();
+        if result.screen != self.screen() {
+            return true;
         }
         self.last_refresh = Instant::now();
         match result.result {
@@ -493,8 +547,9 @@ impl App {
                     self.selected = self.selected.clamp(first, last);
                 }
                 // The new snapshot ships a placeholder detail; force the selected trace's waterfall to
-                // be (re)fetched by clearing what we think is shown.
-                self.detail_trace_id = None;
+                // be (re)fetched by clearing what we think is shown — and what was cached against the
+                // result set this one replaces.
+                self.reset_waterfalls();
                 // Keep an open metric-detail chart live: re-derive its points from the matching series
                 // in the fresh result (matched by label set), so a range change / pan / zoom / auto-
                 // refresh actually redraws the plotted window instead of showing the frozen open-time
@@ -524,6 +579,7 @@ impl App {
         // A measurement that arrived before its snapshot did (an empty database measures faster than
         // the gauges query) is folded in now rather than dropped.
         self.compose_attr_stats();
+        true
     }
 
     /// The inclusive `[first, last]` selection-index range the row cursor may occupy, or `None` when
@@ -887,17 +943,101 @@ mod tests {
     }
 
     #[test]
-    fn landing_a_stale_result_still_releases_the_keyboard() {
-        // `apply` bails out early on a superseded generation. The release happens first: the query
-        // this lock belonged to is over either way, and skipping it would strand the keyboard.
+    fn landing_a_result_for_another_screen_still_releases_the_keyboard() {
+        // `apply` bails out early on a result for a screen the user has since left. The release
+        // happens first: the query this lock belonged to is over either way, and skipping it would
+        // strand the keyboard.
         let mut app = App::new();
         app.begin_loading(Refresh::Interactive);
-        app.apply(QueryResult {
-            generation: app.generation.wrapping_sub(1),
-            screen: Screen::Overview,
-            result: Ok(Snapshot::message("Overview", "")),
-        });
+        assert!(app.apply(QueryResult {
+            generation: app.generation,
+            screen: Screen::Logs,
+            result: Ok(Snapshot::message("Logs", "")),
+        }));
         assert!(!app.loading && !app.input_locked);
         assert!(app.loading_banner().is_none());
+        assert_ne!(app.snapshot.title, "Logs", "but nothing from it lands");
+    }
+
+    #[test]
+    fn a_cancelled_querys_late_result_is_ignored() {
+        let mut app = App::new();
+        app.route = Route::Logs;
+        app.begin_loading(Refresh::Interactive);
+        let cancelled = app.generation;
+        assert!(app.cancel_loading());
+        assert!(!app.loading && !app.input_locked);
+        assert!(app.loading_banner().is_none());
+        assert!(app.last_error.as_deref().unwrap().contains("cancelled"));
+        assert!(!app.cancel_loading(), "nothing left to cancel");
+
+        // The answer turns up anyway: dropped, snapshot untouched.
+        assert!(!app.apply(QueryResult {
+            generation: cancelled,
+            screen: Screen::Logs,
+            result: Ok(Snapshot::message("late", "late")),
+        }));
+        assert_ne!(app.snapshot.title, "late");
+    }
+
+    #[test]
+    fn a_cancelled_querys_late_result_leaves_a_newer_load_locked() {
+        // Cancel, then start another query before the first one's answer turns up. That answer must
+        // not release the keyboard the second query holds.
+        let mut app = App::new();
+        app.route = Route::Logs;
+        app.begin_loading(Refresh::Interactive);
+        let cancelled = app.generation;
+        app.cancel_loading();
+        app.generation = app.generation.wrapping_add(1); // what `request_refresh` does
+        app.begin_loading(Refresh::Interactive);
+        assert!(!app.apply(QueryResult {
+            generation: cancelled,
+            screen: Screen::Logs,
+            result: Ok(Snapshot::message("late", "late")),
+        }));
+        assert!(
+            app.loading && app.input_locked,
+            "the newer query still holds it"
+        );
+        // And the newer query's own answer lands normally.
+        assert!(app.apply(QueryResult {
+            generation: app.generation,
+            screen: Screen::Logs,
+            result: Ok(Snapshot::message("fresh", "fresh")),
+        }));
+        assert_eq!(app.snapshot.title, "fresh");
+        assert!(!app.loading);
+    }
+
+    #[test]
+    fn cancelling_drops_what_was_waiting_on_the_query() {
+        let mut app = App::new();
+        app.route = Route::Traces;
+        app.snapshot = Snapshot::message("Traces", "Loading...");
+        app.begin_loading(Refresh::Interactive);
+        app.pending_refresh = Some(Refresh::Background);
+        app.focus_trace_id = Some("aa".to_owned());
+        app.focus_trace_open = true;
+        app.last_refresh = Instant::now() - Duration::from_secs(3600);
+        app.cancel_loading();
+        assert_eq!(
+            app.pending_refresh, None,
+            "the queued refresh does not replay"
+        );
+        assert_eq!(app.focus_trace_id, None);
+        assert!(
+            !app.focus_trace_open,
+            "the jump will not open on a later arrival"
+        );
+        assert!(
+            app.last_refresh.elapsed() < Duration::from_secs(60),
+            "the auto-refresh timer starts over"
+        );
+        assert!(
+            !app.snapshot.is_loading_placeholder(),
+            "the placeholder no longer claims to be loading: {:?}",
+            app.snapshot.lines
+        );
     }
 }
