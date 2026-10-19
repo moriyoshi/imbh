@@ -57,7 +57,8 @@ Key properties:
   the watermark advanced, which makes segments (`lsn ≤ W`) and replayed tail (`lsn > W`) provably
   disjoint (no double-count) and guarantees no frame `> W` was reclaimed yet (no drop). WAL visibility
   is via the shared OS page cache, so reads are near-real-time (fsync governs crash durability, not
-  cross-process visibility). A writer advertises its WAL mode in a `db.info` marker at open; a
+  cross-process visibility). A writer advertises its WAL mode in a `db.info` marker at open (the same
+marker also carries the durable promote set, retention policy and compression codec, §7.1); a
   read-only open against a **WAL-off** writer — which could only ever see seal-interval freshness — is
   rejected by default with `Error::reader_wal_disabled`, with `DbBuilder::allow_stale_reads()` to opt
   in. **Read-during-delete
@@ -407,8 +408,9 @@ Metrics tables are **not** Tantivy-indexed (attr cardinality is low; dictionary/
   (`fs4::fs_std::FileExt::try_lock_exclusive`, non-blocking); a second writer fails fast with
   `Error::lock_held`. The lock releases on handle drop / process exit, so a crashed writer leaves no
   stale lock. Read-only opens (§5) skip the lock entirely. A read-write open also writes a `db.info`
-  marker advertising its WAL mode, so a reader can detect a WAL-off writer and reject a read-only open
-  that would get only seal-interval freshness (§5). See §7.1.
+  marker advertising its WAL mode (plus the durable promote set, retention policy and compression
+  codec), so a reader can detect a WAL-off writer and reject a read-only open that would get only
+  seal-interval freshness (§5). See §7.1.
 
 ### 7.1 Cross-process concurrency (single-writer, many-reader)
 
@@ -510,6 +512,14 @@ the transitive tree.
 seal-interval freshness); `DbBuilder::allow_stale_reads()` opts in. A missing/unparseable marker reads
 as "unknown" and never rejects (pre-marker DBs open as before).
 
+The marker is a list of tab-separated tagged lines, and it is also where **durable database state**
+lives: `promote` (the promoted key set), `retain_max_age_secs` / `retain_max_disk_bytes` (retention),
+and `compression` (`none`, `lz4`, or `zstd\t<level>`). Omitting the matching builder call on a
+read-write open inherits the recorded value; an explicit call overrides and records it; a read-only
+open always uses the recorded value. Unknown tags are ignored, so an older reader tolerates a newer
+marker, and a missing `compression` line means `Compression::default()` (what every pre-codec database
+was written with).
+
 **Public API.** `DbBuilder::access(Access)` with `Access::{ReadWrite (default), ReadOnly}`;
 `Db::open_read_only(path)` convenience. Read-write open may return `Error::lock_held`. On a read-only
 `Db`, ingest/seal/maintain/retain/compact return `Error::read_only`; the query APIs work unchanged and
@@ -558,9 +568,12 @@ So the split is by **cost profile** instead. Rewriting is ~99% expensive IO and 
 bookkeeping, and the halves have different requirements:
 
 - **Prepare** needs only read access. `imbh_storage::prepare_pending` opens the database read-only
-  (no lock — §7.1 readers already work against a live writer), reads the manifest and the durable
-  promoted set off disk, rewrites a segment group into one new file plus its `.tidx`, and leaves a
-  record under `<db>/pending/`. It never touches the manifest and never deletes anything.
+  (no lock — §7.1 readers already work against a live writer), reads the manifest, the durable
+  promoted set and the durable compression codec (`read_compression`) off disk, rewrites a segment group into one new file plus its `.tidx`, and leaves a
+  record under `<db>/pending/`. It never touches the manifest and never deletes anything. When
+  `max_jobs` caps a pass, eligible partitions are taken **oldest first**: UTC partition day, then the
+  partition's earliest segment time, then `Table::ALL` order — a total, deterministic order that
+  `Db::compact_bounded` shares, so in-process and out-of-process slices agree.
 - **Commit** is the writer's, and cheap. `Db::commit_pending` validates the record and performs one
   manifest delta then unlinks the inputs — work the writer already does at seal.
 
@@ -616,8 +629,10 @@ claim `A`, and whichever committed first would invalidate the other.
 `stat()` per segment, so there is no expensive half to move off-process — the writer computes the drop
 list faster than it could read a record describing one. A "drop A" record would also race a
 "merge A,B -> C" record for the same input, dissolving the deliberate `commit_pending()`-before-
-`retain()` ordering in `maintain()`. Instead **retention policy is durable state** (§6.1), so a
-housekeeper's offline mode applies the host's own policy rather than one from its own flags.
+`retain()` ordering in `maintain()`. Instead **retention policy is durable state** (§7.1, `db.info`), so a
+housekeeper's offline mode applies the host's own policy rather than one from its own flags. The
+compression codec is durable state for the same reason: rewritten segments use the host's codec, not
+the housekeeper's default.
 
 **Feature gating.** `compaction` (default on) carries the rewrite; `commit_pending` stays in every
 build. `housekeeper` implies it and adds the `imbh-housekeeper` binary. Measured: dropping
@@ -771,6 +786,20 @@ row ordinals onto the kept groups and read the wrong rows.
 > built, and remains a possible follow-up — it would additionally save the footer read, at the cost of
 > a breaking change to `imbh_query::SegmentInput`.
 
+**Column projection reaches the Parquet reader.** `scan()` takes DataFusion's `projection` and each
+segment opens with a `ProjectionMask::roots` built by matching column **names** against that file's
+own root columns (never table-schema indices), so older segments missing a promoted column, reordered
+or extra columns, and differently stored types all go through the same `coerce` as before. The buffer
+snapshot is coerced to the identical projected schema. Because every claim above is `Inexact`,
+DataFusion keeps each pushed filter in a `FilterExec` above the scan, so its columns are always in
+`projection` — nothing inside the scan needs an unprojected column (blooms and row-group statistics
+come from the footer, the `RowSelection` from the `.tidx`), and a column mask never renumbers rows, so
+it composes with both. A two-column `spans` query therefore no longer decodes the
+`attributes`/`resource`/`events`/`links` JSON. `ScanStats::bytes_scanned` counts only the projected
+columns (≈ 0 for `count(*)`). Measured: logs `count(*)` 8.1 → 1.7 ms and spans `hex(trace_id) = …`
+7.1 → 2.3 ms at 60 segments (`prune-bench`); `matches(name, …)` 10.8 → 4.0 ms at mid cardinality
+(`spanindex-bench`). A crate-internal switch keeps the unprojected path for the on/off equality test.
+
 **Page-index pruning is not implemented.** The writer currently emits one row group per segment, so
 the row-group narrowing path above is dormant in practice and the whole-segment skip is where the win
 is. Finer within-segment pruning would need `ArrowReaderOptions::with_page_index(true)` plus
@@ -855,6 +884,7 @@ impl Db {
     pub async fn compact(&self) -> Result<CompactionReport>;
     pub async fn snapshot(&self, dir: impl AsRef<Path>) -> Result<SnapshotInfo>;
     pub async fn stats(&self) -> Result<DbStats>;
+    pub fn compression(&self) -> Compression;   // the resolved codec (builder, else db.info, else default)
     pub async fn export(&self, table: Table, range: TimeRange) -> Result<Vec<u8>>;  // Arrow IPC
     pub fn segments(&self) -> Vec<SegmentRef>;
     pub fn segment_files(&self, table: Table) -> Vec<PathBuf>;                       // zero-copy handoff
@@ -866,7 +896,7 @@ impl Db {
 pub struct DbBuilder { /* … */ }
 impl DbBuilder {
     pub fn memory_budget(self, b: MemoryBudget) -> Self;   // caps buffer + query pool + writer heap
-    pub fn compression(self, c: Compression) -> Self;      // Zstd(i32) | Lz4 | None
+    pub fn compression(self, c: Compression) -> Self;      // Zstd(i32) | Lz4 | None; omitted = inherit db.info
     pub fn wal(self, mode: WalMode) -> Self;               // Off | Interval(Duration) | Always
     pub fn retention(self, r: Retention) -> Self;          // Retention::days(n).max_disk_bytes(b)
     pub fn maintenance(self, m: Maintenance) -> Self;      // Manual | Background(Duration) | Runtime(Handle, Duration)
@@ -1641,7 +1671,7 @@ One pass is seal → commit pending rewrites → apply retention (`Db::maintain`
 the body says `{"compact": true}`.
 
 **`max_jobs` bounds the work of one pass**, the way `imbh-housekeeper --max-jobs` bounds a preparer's:
-it caps the **partitions** compaction rewrites (`Db::compact_bounded`), so a corpus too large to
+it caps the **partitions** compaction rewrites (`Db::compact_bounded`, oldest partitions first, §7.2), so a corpus too large to
 compact in one call is drained a slice at a time instead of forcing a choice between an hour-long pass
 and never compacting. Partitions past the bound are left exactly as they were — untouched, still
 listed, still queryable — so a capped pass is a *slice*, not a partial one, and there is nothing to
