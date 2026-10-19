@@ -172,11 +172,16 @@ impl Cache {
 /// from line to line.
 pub struct Bound {
     script: Arc<Script>,
-    /// `.info`, `.resource` and the trace fields — cloned, not rebuilt, for every line.
+    /// `.info` — cloned, not rebuilt, for every line.
     seed: Value,
-    /// `.resource` as the script receives it, so "the script did not touch the resource" is one
-    /// comparison rather than a rebuild.
-    seed_resource: Value,
+    /// The container's resource as of `StartLogging`, and `.resource` as the script receives it.
+    ///
+    /// Only the *starting point* of each [`Remapper`]'s own copy: the container's resource is not
+    /// fixed at `StartLogging` (a bridge-network refresh swaps a fuller one in, see
+    /// `Container::set_networks`), so a remapper re-derives the VRL value whenever the container's
+    /// `Arc` changes. Kept here so the common case — nothing changed since start — costs the first
+    /// line a pointer comparison rather than a conversion.
+    seed_resource: (Arc<Resource>, Value),
 }
 
 impl Bound {
@@ -186,12 +191,12 @@ impl Bound {
         if script.wants_info {
             root.insert("info".into(), container_info(info));
         }
-        let resource = resource_to_vrl(&container.resource());
-        root.insert("resource".into(), resource.clone());
+        let resource = container.resource();
+        let value = resource_to_vrl(&resource);
         Bound {
             script,
             seed: Value::Object(root),
-            seed_resource: resource,
+            seed_resource: (resource, value),
         }
     }
 }
@@ -336,6 +341,11 @@ pub struct Remapper {
     /// producing the same resource shares one allocation — which is what keeps `encode`'s grouping
     /// a pointer comparison (see `ingest::encode`).
     interned: Option<(Value, Arc<Resource>)>,
+    /// The container's resource as VRL saw it last, keyed by the `Arc` it came from — `.resource`'s
+    /// seed, and what "the script did not touch the resource" is compared against. Like
+    /// [`Remapper::networks`], it changes on a discovery refresh, so it is rebuilt at most that often
+    /// and costs every other line one pointer comparison.
+    resource: (Arc<Resource>, Value),
     /// The container's network attachments as VRL saw them last, keyed by the `Arc` they came from.
     /// Networks change on a discovery refresh, not per line, so this is rebuilt at most that often.
     networks: Option<(Attachments, Value)>,
@@ -346,6 +356,7 @@ pub struct Remapper {
 impl Remapper {
     pub fn new(bound: Arc<Bound>) -> Remapper {
         Remapper {
+            resource: bound.seed_resource.clone(),
             bound,
             runtime: Runtime::default(),
             target: TargetValue {
@@ -418,9 +429,17 @@ impl Remapper {
                 info.insert("networks".into(), value.clone());
             }
         }
+        // `.resource` likewise: the container's resource gains `container.network.*` on a refresh,
+        // and a script must see the resource the record will actually be stored under.
+        let current = container.resource();
+        if !Arc::ptr_eq(&self.resource.0, &current) {
+            let value = resource_to_vrl(&current);
+            self.resource = (current, value);
+        }
         let Value::Object(root) = &mut self.target.value else {
             return;
         };
+        root.insert("resource".into(), self.resource.1.clone());
 
         let text = String::from_utf8_lossy(super::ingest::strip_newline(&entry.line)).into_owned();
         let stamp = Value::Timestamp(chrono::DateTime::from_timestamp_nanos(nanos));
@@ -505,9 +524,7 @@ impl Remapper {
         };
 
         let resource = match root.get("resource") {
-            Some(value) if *value != self.bound.seed_resource => {
-                Some(self.intern(value.clone(), container))
-            }
+            Some(value) if *value != self.resource.1 => Some(self.intern(value.clone(), container)),
             _ => None,
         };
         Outcome::Record(record, resource)
@@ -850,6 +867,87 @@ mod tests {
         };
         assert_eq!(attr(&list.values, "bridge"), Some("172.17.0.2"));
         assert_eq!(attr(&list.values, "myproj_default"), Some("172.23.0.7"));
+    }
+
+    /// `.resource` is not fixed at `StartLogging` either: a network refresh swaps a fuller resource
+    /// into the container (`Container::set_networks`), and the script must see the resource the
+    /// record will be stored under — not the pre-discovery one the binding was built from.
+    #[test]
+    fn a_script_sees_the_containers_current_resource_after_a_network_refresh() {
+        let (container, bound) = bind(
+            r#"{"ContainerID":"abc","ContainerName":"/web"}"#,
+            r#".attributes.seen_ip = .resource."container.network.bridge.ip""#,
+        );
+        let mut remapper = Remapper::new(bound);
+
+        let (record, resource) = record_of(remapper.apply(&container, &entry("stdout", "x\n")));
+        assert_eq!(
+            attr(&record.attributes, "seen_ip"),
+            None,
+            "nothing discovered yet"
+        );
+        assert!(
+            resource.is_none(),
+            "reading the resource is not overriding it"
+        );
+
+        container.set_networks(&[("bridge".to_owned(), "172.17.0.2".parse().unwrap())]);
+        let (record, resource) = record_of(remapper.apply(&container, &entry("stdout", "y\n")));
+        assert_eq!(
+            attr(&record.attributes, "seen_ip"),
+            Some("172.17.0.2"),
+            "the script must see the refreshed resource"
+        );
+        // Still untouched relative to what the script was given, so still no override — otherwise
+        // every line after a refresh would open its own group in `encode`.
+        assert!(
+            resource.is_none(),
+            "an untouched refreshed resource is not an override"
+        );
+
+        // The conversion is cached per `Arc`: another line with nothing changed reuses it.
+        let cached = remapper.resource.0.clone();
+        record_of(remapper.apply(&container, &entry("stdout", "z\n")));
+        assert!(Arc::ptr_eq(&cached, &remapper.resource.0));
+        assert!(Arc::ptr_eq(&cached, &container.resource()));
+    }
+
+    /// The other half of the same bug: a script that *extends* the resource produces an override
+    /// built from what it was given. Seeded with the pre-discovery resource, that override would
+    /// silently drop `container.network.*` from every record stored after the refresh.
+    #[test]
+    fn a_resource_override_after_a_refresh_keeps_the_network_attributes() {
+        let (container, bound) = bind(
+            r#"{"ContainerID":"abc","ContainerName":"/web"}"#,
+            r#".resource."deployment.environment" = "prod""#,
+        );
+        let mut remapper = Remapper::new(bound);
+        let (_, before) = record_of(remapper.apply(&container, &entry("stdout", "x\n")));
+        let before = before.expect("adding an attribute is an override");
+        assert_eq!(
+            attr(&before.attributes, "container.network.bridge.ip"),
+            None
+        );
+
+        container.set_networks(&[("bridge".to_owned(), "172.17.0.2".parse().unwrap())]);
+        let (_, after) = record_of(remapper.apply(&container, &entry("stdout", "y\n")));
+        let after = after.expect("adding an attribute is an override");
+        assert_eq!(
+            attr(&after.attributes, "container.network.bridge.ip"),
+            Some("172.17.0.2")
+        );
+        assert_eq!(
+            attr(&after.attributes, "deployment.environment"),
+            Some("prod")
+        );
+        assert!(
+            !Arc::ptr_eq(&before, &after),
+            "a changed resource must not reuse the interned pre-refresh override"
+        );
+
+        // And the interning still holds across lines once the resource is stable again.
+        let (_, again) = record_of(remapper.apply(&container, &entry("stdout", "z\n")));
+        assert!(Arc::ptr_eq(&after, &again.expect("override")));
     }
 
     /// A script that never mentions `.info` must not pay for the networks object at all — the same

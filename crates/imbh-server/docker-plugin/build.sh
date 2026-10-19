@@ -20,6 +20,8 @@
 #   FEATURES=docker ./…/build.sh                             # trim the imbhd feature set
 #   BASE=debian:trixie-slim ./…/build.sh                     # host glibc newer than bookworm's
 #   IMBH_BIND=none ./…/build.sh                              # no TCP listeners at all
+#   CARGO_TARGET_DIR=/elsewhere ./…/build.sh                 # imbhd is taken from that target dir
+#   PLUGIN_STAMP=$(date +%s%N) ./…/build.sh                  # a rootfs no other plugin can share
 #
 # Then:  ${DOCKER} plugin enable "${PLUGIN}"
 set -eu
@@ -71,13 +73,17 @@ esac
 
 echo "==> cargo build --release (imbhd features: ${FEATURES})"
 cargo build --release -p imbh-server --features "${FEATURES}"
+# Wherever cargo actually put it: honouring CARGO_TARGET_DIR here, and not just in cargo, is what
+# keeps a redirected build from staging a stale target/release/imbhd. Relative values resolve
+# against ${ROOT}, as cargo's own do (we are cd'd there).
+TARGET_DIR=${CARGO_TARGET_DIR:-target}
 
 # Under target/ so it inherits .gitignore; the context root is this directory, so the repo-root
 # .dockerignore (which excludes target/) does not apply to it.
 CTX="${ROOT}/target/plugin-ctx"
 rm -rf "${CTX}"
 mkdir -p "${CTX}/linux/${arch}"
-install -m 0755 target/release/imbhd "${CTX}/linux/${arch}/imbhd"
+install -m 0755 "${TARGET_DIR}/release/imbhd" "${CTX}/linux/${arch}/imbhd"
 # Apache-2.0 §4(d): the notices travel with every binary distribution, this rootfs included.
 install -m 0644 LICENSE "${CTX}/LICENSE"
 install -m 0644 THIRD-PARTY-NOTICES.txt "${CTX}/THIRD-PARTY-NOTICES.txt"
@@ -120,6 +126,13 @@ echo "==> exporting the rootfs"
 CID=$(${DOCKER} create "${IMAGE}" true)
 ${DOCKER} export "${CID}" | tar -x -C "${WORK}/rootfs"
 ${DOCKER} rm -f "${CID}" > /dev/null
+# The plugin store is content-addressed (see "creating plugin" below): a rebuild of the same commit
+# yields the same rootfs digest, which `plugin create` refuses under a second name. PLUGIN_STAMP
+# makes this rootfs unique, for registering a throwaway copy beside an installed one -- the opt-in
+# daemon test (tests/docker_plugin_daemon.rs) relies on it.
+if [ -n "${PLUGIN_STAMP:-}" ]; then
+  printf '%s\n' "${PLUGIN_STAMP}" > "${WORK}/rootfs/usr/share/doc/imbh/BUILD-STAMP"
+fi
 cp "${HERE}/config.json" "${WORK}/config.json"
 
 echo "==> creating plugin ${PLUGIN}"

@@ -386,7 +386,9 @@ on its own, so a script that changes nothing behaves exactly like no script at a
 .severity_text
 .body                       # seeded with .line; any VRL value is accepted
 .attributes                 # { "log.iostream": ... }
-.resource                   # service.name, container.*, container.label.*, container.env.*
+.resource                   # service.name, container.*, container.label.*, container.env.*,
+                            #   container.network.* -- current as of each line, so it too can
+                            #   fill in mid-container
 .trace_id / .span_id        # 32 / 16 hex characters
 .trace_flags
 ```
