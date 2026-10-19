@@ -911,3 +911,313 @@ fn promotion_reaches_the_next_seal_not_a_later_pass() {
         db.close().await.unwrap();
     });
 }
+
+const DAY_NS: u64 = 24 * 3_600 * 1_000_000_000;
+
+/// Every column chunk's codec in one Parquet segment.
+fn parquet_codecs(path: &std::path::Path) -> Vec<parquet::basic::Compression> {
+    use parquet::file::reader::{FileReader, SerializedFileReader};
+    let reader = SerializedFileReader::new(std::fs::File::open(path).unwrap()).unwrap();
+    reader
+        .metadata()
+        .row_groups()
+        .iter()
+        .flat_map(|rg| rg.columns().iter().map(|c| c.compression()))
+        .collect()
+}
+
+/// Whether **every** column chunk of `path` uses LZ4 (`Compression::Lz4` writes `LZ4_RAW`).
+fn all_lz4(path: &std::path::Path) -> bool {
+    let codecs = parquet_codecs(path);
+    !codecs.is_empty()
+        && codecs
+            .iter()
+            .all(|c| matches!(c, parquet::basic::Compression::LZ4_RAW))
+}
+
+/// **The compression codec is durable database state**, like the promoted key set and retention.
+///
+/// It was per-handle config: reopening without `compression()` silently went back to the default, and
+/// an out-of-process housekeeper had no way to learn the host's codec at all. Now calling it sets and
+/// records the codec, omitting it inherits, and a reader reports the database's codec rather than
+/// its builder's.
+#[test]
+fn the_compression_codec_is_durable_db_state() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let rt = ct_rt();
+
+    let db: Arc<Db> = Db::builder(dir)
+        .compression(Compression::Zstd(9))
+        .open()
+        .unwrap();
+    assert_eq!(db.compression(), Compression::Zstd(9));
+    rt.block_on(db.close()).unwrap();
+    drop(db);
+    assert_eq!(
+        imbh::read_compression(dir),
+        Compression::Zstd(9),
+        "recorded"
+    );
+
+    // Reopened WITHOUT compression(): inherited — the level too — not reset to the default.
+    let db: Arc<Db> = Db::builder(dir).open().unwrap();
+    assert_eq!(db.compression(), Compression::Zstd(9));
+    rt.block_on(db.close()).unwrap();
+    drop(db);
+
+    // An explicit call overwrites it, and that sticks too.
+    let db: Arc<Db> = Db::builder(dir)
+        .compression(Compression::Lz4)
+        .open()
+        .unwrap();
+    rt.block_on(db.close()).unwrap();
+    drop(db);
+    let db: Arc<Db> = Db::builder(dir).open().unwrap();
+    assert_eq!(db.compression(), Compression::Lz4, "the change persisted");
+    rt.block_on(async {
+        // And the inherited codec is what this handle actually writes with.
+        db.ingest_otlp_rich_ok("cart", "hello", 1, &[]).await;
+        db.flush().await.unwrap();
+    });
+    let segs = db.segment_files(Table::Logs).unwrap();
+    assert_eq!(segs.len(), 1);
+    assert!(all_lz4(&segs[0]), "{:?}", parquet_codecs(&segs[0]));
+
+    // A reader reports the database's codec, whatever its own builder said.
+    let reader = Db::builder(dir)
+        .access(imbh::Access::ReadOnly)
+        .compression(Compression::None)
+        .open()
+        .unwrap();
+    assert_eq!(reader.compression(), Compression::Lz4);
+    rt.block_on(db.close()).unwrap();
+}
+
+/// **A `db.info` with no codec line — one written by 0.9.0 — opens exactly as it did then.**
+///
+/// The handle uses the default codec, and the open does not *invent* a line for a codec nobody
+/// chose: the marker keeps reading as "unrecorded" until a host sets one. The other durable fields
+/// in the same file are untouched.
+#[test]
+fn a_db_info_without_a_codec_line_opens_with_the_default() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let rt = ct_rt();
+
+    let db: Arc<Db> = Db::builder(dir)
+        .compression(Compression::Lz4)
+        .promote(Promote::new(["env"]))
+        .retention(Retention::days(7))
+        .open()
+        .unwrap();
+    rt.block_on(db.close()).unwrap();
+    drop(db);
+
+    // Rewrite the marker the way 0.9.0 writes it: every line it knows, and no `compression` line.
+    let info = dir.join("db.info");
+    let text = std::fs::read_to_string(&info).unwrap();
+    assert!(text.lines().any(|l| l.starts_with("compression\t")));
+    let old: String = text
+        .lines()
+        .filter(|l| !l.starts_with("compression\t"))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    std::fs::write(&info, &old).unwrap();
+    assert_eq!(imbh::read_compression(dir), Compression::default());
+
+    let db: Arc<Db> = Db::builder(dir).open().unwrap();
+    assert_eq!(db.compression(), Compression::default(), "today's default");
+    assert_eq!(db.promote().keys(), ["env"], "the other fields still read");
+    assert_eq!(db.retention(), Retention::days(7));
+    rt.block_on(async {
+        db.ingest_otlp_rich_ok("cart", "hello", 1, &[]).await;
+        db.flush().await.unwrap();
+    });
+    let segs = db.segment_files(Table::Logs).unwrap();
+    assert!(
+        parquet_codecs(&segs[0])
+            .iter()
+            .all(|c| matches!(c, parquet::basic::Compression::ZSTD(_))),
+        "written with the default zstd"
+    );
+    rt.block_on(db.close()).unwrap();
+    drop(db);
+    assert!(
+        !std::fs::read_to_string(&info)
+            .unwrap()
+            .lines()
+            .any(|l| l.starts_with("compression\t")),
+        "an open that chose nothing records nothing"
+    );
+}
+
+/// **A housekeeper writes rewritten segments with the host's codec**, not its own default — and so
+/// does in-process compaction on a handle that merely inherited it.
+///
+/// The host chooses LZ4 (distinguishable from the zstd default in every column chunk's metadata). The
+/// preparer is handed `read_compression(dir)`, which is exactly what `imbh-housekeeper` does.
+#[test]
+fn rewritten_segments_use_the_persisted_codec() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let rt = ct_rt();
+
+    let db: Arc<Db> = Db::builder(dir)
+        .compression(Compression::Lz4)
+        .open()
+        .unwrap();
+    rt.block_on(async {
+        for n in 0..2u64 {
+            db.ingest_otlp_rich_ok("cart", "a", DAY_NS + n, &[]).await;
+            db.flush().await.unwrap();
+        }
+        db.close().await.unwrap();
+    });
+    drop(db);
+
+    // Out of process: the housekeeper's call.
+    let prepared = prepare_pending(dir, imbh::read_compression(dir), 4).unwrap();
+    assert_eq!(prepared.len(), 1);
+    let output = dir.join(&prepared[0].output.relative_path);
+    assert!(all_lz4(&output), "{:?}", parquet_codecs(&output));
+
+    // In process, on a handle that never called `compression()`: commit the record at open, add a
+    // second day's worth of segments, and compact them.
+    let db: Arc<Db> = Db::builder(dir).open().unwrap();
+    rt.block_on(async {
+        assert_eq!(db.segment_files(Table::Logs).unwrap().len(), 1, "committed");
+        for n in 0..2u64 {
+            db.ingest_otlp_rich_ok("cart", "b", 2 * DAY_NS + n, &[])
+                .await;
+            db.flush().await.unwrap();
+        }
+        let report = db.compact().await.unwrap();
+        assert_eq!(report.segments_created, 1);
+        let segs = db.segment_files(Table::Logs).unwrap();
+        assert_eq!(segs.len(), 2);
+        for s in &segs {
+            assert!(all_lz4(s), "{s:?}: {:?}", parquet_codecs(s));
+        }
+        db.close().await.unwrap();
+    });
+}
+
+/// Ingest the fixture both oldest-first tests share: four eligible (two-segment) partitions whose
+/// oldest-first order differs from table-iteration order at every position.
+///
+/// | order | partition   | why it is there                                                  |
+/// |-------|-------------|------------------------------------------------------------------|
+/// | 1     | spans, day 1 | oldest day, even though `logs` iterates first                   |
+/// | 2     | logs, day 2  |                                                                 |
+/// | 3     | spans, day 3 | same day as logs/3, but its data starts earlier (time tiebreak) |
+/// | 4     | logs, day 3  |                                                                 |
+///
+/// Table-iteration order — the old planner's — would have been logs/2, logs/3, spans/1, spans/3.
+async fn ingest_oldest_first_fixture(db: &Arc<Db>) {
+    use imbh_test_support::otlp::otlp_trace;
+    for n in 0..2u64 {
+        let t = DAY_NS + n;
+        db.ingest_otlp_traces(&otlp_trace("cart", "op", 1, t, t + 1, 0))
+            .await
+            .unwrap();
+        db.flush().await.unwrap();
+    }
+    for n in 0..2u64 {
+        db.ingest_otlp_rich_ok("cart", "d2", 2 * DAY_NS + n, &[])
+            .await;
+        db.flush().await.unwrap();
+    }
+    for n in 0..2u64 {
+        let t = 3 * DAY_NS + n;
+        db.ingest_otlp_traces(&otlp_trace("cart", "op", 1, t, t + 1, 0))
+            .await
+            .unwrap();
+        db.ingest_otlp_rich_ok("cart", "d3", t + 100, &[]).await;
+        db.flush().await.unwrap();
+    }
+    assert_eq!(db.segment_files(Table::Logs).unwrap().len(), 4);
+    assert_eq!(db.segment_files(Table::Spans).unwrap().len(), 4);
+}
+
+/// **A bounded preparer pass takes the oldest partitions first**, across tables, deterministically.
+///
+/// With more eligible work than `max_jobs`, which partitions a pass picks is the whole pacing
+/// policy. The planner used to take tables and days in iteration order — all of `logs` before any of
+/// `spans` — so a busy table's history could starve another's indefinitely.
+#[test]
+fn a_bounded_prepare_pass_takes_the_oldest_partitions_first() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let rt = ct_rt();
+    let db: Arc<Db> = Db::builder(dir).open().unwrap();
+    rt.block_on(async {
+        ingest_oldest_first_fixture(&db).await;
+
+        let picked = |jobs: &[imbh::PendingRewrite]| -> Vec<(Table, u64)> {
+            jobs.iter()
+                .map(|r| (r.table, r.output.min_time_unix_nano as u64 / DAY_NS))
+                .collect()
+        };
+        let first = prepare_pending(dir, Compression::default(), 2).unwrap();
+        assert_eq!(
+            picked(&first),
+            [(Table::Spans, 1), (Table::Logs, 2)],
+            "the two oldest partitions, whatever table they are in"
+        );
+        // Deterministic: an unchanged database plans the same pass again. (Those duplicate records
+        // are harmless — the second one for each input set is discarded at commit.)
+        let again = prepare_pending(dir, Compression::default(), 2).unwrap();
+        assert_eq!(picked(&again), picked(&first));
+        let report = db.commit_pending().await.unwrap();
+        assert_eq!(report.applied, 2);
+
+        // The next slices: same day, earlier data first, then table order.
+        let next = prepare_pending(dir, Compression::default(), 1).unwrap();
+        assert_eq!(picked(&next), [(Table::Spans, 3)]);
+        db.commit_pending().await.unwrap();
+        let last = prepare_pending(dir, Compression::default(), 1).unwrap();
+        assert_eq!(picked(&last), [(Table::Logs, 3)]);
+        db.commit_pending().await.unwrap();
+        assert!(
+            prepare_pending(dir, Compression::default(), 1)
+                .unwrap()
+                .is_empty(),
+            "drained"
+        );
+        assert_eq!(count_sql(&db, "SELECT count(*) AS c FROM logs").await, 4);
+        assert_eq!(count_sql(&db, "SELECT count(*) AS c FROM spans").await, 4);
+        db.close().await.unwrap();
+    });
+}
+
+/// **`compact_bounded` spends its budget in the same oldest-first order as the preparer**, so an
+/// in-process drain and an out-of-process one agree on what "the next slice" is.
+#[test]
+fn a_bounded_compaction_takes_the_oldest_partitions_first() {
+    let tmp = tempfile::tempdir().unwrap();
+    let rt = ct_rt();
+    let db: Arc<Db> = Db::builder(tmp.path()).open().unwrap();
+    rt.block_on(async {
+        ingest_oldest_first_fixture(&db).await;
+        let counts = |db: &Arc<Db>| {
+            (
+                db.segment_files(Table::Logs).unwrap().len(),
+                db.segment_files(Table::Spans).unwrap().len(),
+            )
+        };
+        // (logs, spans) segment counts after each one-partition slice.
+        let expected = [(4, 3), (3, 3), (3, 2), (2, 2)];
+        for (i, want) in expected.into_iter().enumerate() {
+            let r = db.compact_bounded(1).await.unwrap();
+            assert_eq!(r.segments_created, 1, "slice {i}");
+            assert_eq!(
+                counts(&db),
+                want,
+                "slice {i}: spans/1, logs/2, spans/3, logs/3"
+            );
+        }
+        assert_eq!(db.compact_bounded(1).await.unwrap().segments_created, 0);
+        db.close().await.unwrap();
+    });
+}

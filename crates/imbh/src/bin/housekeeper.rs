@@ -31,12 +31,21 @@
 //! ```text
 //! imbh-housekeeper <db-dir> [options]
 //!
-//!   --max-jobs <n>     rewrites to prepare per pass (default 4)
+//!   --max-jobs <n>     rewrites to prepare per pass (default 4), oldest partitions first
 //!   --every <seconds>  run continuously at this interval instead of once
 //!   --commit           take the writer lock and commit the records too — only valid when no
 //!                      writer is running; fails fast if one holds the lock
 //!   --json             machine-readable output
 //! ```
+//!
+//! **Pacing is oldest-first.** When more partitions are eligible than `--max-jobs` allows — the
+//! first pass after a `set_promote` makes every segment lacking the new column eligible — a pass
+//! takes the oldest UTC-day partitions first, across all tables (ties: earliest segment time, then
+//! table order; see `imbh_storage::prepare_pending`). A past day's segment set is final, so
+//! converging it is work done once, whereas the current day keeps gaining segments.
+//!
+//! **Output is written with the database's own codec** — the durable compression recorded in
+//! `db.info` by the host (`DbBuilder::compression`), not this process's default.
 //!
 //! `--commit` is the offline mode, and it falls out of the same design rather than being a second
 //! implementation: with no writer running, this process can be the writer for as long as the swap
@@ -55,13 +64,14 @@ use std::error::Error;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use imbh::{Compression, Db, MaintenanceReport, PendingRewrite, prepare_pending};
+use imbh::{Db, MaintenanceReport, PendingRewrite, prepare_pending, read_compression};
 
 const USAGE: &str = "\
 imbh-housekeeper <db-dir> [options]
 
   --max-jobs <n>     rewrites to prepare per pass (default 4). Bounds the burst after a
-                     `set_promote`, which makes every segment lacking the new column eligible.
+                     `set_promote`, which makes every segment lacking the new column eligible;
+                     the oldest day-partitions are taken first.
   --every <seconds>  run continuously at this interval instead of a single pass
   --commit           also commit the prepared records, taking the writer lock. ONLY valid when no
                      writer is running; fails fast if one holds the lock.
@@ -126,10 +136,13 @@ fn main() -> Result<(), Box<dyn Error>> {
 
 fn pass(cfg: &Config) -> Result<(), Box<dyn Error>> {
     let started = Instant::now();
-    // The compression a prepared segment is written with. It affects only this output's bytes, not
-    // how anything else is read, so a housekeeper disagreeing with the host costs a size difference
-    // and nothing more.
-    let prepared = prepare_pending(&cfg.dir, Compression::default(), cfg.max_jobs)?;
+    // Write prepared segments with the database's **durable** codec, the one the host records in
+    // `db.info`, so rewritten history is compressed the way the host's own seals are. Re-read every
+    // pass: a host reopened with a different `compression()` changes it. (Segments are
+    // self-describing, so a mismatch would only ever have cost a size difference — but it is the
+    // same reader/writer incoherence the durable promote set and retention removed.)
+    let compression = read_compression(&cfg.dir);
+    let prepared = prepare_pending(&cfg.dir, compression, cfg.max_jobs)?;
     let elapsed = started.elapsed();
 
     let committed: Option<MaintenanceReport> = if cfg.commit {
